@@ -4,6 +4,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal, kl_divergence
 
+import os
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+from src.encoder_decoder_model import *
+
 # https://arxiv.org/pdf/2411.03936
 # GuideVAE model implementation
 # Conditional VAE with conditioning on user profiles
@@ -245,4 +252,44 @@ class VAE(nn.Module):
         self.eval() # Set model to evaluation mode
         print("Training complete.")
         return
+
+class CVAE(VAE):
+    def __init__(self,
+                 input_dim=None,
+                 condition_object = None,
+                 latent_dim = 10,
+                distribution_dict = {},
+                 **_):
+        # Kwarg Handling
+        kwargs = dict(locals())
+        for key in ["self","__class__", "input_dim", "condition_object"]: kwargs.pop(key)
+        self.model_kwargs = kwargs
+        super(CVAE, self).__init__(input_dim=input_dim, distribution_dict=distribution_dict, **self.model_kwargs)
+
+        self.condition_dim = condition_object.condition_dim
+
+        self.encoder = get_encoder_model() # TODO: implement this function
+        self.decoder = get_decoder_model() # TODO: implement this function
+
+        self.prior_params = get_prior_params() # TODO: implement this function
     
+    def forward():
+        pass # TODO: implement forward method
+
+    def sample():
+        pass # TODO: implement sample method
+
+    def reconstruct():
+        pass # TODO: implement reconstruct method
+
+    def loglikelihood():
+        pass # TODO: implement loglikelihood method
+
+    def train_core():
+        pass # TODO: implement train_core method
+
+    def validate():
+        pass # TODO: implement validate method
+
+    def move_to_device(self, inputs, device):
+        return super().move_to_device(inputs, device)
