@@ -35,7 +35,7 @@ class VAE(nn.Module):
 
         # Remove unwanted keys from kwargs (all in the list)
         for key in ["self","__class__", "input_dim"]: kwargs.pop(key)
-        self.model_kwargs = kwargs # Store remaining kwargs
+        distribution_dict = {}, self.model_kwargs = kwargs # Store remaining kwargs
         # Set each remaining kwarg as an attribute
         for key in kwargs: setattr(self, key, kwargs[key])
 
@@ -43,11 +43,11 @@ class VAE(nn.Module):
         self.input_dim = input_dim
 
         # Define encoder and decoder networks
-        self.encoder = get_encoder_model() # TODO: Implement this function
-        self.decoder = get_decoder_model() # TODO: Implement this function
+        self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=distribution_dict.get("latent_dim", 10), **self.model_kwargs)
+        self.decoder = get_decoder_model(latent_dim=distribution_dict.get("latent_dim", 10), output_dim=input_dim, **self.model_kwargs)
 
         # Prior parameters for latent spaces
-        self.prior_params = get_prior_params() # TODO: Implement this function
+        self.prior_params = get_prior_params(input_dim=input_dim, latent_dim=distribution_dict.get("latent_dim", 10), **self.model_kwargs)
 
         # Calculate and store the number of parameters
         self.num_parameters = self.encoder._num_parameters() + self.decoder._num_parameters()
@@ -64,11 +64,11 @@ class VAE(nn.Module):
     
     @torch.no_grad()
     def sample(self, num_samples_prior = 1, num_samples_posterior = 1):
-        # Sample from the encoder's prior
+        # Sample from the encoder's prior giving latent space samples
         z = self.encoder.sample(param_dict=self.prior_params, num_samples=num_samples_prior, **self.model_kwargs)
-        # Decode the sampled latent variables
+        # Decode the sampled latent variables to get reconstruction parameters
         recon_params_dict = self.decoder(z)
-        # Generate samples from the decoder 
+        # Generate samples from the decoder using the reconstruction parameters
         samples = self.decoder.sample(recon_params_dict, num_samples=num_samples_posterior, **self.model_kwargs)
         # Return both the samples and the reconstruction parameters
         return {"samples": samples, "recon_params_dict": recon_params_dict}
@@ -104,15 +104,16 @@ class VAE(nn.Module):
         return recon_loglikelihood.mean(0)
 
     def loss(self, inputs, recon_params_dict, posterior_params_dict, beta=1.0, prior_params=None, **_):
-        # Compute reconstruction log-likelihood
+        # Compute reconstruction log-likelihood (we use reconstruction only because of VAE structure)
         recon_loglikelihood = self.reconstruction_loglikelihood(inputs, recon_params_dict, **self.model_kwargs)
-        # Compute KL divergence
+        # Compute KL divergence between posterior and prior
         if prior_params is None:
             prior_params = self.prior_params
         kl_div = self.encoder.kl_divergence(posterior_params_dict, prior_params, **self.model_kwargs)
         kl_div = kl_div.mean(0)
         loss = -(recon_loglikelihood - beta * kl_div)
         # TODO: MMD (mean maximum discrepancy) has been shown to be useful for smart meter data by one of the papers
+        # TODO: take loglikelihood of samples too??
         return {"loss": loss, "recon_loglikelihood": recon_loglikelihood, "kl_divergence": kl_div}["loss"]
 
     def train_core(self, inputs, optim, **_):

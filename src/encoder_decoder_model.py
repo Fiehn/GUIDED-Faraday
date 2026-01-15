@@ -5,6 +5,7 @@ from torch.distributions import Normal, kl_divergence
 
 # Will be a standard Gaussian encoder/decoder model.
 # GuideVAE style model will come later.
+# === Gaussian encoder and decoder Model ===
 class GaussianCoder(torch.nn.Module):
     def __init__(self, input_dim, output_dim, 
                  learn_sigma=False, 
@@ -53,9 +54,10 @@ class GaussianCoder(torch.nn.Module):
         return param_dict
     
     def sample(self, param_dict=None, num_samples=1,**_):
-        # Sample from the Gaussian defined by param_dict by mu + sigma * N(0,1)
-        return param_dict["mu"] + param_dict["sigma"] * torch.randn((num_samples, param_dict["mu"].shape[0]), param_dict["mu"].shape[1]).to(param_dict["mu"].device)
-    
+        # A helper function to sample from the Gaussian defined by param_dict using reparameterization trick
+        # calls reparameterize function
+        return self.reparameterize(param_dict, num_samples=num_samples)
+
     def loglikelihood(self, inputs, param_dict):
         # Compute log likelihood of inputs under the Gaussian defined by param_dict
         # TODO: I think this is where we might do multivariate Gaussian later??
@@ -73,7 +75,17 @@ class GaussianCoder(torch.nn.Module):
         # Here in the Gaussian case, we create a diagonal covariance matrix from the sigma parameters
         return torch.eye(param_dict["mu"].shape[1]).to(param_dict["mu"].device) * (param_dict["sigma"] ** 2).unsqueeze(-1)
     
-
+    def reparameterize(self, param_dict, num_samples=1):
+        # Reparameterization trick: sample epsilon from N(0,1) and return mu + sigma * epsilon
+        mu = param_dict["mu"]
+        sigma = param_dict["sigma"]
+        batch_size, output_dim = mu.shape
+        # Sample epsilon
+        epsilon = torch.randn((num_samples, batch_size, output_dim)).to(mu.device)
+        samples = mu.unsqueeze(0) + sigma.unsqueeze(0) * epsilon
+        return samples
+    
+# === This is a basic NN block used in the Parameterizer ===
 class NNBlock(nn.Module):
     def __init__(self,
                  input_dim,
@@ -130,7 +142,7 @@ class NNBlock(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-
+# === This is the actual network structure ===
 class Parameterizer(nn.Module):
     def __init__(self,
                  intput_dim,
