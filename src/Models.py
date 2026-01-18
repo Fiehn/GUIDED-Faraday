@@ -10,6 +10,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 from src.encoder_decoder_model import *
+from src.Conditioner import *
 
 # https://arxiv.org/pdf/2411.03936
 # GuideVAE model implementation
@@ -85,9 +86,9 @@ class VAE(nn.Module):
         
         recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=num_samples)
         # Compute log-likelihood of inputs given reconstruction parameters
-        posterior_loglikelihood = self.encoder.loglikelihood() # TODO: implement this method
-        recon_loglikelihood = self.decoder.loglikelihood() # TODO: implement this method
-        prior_loglikelihood = self.encoder.loglikelihood() # TODO: implement this method
+        posterior_loglikelihood = self.encoder.loglikelihood(inputs, posterior_params_dict, **self.model_kwargs)
+        recon_loglikelihood = self.decoder.loglikelihood(inputs, recon_params_dict, **self.model_kwargs)
+        prior_loglikelihood = self.encoder.loglikelihood(inputs, self.prior_params, **self.model_kwargs)
 
         # Combine log-likelihoods to compute ELBO ?? is it Elbo
         return (posterior_loglikelihood.sum(-1) + recon_loglikelihood.sum(-1) - prior_loglikelihood.sum(-1)).mean(0)
@@ -116,7 +117,7 @@ class VAE(nn.Module):
         # TODO: take loglikelihood of samples too??
         return {"loss": loss, "recon_loglikelihood": recon_loglikelihood, "kl_divergence": kl_div}["loss"]
 
-    def train_core(self, inputs, optim, **_):
+    def train_core(self, inputs, optim,gradient_clip=None, gradient_clip_kwargs=None, **_):
         # Forward pass
         recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=1) # TODO: need to implement a input system for kwargs
         
@@ -124,8 +125,8 @@ class VAE(nn.Module):
         optim.zero_grad() # Zero gradients
         loss = self.loss(inputs, recon_params_dict, posterior_params_dict, beta=1.0, prior_params= self.prior_params, **self.model_kwargs) # TODO: need to implement a input system for kwargs
         loss.backward() # Backpropagate
-        # if grad_clip is not None: (TODO: implement gradient clipping)
-        #     torch.nn.utils.clip_grad_norm_(self.parameters(), grad_clip)
+        if gradient_clip is not None:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_kwargs.get("max_norm", 1.0))
         optim.step() # Update parameters
         return loss
     
@@ -229,7 +230,7 @@ class VAE(nn.Module):
             for batch in trainloader:
                 iterations += 1
                 batch = self.move_to_device(batch, device)
-                loss = self.train_core(batch, optim, beta=beta, **self.model_kwargs)
+                loss = self.train_core(batch, optim, beta=beta, gradient_clip=gradient_clip, gradient_clip_kwargs=gradient_clip_kwargs, **self.model_kwargs)
 
             # Validation Step
             if valloader is not None and (epochs % validation_freq == 0):
@@ -269,28 +270,89 @@ class CVAE(VAE):
 
         self.condition_dim = condition_object.condition_dim
 
-        self.encoder = get_encoder_model() # TODO: implement this function
-        self.decoder = get_decoder_model() # TODO: implement this function
+        self.encoder = get_encoder_model(input_dim=input_dim + self.condition_dim, latent_dim=latent_dim, **self.model_kwargs)
+        self.decoder = get_decoder_model(input_dim=input_dim + self.condition_dim, latent_dim=latent_dim, **self.model_kwargs)
 
-        self.prior_params = get_prior_params() # TODO: implement this function
+        self.prior_params = get_prior_params(latent_dim=latent_dim, device="cpu", **self.model_kwargs)
     
-    def forward():
-        pass # TODO: implement forward method
+    def forward(self, inputs, conditions, num_samples=1):
+        if conditions.ndims == 2:
+            posterior_params_dict = self.encoder(torch.cat([inputs, conditions], dim=-1))
+            z = self.encoder.reparameterize(posterior_params_dict, num_samples, **self.model_kwargs)
+            recon_params_dict = self.decoder(torch.cat([z, conditions.unsqueeze(1).expand(-1, z.size(1), -1)], dim=-1))
+            for key in recon_params_dict:
+                recon_params_dict[key] = recon_params_dict[key].squeeze(1)
+            return {"recon_params_dict": recon_params_dict, "posterior_params_dict": posterior_params_dict}, {"samples": z}
+        elif conditions.ndims == 3:
+            if conditions.size(1) != num_samples:
+                raise ValueError("Conditions size does not match number of samples.")
+            posterior_params_dict = self.encoder(torch.cat([inputs.unsqueeze(1).expand(-1,
+                                                                    num_samples,
+                                                                    -1), conditions], dim=-1))
+            z = self.encoder.reparameterize(posterior_params_dict, num_samples, **self.model_kwargs)
+            recon_params_dict = self.decoder(torch.cat([z, conditions], dim=-1))
+            for key in recon_params_dict:
+                recon_params_dict[key] = recon_params_dict[key].squeeze(1)
+            return {"recon_params_dict": recon_params_dict, "posterior_params_dict": posterior_params_dict}, {"samples": z}
+        else: # TODO: make this larger??
+            raise ValueError("Conditions must be 2D or 3D tensor.") # TODO: double check this implementation
 
-    def sample():
-        pass # TODO: implement sample method
+    @torch.no_grad()
+    def sample(self, condition, num_prior_samples = 1, num_posterior_samples = 1):
+        if condition.ndims == 2:
+            z = self.encoder.sample(param_dict=self.prior_params, num_samples=num_prior_samples, **self.model_kwargs)
+            recon_params_dict = self.decoder(torch.cat([z, condition.unsqueeze(1).expand(-1, z.size(1), -1)], dim=-1))
+            samples = self.decoder.sample(recon_params_dict, num_samples=num_posterior_samples, **self.model_kwargs)
+            return {"samples": samples, "recon_params_dict": recon_params_dict}
+        elif condition.ndims == 3:
+            if condition.size(1) != num_prior_samples:
+                raise ValueError("Condition size does not match number of prior samples.")
+            z = self.encoder.sample(param_dict=self.prior_params, num_samples=num_prior_samples, **self.model_kwargs)
+            recon_params_dict = self.decoder(torch.cat([z, condition], dim=-1))
+            samples = self.decoder.sample(recon_params_dict, num_samples=num_posterior_samples, **self.model_kwargs)
+            return {"samples": samples, "recon_params_dict": recon_params_dict}
+        else:
+            raise ValueError("Condition must be 2D or 3D tensor.") # TODO: double check this implementation
+        
+    @torch.no_grad()
+    def reconstruct(self, inputs, conditions, num_samples=1):
+        outputs, _ = self.forward(inputs, conditions, num_samples=num_samples)
+        return outputs["recon_params_dict"], outputs["posterior_params_dict"]
 
-    def reconstruct():
-        pass # TODO: implement reconstruct method
+    @torch.no_grad()
+    def loglikelihood(self, inputs, conditions, num_samples=1):
+        outputs, _ = self.forward(inputs, conditions, num_samples=num_samples)
+        posterior_params_dict = outputs["posterior_params_dict"]
+        recon_params_dict = outputs["recon_params_dict"]
+        posterior_loglikelihood = self.encoder.loglikelihood(inputs, posterior_params_dict, **self.model_kwargs)
+        recon_loglikelihood = self.decoder.loglikelihood(inputs, recon_params_dict, **self.model_kwargs)
+        prior_loglikelihood = self.encoder.loglikelihood(inputs, self.prior_params, **self.model_kwargs)
+        return (posterior_loglikelihood.sum(-1) + recon_loglikelihood.sum(-1) - prior_loglikelihood.sum(-1)).mean(0)
+        
+    def train_core(self, inputs, optim, **_):
+        inputs, conditions = inputs
+        outputs, _ = self.forward(inputs, conditions, num_samples=1)
+        optim.zero_grad(set_tp_none = True)
+        loss = self.loss(inputs, outputs["recon_params_dict"], outputs["posterior_params_dict"], beta=1.0, prior_params=self.prior_params, **self.model_kwargs)
+        loss["loss"].backward()
+        optim.step()
+        return loss
 
-    def loglikelihood():
-        pass # TODO: implement loglikelihood method
-
-    def train_core():
-        pass # TODO: implement train_core method
-
-    def validate():
-        pass # TODO: implement validate method
+    @torch.no_grad()
+    def validate(self, valloader, num_samples = 1, beta = 1.0, device = "cpu"):
+        self.eval()
+        val_loss = {"elbo": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
+        for batch in valloader:
+            inputs, conditions = batch
+            inputs = inputs.to(device)
+            conditions = conditions.to(device)
+            outputs, _ = self.forward(inputs, conditions, num_samples=num_samples)
+            loss_dict = self.loss(inputs, outputs["recon_params_dict"], outputs["posterior_params_dict"], beta=beta, prior_params=self.prior_params, **self.model_kwargs)
+            for key in val_loss:
+                val_loss[key] += loss_dict[key].item() * inputs.size(0)
+        for key in val_loss:
+            val_loss[key] /= len(valloader.dataset)
+        return val_loss
 
     def move_to_device(self, inputs, device):
         return super().move_to_device(inputs, device)
