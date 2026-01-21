@@ -4,12 +4,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal, kl_divergence
 from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+import json
 
 import os
 import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
-sys.path.append(parent_dir)
+sys.path.append(parent_dir) 
 from src.encoder_decoder_model import *
 from src.Conditioner import *
 
@@ -36,16 +38,18 @@ class EarlyStopping:
             self.best_score = score
             if epoch is not None:
                 self.best_epoch = epoch
+            return True
         elif score < self.best_score + self.min_delta:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-                
+            return False                
         else:
             self.best_score = score
             self.counter = 0
             if epoch is not None:
                 self.best_epoch = epoch
+            return True
     def reset(self):
         self.counter = 0
         self.best_score = None
@@ -70,21 +74,24 @@ class VAE(nn.Module):
         kwargs = dict(locals())
 
         # Remove unwanted keys from kwargs (all in the list)
-        for key in ["self","__class__", "input_dim"]: kwargs.pop(key)
-        distribution_dict = {}
+        for key in ["self","__class__", "input_dim", "distribution_dict", "_"]: 
+            kwargs.pop(key, None)  # Use pop with default to avoid KeyError
+        
         self.model_kwargs = kwargs # Store remaining kwargs
         # Set each remaining kwarg as an attribute
-        for key in kwargs: setattr(self, key, kwargs[key])
+        for key in kwargs: 
+            setattr(self, key, kwargs[key])
 
         # === VAE Components ===
         self.input_dim = input_dim
+        latent_dim = distribution_dict.get("latent_dim", 10)
 
-        # Define encoder and decoder networks
-        self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=distribution_dict.get("latent_dim", 10), **self.model_kwargs)
-        self.decoder = get_decoder_model(latent_dim=distribution_dict.get("latent_dim", 10), output_dim=input_dim, **self.model_kwargs)
+        # Define encoder and decoder networks - don't pass model_kwargs to avoid circular references
+        self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim)
+        self.decoder = get_decoder_model(latent_dim=latent_dim, output_dim=input_dim)
 
         # Prior parameters for latent spaces
-        self.prior_params = get_prior_params(input_dim=input_dim, latent_dim=distribution_dict.get("latent_dim", 10),device="cpu", **self.model_kwargs)
+        self.prior_params = get_prior_params(latent_dim=latent_dim, device="cpu")
 
         # Calculate and store the number of parameters
         self.num_parameters = self.encoder._num_parameters() + self.decoder._num_parameters()
@@ -93,20 +100,19 @@ class VAE(nn.Module):
         # Encode inputs to get posterior parameters
         posterior_params_dict = self.encoder(inputs)
         # Sample latent variables using reparameterization trick 
-        z = self.encoder.reparameterize(posterior_params_dict, num_samples, **self.model_kwargs) 
+        z = self.encoder.reparameterize(posterior_params_dict, num_samples=num_samples)
         # Decode latent samples to get reconstruction parameters
         recon_params_dict = self.decoder(z)
-        # TODO: reshape issues are waiting here
         return recon_params_dict, posterior_params_dict
     
     @torch.no_grad()
     def sample(self, num_samples_prior = 1, num_samples_posterior = 1):
         # Sample from the encoder's prior giving latent space samples (ancestral sampling)
-        z = self.encoder.sample(param_dict=self.prior_params, num_samples=num_samples_prior, **self.model_kwargs)
+        z = self.encoder.sample(param_dict=self.prior_params, num_samples=num_samples_prior)
         # Decode the sampled latent variables to get reconstruction parameters
         recon_params_dict = self.decoder(z)
         # Generate samples from the decoder using the reconstruction parameters
-        samples = self.decoder.sample(recon_params_dict, num_samples=num_samples_posterior, **self.model_kwargs)
+        samples = self.decoder.sample(recon_params_dict, num_samples=num_samples_posterior)
         # Return both the samples and the reconstruction parameters
         return {"samples": samples, "recon_params_dict": recon_params_dict}
     
@@ -118,35 +124,32 @@ class VAE(nn.Module):
 
     @torch.no_grad()
     def loglikelihood(self, inputs, num_samples=1):
-        # TODO: double check this implementation
-        
         recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=num_samples)
         # Compute log-likelihood of inputs given reconstruction parameters
-        posterior_loglikelihood = self.encoder.loglikelihood(inputs, posterior_params_dict, **self.model_kwargs)
-        recon_loglikelihood = self.decoder.loglikelihood(inputs, recon_params_dict, **self.model_kwargs)
-        prior_loglikelihood = self.encoder.loglikelihood(inputs, self.prior_params, **self.model_kwargs)
+        posterior_loglikelihood = self.encoder.loglikelihood(inputs, posterior_params_dict)
+        recon_loglikelihood = self.decoder.loglikelihood(inputs, recon_params_dict)
+        prior_loglikelihood = self.encoder.loglikelihood(inputs, self.prior_params)
 
-        # Combine log-likelihoods to compute ELBO ?? is it Elbo
+        # Combine log-likelihoods to compute ELBO
         return (posterior_loglikelihood.sum(-1) + recon_loglikelihood.sum(-1) - prior_loglikelihood.sum(-1)).mean(0)
     
     def kl_divergence(self, posterior_params_dict):
         # Compute KL divergence between posterior and prior distributions
-        kl_div = self.encoder.kl_divergence(posterior_params_dict, self.prior_params, **self.model_kwargs)
+        kl_div = self.encoder.kl_divergence(posterior_params_dict, self.prior_params)
         return kl_div.mean(0)
     
     def reconstruction_loglikelihood(self, inputs, recon_params_dict, **_):
         # Compute reconstruction log-likelihood of inputs given reconstruction parameters
-        # TODO: double check this implementation
-        recon_loglikelihood = self.decoder.loglikelihood(inputs, recon_params_dict, **self.model_kwargs)
+        recon_loglikelihood = self.decoder.loglikelihood(inputs, recon_params_dict)
         return recon_loglikelihood.mean(0)
-
+    
     def loss(self, inputs, recon_params_dict, posterior_params_dict, beta=1.0, prior_params=None, **_):
         # Compute reconstruction log-likelihood (we use reconstruction only because of VAE structure)
-        recon_loglikelihood = self.reconstruction_loglikelihood(inputs, recon_params_dict, **self.model_kwargs)
+        recon_loglikelihood = self.reconstruction_loglikelihood(inputs, recon_params_dict)
         # Compute KL divergence between posterior and prior
         if prior_params is None:
             prior_params = self.prior_params
-        kl_div = self.encoder.kl_divergence(posterior_params_dict, prior_params, **self.model_kwargs)
+        kl_div = self.encoder.kl_divergence(posterior_params_dict, prior_params)
         kl_div = kl_div.mean()
         # Ensure recon_loglikelihood is also a scalar
         if recon_loglikelihood.dim() > 0:
@@ -156,13 +159,16 @@ class VAE(nn.Module):
         # TODO: take loglikelihood of samples too??
         return {"loss": loss, "recon_loglikelihood": recon_loglikelihood, "kl_divergence": kl_div}
 
-    def train_core(self, inputs, optim, gradient_clip=None, gradient_clip_kwargs=None, **_):
-        # Forward pass
-        recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=1) # TODO: need to implement a input system for kwargs
+    def train_core(self, inputs, optim, gradient_clip=None, gradient_clip_kwargs=None, beta=1.0, **_):
+        if inputs.dim() == 3:
+            inputs = inputs.reshape(inputs.shape[0], -1)
+        
+         # Forward pass
+        recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=1)
         
         # Compute loss (negative ELBO)
         optim.zero_grad() # Zero gradients
-        loss_dict = self.loss(inputs, recon_params_dict, posterior_params_dict, beta=1.0, prior_params= self.prior_params, **self.model_kwargs) # TODO: need to implement a input system for kwargs
+        loss_dict = self.loss(inputs, recon_params_dict, posterior_params_dict, beta=beta, prior_params=self.prior_params)
         loss_dict["loss"].backward() # Backpropagate
         if gradient_clip is not None:
             torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_kwargs.get("max_norm", 1.0))
@@ -171,16 +177,19 @@ class VAE(nn.Module):
     
     def validate(self, valloader, num_samples = 1, device = "cpu"):
         self.eval() # Set model to evaluation mode
-        # Validaition loop
+        # Validation loop
         val_loss = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
         # Disable gradient computation
         with torch.no_grad():
             # Iterate over validation data
             for batch in valloader:
                 batch = batch.to(device)
+                # Flatten if needed
+                if batch.dim() == 3:
+                    batch = batch.reshape(batch.shape[0], -1)
                 # Forward pass
                 recon_params_dict, posterior_params_dict = self.forward(batch, num_samples=num_samples)
-                loss_dict = self.loss(batch, recon_params_dict, posterior_params_dict, beta=1.0, prior_params=self.prior_params, **self.model_kwargs)
+                loss_dict = self.loss(batch, recon_params_dict, posterior_params_dict, beta=1.0, prior_params=self.prior_params)
                 # Accumulate losses
                 for key in val_loss:
                     val_loss[key] += loss_dict[key].item() * batch.size(0)
@@ -235,44 +244,108 @@ class VAE(nn.Module):
             epochs = 1000,
             validation_freq = 1,
             validation_num_samples = 10,
-            device = "cpu",
+            device = "cpu",  # Add device parameter
             early_stopping = True,
             early_stopping_kwargs = {"patience": 10, "min_delta": 0.001},
             save_epoch_freq = 10,
             writer = None,
             log_dir = './runs/VAE_training',
+            model_name = None, # Optionally specify model name for saving
+            save_dir = './models/',
             **_):
+        # === Generate a model tag ===
+        time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if model_name is None:
+            model_tag = f"{self.__class__.__name__}_{self.decoder.__class__.__name__}_{time_stamp}"
+        else:
+            model_tag = f"{model_name}_{time_stamp}"
+        os.makedirs(save_dir, exist_ok=True)
+        model_save_path = os.path.join(save_dir, model_tag)
+
         # === Take Kwarg Inputs ===
-        self.model_kwargs.update(locals())
-        for key in self.model_kwargs: setattr(self, key, self.model_kwargs[key])
+        fit_kwargs = dict(locals())
+        for key in ["self", "trainloader", "valloader", "writer", "_"]:
+            fit_kwargs.pop(key, None)
+        self.model_kwargs.update(fit_kwargs)
+        self.model_kwargs['model_tag'] = model_tag
         
-        # Initialize TensorBoard writer
+        # === Save training configuration ===
+        config_path = os.path.join(save_dir, "training_config.json")
+        config = {
+            'model_tag': model_tag,
+            'timestamp': time_stamp,
+            'hyperparameters': {
+                'lr': lr,
+                'weight_decay': weight_decay,
+                'beta': beta,
+                'epochs': epochs,
+                'batch_size': trainloader.batch_size,
+                'gradient_clip': gradient_clip,
+                'lr_scheduler': lr_scheduler,
+                'early_stopping': early_stopping,
+            },
+            'model_architecture': {
+                'input_dim': self.input_dim,
+                'num_parameters': self.num_parameters,
+            }
+        }
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=4)
+        print(f"Training configuration saved to: {config_path}")
+
+        # === Initialize TensorBoard writer ===
         if writer is None:
-            writer = SummaryWriter(log_dir=log_dir)
-            print(f"TensorBoard logging to: {log_dir}")
+            log_dir_tagged = os.path.join(log_dir, model_tag)
+            writer = SummaryWriter(log_dir=log_dir_tagged)
+            print(f"TensorBoard logging to: {log_dir_tagged}")
+            # Log configuration to TensorBoard
+            writer.add_text('Config/model_tag', model_tag, 0)
+            writer.add_text('Config/hyperparameters', json.dumps(config['hyperparameters'], indent=2), 0)
 
         # === Setup Optimizer and Scheduler ===
         optim = self.get_optimizer(lr=lr, weight_decay=weight_decay)
         if lr_scheduler:
             scheduler = torch.optim.lr_scheduler.StepLR(optim, **lr_scheduler_kwargs)
         
-        self.to(device)
+        if next(self.parameters()).device != torch.device(device):
+            self.to(device)
         self.prior_params = {key: val.to(device) for key, val in self.prior_params.items()}
 
         if early_stopping:
             earlystopping = EarlyStopping(**early_stopping_kwargs)
-        
+
         # Log model graph
         try:
+            # Get a sample batch from the trainloader
             sample_batch = next(iter(trainloader))
             sample_batch = self.move_to_device(sample_batch, device)
-            writer.add_graph(self, sample_batch)
-        except:
-            print("Could not log model graph to TensorBoard")
-        
+            # Flatten the batch if needed for the model input
+            if sample_batch.dim() == 3:
+                sample_batch = sample_batch.reshape(sample_batch.shape[0], -1)
+            
+            # Create a wrapper class that returns tensors instead of dict for graph tracing
+            class ModelWrapper(nn.Module):
+                def __init__(self, model):
+                    super().__init__()
+                    self.model = model
+                
+                def forward(self, x):
+                    # Call the actual model
+                    recon_params, posterior_params = self.model.forward(x, num_samples=1)
+                    # Return just the mu values as tensors (TensorBoard can trace this)
+                    return recon_params['mu'], posterior_params['mu']
+            
+            wrapper = ModelWrapper(self)
+            writer.add_graph(wrapper, sample_batch)
+            print("Model graph logged to TensorBoard")
+        except Exception as e:
+            print(f"Could not log model graph to TensorBoard: {e}")
+    
         # === Training Loop ===
         self.train()
         global_step = 0
+        best_val_loss = float('inf')
+        best_epoch = 0
         for epoch in range(epochs):
             epoch_train_loss = 0.0
             epoch_train_recon = 0.0
@@ -282,7 +355,13 @@ class VAE(nn.Module):
             for batch in trainloader:
                 global_step += 1
                 batch = self.move_to_device(batch, device)
-                loss_dict = self.train_core(batch, optim, beta=beta, gradient_clip=gradient_clip, gradient_clip_kwargs=gradient_clip_kwargs, **self.model_kwargs)
+                loss_dict = self.train_core(
+                    batch, 
+                    optim, 
+                    beta=beta, 
+                    gradient_clip=gradient_clip, 
+                    gradient_clip_kwargs=gradient_clip_kwargs
+                )
                 
                 # Accumulate epoch losses
                 epoch_train_loss += loss_dict["loss"].item()
@@ -300,6 +379,7 @@ class VAE(nn.Module):
                     for name, param in self.named_parameters():
                         if param.grad is not None:
                             writer.add_histogram(f'Gradients/{name}', param.grad, global_step)
+                            writer.add_scalar(f'Gradients_norm/{name}', param.grad.norm().item(), global_step)
                         writer.add_histogram(f'Parameters/{name}', param, global_step)
 
             # Compute average epoch losses
@@ -315,52 +395,113 @@ class VAE(nn.Module):
             # Log learning rate
             current_lr = optim.param_groups[0]['lr']
             writer.add_scalar('Train/learning_rate', current_lr, epoch)
-            
-            print(f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.4f}, Recon: {avg_train_recon:.4f}, KL: {avg_train_kl:.4f}")
 
-            # Validation Step
+            # === Validation Phase ===
+            val_loss_dict = None
             if valloader is not None and ((epoch + 1) % validation_freq == 0):
-                val_loss = self.validate(valloader, num_samples=validation_num_samples, device=device)
+                val_loss_dict = self.validate(valloader, num_samples=validation_num_samples, device=device)
                 
                 # Log validation metrics
-                writer.add_scalar('Val/loss', val_loss["loss"], epoch)
-                writer.add_scalar('Val/recon_loglikelihood', val_loss["recon_loglikelihood"], epoch)
-                writer.add_scalar('Val/kl_divergence', val_loss["kl_divergence"], epoch)
+                writer.add_scalar('Val/Epoch/loss', val_loss_dict["loss"], epoch)
+                writer.add_scalar('Val/Epoch/recon_loglikelihood', val_loss_dict["recon_loglikelihood"], epoch)
+                writer.add_scalar('Val/Epoch/kl_divergence', val_loss_dict["kl_divergence"], epoch)
                 
                 # Log train vs val comparison
                 writer.add_scalars('Comparison/loss', {
                     'train': avg_train_loss,
-                    'val': val_loss["loss"]
+                    'val': val_loss_dict["loss"]
+                }, epoch)
+                writer.add_scalars('Comparison/recon', {
+                    'train': avg_train_recon,
+                    'val': val_loss_dict["recon_loglikelihood"]
+                }, epoch)
+                writer.add_scalars('Comparison/kl', {
+                    'train': avg_train_kl,
+                    'val': val_loss_dict["kl_divergence"]
                 }, epoch)
                 
-                print(f"Epoch {epoch+1}/{epochs} - Val Loss: {val_loss['loss']:.4f}, Recon: {val_loss['recon_loglikelihood']:.4f}, KL: {val_loss['kl_divergence']:.4f}")
+                 # === Save Best Model ===
+                if val_loss_dict["loss"] < best_val_loss:
+                    best_val_loss = val_loss_dict["loss"]
+                    best_epoch = epoch
+                    best_model_path = os.path.join(save_dir, f"{model_tag}_best.pt")
+                    self.save_model(save_path=save_dir, model_name=f"{model_tag}_best", device=device)
+                    print(f"    New best model saved (Val Loss: {best_val_loss:.4f})")
+                    writer.add_text('Training/best_model', f'New best at epoch {epoch+1}, Val Loss: {best_val_loss:.4f}', epoch)
 
+                # Print progress
+                print(f"Epoch [{epoch+1:4d}/{epochs}] "
+                      f"Train Loss: {avg_train_loss:.4f} | "
+                      f"Val Loss: {val_loss_dict['loss']:.4f} | "
+                      f"LR: {current_lr:.2e} | "
+                      f"Best: {best_val_loss:.4f}@{best_epoch+1}")
+
+                # Early stopping check
                 if early_stopping:
-                    earlystopping(val_loss["loss"], epoch=epoch)
+                    is_best = earlystopping(val_loss_dict["loss"], epoch=epoch)
                     if earlystopping.early_stop:
+                        print(f"\n{'='*60}")
                         print(f"Early stopping triggered at epoch {epoch+1}")
-                        writer.add_text('Training/early_stop', f'Stopped at epoch {epoch+1}', epoch)
+                        print(f"Best model at epoch {best_epoch+1} with Val Loss: {best_val_loss:.4f}")
+                        print(f"{'='*60}\n")
+                        writer.add_text('Training/early_stop', 
+                                      f'Stopped at epoch {epoch+1}, Best: {best_epoch+1}', epoch)
                         break
-            
-            # Learning Rate Scheduler Step
+            else:
+                # No validation - just print training progress
+                print(f"Epoch [{epoch+1:4d}/{epochs}] "
+                      f"Train Loss: {avg_train_loss:.4f} | "
+                      f"Recon: {avg_train_recon:.4f} | "
+                      f"KL: {avg_train_kl:.4f} | "
+                      f"LR: {current_lr:.2e}")
+                
+            # === Learning Rate Scheduler Step ===
             if lr_scheduler:
                 scheduler.step()
             
             # Save Model Checkpoint
             if (epoch + 1) % save_epoch_freq == 0:
-                self.save_model(save_path="./models/", model_name=f"model_epoch_{epoch+1}", device=device)
-                writer.add_text('Training/checkpoint', f'Saved model at epoch {epoch+1}', epoch)
+                checkpoint_path = os.path.join(save_dir, f"{model_tag}_epoch_{epoch+1}.pt")
+                self.save_model(save_path=save_dir, model_name=f"{model_tag}_epoch_{epoch+1}", device=device)
+                writer.add_text('Training/checkpoint', f'Checkpoint saved at epoch {epoch+1}', epoch)
+                print(f"    Checkpoint saved: epoch_{epoch+1}")
         
-        self.to("cpu") # Move model back to CPU after training
+        # === Training Complete ===
+        print(f"\n{'='*60}")
+        print(f"Training complete: {model_tag}")
+        print(f"Best model: Epoch {best_epoch+1} with Val Loss: {best_val_loss:.4f}")
+        print(f"Model saved to: {os.path.join(save_dir, model_tag)}")
+        print(f"{'='*60}\n")
+
+        final_model_path = os.path.join(save_dir, f"{model_tag}_final.pt")
+        self.to("cpu")
         self.prior_params = {key: val.to("cpu") for key, val in self.prior_params.items()}
-        self.eval() # Set model to evaluation mode
-        print("Training complete.")
+        self.save_model(save_path=save_dir, model_name=f"{model_tag}_final", device="cpu")
+
+        # Save training summary
+        summary = {
+            'model_tag': model_tag,
+            'total_epochs': epoch + 1,
+            'best_epoch': best_epoch + 1,
+            'best_val_loss': best_val_loss,
+            'final_train_loss': avg_train_loss,
+            'early_stopped': early_stopping and earlystopping.early_stop,
+        }
+        summary_path = os.path.join(save_dir, f"{model_tag}_summary.json")
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=4)
+
+        # Log final summary to TensorBoard
+        summary_text = "\n".join([f"{k}: {v}" for k, v in summary.items()])
+        writer.add_text('Training/summary', summary_text, epoch)
+        
+        self.eval()
         
         # Close writer
         if writer is not None:
             writer.close()
             print(f"TensorBoard logs saved to: {log_dir}")
-        return
+        return model_tag
 
 class CVAE(VAE):
     def __init__(self,
@@ -383,26 +524,16 @@ class CVAE(VAE):
         self.prior_params = get_prior_params(latent_dim=latent_dim, device="cpu", **self.model_kwargs)
     
     def forward(self, inputs, conditions, num_samples=1):
-        if conditions.ndims == 2:
-            posterior_params_dict = self.encoder(torch.cat([inputs, conditions], dim=-1))
-            z = self.encoder.reparameterize(posterior_params_dict, num_samples, **self.model_kwargs)
-            recon_params_dict = self.decoder(torch.cat([z, conditions.unsqueeze(1).expand(-1, z.size(1), -1)], dim=-1))
-            for key in recon_params_dict:
-                recon_params_dict[key] = recon_params_dict[key].squeeze(1)
-            return {"recon_params_dict": recon_params_dict, "posterior_params_dict": posterior_params_dict}, {"samples": z}
-        elif conditions.ndims == 3:
-            if conditions.size(1) != num_samples:
-                raise ValueError("Conditions size does not match number of samples.")
-            posterior_params_dict = self.encoder(torch.cat([inputs.unsqueeze(1).expand(-1,
-                                                                    num_samples,
-                                                                    -1), conditions], dim=-1))
-            z = self.encoder.reparameterize(posterior_params_dict, num_samples, **self.model_kwargs)
-            recon_params_dict = self.decoder(torch.cat([z, conditions], dim=-1))
-            for key in recon_params_dict:
-                recon_params_dict[key] = recon_params_dict[key].squeeze(1)
-            return {"recon_params_dict": recon_params_dict, "posterior_params_dict": posterior_params_dict}, {"samples": z}
-        else: # TODO: make this larger??
-            raise ValueError("Conditions must be 2D or 3D tensor.") # TODO: double check this implementation
+    
+        posterior_params_dict = self.encoder(torch.cat([inputs.unsqueeze(1).expand(-1,
+                                                                num_samples,
+                                                                -1), conditions], dim=-1))
+        z = self.encoder.reparameterize(posterior_params_dict, num_samples, **self.model_kwargs)
+        recon_params_dict = self.decoder(torch.cat([z, conditions], dim=-1))
+        for key in recon_params_dict:
+            recon_params_dict[key] = recon_params_dict[key].squeeze(1)
+        return {"recon_params_dict": recon_params_dict, "posterior_params_dict": posterior_params_dict}, {"samples": z}
+
 
     @torch.no_grad()
     def sample(self, condition, num_prior_samples = 1, num_posterior_samples = 1):

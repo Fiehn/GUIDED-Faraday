@@ -11,6 +11,8 @@ from sklearn.decomposition import LatentDirichletAllocation
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from scipy.spatial.distance import cdist
 import pickle
+from tqdm import tqdm
+import os
 
 class UserProfiler(LatentDirichletAllocation):
     """
@@ -24,17 +26,23 @@ class UserProfiler(LatentDirichletAllocation):
     """
     def __init__(self, n_topics = 10, num_clusters = 100, random_state=None, **kwargs):
         super(UserProfiler, self).__init__(n_components=n_topics, random_state=random_state)
-        self.num_topics = n_topics
+        self.n_topics = n_topics
         self.num_clusters = num_clusters
 
         self.random_state = random_state
         self.model_kwargs = locals()
+        self.path = None
+        self.verbose = kwargs.get('verbose', False)
     
     def create_corpus(self, X, num_entities, missing_idx, num_clusters, cluster_centers):
         # Will cluster an entity's features into num_clusters clusters
         # Then One-hot encode the cluster assignments for each entity
         # Finally sum over entities to get document-term matrix
 
+        if self.verbose:
+            print(f"Creating corpus for {num_entities} entities...")
+
+        # TODO: This is bug filled
         # First cluster the entities
         labels = cdist(X, cluster_centers).argmin(axis=1)
         # One-hot encode the cluster labels
@@ -56,15 +64,22 @@ class UserProfiler(LatentDirichletAllocation):
         # TODO: they scale the data here?? or before??
 
         # Find missing entities and create a mask
-        X_missing = X.reshpae(-1, num_features)
+        X_missing = X.reshape(-1, num_features)
         missing_idx = np.isnan(X_missing.sum(1))
         X_fit = X_missing[~missing_idx]
 
         # TODO: reduce dimensions (svd or pca) before clustering??
 
         # Cluster the entities to create "words"
-        cluster_model = MiniBatchKMeans(n_clusters=self.num_clusters, random_state=self.random_state) # TODO: change these hyperparameters
+        if self.verbose:
+            print(f"Clustering {X_fit.shape[0]} entities into {self.num_clusters} clusters...")
+        
+        cluster_model = MiniBatchKMeans(n_clusters=self.num_clusters, random_state=self.random_state, verbose=self.verbose) # TODO: change these hyperparameters
         cluster_model.fit(X_fit)
+        
+        if self.verbose:
+            print("Clustering complete.")
+
         self.cluster_centers_ = cluster_model.cluster_centers_
 
         # Create corpus for LDA
@@ -75,8 +90,14 @@ class UserProfiler(LatentDirichletAllocation):
         for key, value in self.fit_kwargs.items():
             if hasattr(self, key):
                 setattr(self, key, value)
+        
+        if self.verbose:
+            print("Fitting LDA model...")
+            
         super(UserProfiler, self).fit(X_corpus)
         self.lambda_matrix = self.components_
+        if self.path is not None:
+            self.save(self.path)
         return self
     
     def transform(self, X):
@@ -85,13 +106,35 @@ class UserProfiler(LatentDirichletAllocation):
         missing_idx = np.isnan(X_missing.sum(1))
         X_fit = X_missing[~missing_idx]
 
+
         # TODO: reduce dimensions (svd or pca) before clustering??
+
+        if self.verbose:
+            print("Transforming input data to topic distributions...")
 
         X_corpus = self.create_corpus(X_fit, num_entities, missing_idx, self.num_clusters, self.cluster_centers_)
         topic_distributions = super(UserProfiler, self)._unnormalized_transform(X_corpus)
         return topic_distributions
+    
+    def get_user_profiles(self, X, retrain=False):
+        # If this model has not been trained and a model already exists on disk then load it and return the user profiles for the input data
+        if os.path.exists(self.path) and not retrain and self.lambda_matrix is not None:
+            with open(self.path, "rb") as f:
+                obj = pickle.load(f)
+            return obj.transform(X)
+        elif retrain or self.lambda_matrix is None:
+            self.fit(X, self.fit_kwargs)
+            return self.transform(X)
+        else:
+            # Lambda matrix is already computed and stored in self.lambda_matrix
+            # We can use it to transform the input data without retraining or loading from disk
+            return self.transform(X)
+
+    def get_conditions(self, X):
+        return self.get_user_profiles(X, retrain=False)
 
     def save(self, path):
+        self.path = path
         with open(path, "wb") as f:
             pickle.dump(self, f)
     
@@ -101,18 +144,45 @@ class UserProfiler(LatentDirichletAllocation):
             obj = pickle.load(f)
         return obj
     
+# === Day of week conditioning ===
+# TODO: implement day of week conditioning, the data is in DST date stamps in the dataset
+
+
 
 # =============
 # Conditioner Module - Holds an object that creates and determines type of conditioning to be used in Models
 # ============
 
 class Conditioner():
-    def __init__(self, tags, type = "None", **kwargs):
+    def __init__(self, tags = [], **kwargs):
+        # Tags is the name of the condition, e.g. "user_profiles", "days", "weeks" and so on
         self.tags = tags
-        self.type = type
+        # Dimention is important for the model to know how much conditioning to expect
         self.condition_dim = 0
-        # TODO:
+        # Dictionary to hold the conditioning items
+        self.condition_items = {}
     
-    def get_conditioning(self, inputs):
-        pass #TODO:
+    def add_condition_item(self, tag, item):
+        # Add the tag to the list of tags
+        self.tags.append(tag)
+        # Add the item to the dictionary
+        self.condition_items[tag] = item
+        # Add the condition dimension to the total condition dimension
+        self.condition_dim += item.condition_dim
 
+    def get_conditions(self, inputs): 
+        # Get the conditions from each item in the tag list
+        for tag in self.tags:
+            self.condition_items[tag].get_conditions(inputs)
+        return self.condition_items
+    
+    def save(self, path):
+        self.path = path
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+    
+    @staticmethod
+    def load(path):
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        return obj

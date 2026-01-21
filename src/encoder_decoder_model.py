@@ -9,7 +9,7 @@ from torch.distributions import Normal, kl_divergence
 # GuideVAE style model will come later.
 # === Gaussian encoder and decoder Model ===
 class GaussianCoder(torch.nn.Module):
-    def __init__(self, input_dim, output_dim, 
+    def __init__(self, input_dim, output_dim,  
                  learn_sigma=False, 
                  sigma_fixed=1.0,
                  num_hidden_layers=2,
@@ -62,7 +62,6 @@ class GaussianCoder(torch.nn.Module):
 
     def loglikelihood(self, inputs, param_dict, **_):
         # Compute log likelihood of inputs under the Gaussian defined by param_dict
-        # TODO: I think this is where we might do multivariate Gaussian later??
         mu = param_dict["mu"]
         sigma = param_dict["sigma"]
         var = sigma ** 2
@@ -107,7 +106,7 @@ class GaussianCoder(torch.nn.Module):
         return samples
 
 # =================
-# Dictionary approach with PDCC matrix as the covariance
+# Dictionary approach with PDCC matrix as the covariance (Guide VAE)
 # =================
 class DictionaryCoder(torch.nn.Module):
     def __init__(self,
@@ -137,7 +136,7 @@ class DictionaryCoder(torch.nn.Module):
 
         self.parameterizer = Parameterizer(
             input_dim=input_dim,
-            output_dim={"dictionary_codes": dictionary_size, "output_codes": output_dim},
+            output_dim={"sigma": dictionary_size, "mu": output_dim},
             dist_parameters=["mu", "sigma"],
             num_hidden_layers=num_hidden_layers,
             num_neurons=num_neurons,
@@ -148,14 +147,16 @@ class DictionaryCoder(torch.nn.Module):
         # The dictionary SigmaMapper is a learnable parameter
         # It maps the dictionary codes to the output space
         # So it would be the U dictionary in the guide paper
+        # Setting this to be a learnable parameter is equivalent to the dictionary being learned in training through the data
         self.SigmaMapper = torch.nn.Parameter(torch.randn(output_dim, dictionary_size), requires_grad=True)
 
     def _num_parameters(self):
         return self.parameterizer._num_parameters()
     
     def get_SigmaMapper(self):
-        # TODO: normalize the SigmaMapper to have unit norm columns??
-        return self.SigmaMapper
+        # The sigmaMapper is normalized to have unit norm
+        return self.SigmaMapper / torch.norm(self.SigmaMapper, dim=0, keepdim=True)
+    
     def forward(self, inputs):
         param_dict = self.parameterizer(inputs)
         param_dict["sigma"] = torch.nn.functional.relu(param_dict["sigma"]).clamp(self.sigma_lower_lim, self.sigma_upper_lim)
@@ -181,8 +182,11 @@ class DictionaryCoder(torch.nn.Module):
         return torch.distributions.MultivariateNormal(loc=param_dict["mu"], covariance_matrix=Sigma).log_prob(inputs)
     
     def kl_divergence(self, param_dict_q, param_dict_p=None, **_):
-        # TODO: implement KL divergence for multivariate Gaussian with PDCC covariance
-        pass
+        # TODO: double check this pleaase
+        return torch.distributions.kl.kl_divergence(
+            torch.distributions.MultivariateNormal(loc=param_dict_q["mu"], covariance_matrix=self.create_covariance_matrix(param_dict_q)),
+            torch.distributions.MultivariateNormal(loc=param_dict_p["mu"], covariance_matrix=self.create_covariance_matrix(param_dict_p))
+        )
 
     def create_covariance_matrix(self, param_dict):
         # THis is the spot that is interesting 
@@ -197,59 +201,6 @@ class DictionaryCoder(torch.nn.Module):
 
     def get_marginal_sigmas(self,param_dict):
         return torch.sqrt(torch.diagonal(self.create_covariance_matrix(param_dict), dim1=-2, dim2=-1))
-
-# === This is a basic NN block used in the Parameterizer ===
-class NNBlock(nn.Module):
-    def __init__(self,
-                 input_dim,
-                 output_dim,
-                 num_neurons=64,
-                 num_hidden_layers=2,
-                 dropout=True,
-                dropout_rate=0.2,
-                batch_norm=False,
-                **_):
-        super(NNBlock, self).__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.num_neurons = num_neurons
-        self.num_hidden_layers = num_hidden_layers
-        self.dropout = dropout
-        self.dropout_rate = dropout_rate
-        
-        # === Here we build the layers of the block ===
-        # The input layer will sequentially pass through the following: Linear, ReLU, (BatchNorm), (Dropout)
-        self.input_layer = nn.Sequential(
-            nn.Linear(input_dim, num_neurons),
-            nn.ReLU()
-        )
-        if batch_norm:
-            self.input_layer.add_module("batch_norm", nn.BatchNorm1d(num_neurons))
-        if dropout:
-            self.input_layer.add_module("dropout", nn.Dropout(dropout_rate))
-        # Hidden layers is a module list of num_hidden_layers layers
-        self.hidden_layers = nn.ModuleList()
-        for _ in range(num_hidden_layers):
-            layer = nn.Sequential(
-                nn.Linear(num_neurons, num_neurons),
-                nn.ReLU()
-            )
-            if batch_norm:
-                layer.add_module("batch_norm", nn.BatchNorm1d(num_neurons))
-            if dropout:
-                layer.add_module("dropout", nn.Dropout(dropout_rate))
-            self.hidden_layers.append(layer)
-        # Output layer is a simple linear layer to output_dim
-        self.output_layer = nn.Linear(num_neurons, output_dim)
-    def forward(self, x):
-        # Pass through the layers
-        h = self.input_layer(x)
-        for layer in self.hidden_layers:
-            h = layer(h)
-        h = self.output_layer(h)
-        return h
-    def _num_parameters(self):
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 # === This is the actual network structure ===
@@ -267,56 +218,63 @@ class Parameterizer(nn.Module):
         super(Parameterizer, self).__init__()
         self.dist_parameters = dist_parameters
         
-        # We build the network from blocks of NN layers
-        # We have a shared block followed by separate blocks for each distribution parameter
-        # We dont want to cross the wires between parameters
-        # So we use a ModuleDict to hold the blocks
-        self.block_dict = nn.ModuleDict()
-        self.block_dict["shared_block"] = NNBlock(
-            input_dim=input_dim,
-            output_dim=num_neurons,
-            num_hidden_layers=num_hidden_layers,
-            num_neurons=num_neurons,
-            dropout=dropout,
-            dropout_rate=dropout_rate,
-            batch_norm=batch_norm
-        )
-        # If output dim is an integer (not using guide) then all parameters have same output dim
-        # and we create a block for each parameter
+        # Build shared block - simplified to avoid deep nesting
+        layers = []
+        layers.append(nn.Linear(input_dim, num_neurons))
+        layers.append(nn.ReLU())
+        if batch_norm:
+            layers.append(nn.BatchNorm1d(num_neurons))
+        if dropout:
+            layers.append(nn.Dropout(dropout_rate))
+        
+        for _ in range(num_hidden_layers):
+            layers.append(nn.Linear(num_neurons, num_neurons))
+            layers.append(nn.ReLU())
+            if batch_norm:
+                layers.append(nn.BatchNorm1d(num_neurons))
+            if dropout:
+                layers.append(nn.Dropout(dropout_rate))
+        
+        self.shared_block = nn.Sequential(*layers)
+        
+        # Build parameter-specific heads
+        self.param_heads = nn.ModuleDict()
+        
         if isinstance(output_dim, int):
             for param in dist_parameters:
-                self.block_dict[f"{param}_block"] = NNBlock(
-                    input_dim=num_neurons,
-                    output_dim=output_dim,
-                    num_hidden_layers=num_hidden_layers,
-                    num_neurons=num_neurons,
-                    dropout=dropout,
-                    dropout_rate=dropout_rate,
-                    batch_norm=batch_norm
-                )
+                head_layers = []
+                head_layers.append(nn.Linear(num_neurons, num_neurons))
+                head_layers.append(nn.ReLU())
+                if batch_norm:
+                    head_layers.append(nn.BatchNorm1d(num_neurons))
+                if dropout:
+                    head_layers.append(nn.Dropout(dropout_rate))
+                head_layers.append(nn.Linear(num_neurons, output_dim))
+                self.param_heads[param] = nn.Sequential(*head_layers)
         elif isinstance(output_dim, dict):
-            # If output dim is a dict (using guide) then we create blocks for each specified output dimension
-            # this means that we train the U dictionary with a seperate block from the output codes
-            for key in output_dim:
+            for key in dist_parameters:
                 if key in output_dim:
-                    self.block_dict[f"{key}_block"] = NNBlock(
-                        input_dim=num_neurons,
-                        output_dim=output_dim[key],
-                        num_hidden_layers=num_hidden_layers,
-                        num_neurons=num_neurons,
-                        dropout=dropout,
-                        dropout_rate=dropout_rate,
-                        batch_norm=batch_norm
-                    )
+                    head_layers = []
+                    head_layers.append(nn.Linear(num_neurons, num_neurons))
+                    head_layers.append(nn.ReLU())
+                    if batch_norm:
+                        head_layers.append(nn.BatchNorm1d(num_neurons))
+                    if dropout:
+                        head_layers.append(nn.Dropout(dropout_rate))
+                    head_layers.append(nn.Linear(num_neurons, output_dim[key]))
+                    self.param_heads[key] = nn.Sequential(*head_layers)
         
     def forward(self, x):
-        h = self.block_dict["shared_block"](x)
+        h = self.shared_block(x)
         param_dict = {}
         for param in self.dist_parameters:
-            param_dict[param] = self.block_dict[f"{param}_block"](h)
+            param_dict[param] = self.param_heads[param](h)
         return param_dict
+        
     def _num_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
     
 def get_encoder_model(input_dim, latent_dim, **kwargs):
     return GaussianCoder(

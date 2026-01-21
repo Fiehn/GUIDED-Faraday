@@ -43,7 +43,16 @@ class SmartMeterCSV:
         if not os.path.exists(path):
             raise FileNotFoundError(f"File {filename} not found in directory {self.data_dir}")
 
-        df = pd.read_csv(path)
+        columns_to_load = [self.meter_col, self.timestamp_dst_col, self.timestamp_utc_col] + self.value_cols
+        
+        df = pd.read_csv(
+            path,
+            usecols=columns_to_load,
+            dtype={
+                self.meter_col: 'int32',  # Optimize meter_number dtype
+                **{col: 'float32' for col in self.value_cols}  # Optimize value columns
+            }
+        )
 
         # Parse timestamps
         df[self.timestamp_dst_col] = pd.to_datetime(df[self.timestamp_dst_col])
