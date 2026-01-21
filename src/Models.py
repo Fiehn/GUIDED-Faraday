@@ -285,8 +285,11 @@ class VAE(nn.Module):
                 'early_stopping': early_stopping,
             },
             'model_architecture': {
+                'class_name': self.__class__.__name__,
                 'input_dim': self.input_dim,
                 'num_parameters': self.num_parameters,
+                'encoder': self.encoder.__class__.__name__,
+                'decoder': self.decoder.__class__.__name__,
             }
         }
         with open(config_path, 'w') as f:
@@ -314,8 +317,9 @@ class VAE(nn.Module):
         if early_stopping:
             earlystopping = EarlyStopping(**early_stopping_kwargs)
 
-        # Log model graph
+        # === Log model graph ====
         try:
+            # TODO: is very blurry, but might be somewhat nice to have
             # Get a sample batch from the trainloader
             sample_batch = next(iter(trainloader))
             sample_batch = self.move_to_device(sample_batch, device)
@@ -336,10 +340,18 @@ class VAE(nn.Module):
                     return recon_params['mu'], posterior_params['mu']
             
             wrapper = ModelWrapper(self)
-            writer.add_graph(wrapper, sample_batch)
+            
+            # Suppress tracing warnings (expected for stochastic models like VAE)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
+                warnings.filterwarnings("ignore", message="Encountering a dict")
+                writer.add_graph(wrapper, sample_batch)
+            
             print("Model graph logged to TensorBoard")
+            
         except Exception as e:
-            print(f"Could not log model graph to TensorBoard: {e}")
+            print(f"Note: Could not log computational graph ({str(e)})")
     
         # === Training Loop ===
         self.train()

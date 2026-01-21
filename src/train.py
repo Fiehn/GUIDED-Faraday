@@ -8,6 +8,8 @@ from src.Conditioner import *
 from src.Models import *
 from src.dataloader import *
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
 
 # Set up device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -52,7 +54,7 @@ if __name__ == "__main__":
         seed=seed,
         train_frac=train_frac,
         val_frac=val_frac,
-        max_meters=10,
+        max_meters= None,
     )
 
     dm.setup()
@@ -96,14 +98,17 @@ if __name__ == "__main__":
     
     print("Training complete. Model saved as ", model_tag)
     
+    # Reopen TensorBoard writer for logging visualizations
+    log_dir_tagged = os.path.join('./runs/VAE_training', model_tag)
+    writer = SummaryWriter(log_dir=log_dir_tagged)
+    
     # Load the model for visualization
     VAE_model.to(device)
     VAE_model.prior_params = {key: val.to(device) for key, val in VAE_model.prior_params.items()}
     VAE_model.eval()
     
-    import matplotlib.pyplot as plt
-    
-    # Get test data for reconstruction visualization
+    # ===== RECONSTRUCTION VISUALIZATION =====
+    print("\nGenerating reconstruction visualizations...")
     with torch.no_grad():
         for x in tqdm(test_loader, desc="Reconstruction", leave=False):
             x = x.to(device)
@@ -123,24 +128,35 @@ if __name__ == "__main__":
         axes = [axes]
     
     for i in range(num_samples_to_plot):
-        axes[i].plot(x_original[i, :, 0].cpu().numpy(), label='Original', marker='o', alpha=0.7)
-        axes[i].plot(recon_reshaped[i, :, 0].cpu().numpy(), label='Reconstructed', marker='s', alpha=0.7)
-        axes[i].set_title(f'Sample {i+1} - Consumption', fontsize=12)
+        axes[i].plot(x_original[i, :, 0].cpu().numpy(), label='Original', marker='o', alpha=0.7, linewidth=2)
+        axes[i].plot(recon_reshaped[i, :, 0].cpu().numpy(), label='Reconstructed', marker='s', alpha=0.7, linewidth=2)
+        axes[i].set_title(f'Sample {i+1} - Energy Consumption', fontsize=12, fontweight='bold')
         axes[i].set_xlabel('Hour', fontsize=10)
         axes[i].set_ylabel('Energy (kWh)', fontsize=10)
-        axes[i].legend()
+        axes[i].legend(fontsize=10)
         axes[i].grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig('Output/Plots/reconstruction_comparison.png', dpi=150)
     print("Saved reconstruction comparison to Output/Plots/reconstruction_comparison.png")
     plt.close()
+
+    # Save to file
+    os.makedirs('Output/Plots', exist_ok=True)
+    reconstruction_path = f'Output/Plots/{model_tag}_reconstruction.png'
+    plt.savefig(reconstruction_path, dpi=150, bbox_inches='tight')
+    print(f"Saved reconstruction comparison to {reconstruction_path}")
+    
+    # Add to TensorBoard
+    writer.add_figure('Validation/Reconstructions', fig, global_step=0)
+    plt.close()
     
     #use case:
     # Create 10k synthetic samples to instantiate a new transformer station
     # some users dont have ev's, so we input them and add condition on ev
 
-    # Generate synthetic samples
+    # ===== SYNTHETIC SAMPLES VISUALIZATION =====
+    print("Generating synthetic samples...")
     with torch.no_grad():
         num_synthetic = 5
         latent_dim = VAE_model.prior_params["mu"].shape[1]
@@ -157,16 +173,86 @@ if __name__ == "__main__":
         axes = [axes]
     
     for i in range(num_synthetic):
-        axes[i].plot(synthetic_data[i, :, 0].cpu().numpy(), marker='o', color='green', alpha=0.7)
-        axes[i].set_title(f'Synthetic Sample {i+1} - Consumption', fontsize=12)
+        axes[i].plot(synthetic_data[i, :, 0].cpu().numpy(), marker='o', color='green', alpha=0.7, linewidth=2)
+        axes[i].set_title(f'Synthetic Sample {i+1} - Energy Consumption', fontsize=12, fontweight='bold')
         axes[i].set_xlabel('Hour', fontsize=10)
         axes[i].set_ylabel('Energy (kWh)', fontsize=10)
         axes[i].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('Output/Plots/synthetic_samples.png', dpi=150)
-    print("Saved synthetic samples to synthetic_samples.png")
+    
+    # Save to file
+    synthetic_path = f'Output/Plots/{model_tag}_synthetic.png'
+    plt.savefig(synthetic_path, dpi=150, bbox_inches='tight')
+    print(f"Saved synthetic samples to {synthetic_path}")
+    
+    # Add to TensorBoard
+    writer.add_figure('Validation/Synthetic_Samples', fig, global_step=0)
+    plt.close()
+
+    # ===== COMPARISON PLOT =====
+    print("Generating comparison visualization...")
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # Plot 1: Original samples
+    for i in range(min(3, x_original.shape[0])):
+        axes[0].plot(x_original[i, :, 0].cpu().numpy(), alpha=0.6, label=f'Sample {i+1}')
+    axes[0].set_title('Original Samples', fontsize=12, fontweight='bold')
+    axes[0].set_xlabel('Hour', fontsize=10)
+    axes[0].set_ylabel('Energy (kWh)', fontsize=10)
+    axes[0].legend(fontsize=8)
+    axes[0].grid(True, alpha=0.3)
+    
+    # Plot 2: Reconstructed samples
+    for i in range(min(3, recon_reshaped.shape[0])):
+        axes[1].plot(recon_reshaped[i, :, 0].cpu().numpy(), alpha=0.6, label=f'Sample {i+1}')
+    axes[1].set_title('Reconstructed Samples', fontsize=12, fontweight='bold')
+    axes[1].set_xlabel('Hour', fontsize=10)
+    axes[1].set_ylabel('Energy (kWh)', fontsize=10)
+    axes[1].legend(fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+    
+    # Plot 3: Synthetic samples
+    for i in range(min(3, synthetic_data.shape[0])):
+        axes[2].plot(synthetic_data[i, :, 0].cpu().numpy(), alpha=0.6, label=f'Sample {i+1}', color='green')
+    axes[2].set_title('Synthetic Samples', fontsize=12, fontweight='bold')
+    axes[2].set_xlabel('Hour', fontsize=10)
+    axes[2].set_ylabel('Energy (kWh)', fontsize=10)
+    axes[2].legend(fontsize=8)
+    axes[2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+
+    # Save comparison
+    comparison_path = f'Output/Plots/{model_tag}_comparison.png'
+    plt.savefig(comparison_path, dpi=150, bbox_inches='tight')
+    print(f"Saved comparison plot to {comparison_path}")
+    
+    # Add to TensorBoard
+    writer.add_figure('Validation/Comparison', fig, global_step=0)
     plt.close()
     
-    print("Validation and visualization complete.")
-    print(f"View TensorBoard logs with: tensorboard --logdir=./runs/VAE_training")
+    # ===== STATISTICS =====
+    # Log sample statistics to TensorBoard
+    writer.add_scalar('Validation/Original_Mean', x_original.mean().item(), 0)
+    writer.add_scalar('Validation/Original_Std', x_original.std().item(), 0)
+    writer.add_scalar('Validation/Reconstructed_Mean', recon_reshaped.mean().item(), 0)
+    writer.add_scalar('Validation/Reconstructed_Std', recon_reshaped.std().item(), 0)
+    writer.add_scalar('Validation/Synthetic_Mean', synthetic_data.mean().item(), 0)
+    writer.add_scalar('Validation/Synthetic_Std', synthetic_data.std().item(), 0)
+    
+    # Reconstruction error
+    mse = ((x_original - recon_reshaped) ** 2).mean().item()
+    mae = (x_original - recon_reshaped).abs().mean().item()
+    writer.add_scalar('Validation/MSE', mse, 0)
+    writer.add_scalar('Validation/MAE', mae, 0)
+    
+    print(f"\nValidation Metrics:")
+    print(f"  Reconstruction MSE: {mse:.4f}")
+    print(f"  Reconstruction MAE: {mae:.4f}")
+    
+    # Close writer
+    writer.close()
+    
+    print("\nValidation and visualization complete.")
+    print(f"View TensorBoard logs with: tensorboard --logdir=./runs/VAE_training/{model_tag}")
