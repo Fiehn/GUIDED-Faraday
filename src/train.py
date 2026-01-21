@@ -32,8 +32,8 @@ if __name__ == "__main__":
 
     window=WindowSpec(input_len=24, stride=24) # full day windows
 
-    batch_size=24
-    num_workers=4
+    batch_size=256
+    num_workers=0
     shuffle_train=False
     seed=0
     train_frac=0.8
