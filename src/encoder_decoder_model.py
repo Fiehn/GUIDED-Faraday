@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal, kl_divergence
 
+#zero preserving log transform!!! TODO: add this later
+
 # Will be a standard Gaussian encoder/decoder model.
 # GuideVAE style model will come later.
 # === Gaussian encoder and decoder Model ===
@@ -58,7 +60,7 @@ class GaussianCoder(torch.nn.Module):
         # calls reparameterize function
         return self.reparameterize(param_dict, num_samples=num_samples)
 
-    def loglikelihood(self, inputs, param_dict):
+    def loglikelihood(self, inputs, param_dict, **_):
         # Compute log likelihood of inputs under the Gaussian defined by param_dict
         # TODO: I think this is where we might do multivariate Gaussian later??
         mu = param_dict["mu"]
@@ -68,14 +70,33 @@ class GaussianCoder(torch.nn.Module):
         return log_likelihood
 
     def kl_divergence(self, param_dict_q, param_dict_p=None, **_):
-        # Compute KL divergence between two Gaussians
-        return kl_divergence(param_dict_q, param_dict_p) # TODO: implement in utils.py
+        # Compute KL divergence between two diagonal Gaussians
+        # KL(q||p) = 0.5 * sum(sigma_p^2/sigma_q^2 + (mu_q - mu_p)^2/sigma_q^2 - 1 + log(sigma_q^2/sigma_p^2))
+        mu_q = param_dict_q["mu"]
+        sigma_q = param_dict_q["sigma"]
+        
+        if param_dict_p is None:
+            # KL divergence with standard normal N(0,I)
+            mu_p = torch.zeros_like(mu_q)
+            sigma_p = torch.ones_like(sigma_q)
+        else:
+            mu_p = param_dict_p["mu"]
+            sigma_p = param_dict_p["sigma"]
+        
+        var_q = sigma_q ** 2
+        var_p = sigma_p ** 2
+        
+        kl = 0.5 * torch.sum(
+            var_q / var_p + ((mu_q - mu_p) ** 2) / var_p - 1 + torch.log(var_p / var_q),
+            dim=-1
+        )
+        return kl
     
     def create_covariance_matrix(self, param_dict):
         # Here in the Gaussian case, we create a diagonal covariance matrix from the sigma parameters
         return torch.eye(param_dict["mu"].shape[1]).to(param_dict["mu"].device) * (param_dict["sigma"] ** 2).unsqueeze(-1)
     
-    def reparameterize(self, param_dict, num_samples=1):
+    def reparameterize(self, param_dict, num_samples=1, **_):
         # Reparameterization trick: sample epsilon from N(0,1) and return mu + sigma * epsilon
         mu = param_dict["mu"]
         sigma = param_dict["sigma"]
@@ -117,7 +138,7 @@ class DictionaryCoder(torch.nn.Module):
         self.parameterizer = Parameterizer(
             input_dim=input_dim,
             output_dim={"dictionary_codes": dictionary_size, "output_codes": output_dim},
-            dist_parameters=["codes"],
+            dist_parameters=["mu", "sigma"],
             num_hidden_layers=num_hidden_layers,
             num_neurons=num_neurons,
             dropout=dropout,
@@ -126,7 +147,7 @@ class DictionaryCoder(torch.nn.Module):
         
         # The dictionary SigmaMapper is a learnable parameter
         # It maps the dictionary codes to the output space
-        # So it would be the U dictionary in the guide paper ???
+        # So it would be the U dictionary in the guide paper
         self.SigmaMapper = torch.nn.Parameter(torch.randn(output_dim, dictionary_size), requires_grad=True)
 
     def _num_parameters(self):
@@ -141,20 +162,20 @@ class DictionaryCoder(torch.nn.Module):
         # TODO: They clamp mu as well?? Check later
         return param_dict
 
-    def reparameterize(self, param_dict, num_samples=1):
+    def reparameterize(self, param_dict, num_samples=1, **_):
         # Reparameterization trick for dictionary approach
         # Sample epsilon from N(0, I) in the dictionary space
         mu, sigma = param_dict["mu"], param_dict["sigma"]
         eps = torch.randn((num_samples, mu.shape[0], self.dictionary_size)).to(mu.device)
         
         # Map to output space using SigmaMapper
-        corr_sigma = self.get_SigmaMapper() @ (eps * sigma)[..., None]  # TODO: understand this step better'
+        corr_sigma = self.get_SigmaMapper() @ (eps * sigma)[..., None] # num_samples x batch_size x output_dim x 1
         return mu.unsqueeze(0) + corr_sigma.squeeze(-1)
     
     def sample(self, param_dict=None, num_samples=1, **_):
         return self.reparameterize(param_dict, num_samples=num_samples)
     
-    def loglikelihood(self, inputs, param_dict):
+    def loglikelihood(self, inputs, param_dict, **_):
         # Compute log likelihood of inputs under the multivariate Gaussian defined by param_dict
         Sigma = self.create_covariance_matrix(param_dict)
         return torch.distributions.MultivariateNormal(loc=param_dict["mu"], covariance_matrix=Sigma).log_prob(inputs)
@@ -222,22 +243,19 @@ class NNBlock(nn.Module):
         self.output_layer = nn.Linear(num_neurons, output_dim)
     def forward(self, x):
         # Pass through the layers
-        # view will flatten all dimensions except batch
-        h = x.view(-1, self.input_dim)
-        h = self.input_layer(h)
+        h = self.input_layer(x)
         for layer in self.hidden_layers:
             h = layer(h)
         h = self.output_layer(h)
         return h
     def _num_parameters(self):
-        # honestly is ai, i dont know what numel is? TODO: look up later
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 # === This is the actual network structure ===
 class Parameterizer(nn.Module):
     def __init__(self,
-                 intput_dim,
+                 input_dim,
                  output_dim,
                  dist_parameters,
                  num_hidden_layers=2,
@@ -255,7 +273,7 @@ class Parameterizer(nn.Module):
         # So we use a ModuleDict to hold the blocks
         self.block_dict = nn.ModuleDict()
         self.block_dict["shared_block"] = NNBlock(
-            input_dim=intput_dim,
+            input_dim=input_dim,
             output_dim=num_neurons,
             num_hidden_layers=num_hidden_layers,
             num_neurons=num_neurons,
@@ -265,7 +283,7 @@ class Parameterizer(nn.Module):
         )
         # If output dim is an integer (not using guide) then all parameters have same output dim
         # and we create a block for each parameter
-        if output_dim is int:
+        if isinstance(output_dim, int):
             for param in dist_parameters:
                 self.block_dict[f"{param}_block"] = NNBlock(
                     input_dim=num_neurons,
@@ -280,7 +298,7 @@ class Parameterizer(nn.Module):
             # If output dim is a dict (using guide) then we create blocks for each specified output dimension
             # this means that we train the U dictionary with a seperate block from the output codes
             for key in output_dim:
-                if key in dist_parameters:
+                if key in output_dim:
                     self.block_dict[f"{key}_block"] = NNBlock(
                         input_dim=num_neurons,
                         output_dim=output_dim[key],
@@ -292,14 +310,12 @@ class Parameterizer(nn.Module):
                     )
         
     def forward(self, x):
-        h = x.view(-1, self.block_dict["shared_block"].input_dim)
-        h = self.block_dict["shared_block"](h)
+        h = self.block_dict["shared_block"](x)
         param_dict = {}
         for param in self.dist_parameters:
             param_dict[param] = self.block_dict[f"{param}_block"](h)
         return param_dict
     def _num_parameters(self):
-        # TODO: look up what numel is?
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
 def get_encoder_model(input_dim, latent_dim, **kwargs):

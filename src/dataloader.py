@@ -178,6 +178,7 @@ class SmartMeterDataModule:
         seed: int = 0,
         train_frac: float = 0.8,
         val_frac: float = 0.1,
+        max_meters: Optional[int] = None,
     ):
         self.loader = SmartMeterCSV(
             data_dir=data_dir,
@@ -195,10 +196,15 @@ class SmartMeterDataModule:
         self.seed = seed
         self.train_frac = train_frac
         self.val_frac = val_frac
+        self.max_meters = max_meters
 
     def setup(self) -> None:
         self.loader.load(self.filename)
         meter_ids = self.loader.meter_ids()
+
+        # Limit number of meters if max_meters is specified
+        if self.max_meters is not None:
+            meter_ids = meter_ids[:self.max_meters]
 
         rng = np.random.default_rng(self.seed)
         rng.shuffle(meter_ids)

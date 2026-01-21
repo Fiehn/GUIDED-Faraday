@@ -18,7 +18,7 @@ def preview_loader(name, loader, n_batches=1):
 
 def main():
     dm = SmartMeterDataModule(
-        data_dir="/Users/clarareginekold/Desktop/dtu/THESIS/Thesis/data/hourly_measurements_package1",
+        data_dir="data/",
         filename="hourly_measurements_2023_9.csv",
 
         meter_col="meter_number",
@@ -48,6 +48,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
 
 # output: shuffled meter IDs, then assigned ~80% of meters to train, ~10% val, ~10% test.
 # no meter appears in more than one split. 
