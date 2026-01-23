@@ -5,7 +5,9 @@ from typing import Optional, Sequence, Tuple, List, Dict
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, TensorDataset
+import torch
+
 
 
 # read and preprocess 
@@ -116,6 +118,7 @@ class SmartMeterWindowDataset(Dataset):
     def __init__(
         self,
         meter_df: pd.DataFrame,
+        meter_id: int = 0,
         *,
         feature_cols: Sequence[str],
         window: WindowSpec,
@@ -127,7 +130,10 @@ class SmartMeterWindowDataset(Dataset):
         self.drop_nan_windows = drop_nan_windows
         self.dtype = dtype
         self.values = meter_df[self.feature_cols].to_numpy(dtype=np.float32)
+        self.meter_id = meter_id
+        self.times = meter_df.index.to_numpy()
         self.starts = self._compute_starts(drop_nan_windows)
+        
 
     # determines which window start positions are allowed
     def _compute_starts(self, drop_nan: bool) -> np.ndarray:
@@ -161,7 +167,8 @@ class SmartMeterWindowDataset(Dataset):
         s = int(self.starts[idx])
         L = self.window.input_len
         x = self.values[s : s + L]
-        return torch.tensor(x, dtype=self.dtype)
+        dow = pd.Timestamp(self.times[s]).dayofweek # day of week: monday=0 ... sunday=6  - this is for conditioning
+        return (torch.tensor(x, dtype=self.dtype), torch.tensor(self.meter_id, dtype=torch.long), torch.tensor(dow, dtype=torch.long))
 
 
 # build DataLoaders for train/val/test splits (wraps full pipeline)
@@ -206,6 +213,9 @@ class SmartMeterDataModule:
         self.train_frac = train_frac
         self.val_frac = val_frac
         self.max_meters = max_meters
+        self._train_ds = None 
+        self._val_ds = None
+        self._test_ds = None
 
     def setup(self) -> None:
         self.loader.load(self.filename)
@@ -219,8 +229,10 @@ class SmartMeterDataModule:
         rng.shuffle(meter_ids)
 
         n = len(meter_ids)
-        n_train = int(n * self.train_frac)
-        n_val = int(n * self.val_frac)
+        n_train = max(1, int(n * self.train_frac)) # int(n * self.train_frac)
+        n_val = max(1, int(n * self.val_frac)) # int(n * self.val_frac)
+        if n_train + n_val >= n: # dont exceed n
+            n_val = max(0, n-n_train - 1) # leave at least 1 for test if possible
 
         self.train_ids = meter_ids[:n_train]
         self.val_ids = meter_ids[n_train : n_train + n_val]
@@ -231,17 +243,23 @@ class SmartMeterDataModule:
         self._test_ds = self._make_dataset(self.test_ids)
 
     def _make_dataset(self, meter_ids):
-        from torch.utils.data import ConcatDataset
 
         datasets = []
         for mid in meter_ids:
             ds = SmartMeterWindowDataset(
                 self.loader.meter_frame(mid),
+                meter_id=mid,
                 feature_cols=self.feature_cols,
                 window=self.window,
             )
             if len(ds) > 0:
                 datasets.append(ds)
+            
+        if len(datasets) == 0:
+            x_empty = torch.empty((0, self.window.input_len, len(self.feature_cols)), dtype=torch.float32)
+            meter_empty = torch.empty((0,), dtype=torch.long)
+            dow_empty = torch.empty((0,), dtype=torch.long)
+            return TensorDataset(x_empty, meter_empty, dow_empty)
 
         return ConcatDataset(datasets)
 
@@ -281,10 +299,15 @@ if __name__ == "__main__":
         num_workers=0,
     )
     dm.setup()
+    print("train meters:", len(dm.train_ids), "val meters:", len(dm.val_ids), "test meters:", len(dm.test_ids))
+    print("train ds len:", len(dm._train_ds), "val ds len:", len(dm._val_ds), "test ds len:", len(dm._test_ds))
 
     train_loader = dm.train_dataloader()
-    x, y = next(iter(train_loader))
-    print("x shape:", x.shape)  # [B, 24, F]
+    x, meter_id, dow = next(iter(train_loader))
+    print("x shape:", x.shape) # [B, 24, F]
+    print("meter_id shape:", meter_id.shape, "example:", meter_id[:5])
+    print("dow shape:", dow.shape, "example:", dow[:10])
+
 
 
 
