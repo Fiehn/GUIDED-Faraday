@@ -1,0 +1,30 @@
+[project]
+name = "thesis"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "graphviz>=0.21",
+    "matplotlib>=3.10.8",
+    "pandas>=2.3.3",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.0",
+    "tensorboard>=2.20.0",
+    "torch>=2.9.1",
+    "torchviz>=0.0.3",
+    "tqdm>=4.67.1",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
