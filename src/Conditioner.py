@@ -145,8 +145,34 @@ class UserProfiler(LatentDirichletAllocation):
         return obj
     
 # === Day of week conditioning ===
-# TODO: implement day of week conditioning, the data is in DST date stamps in the dataset
+class DayOfWeekConditioner():
+    def __init__(self):
+        self.condition_dim = 7
 
+    def get_conditions(self, timestamps):
+        """
+        timestamps: tensor of Unix timestamps (float) or array-like of pandas Timestamps
+        returns: [B, 7] one-hot encoded day of week
+        """
+        # Handle both tensor of floats and list of pandas Timestamps
+        if isinstance(timestamps, torch.Tensor):
+            # Convert Unix timestamps back to pandas Timestamps
+            timestamps = [pd.Timestamp(ts.item(), unit='s') for ts in timestamps]
+        elif not isinstance(timestamps, (list, np.ndarray)):
+            timestamps = [timestamps]
+        
+        # Extract day of week for all timestamps
+        days_of_week = []
+        for ts in timestamps:
+            if isinstance(ts, (int, float)):
+                ts = pd.Timestamp(ts, unit='s')
+            days_of_week.append(ts.dayofweek)  # 0=Monday, 6=Sunday
+        
+        # Convert to tensor and one-hot encode
+        dow_tensor = torch.tensor(days_of_week, dtype=torch.long)
+        dow_onehot = F.one_hot(dow_tensor, num_classes=7).float()
+        
+        return dow_onehot
 
 
 # =============
@@ -171,11 +197,26 @@ class Conditioner():
         self.condition_dim += item.condition_dim
 
     def get_conditions(self, inputs): 
-        # Get the conditions from each item in the tag list
+        """
+        Get conditions from all registered conditioners.
+        Returns concatenated tensor of all conditions.
+        """
+        conditions = []
         for tag in self.tags:
-            self.condition_items[tag].get_conditions(inputs)
-        return self.condition_items
+            cond = self.condition_items[tag].get_conditions(inputs)
+            if isinstance(cond, np.ndarray):
+                cond = torch.tensor(cond, dtype=torch.float32)
+            conditions.append(cond)
+        
+        if len(conditions) == 0:
+            return None
+        
+        # Concatenate all conditions along feature dimension
+        return torch.cat(conditions, dim=-1)
     
+    def get_condition_dim(self):
+        return int(self.condition_dim)
+
     def save(self, path):
         self.path = path
         with open(path, "wb") as f:

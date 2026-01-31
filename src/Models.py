@@ -544,121 +544,15 @@ class VAE(nn.Module):
         return model_tag
 
 
-
-
-
-
-# old CVAE implementation 
-
-# class CVAE(VAE):
-#     def __init__(self,
-#                  input_dim=None,
-#                  condition_object = None,
-#                  latent_dim = 10,
-#                 distribution_dict = {},
-#                  **_):
-#         # Kwarg Handling
-#         kwargs = dict(locals())
-#         for key in ["self","__class__", "input_dim", "condition_object"]: kwargs.pop(key)
-#         self.model_kwargs = kwargs
-#         super(CVAE, self).__init__(input_dim=input_dim, distribution_dict=distribution_dict, **self.model_kwargs)
-
-#         self.condition_dim = condition_object.condition_dim
-
-#         self.encoder = get_encoder_model(input_dim=input_dim + self.condition_dim, latent_dim=latent_dim, **self.model_kwargs)
-#         self.decoder = get_decoder_model(input_dim=input_dim + self.condition_dim, latent_dim=latent_dim, **self.model_kwargs)
-
-#         self.prior_params = get_prior_params(latent_dim=latent_dim, device="cpu", **self.model_kwargs)
-    
-#     def forward(self, inputs, conditions, num_samples=1):
-    
-#         posterior_params_dict = self.encoder(torch.cat([inputs.unsqueeze(1).expand(-1,
-#                                                                 num_samples,
-#                                                                 -1), conditions], dim=-1))
-#         z = self.encoder.reparameterize(posterior_params_dict, num_samples, **self.model_kwargs)
-#         recon_params_dict = self.decoder(torch.cat([z, conditions], dim=-1))
-#         for key in recon_params_dict:
-#             recon_params_dict[key] = recon_params_dict[key].squeeze(1)
-#         return {"recon_params_dict": recon_params_dict, "posterior_params_dict": posterior_params_dict}, {"samples": z}
-
-
-#     @torch.no_grad()
-#     def sample(self, condition, num_prior_samples = 1, num_posterior_samples = 1):
-#         # TODO: double check this implementation
-#         if condition.ndims == 2:
-#             z = self.encoder.sample(param_dict=self.prior_params, num_samples=num_prior_samples, **self.model_kwargs)
-#             recon_params_dict = self.decoder(torch.cat([z, condition.unsqueeze(1).expand(-1, z.size(1), -1)], dim=-1))
-#             samples = self.decoder.sample(recon_params_dict, num_samples=num_posterior_samples, **self.model_kwargs)
-#             return {"samples": samples, "recon_params_dict": recon_params_dict}
-#         elif condition.ndims == 3:
-#             if condition.size(1) != num_prior_samples:
-#                 raise ValueError("Condition size does not match number of prior samples.")
-#             z = self.encoder.sample(param_dict=self.prior_params, num_samples=num_prior_samples, **self.model_kwargs)
-#             recon_params_dict = self.decoder(torch.cat([z, condition], dim=-1))
-#             samples = self.decoder.sample(recon_params_dict, num_samples=num_posterior_samples, **self.model_kwargs)
-#             return {"samples": samples, "recon_params_dict": recon_params_dict}
-#         else:
-#             raise ValueError("Condition must be 2D or 3D tensor.") # TODO: double check this implementation
-        
-#     @torch.no_grad()
-#     def reconstruct(self, inputs, conditions, num_samples=1):
-#         outputs, _ = self.forward(inputs, conditions, num_samples=num_samples)
-#         return outputs["recon_params_dict"], outputs["posterior_params_dict"]
-
-#     @torch.no_grad()
-#     def loglikelihood(self, inputs, conditions, num_samples=1):
-        
-#         outputs, _ = self.forward(inputs, conditions, num_samples=num_samples)
-#         posterior_params_dict = outputs["posterior_params_dict"]
-#         recon_params_dict = outputs["recon_params_dict"]
-#         posterior_loglikelihood = self.encoder.loglikelihood(inputs, posterior_params_dict, **self.model_kwargs)
-#         recon_loglikelihood = self.decoder.loglikelihood(inputs, recon_params_dict, **self.model_kwargs)
-#         prior_loglikelihood = self.encoder.loglikelihood(inputs, self.prior_params, **self.model_kwargs)
-#         return (posterior_loglikelihood.sum(-1) + recon_loglikelihood.sum(-1) - prior_loglikelihood.sum(-1)).mean(0)
-        
-#     def train_core(self, inputs, optim, **_):
-#         inputs, conditions = inputs
-#         outputs, _ = self.forward(inputs, conditions, num_samples=1)
-#         optim.zero_grad(set_tp_none = True)
-#         loss_dict = self.loss(inputs, outputs["recon_params_dict"], outputs["posterior_params_dict"], beta=1.0, prior_params=self.prior_params, **self.model_kwargs)
-#         loss_dict["loss"].backward()
-#         optim.step()
-#         return loss_dict["loss"]
-
-#     @torch.no_grad()
-#     def validate(self, valloader, num_samples = 1, beta = 1.0, device = "cpu"):
-#         self.eval()
-#         val_loss = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
-#         for batch in valloader:
-#             inputs, conditions = batch
-#             inputs = inputs.to(device)
-#             conditions = conditions.to(device)
-#             outputs, _ = self.forward(inputs, conditions, num_samples=num_samples)
-#             loss_dict = self.loss(inputs, outputs["recon_params_dict"], outputs["posterior_params_dict"], beta=beta, prior_params=self.prior_params, **self.model_kwargs)
-#             for key in val_loss:
-#                 val_loss[key] += loss_dict[key].item() * inputs.size(0)
-#         for key in val_loss:
-#             val_loss[key] /= len(valloader.dataset)
-#         return val_loss
-
-#     def move_to_device(self, inputs, device):
-#         return super().move_to_device(inputs, device)
-
-
-
-
-
-
-
-
-# new cvae implementation
-
+# ==============
+# Define the Conditional VAE (CVAE) class
+# ==============
 class CVAE(VAE):
     def __init__(
         self,
         input_dim: int,
         *,
-        condition_dim: int,
+        conditioner: Conditioner,
         latent_dim: int = 10,
         distribution_dict: dict = None,
         **kwargs,
@@ -670,7 +564,8 @@ class CVAE(VAE):
 
         super().__init__(input_dim=input_dim, distribution_dict=distribution_dict, **kwargs)
 
-        self.condition_dim = int(condition_dim)
+        self.conditioner = conditioner
+        self.condition_dim = conditioner.get_condition_dim()
         self.latent_dim = int(latent_dim)
 
         # Define encoder and decoder networks
@@ -690,27 +585,25 @@ class CVAE(VAE):
         self.prior_params = get_prior_params(latent_dim=latent_dim, device="cpu")
 
     def _prep_inputs(self, x: torch.Tensor) -> torch.Tensor:
-        # can be either [B, L, F] or [B, D]
+        """ Flatten [B, L, F] to [B, D] if needed """
         if x.dim() == 3:
             return x.reshape(x.shape[0], -1)
         return x
 
-    def _prep_conditions(self, c: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, c: torch.Tensor, num_samples: int = 1):
         """
-        Accept:
-          - [B] int day-of-week -> one-hot [B, 7]
-          - [B, C] one-hot/continuous
+        Forward pass with pre-computed conditions.
+        
+        Args:
+            x: Input tensor [B, D] (already flattened)
+            c: Condition tensor [B, C] (already computed)
+            num_samples: Number of latent samples
+        
+        Returns:
+            recon_params: dict with [S, B, D] tensors
+            q_params: dict with [B, latent_dim] tensors
         """
-        if c.dim() == 1:
-            # day-of-week integers
-            return torch.nn.functional.one_hot(c, num_classes=self.condition_dim).float()
-        return c.float()
-
-    def forward(self, inputs: torch.Tensor, conditions: torch.Tensor, num_samples: int = 1):
-        x = self._prep_inputs(inputs) # input [B, D]
-        c = self._prep_conditions(conditions) # conditions [B, C]
-
-        # Encode inputs to get posterior parameters - encoder input: [B, D+C]
+        # Encode: [B, D+C] -> posterior params
         enc_in = torch.cat([x, c], dim=-1)
         q_params = self.encoder(enc_in) # dict of [B, latent_dim] params
 
@@ -718,10 +611,10 @@ class CVAE(VAE):
         z = self.encoder.reparameterize(q_params, num_samples=num_samples)
 
         # expand c to match z: [S, B, C]
-        cS = c.unsqueeze(0).expand(num_samples, -1, -1)
+        c_expanded = c.unsqueeze(0).expand(num_samples, -1, -1)
 
-        # decoder input: [S, B, latent_dim + C] -> flatten to [S*B, ...] for MLP
-        dec_in = torch.cat([z, cS], dim=-1)
+        # Decode: [S, B, latent_dim + C] -> recon params
+        dec_in = torch.cat([z, c_expanded], dim=-1)
         S, B, DC = dec_in.shape
         dec_in_flat = dec_in.reshape(S * B, DC)
 
@@ -732,27 +625,32 @@ class CVAE(VAE):
         for k in recon_params:
             recon_params[k] = recon_params[k].reshape(S, B, -1)
 
-        return recon_params, q_params  # recon has sample dim, q_params doesn't
+        return recon_params, q_params 
 
-    def loss(self, inputs, recon_params, posterior_params, beta=1.0, **_):
-        # inputs: [B, D]
-        x = self._prep_inputs(inputs)
-
-        # recon_params: dict of [S, B, D] -> use S=1 during training or average over S
+    def loss(self, x: torch.Tensor, recon_params, posterior_params, beta=1.0, **_):
+        """Compute ELBO loss."""
+        # recon_params: dict of [S, B, D] -> use first sample for training
         if recon_params["mu"].dim() == 3:
-            recon_params_1 = {k: v[0] for k, v in recon_params.items()}  # [B, D]
+            recon_params_squeezed = {k: v[0] for k, v in recon_params.items()}
         else:
-            recon_params_1 = recon_params
+            recon_params_squeezed = recon_params
 
-        return super().loss(x, recon_params_1, posterior_params, beta=beta, prior_params=self.prior_params)
+        return super().loss(x, recon_params_squeezed, posterior_params, beta=beta, prior_params=self.prior_params)
 
     def train_core(self, batch, optim, beta=1.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
-        x, meter_id, dow = batch # meter_id is unused
-        x = self._prep_inputs(x)
-        c = self._prep_conditions(dow)
+        x, meter_id, timestamps = batch
 
+        # Prep inputs: [B, L, F] -> [B, D] if needed
+        x = self._prep_inputs(x)
+
+        # Compute conditions
+        c = self.conditioner.get_conditions(timestamps)
+        c = self.move_to_device(c, device=x.device)
+
+        # Forward pass
         recon_params, q_params = self.forward(x, c, num_samples=1)
 
+        # Backward pass
         optim.zero_grad(set_to_none=True)
         loss_dict = self.loss(x, recon_params, q_params, beta=beta)
         loss_dict["loss"].backward()
@@ -769,13 +667,15 @@ class CVAE(VAE):
         agg = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
         n = 0
 
-        for x, meter_id, dow in valloader:
+        for x, meter_id, timestamps in valloader:
             x = x.to(device)
-            dow = dow.to(device)
 
+            # Prep inputs and conditions
             x = self._prep_inputs(x)
-            c = self._prep_conditions(dow)
+            c = self.conditioner.get_conditions(timestamps)
+            c = self.move_to_device(c, device=device)
 
+            # Forward pass
             recon_params, q_params = self.forward(x, c, num_samples=1)
             loss_dict = self.loss(x, recon_params, q_params, beta=beta)
 
@@ -792,13 +692,7 @@ class CVAE(VAE):
     def sample(self, conditions: torch.Tensor, num_prior_samples: int = 1, num_x_samples: int = 1, device: str = "cpu",):
         self.eval()
 
-        cond = conditions.to(device)
-
-        # normalize conditions to either [B] or [B, C] - if it passes [S, B] or [S, B, ...], collapse to [B, ...]
-        if cond.dim() >= 2 and cond.shape[0] == num_prior_samples:
-            cond = cond[0]  # take first S slice -> [B] or [B, C]
-
-        c = self._prep_conditions(cond)  # [B, C]
+        c = self.move_to_device(conditions, device=device)
         B = c.size(0)
 
         # sample z: [S, B, latent_dim] 
@@ -807,11 +701,11 @@ class CVAE(VAE):
         prior_params["sigma"] = prior_params["sigma"].expand(B, -1)
         z = self.encoder.sample(prior_params, num_samples=num_prior_samples)  # [S, B, latent_dim]
 
-        # expand c to [S, B, C]
-        cS = c.unsqueeze(0).expand(num_prior_samples, B, c.size(-1))
+        # Expand c to [S, B, C]
+        c_expanded = c.unsqueeze(0).expand(num_prior_samples, B, -1)
 
         # decode 
-        dec_in = torch.cat([z, cS], dim=-1)  # [S, B, latent_dim + C]
+        dec_in = torch.cat([z, c_expanded], dim=-1)  # [S, B, latent_dim + C]
         S, B, DC = dec_in.shape
         dec_in_flat = dec_in.reshape(S * B, DC)
 
@@ -825,7 +719,13 @@ class CVAE(VAE):
             params_s = {k: v[s] for k, v in recon_params.items()}         # [B, D]
             xs = self.decoder.sample(params_s, num_samples=num_x_samples) # [num_x_samples, B, D]
             xs_all.append(xs)
-        
-        print("CVAE.sample() called")
 
         return torch.stack(xs_all, dim=0)  # [S, num_x_samples, B, D]
+    
+    @torch.no_grad()
+    def reconstruct(self, x: torch.Tensor, timestamps: torch.Tensor, num_samples: int = 1):
+        self.eval()
+        x = self._prep_inputs(x)
+        c = self.conditioner.get_conditions(timestamps) # TODO : neeeds to be general so that it works with other conditions
+        c = self.move_to_device(c, device=x.device)
+        return self.forward(x, c, num_samples=num_samples)

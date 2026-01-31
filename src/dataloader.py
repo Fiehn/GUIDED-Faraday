@@ -8,8 +8,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, TensorDataset
 import torch
 
-
-
 # read and preprocess 
 class SmartMeterCSV:
     """
@@ -124,6 +122,7 @@ class SmartMeterWindowDataset(Dataset):
         window: WindowSpec,
         drop_nan_windows: bool = True,
         dtype: torch.dtype = torch.float32,
+        normalizer = None,
     ):
         self.feature_cols = list(feature_cols) 
         self.window = window
@@ -133,8 +132,8 @@ class SmartMeterWindowDataset(Dataset):
         self.meter_id = meter_id
         self.times = meter_df.index.to_numpy()
         self.starts = self._compute_starts(drop_nan_windows)
+        self.normalizer = normalizer
         
-
     # determines which window start positions are allowed
     def _compute_starts(self, drop_nan: bool) -> np.ndarray:
         T = self.values.shape[0]
@@ -167,8 +166,20 @@ class SmartMeterWindowDataset(Dataset):
         s = int(self.starts[idx])
         L = self.window.input_len
         x = self.values[s : s + L]
-        dow = pd.Timestamp(self.times[s]).dayofweek # day of week: monday=0 ... sunday=6  - this is for conditioning
-        return (torch.tensor(x, dtype=self.dtype), torch.tensor(self.meter_id, dtype=torch.long), torch.tensor(dow, dtype=torch.long))
+        start_time = self.times[s]  # Get the start timestamp for this window
+        
+        # Convert pandas Timestamp to Unix timestamp (seconds since epoch)
+        # This preserves precision far more than needed but its fine
+        timestamp_unix = start_time.timestamp()
+
+        if self.normalizer is not None:
+            x = self.normalizer.transform(x)
+        
+        return (
+            torch.tensor(x, dtype=self.dtype),
+            torch.tensor(self.meter_id, dtype=torch.long),
+            torch.tensor(timestamp_unix, dtype=torch.float64)
+        )
 
 
 # build DataLoaders for train/val/test splits (wraps full pipeline)
@@ -195,6 +206,7 @@ class SmartMeterDataModule:
         train_frac: float = 0.8,
         val_frac: float = 0.1,
         max_meters: Optional[int] = None,
+        normalizer = None,
     ):
         self.loader = SmartMeterCSV(
             data_dir=data_dir,
@@ -216,6 +228,7 @@ class SmartMeterDataModule:
         self._train_ds = None 
         self._val_ds = None
         self._test_ds = None
+        self.normalizer = normalizer
 
     def setup(self) -> None:
         self.loader.load(self.filename)
@@ -238,9 +251,28 @@ class SmartMeterDataModule:
         self.val_ids = meter_ids[n_train : n_train + n_val]
         self.test_ids = meter_ids[n_train + n_val :]
 
+        # fit normalizer if provided
+        if self.normalizer is not None:
+            self._fit_normalizer()
+
         self._train_ds = self._make_dataset(self.train_ids)
         self._val_ds = self._make_dataset(self.val_ids)
         self._test_ds = self._make_dataset(self.test_ids)
+
+    def _fit_normalizer(self):
+        """ Fit normalizer on training data only """
+        all_values = []
+        for mid in self.train_ids:
+            meter_df = self.loader.meter_frame(mid)
+            values = meter_df[self.feature_cols].to_numpy(dtype=np.float32)
+            all_values.append(values)
+
+        if len(all_values) == 0:
+            raise ValueError("No training data available to fit normalizer.")
+        
+        all_values = np.concatenate(all_values, axis=0)
+        all_values_tensor = all_values
+        self.normalizer.fit(all_values_tensor)
 
     def _make_dataset(self, meter_ids):
 
@@ -251,6 +283,7 @@ class SmartMeterDataModule:
                 meter_id=mid,
                 feature_cols=self.feature_cols,
                 window=self.window,
+                normalizer=self.normalizer,
             )
             if len(ds) > 0:
                 datasets.append(ds)
@@ -258,10 +291,13 @@ class SmartMeterDataModule:
         if len(datasets) == 0:
             x_empty = torch.empty((0, self.window.input_len, len(self.feature_cols)), dtype=torch.float32)
             meter_empty = torch.empty((0,), dtype=torch.long)
-            dow_empty = torch.empty((0,), dtype=torch.long)
-            return TensorDataset(x_empty, meter_empty, dow_empty)
+            ts_empty = torch.empty((0,), dtype=torch.long)
+            return TensorDataset(x_empty, meter_empty, ts_empty)
 
         return ConcatDataset(datasets)
+
+    def get_normalizer(self):
+        return self.normalizer
 
     def train_dataloader(self):
         return DataLoader(
@@ -308,100 +344,4 @@ if __name__ == "__main__":
     print("meter_id shape:", meter_id.shape, "example:", meter_id[:5])
     print("dow shape:", dow.shape, "example:", dow[:10])
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# class RawData:
-#     def __init__(self, data_dir):
-#         self.data_dir = data_dir
-#         self.data = None
-
-#     def load_data(self, filename):
-#         file_path = os.path.join(self.data_dir, filename)
-#         if not os.path.exists(file_path):
-#             raise FileNotFoundError(f"File {filename} not found in directory {self.data_dir}")
-#         data = pd.read_csv(file_path)
-#         return data
-    
-#     def preprocess_data(self, data):
-#         # The columns are: meter_number, timestamp_dst, timestamp_utc, hourly_energy_consumption, hourly_energy_production
-#         # The meter_number is a unique identifier for each meter, this will be used for indexing
-#         data['timestamp_utc'] = pd.to_datetime(data['timestamp_utc'])
-#         data.set_index(['meter_number', 'timestamp_utc'], inplace=True)
-#         data.sort_index(inplace=True)
-
-#         # 0 value imputation for consumption and production
-#         data['hourly_energy_consumption'].replace(0, np.nan, inplace=True)
-#         data['hourly_energy_production'].replace(0, np.nan, inplace=True)
-
-#         return data
-    
-#     def get_data(self, filename):
-#         raw_data = self.load_data(filename)
-#         self.data = self.preprocess_data(raw_data)
-#         return self.data
-    
-#     def get_all_meter_numbers(self):
-#         if self.data is None:
-#             raise ValueError("Data not loaded. Please load data first using get_data method.")
-#         return self.data.index.get_level_values('meter_number').unique().tolist()
-    
-#     def get_data_by_meter(self, meter_number):
-#         if self.data is None:
-#             raise ValueError("Data not loaded. Please load data first using get_data method.")
-#         return self.data.xs(meter_number, level='meter_number')
-
-#     def examine_data(self):
-#         if self.data is None:
-#             raise ValueError("Data not loaded. Please load data first using get_data method.")
-#         print("Data Info:")
-#         print(self.data.info())
-#         print("\nData Description:")
-#         print(self.data.describe())
-#         print("\nMissing Values:")
-#         print(self.data.isnull().sum())
-
-# if __name__ == "__main__":
-#     data_dir = "data"
-#     filename = "hourly_measurements_2023_12.csv"
-#     raw_data_loader = RawData(data_dir)
-#     data = raw_data_loader.get_data(filename)
-#     print("Data loaded and preprocessed successfully.")
-#     print(data.head())
-#     raw_data_loader.examine_data()
-
-#     # How many unique meter numbers are there?
-#     unique_meters = raw_data_loader.get_all_meter_numbers()
-#     print(f"Number of unique meter numbers: {len(unique_meters)}")
-
-#     # Get data for a specific meter number
-#     sample_meter_number = unique_meters[0]
-#     meter_data = raw_data_loader.get_data_by_meter(sample_meter_number)
-#     print(f"Data for meter number {sample_meter_number}:")
-#     print(meter_data.head())
-    
-#     # Plot some consumption for a random 24 hours
-#     sample_data = meter_data.head(24)
-#     plt.figure(figsize=(10, 5))
-#     plt.plot(sample_data.index, sample_data['hourly_energy_consumption'], marker='o')
-#     plt.title(f'Hourly Energy Consumption for Meter {sample_meter_number} (First 24 Hours)')
-#     plt.xlabel('Timestamp (UTC)')
-#     plt.ylabel('Hourly Energy Consumption')
-#     plt.grid()
-#     plt.show()
 

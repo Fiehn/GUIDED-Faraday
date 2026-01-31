@@ -7,6 +7,7 @@ from src.encoder_decoder_model import *
 from src.Conditioner import *
 from src.Models import *
 from src.dataloader import *
+from src.normalizer import *
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
@@ -25,8 +26,8 @@ def run_test(model_type: str = "vae"):
 
     ##############################
     # load data
-    data_dir = "/Users/clarareginekold/Desktop/dtu/THESIS/Thesis/data/" # "data/"
-    filename = "hourly_measurements_2023_9.csv"
+    data_dir = "data/" # "data/"
+    filename = "hourly_measurements_2023_10.csv"
 
     meter_col = "meter_number"
     timestamp_dst_col = "timestamp_dst"
@@ -38,9 +39,10 @@ def run_test(model_type: str = "vae"):
     batch_size = 32 # 256 # tried smaller batch size for CVAE
     num_workers = 0
     shuffle_train = False
-    seed = 0
+    seed = 2
     train_frac = 0.8
     val_frac = 0.1
+    normalizer = Normalizer(method='zero_preserved_log')
 
     print("Initializing DataModule...")
     dm = SmartMeterDataModule(
@@ -57,9 +59,10 @@ def run_test(model_type: str = "vae"):
         seed=seed,
         train_frac=train_frac,
         val_frac=val_frac,
-        max_meters=10, # None # tried smaller number for CVAE
+        max_meters=3, # None # tried smaller number for CVAE
+        normalizer=normalizer,
     )
-
+    
     dm.setup()
     print("done setup")
     train_loader = dm.train_dataloader()
@@ -68,10 +71,10 @@ def run_test(model_type: str = "vae"):
 
     ##############################
     # get one batch
-    x, meter_id, dow = next(iter(train_loader))
+    x, meter_id, timestamps = next(iter(train_loader))  # Now also get timestamps
     print("x shape:", x.shape)
     print("meter_id shape:", meter_id.shape, "example:", meter_id[:5])
-    print("dow shape:", dow.shape, "example:", dow[:10])
+    print("timestamps shape:", len(timestamps))
 
     # flatten for vae and cvae
     x_flat = x.reshape(x.shape[0], -1)
@@ -79,6 +82,14 @@ def run_test(model_type: str = "vae"):
 
     num_features = x.shape[2]
     input_dim = 24 * num_features  # flattened window dim
+    print("input_dim:", input_dim)
+
+    # Test conditioner - pass timestamps instead of x
+    conditioner = Conditioner()
+    conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
+    cond = conditioner.get_conditions(timestamps)  # Pass timestamps, not x
+    print("Condition shape (day of week):", cond.shape)  # should be [batch_size, 7]
+    print("Condition example (first 3):\n", cond[:3])
 
     ##############################
     # use chosen model
@@ -88,7 +99,7 @@ def run_test(model_type: str = "vae"):
         log_dir = "./runs/VAE_training"
     else:
         print("Initializing CVAE model (condition = day-of-week)...")
-        model = CVAE(input_dim=input_dim, condition_dim=7, latent_dim=10)
+        model = CVAE(input_dim=input_dim, condition_dim=7, latent_dim=10, conditioner=conditioner)
         log_dir = "./runs/CVAE_training"
 
     ##############################
@@ -133,38 +144,93 @@ def run_test(model_type: str = "vae"):
     ##############################
     # Reconstruction
     print("\nGenerating reconstruction visualizations...")
+    num_recon_samples = 3  # Number of reconstructions per original
+    
     with torch.no_grad():
-        x, meter_id, dow = next(iter(test_loader))
+        x, meter_id, timestamps = next(iter(test_loader))
         x = x.to(device)
-        dow = dow.to(device)
-        x_original = x
+        timestamps = timestamps.to(device)
+        x_original = x  # This is normalized
         x_flat = x.reshape(x.shape[0], -1)
 
         if model_type == "vae":
-            recon_params, _ = model.forward(x_flat, num_samples=1)
-            recon_mu = recon_params["mu"]
-            if recon_mu.dim() == 3:
-                recon_mu = recon_mu.squeeze(0)  # [B, D]
+            recon_params, _ = model.forward(x_flat, num_samples=num_recon_samples)
+            recon_mu = recon_params["mu"]  # [S, B, D]
+            condition_labels = None
         else:
-            recon_params, _ = model.forward(x_flat, dow, num_samples=1)
-            recon_mu = recon_params["mu"][0]  # [B, D] (S=1)
+            # CVAE: use reconstruct method which handles conditioning internally
+            recon_params, _ = model.reconstruct(x_flat, timestamps, num_samples=num_recon_samples)
+            recon_mu = recon_params["mu"]  # [S, B, D]
+            
+            # Extract day-of-week labels for display
+            day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            condition_labels = []
+            for ts in timestamps.cpu():
+                dt = pd.Timestamp(ts.item(), unit='s')
+                day_name = day_names[dt.dayofweek]
+                date_str = dt.strftime("%Y-%m-%d")
+                condition_labels.append(f"{day_name} ({date_str})")
 
-        recon_reshaped = recon_mu.reshape(x_original.shape[0], x_original.shape[1], x_original.shape[2])
+        # recon_mu shape: [S, B, D] -> reshape to [S, B, L, F]
+        S, B, D = recon_mu.shape
+        L, F = x_original.shape[1], x_original.shape[2]
+        recon_reshaped = recon_mu.reshape(S, B, L, F)  # [num_samples, batch, length, features]
+        
+        # Inverse transform for plotting in original scale
+        # Move to CPU first, then inverse transform (returns torch tensor)
+        x_original_denorm = normalizer.inverse_transform(x_original.cpu())
+        recon_denorm = normalizer.inverse_transform(recon_reshaped.cpu())
 
-    # Plot original vs reconstructed
+    # Plot original vs multiple reconstructions
     num_samples_to_plot = min(3, x_original.shape[0])
-    fig, axes = plt.subplots(num_samples_to_plot, 1, figsize=(14, 4 * num_samples_to_plot))
+    fig, axes = plt.subplots(num_samples_to_plot, 1, figsize=(14, 5 * num_samples_to_plot))
     if num_samples_to_plot == 1:
         axes = [axes]
 
+    # Color palette for reconstructions
+    recon_colors = ['#e74c3c', '#3498db', '#2ecc71', '#9b59b6', '#f39c12']
+
     for i in range(num_samples_to_plot):
-        axes[i].plot(x_original[i, :, 0].detach().cpu().numpy(), label="Original", marker="o", alpha=0.7, linewidth=2)
-        axes[i].plot(recon_reshaped[i, :, 0].detach().cpu().numpy(), label="Reconstructed", marker="s", alpha=0.7, linewidth=2)
-        axes[i].set_title(f"Sample {i+1} - Energy Consumption")
+        # x_original_denorm is a torch.Tensor, convert to numpy for plotting
+        axes[i].plot(
+            x_original_denorm[i, :, 0].numpy() if isinstance(x_original_denorm, torch.Tensor) else x_original_denorm[i, :, 0],
+            label="Original", 
+            marker="o", 
+            color="black",
+            alpha=0.9, 
+            linewidth=2,
+            markersize=4
+        )
+        
+        # Plot each reconstruction sample
+        for s in range(num_recon_samples):
+            axes[i].plot(
+                recon_denorm[s, i, :, 0].numpy() if isinstance(recon_denorm, torch.Tensor) else recon_denorm[s, i, :, 0],
+                label=f"Recon {s+1}", 
+                marker="s", 
+                color=recon_colors[s % len(recon_colors)],
+                alpha=0.6, 
+                linewidth=1.5,
+                markersize=3
+            )
+        
+        # Build title with condition info
+        if condition_labels is not None:
+            title = f"Sample {i+1} - Energy Consumption | Condition: {condition_labels[i]}"
+        else:
+            title = f"Sample {i+1} - Energy Consumption"
+        
+        axes[i].set_title(title)
         axes[i].set_xlabel("Hour")
         axes[i].set_ylabel("Energy (kWh)")
-        axes[i].legend()
+        axes[i].legend(loc="upper right")
         axes[i].grid(True, alpha=0.3)
+
+    # Add overall figure title for model type
+    fig_title = f"{'CVAE' if model_type == 'cvae' else 'VAE'} Reconstruction ({num_recon_samples} samples per original)"
+    if model_type == "cvae":
+        fig_title += " - Conditioned on Day of Week"
+    fig.suptitle(fig_title, fontsize=14, fontweight='bold', y=1.02)
 
     plt.tight_layout()
     reconstruction_path = f"Output/Plots/{model_tag}_reconstruction.png"
@@ -183,36 +249,55 @@ def run_test(model_type: str = "vae"):
         if model_type == "vae":
             latent_dim = model.prior_params["mu"].shape[1]
             prior_samples = torch.randn(num_synthetic, latent_dim, device=device) * model.prior_params["sigma"] + model.prior_params["mu"]
-            synthetic_params = model.decoder(prior_samples)  # decoder expects [B, latent_dim] (S=1 case)
+            synthetic_params = model.decoder(prior_samples)
             synthetic_mu = synthetic_params["mu"]
             if synthetic_mu.dim() == 3:
                 synthetic_mu = synthetic_mu.squeeze(0)
             synthetic_data = synthetic_mu.reshape(num_synthetic, x_original.shape[1], x_original.shape[2])
+            synthetic_condition_label = None
 
-        else: # CVAE
-            B = num_synthetic
+        else:  # CVAE
+            monday_ts = pd.Timestamp("2023-01-02 12:00:00").timestamp()
+            fake_timestamps = torch.tensor([monday_ts] * num_synthetic, dtype=torch.float64)
+            fake_conditions = model.conditioner.get_conditions(fake_timestamps)
+            fake_conditions = fake_conditions.to(device)
+            samples = model.sample(fake_conditions, num_prior_samples=1, num_x_samples=1, device=device)
+            synthetic_flat = samples[0, 0]
+            synthetic_data = synthetic_flat.reshape(num_synthetic, x_original.shape[1], x_original.shape[2])
+            synthetic_condition_label = "Monday"
 
-            # either: all Monday
-            cond = torch.zeros(B, dtype=torch.long, device=device)
+        # Denormalize synthetic data
+        synthetic_data_denorm = normalizer.inverse_transform(synthetic_data.cpu())
 
-            # or: random days
-            # cond = torch.randint(0, 7, (B,), device=device)
-
-            samples = model.sample(cond, num_prior_samples=1, num_x_samples=1, device=device)
-            synthetic_flat = samples[0, 0]  # [B, D]
-            synthetic_data = synthetic_flat.reshape(B, x_original.shape[1], x_original.shape[2])
-
-    # # Plot synthetic data
+    # Plot synthetic data
     fig, axes = plt.subplots(num_synthetic, 1, figsize=(14, 4 * num_synthetic))
     if num_synthetic == 1:
         axes = [axes]
 
     for i in range(num_synthetic):
-        axes[i].plot(synthetic_data[i, :, 0].detach().cpu().numpy(), marker="o", alpha=0.7, linewidth=2)
-        axes[i].set_title(f"Synthetic Sample {i+1} - Energy Consumption")
+        axes[i].plot(
+            synthetic_data_denorm[i, :, 0].numpy() if isinstance(synthetic_data_denorm, torch.Tensor) else synthetic_data_denorm[i, :, 0],
+            marker="o", 
+            alpha=0.7, 
+            linewidth=2
+        )
+        
+        # Build title with condition info
+        if synthetic_condition_label is not None:
+            title = f"Synthetic Sample {i+1} | Condition: {synthetic_condition_label}"
+        else:
+            title = f"Synthetic Sample {i+1} - Energy Consumption"
+        
+        axes[i].set_title(title)
         axes[i].set_xlabel("Hour")
         axes[i].set_ylabel("Energy (kWh)")
         axes[i].grid(True, alpha=0.3)
+
+    # Add overall figure title
+    fig_title = f"{'CVAE' if model_type == 'cvae' else 'VAE'} Synthetic Samples"
+    if model_type == "cvae" and synthetic_condition_label:
+        fig_title += f" (Conditioned on {synthetic_condition_label})"
+    fig.suptitle(fig_title, fontsize=14, fontweight='bold', y=1.02)
 
     plt.tight_layout()
 
