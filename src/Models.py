@@ -14,11 +14,35 @@ parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir) 
 from src.encoder_decoder_model import *
 from src.Conditioner import *
+from src.priors import *
 
 # https://arxiv.org/pdf/2411.03936
 # GuideVAE model implementation
 # Conditional VAE with conditioning on user profiles
 # and a parameterized covariance matrix (PDCC)
+
+# TODO:
+# - Implement autocast with GradScaler for mixed precision training (Much faster training on GPUs)
+# - Make sure everything works with CPU and GPU seamlessly
+# - Fix the logging so that it is not too cluttered
+# - Move graphs and stuff to another file
+# - Implement learning rate finder utility
+# - Implement model checkpointing and resuming training
+# - Implement unit tests for all components
+# - Implement the user profile conditioning properly
+# - Ensure PDCC works as intended
+# - Declutter the code and add more comments/docstrings
+# - Optimize data loading and preprocessing pipeline
+# - Enhance the model saving/loading mechanism
+# - Add more conditions
+# - Hyperparameter tuning utilities (for optimizers, architectures, etc.)
+# - Make sure the model works with variable length sequences (padding/masking)
+# - IMPORTANT: Streaming algorithm for user profiles (online LDA) and normalization (running mean/std) and for the training (online/streaming VAE training)
+# - Implement scheduler for beta (KL weight) during training (KL annealing)
+# - Implement different priors (sparse, mixture of Gaussians, VampPrior, etc.)
+# - Fix the conditioner to properly handle conditions
+# - Test loading of models and make sure it is possible and reliable
+# - Test different loss functions and double check the current implementation against the literature
 
 class EarlyStopping:
     def __init__(self, patience=10, min_delta=0.001, mode='min'):
@@ -59,13 +83,14 @@ class EarlyStopping:
 # ==============
 # Define a base VAE class that CVAE will inherit from
 #   - should be the base that contains all core aspects
-#   - should we make this an abstract class? Probably not necessary in python
 #   - encoder and decoder are modular and can be swapped out (which means they need to be implemented independently)
 # ==============
 class VAE(nn.Module):
     def __init__(self,
                  input_dim=24,
                  distribution_dict = {},
+                 coder_type = "dictionary",
+                 prior_type = None,
                  **_):
         super(VAE, self).__init__()
 
@@ -86,12 +111,15 @@ class VAE(nn.Module):
         self.input_dim = input_dim
         latent_dim = distribution_dict.get("latent_dim", 10)
 
-        # Define encoder and decoder networks - don't pass model_kwargs to avoid circular references
-        self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim)
-        self.decoder = get_decoder_model(latent_dim=latent_dim, output_dim=input_dim)
+        # Prior
+        if prior_type is None:
+            prior_type = "standard_dictionary" if coder_type == "dictionary" else "standard_gaussian"
+        
+        self.prior = get_prior(prior_type=prior_type, latent_dim=latent_dim, device="cpu", dictionary_size=distribution_dict.get("dictionary_size", 100))
 
-        # Prior parameters for latent spaces
-        self.prior_params = get_prior_params(latent_dim=latent_dim, device="cpu")
+        # Define encoder and decoder networks - don't pass model_kwargs to avoid circular references
+        self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim, type=coder_type, prior=self.prior)
+        self.decoder = get_decoder_model(latent_dim=latent_dim, output_dim=input_dim, type=coder_type, prior=self.prior)
 
         # Calculate and store the number of parameters
         self.num_parameters = self.encoder._num_parameters() + self.decoder._num_parameters()
@@ -107,61 +135,89 @@ class VAE(nn.Module):
     
     @torch.no_grad()
     def sample(self, num_samples_prior = 1, num_samples_posterior = 1):
-        # Sample from the encoder's prior giving latent space samples (ancestral sampling)
-        z = self.encoder.sample(param_dict=self.prior_params, num_samples=num_samples_prior)
-        # Decode the sampled latent variables to get reconstruction parameters
-        recon_params_dict = self.decoder(z)
-        # Generate samples from the decoder using the reconstruction parameters
-        samples = self.decoder.sample(recon_params_dict, num_samples=num_samples_posterior)
-        # Return both the samples and the reconstruction parameters
-        return {"samples": samples, "recon_params_dict": recon_params_dict}
+        """Sample from prior and decode."""
+        self.eval()
+
+        # Get prior parameters and move to device
+        prior_params = self.prior.get_params()
+        prior_params = {k: v.to(self.device) for k, v in prior_params.items()}
+
+        # For dictionary priors, we need to expand to a batch
+        batch_size = 1
+        prior_params_expanded = {
+            k: v.expand(batch_size, -1) for k, v in prior_params.items()
+        }
+        # Sample from encoder using prior parameters
+        z = self.encoder.sample(prior_params_expanded, num_samples=num_samples_prior)  # [S, B, latent_dim]
+
+        # Flatten for decoder: [S*B, latent_dim]
+        S, B, D = z.shape
+        z_flat = z.reshape(S * B, D)
+        
+        # Decode
+        recon_params_dict = self.decoder(z_flat)
+        
+        # Reshape back: [S*B, output_dim] -> [S, B, output_dim]
+        for k in recon_params_dict:
+            recon_params_dict[k] = recon_params_dict[k].reshape(S, B, -1)
+        
+        # Sample from decoder
+        samples_all = []
+        for s in range(S):
+            params_s = {k: v[s] for k, v in recon_params_dict.items()}
+            samples = self.decoder.sample(params_s, num_samples=num_samples_posterior)  # [S2, B, D]
+            samples_all.append(samples)
+        
+        samples_stacked = torch.stack(samples_all, dim=0)  # [S, S2, B, D]
+        
+        return {"samples": samples_stacked, "recon_params_dict": recon_params_dict}
     
     @torch.no_grad()
     def reconstruct(self, inputs, num_samples=1):
         # Run a single forward pass to get reconstruction parameters
         recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=num_samples)
         return recon_params_dict, posterior_params_dict
-
+    def reconstruction_loglikelihood(self, inputs, recon_params_dict):
+        # Compute reconstruction log-likelihood
+        return self.decoder.loglikelihood(inputs, recon_params_dict)
     @torch.no_grad()
     def loglikelihood(self, inputs, num_samples=1):
+        """Compute log-likelihood via ELBO."""
         recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=num_samples)
-        # Compute log-likelihood of inputs given reconstruction parameters
-        posterior_loglikelihood = self.encoder.loglikelihood(inputs, posterior_params_dict)
-        recon_loglikelihood = self.decoder.loglikelihood(inputs, recon_params_dict)
-        prior_loglikelihood = self.encoder.loglikelihood(inputs, self.prior_params)
 
-        # Combine log-likelihoods to compute ELBO
-        return (posterior_loglikelihood.sum(-1) + recon_loglikelihood.sum(-1) - prior_loglikelihood.sum(-1)).mean(0)
-    
-    def kl_divergence(self, posterior_params_dict):
-        # Compute KL divergence between posterior and prior distributions
-        kl_div = self.encoder.kl_divergence(posterior_params_dict, self.prior_params)
-        return kl_div.mean(0)
-    
-    def reconstruction_loglikelihood(self, inputs, recon_params_dict, **_):
-        # Compute reconstruction log-likelihood of inputs given reconstruction parameters
+        # Get prior params
+        prior_params = self.prior.get_params()
+        batch_size = inputs.shape[0]
+        prior_params = {k: v.expand(batch_size, -1).to(inputs.device) for k, v in prior_params.items()}
+
+        # Reconstruction log-likelihood
         recon_loglikelihood = self.decoder.loglikelihood(inputs, recon_params_dict)
-        return recon_loglikelihood.mean(0)
+
+        # KL divergence
+        kl_div = self.encoder.kl_divergence(posterior_params_dict, prior_params)
+
+        # ELBO = recon_loglikelihood - KL
+        elbo = recon_loglikelihood - kl_div
+        return elbo.mean(0)
     
-    def loss(self, inputs, recon_params_dict, posterior_params_dict, beta=1.0, prior_params=None, **_):
+    def loss(self, inputs, recon_params_dict, posterior_params_dict, beta=1.0, **_):
         # Compute reconstruction log-likelihood (we use reconstruction only because of VAE structure)
         recon_loglikelihood = self.reconstruction_loglikelihood(inputs, recon_params_dict)
+
         # Compute KL divergence between posterior and prior
-        if prior_params is None:
-            prior_params = self.prior_params
-        kl_div = self.encoder.kl_divergence(posterior_params_dict, prior_params)
+        kl_div = self.encoder.kl_divergence(posterior_params_dict, self.prior)
         kl_div = kl_div.mean()
+
         # Ensure recon_loglikelihood is also a scalar
         if recon_loglikelihood.dim() > 0:
             recon_loglikelihood = recon_loglikelihood.mean()
+
         loss = -(recon_loglikelihood - beta * kl_div)
         # TODO: MMD (mean maximum discrepancy) has been shown to be useful for smart meter data by one of the papers
-        # TODO: take loglikelihood of samples too??
         return {"loss": loss, "recon_loglikelihood": recon_loglikelihood, "kl_divergence": kl_div}
 
     def train_core(self, inputs, optim, gradient_clip=None, gradient_clip_kwargs=None, beta=1.0, **_):
-        
-        # batch can be x OR (x, meter_id, dow)
+        # batch can be x OR (x, meter_id, timeStamp)
         if isinstance(inputs, (list, tuple)):
             inputs = inputs[0]
         else:
@@ -173,10 +229,10 @@ class VAE(nn.Module):
         
         # Forward pass
         recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=1)
-        
+
         # Compute loss (negative ELBO)
         optim.zero_grad() # Zero gradients
-        loss_dict = self.loss(inputs, recon_params_dict, posterior_params_dict, beta=beta, prior_params=self.prior_params)
+        loss_dict = self.loss(inputs, recon_params_dict, posterior_params_dict, beta=beta)
         loss_dict["loss"].backward() # Backpropagate
         if gradient_clip is not None:
             torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_kwargs.get("max_norm", 1.0))
@@ -200,9 +256,15 @@ class VAE(nn.Module):
                 # Flatten if needed
                 if batch.dim() == 3:
                     batch = batch.reshape(batch.shape[0], -1)
+
                 # Forward pass
                 recon_params_dict, posterior_params_dict = self.forward(batch, num_samples=num_samples)
-                loss_dict = self.loss(batch, recon_params_dict, posterior_params_dict, beta=1.0, prior_params=self.prior_params)
+                # Get prior params
+                prior_params = self.prior.get_params()
+                batch_size = batch.shape[0]
+                prior_params = {k: v.expand(batch_size, -1).to(device) for k, v in prior_params.items()}
+                # Get loss
+                loss_dict = self.loss(batch, recon_params_dict, posterior_params_dict, beta=1.0, prior_params=prior_params)
                 # Accumulate losses
                 for key in val_loss:
                     val_loss[key] += loss_dict[key].item() * batch.size(0)
@@ -216,11 +278,7 @@ class VAE(nn.Module):
         # Return Adam optimizer for model parameters
         # TODO: Allow for different optimizers and parameter settings
         return torch.optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay) # TODO: Parameters should be inputted
-    
-    # def move_to_device(self, inputs, device):
-    #     # Move data to specified device (CPU or GPU)
-    #     return inputs.to(device)
-    
+
     def move_to_device(self, batch, device): # Handles: Tensor, tuple/list of tensors, dict of tensors
         if torch.is_tensor(batch):
             return batch.to(device)
@@ -241,20 +299,20 @@ class VAE(nn.Module):
         model_path = os.path.join(save_path, f"{model_name}.pt")
         self.eval() # Set model to evaluation mode
         self.to("cpu") # Move model to CPU for saving
-        self.prior_params = {key: val.to("cpu") for key, val in self.prior_params.items()}
+        self.prior.to("cpu")
         torch.save({
             'model_state_dict': self.state_dict(),
-            'prior_params': self.prior_params,
+            'prior': self.prior,
             'model_kwargs': self.model_kwargs
         }, model_path)
         self.to(device) # Move model back to original device
-        self.prior_params = {key: val.to(device) for key, val in self.prior_params.items()}
+        self.prior.to(device)
         print(f"Model saved to {model_path}")
 
     def load_model(self, load_path, device="cpu"):
         checkpoint = torch.load(load_path, map_location=device)
         self.load_state_dict(checkpoint['model_state_dict'])
-        self.prior_params = {key: val.to(device) for key, val in checkpoint['prior_params'].items()}
+        self.prior = checkpoint['prior']
         self.to(device)
         print(f"Model loaded from {load_path}")
 
@@ -340,47 +398,11 @@ class VAE(nn.Module):
         
         if next(self.parameters()).device != torch.device(device):
             self.to(device)
-        self.prior_params = {key: val.to(device) for key, val in self.prior_params.items()}
+        self.prior.to(device)
 
         if early_stopping:
             earlystopping = EarlyStopping(**early_stopping_kwargs)
 
-        # === Log model graph ====
-        try:
-            # TODO: is very blurry, but might be somewhat nice to have
-            # Get a sample batch from the trainloader
-            sample_batch = next(iter(trainloader))
-            sample_batch = self.move_to_device(sample_batch, device)
-            # Flatten the batch if needed for the model input
-            if sample_batch.dim() == 3:
-                sample_batch = sample_batch.reshape(sample_batch.shape[0], -1)
-            
-            # Create a wrapper class that returns tensors instead of dict for graph tracing
-            class ModelWrapper(nn.Module):
-                def __init__(self, model):
-                    super().__init__()
-                    self.model = model
-                
-                def forward(self, x):
-                    # Call the actual model
-                    recon_params, posterior_params = self.model.forward(x, num_samples=1)
-                    # Return just the mu values as tensors (TensorBoard can trace this)
-                    return recon_params['mu'], posterior_params['mu']
-            
-            wrapper = ModelWrapper(self)
-            
-            # Suppress tracing warnings (expected for stochastic models like VAE)
-            import warnings
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
-                warnings.filterwarnings("ignore", message="Encountering a dict")
-                writer.add_graph(wrapper, sample_batch)
-            
-            print("Model graph logged to TensorBoard")
-            
-        except Exception as e:
-            print(f"Note: Could not log computational graph ({str(e)})")
-    
         # === Training Loop ===
         self.train()
         global_step = 0
@@ -515,7 +537,7 @@ class VAE(nn.Module):
 
         final_model_path = os.path.join(save_dir, f"{model_tag}_final.pt")
         self.to("cpu")
-        self.prior_params = {key: val.to("cpu") for key, val in self.prior_params.items()}
+        self.prior.to("cpu")
         self.save_model(save_path=save_dir, model_name=f"{model_tag}_final", device="cpu")
 
         # Save training summary
@@ -542,6 +564,9 @@ class VAE(nn.Module):
             writer.close()
             print(f"TensorBoard logs saved to: {log_dir}")
         return model_tag
+    
+    def get_SigmaMapper(self):
+        return self.decoder.get_SigmaMapper()
 
 
 # ==============
@@ -555,6 +580,7 @@ class CVAE(VAE):
         conditioner: Conditioner,
         latent_dim: int = 10,
         distribution_dict: dict = None,
+        prior_type: str = None,
         **kwargs,
     ):
         if distribution_dict is None:
@@ -572,17 +598,24 @@ class CVAE(VAE):
         self.encoder = get_encoder_model(
             input_dim=input_dim + self.condition_dim,
             latent_dim=latent_dim,
+            type=kwargs.get("coder_type", "dictionary"),
             **kwargs,
         ) # encoder takes [x, c]
 
         self.decoder = get_decoder_model(
             latent_dim=latent_dim + self.condition_dim,
             output_dim=input_dim,
+            type=kwargs.get("coder_type", "dictionary"),
             **kwargs,
         ) # decoder takes [z, c]
 
         # Prior parameters for latent spaces
-        self.prior_params = get_prior_params(latent_dim=latent_dim, device="cpu")
+        self.prior = get_prior(
+            prior_type=prior_type if prior_type is not None else "standard_dictionary",
+            latent_dim=latent_dim,
+            device="cpu",
+            dictionary_size=distribution_dict.get("dictionary_size", 100),
+        )
 
     def _prep_inputs(self, x: torch.Tensor) -> torch.Tensor:
         """ Flatten [B, L, F] to [B, D] if needed """
@@ -635,7 +668,7 @@ class CVAE(VAE):
         else:
             recon_params_squeezed = recon_params
 
-        return super().loss(x, recon_params_squeezed, posterior_params, beta=beta, prior_params=self.prior_params)
+        return super().loss(x, recon_params_squeezed, posterior_params, beta=beta)
 
     def train_core(self, batch, optim, beta=1.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
         x, meter_id, timestamps = batch
@@ -695,10 +728,11 @@ class CVAE(VAE):
         c = self.move_to_device(conditions, device=device)
         B = c.size(0)
 
-        # sample z: [S, B, latent_dim] 
-        prior_params = {k: v.to(device) for k, v in self.prior_params.items()}
-        prior_params["mu"] = prior_params["mu"].expand(B, -1)
-        prior_params["sigma"] = prior_params["sigma"].expand(B, -1)
+        # Get prior params and expand to batch
+        prior_params = self.prior.get_params()
+        prior_params = {k: v.expand(B, -1).to(device) for k, v in prior_params.items()}
+
+        # Sample z: [S, B, latent_dim]
         z = self.encoder.sample(prior_params, num_samples=num_prior_samples)  # [S, B, latent_dim]
 
         # Expand c to [S, B, C]

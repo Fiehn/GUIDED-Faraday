@@ -156,22 +156,19 @@ class DayOfWeekConditioner():
         """
         # Handle both tensor of floats and list of pandas Timestamps
         if isinstance(timestamps, torch.Tensor):
+            device = timestamps.device
             # Convert Unix timestamps back to pandas Timestamps
-            timestamps = [pd.Timestamp(ts.item(), unit='s') for ts in timestamps]
-        elif not isinstance(timestamps, (list, np.ndarray)):
-            timestamps = [timestamps]
+            days_of_week = ((timestamps / 86400 + 4) % 7).long()  # 1970-01-01 was a Thursday
+        else:
+            days_of_week = []
+            for ts in timestamps:
+                if isinstance(ts, (int, float)):
+                    ts = pd.Timestamp(ts, unit='s')
+                days_of_week.append(ts.dayofweek)  # 0=Monday, 6=Sunday
+            days_of_week = torch.tensor(days_of_week, dtype=torch.long)
+            device = 'cpu'
         
-        # Extract day of week for all timestamps
-        days_of_week = []
-        for ts in timestamps:
-            if isinstance(ts, (int, float)):
-                ts = pd.Timestamp(ts, unit='s')
-            days_of_week.append(ts.dayofweek)  # 0=Monday, 6=Sunday
-        
-        # Convert to tensor and one-hot encode
-        dow_tensor = torch.tensor(days_of_week, dtype=torch.long)
-        dow_onehot = F.one_hot(dow_tensor, num_classes=7).float()
-        
+        dow_onehot = F.one_hot(days_of_week, num_classes=7).float().to(device)
         return dow_onehot
 
 

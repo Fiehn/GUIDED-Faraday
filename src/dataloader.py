@@ -128,11 +128,21 @@ class SmartMeterWindowDataset(Dataset):
         self.window = window
         self.drop_nan_windows = drop_nan_windows
         self.dtype = dtype
-        self.values = meter_df[self.feature_cols].to_numpy(dtype=np.float32)
-        self.meter_id = meter_id
+
+        # Converting to tensor here for efficiency
+        values = meter_df[self.feature_cols].to_numpy(dtype=np.float32)
+        if normalizer is not None:
+            values = normalizer.transform(values)
+            if isinstance(values, np.ndarray):
+                self.values = torch.from_numpy(values).to(dtype)
+            else:
+                self.values = values.to(dtype)
+        else:
+            self.values = torch.from_numpy(values).to(dtype)  # [T, F]
+            
+        self.meter_id = torch.tensor(meter_id, dtype=torch.long)
         self.times = meter_df.index.to_numpy()
         self.starts = self._compute_starts(drop_nan_windows)
-        self.normalizer = normalizer
         
     # determines which window start positions are allowed
     def _compute_starts(self, drop_nan: bool) -> np.ndarray:
@@ -166,20 +176,12 @@ class SmartMeterWindowDataset(Dataset):
         s = int(self.starts[idx])
         L = self.window.input_len
         x = self.values[s : s + L]
-        start_time = self.times[s]  # Get the start timestamp for this window
         
-        # Convert pandas Timestamp to Unix timestamp (seconds since epoch)
-        # This preserves precision far more than needed but its fine
-        timestamp_unix = start_time.timestamp()
-
-        if self.normalizer is not None:
-            x = self.normalizer.transform(x)
-        
-        return (
-            torch.tensor(x, dtype=self.dtype),
-            torch.tensor(self.meter_id, dtype=torch.long),
-            torch.tensor(timestamp_unix, dtype=torch.float64)
+        timestamp_unix = torch.tensor(
+            self.times[s].timestamp(), dtype=torch.float64
         )
+        
+        return x, self.meter_id, timestamp_unix
 
 
 # build DataLoaders for train/val/test splits (wraps full pipeline)
@@ -305,6 +307,8 @@ class SmartMeterDataModule:
             batch_size=self.batch_size,
             shuffle=self.shuffle_train,
             num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=True if self.num_workers > 0 else False,
         )
 
     def val_dataloader(self):
@@ -313,6 +317,8 @@ class SmartMeterDataModule:
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=True if self.num_workers > 0 else False,
         )
 
     def test_dataloader(self):

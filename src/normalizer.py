@@ -13,6 +13,7 @@ class Normalizer:
     def __init__(self, method='zero_preserved_log'):
         self.method = method
         self.fitted = False
+        self.device = 'cpu'
 
         # For zero preserved log normalization
         self.non_zero_mean = None
@@ -22,17 +23,20 @@ class Normalizer:
     
     def _zero_preserved_log_transform(self, X: torch.Tensor) -> torch.Tensor:
         """Zero-preserved log normalization."""
+        is_zero = (X == 0)
         Y = X.clone()
-        is_zero = (Y == 0)
-        
         # Apply log transform to non-zero values
-        Y_nonzero = Y[~is_zero]
-        Y_log = torch.log(Y_nonzero)
-        Y_normalized = (Y_log - self.non_zero_mean) / self.non_zero_std + self.shift
+        if is_zero.any():
+
+            Y_nonzero = Y[~is_zero]
+            Y_log = torch.log(Y_nonzero)
+            Y_normalized = (Y_log - self.non_zero_mean) / self.non_zero_std + self.shift
         
-        # Put back
-        Y[~is_zero] = Y_normalized
-        Y[is_zero] = self.zero_id
+            # Put back
+            Y[~is_zero] = Y_normalized
+            Y[is_zero] = self.zero_id
+        else:
+            Y = (torch.log(Y) - self.non_zero_mean) / self.non_zero_std + self.shift
         
         return Y
 
@@ -53,11 +57,14 @@ class Normalizer:
         return Y  # Returns torch.Tensor, not numpy
     
     def fit(self, X):
+        if isinstance(X, np.ndarray):
+            X = torch.from_numpy(X)
+
         if self.method == 'zero_preserved_log':
             non_zero_values = X[X != 0]
-            log_values = np.log(non_zero_values)
-            self.non_zero_mean = np.nanmean(log_values, axis=0, keepdims=True)
-            self.non_zero_std = np.nanstd(log_values, axis=0, keepdims=True)
+            log_values = torch.log(non_zero_values)
+            self.non_zero_mean = log_values.mean().item()
+            self.non_zero_std = log_values.std().item()
             self.fitted = True
         elif self.method == 'standard':
             self.mean = torch.mean(X, dim=0, keepdim=True)

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal, kl_divergence
+from src.priors import *
 
 #zero preserving log transform!!! TODO: add this later
 
@@ -25,18 +26,10 @@ class GaussianCoder(torch.nn.Module):
         self.learn_sigma = learn_sigma
         self.sigma_fixed = sigma_fixed
 
-        # Do we learn the variance?
-        if self.learn_sigma:
-            # Output both mean and sigma
-            dist_parameters = ["mu", "sigma"]
-        else:
-            # Output only mean
-            dist_parameters = ["mu"]
-
         self.parameterizer = Parameterizer(
             input_dim=input_dim,
             output_dim=output_dim,
-            dist_parameters=dist_parameters,
+            dist_parameters=["mu", "sigma"],
             num_hidden_layers=num_hidden_layers,
             num_neurons=num_neurons,
             dropout=dropout,
@@ -56,39 +49,51 @@ class GaussianCoder(torch.nn.Module):
         return param_dict
     
     def sample(self, param_dict=None, num_samples=1,**_):
-        # A helper function to sample from the Gaussian defined by param_dict using reparameterization trick
-        # calls reparameterize function
+        """ Sampple from the Gaussian defined by param_dict using reparameterization trick """
+        if param_dict is None:
+            raise ValueError("param_dict must be provided for sampling")
         return self.reparameterize(param_dict, num_samples=num_samples)
 
     def loglikelihood(self, inputs, param_dict, **_):
-        # Compute log likelihood of inputs under the Gaussian defined by param_dict
+        """ Compute log likelihood of inputs under the Gaussian defined by param_dict """
         mu = param_dict["mu"]
         sigma = param_dict["sigma"]
         var = sigma ** 2
         log_likelihood = -0.5 * torch.sum(((inputs - mu) ** 2) / var + torch.log(2 * torch.pi * var), dim=1)
         return log_likelihood
 
-    def kl_divergence(self, param_dict_q, param_dict_p=None, **_):
-        # Compute KL divergence between two diagonal Gaussians
-        # KL(q||p) = 0.5 * sum(sigma_p^2/sigma_q^2 + (mu_q - mu_p)^2/sigma_q^2 - 1 + log(sigma_q^2/sigma_p^2))
+    def kl_divergence(self, param_dict_q, prior=None, **_):
+        """
+        Compute KL divergence KL(q||p) using log probabilities.
+        
+        Args:
+            param_dict_q: Posterior parameters
+            prior: BasePrior object (if None, uses standard normal)
+        """
+        # KL(q||p) = 0.5 * sum(sigma_p^2/sigma_q^2 + (mu_q - mu_p)^2/sigma_q^2 - 1 + log(sigma_q^2/sigma_p^2)) TODO: Check back in later
+        
+        # Sample from q(z|x)
+        z = self.reparameterize(param_dict_q, num_samples=1)  # [1, B, D]
+        z = z.squeeze(0)  # [B, D]
+
+        # Compute log q(z|x) - log probability under posterior
         mu_q = param_dict_q["mu"]
         sigma_q = param_dict_q["sigma"]
-        
-        if param_dict_p is None:
-            # KL divergence with standard normal N(0,I)
-            mu_p = torch.zeros_like(mu_q)
-            sigma_p = torch.ones_like(sigma_q)
-        else:
-            mu_p = param_dict_p["mu"]
-            sigma_p = param_dict_p["sigma"]
-        
         var_q = sigma_q ** 2
-        var_p = sigma_p ** 2
-        
-        kl = 0.5 * torch.sum(
-            var_q / var_p + ((mu_q - mu_p) ** 2) / var_p - 1 + torch.log(var_p / var_q),
+        log_q = -0.5 * torch.sum(
+            ((z - mu_q) ** 2) / var_q + torch.log(2 * torch.pi * var_q),
             dim=-1
         )
+        
+       # Compute log p(z) - log probability under prior
+        if prior is None:
+            # Standard normal prior
+            log_p = -0.5 * torch.sum(z ** 2 + torch.log(torch.tensor(2 * torch.pi)), dim=-1)
+        else:
+            log_p = prior.log_prob(z)
+        
+        # KL = E_q[log q(z|x) - log p(z)]
+        kl = log_q - log_p
         return kl
     
     def create_covariance_matrix(self, param_dict):
@@ -104,6 +109,10 @@ class GaussianCoder(torch.nn.Module):
         epsilon = torch.randn((num_samples, batch_size, output_dim)).to(mu.device)
         samples = mu.unsqueeze(0) + sigma.unsqueeze(0) * epsilon
         return samples
+    
+    def get_SigmaMapper(self):
+        # In Gaussian case, there is no SigmaMapper
+        return None
 
 # =================
 # Dictionary approach with PDCC matrix as the covariance (Guide VAE)
@@ -127,10 +136,10 @@ class DictionaryCoder(torch.nn.Module):
             raise ValueError("Dictionary size must be greater than output dimension")
         self.dictionary_size = dictionary_size
 
-        self.sigma_lower_lim = sigma_lim
-        self.sigma_upper_lim = (output_dim/self.dictionary_size)**0.5 * (average_max_std - self.marginal_std_lim) # TODO: UNderstand this step
         self.marginal_std_lim = marginal_std_lim
         self.average_max_std = average_max_std
+        self.sigma_lower_lim = sigma_lim
+        self.sigma_upper_lim = (output_dim/self.dictionary_size)**0.5 * (average_max_std - self.marginal_std_lim) # TODO: UNderstand this step
         self.input_dim = input_dim
         self.output_dim = output_dim
 
@@ -164,40 +173,111 @@ class DictionaryCoder(torch.nn.Module):
         return param_dict
 
     def reparameterize(self, param_dict, num_samples=1, **_):
-        # Reparameterization trick for dictionary approach
-        # Sample epsilon from N(0, I) in the dictionary space
+        """Reparameterization trick for sampling from the multivariate Gaussian defined by param_dict"""
         mu, sigma = param_dict["mu"], param_dict["sigma"]
+        batch_size = mu.shape[0]
+
         eps = torch.randn((num_samples, mu.shape[0], self.dictionary_size)).to(mu.device)
-        
-        # Map to output space using SigmaMapper
-        corr_sigma = self.get_SigmaMapper() @ (eps * sigma)[..., None] # num_samples x batch_size x output_dim x 1
-        return mu.unsqueeze(0) + corr_sigma.squeeze(-1)
+
+        # Scale by sigma in dictionary space: [num_samples, batch_size, dictionary_size]
+        z_dict = eps * sigma.unsqueeze(0)
+
+        # Map to output space using SigmaMapper: [output_dim, dictionary_size]
+        U = self.get_SigmaMapper()  # [output_dim, dictionary_size]
+
+        # Transform: [num_samples, batch_size, dictionary_size] @ [dictionary_size, output_dim]
+        # -> [num_samples, batch_size, output_dim]
+        z_output = torch.einsum('sbd,do->sbo', z_dict, U.T) # (done on GPU this way)
+
+        # Add mean in output space
+        z = mu.unsqueeze(0) + z_output
+
+        return z
     
     def sample(self, param_dict=None, num_samples=1, **_):
+        """Sample from the dictionary-based distribution."""
+        if param_dict is None:
+            raise ValueError("param_dict must be provided for sampling")
         return self.reparameterize(param_dict, num_samples=num_samples)
     
     def loglikelihood(self, inputs, param_dict, **_):
-        # Compute log likelihood of inputs under the multivariate Gaussian defined by param_dict
+        """Compute log likelihood under multivariate Gaussian with PDCC covariance."""
+        mu = param_dict["mu"]
         Sigma = self.create_covariance_matrix(param_dict)
-        return torch.distributions.MultivariateNormal(loc=param_dict["mu"], covariance_matrix=Sigma).log_prob(inputs)
+        # Use PyTorch's MultivariateNormal distribution
+        try:
+            dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=Sigma)
+            return dist.log_prob(inputs)
+        except Exception as e:
+            # Fallback if covariance is not positive definite (IT SHOULD BE by the papers arguments)
+            print(f"Warning: Covariance matrix issue in loglikelihood: {e}")
+            # Add the marginal std lim to diagonal for stability again
+            Sigma_stable = Sigma + torch.eye(self.output_dim, device=Sigma.device) * (self.marginal_std_lim ** 2)
+            dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=Sigma_stable)
+            return dist.log_prob(inputs)
     
-    def kl_divergence(self, param_dict_q, param_dict_p=None, **_):
-        # TODO: double check this pleaase
-        return torch.distributions.kl.kl_divergence(
-            torch.distributions.MultivariateNormal(loc=param_dict_q["mu"], covariance_matrix=self.create_covariance_matrix(param_dict_q)),
-            torch.distributions.MultivariateNormal(loc=param_dict_p["mu"], covariance_matrix=self.create_covariance_matrix(param_dict_p))
-        )
+    def kl_divergence(self, param_dict_q, prior=None, **_):
+        """
+        Compute KL divergence KL(q||p) using the prior's log_prob method.
+        For multivariate Gaussians, we can use the analytical form or Monte Carlo.
+        
+        Args:
+            param_dict_q: Posterior parameters
+            prior: BasePrior object
+        """
+        mu_q = param_dict_q["mu"]
+        Sigma_q = self.create_covariance_matrix(param_dict_q)
+
+        if prior is None:
+            # Default to standard normal in dictionary space
+            mu_p = torch.zeros_like(mu_q)
+            Sigma_p = torch.eye(self.output_dim, device=mu_q.device).unsqueeze(0).expand(mu_q.shape[0], -1, -1)
+        else:
+            # Get prior parameters and create covariance
+            prior_params = prior.get_params()
+            batch_size = mu_q.shape[0]
+            prior_params = {k: v.expand(batch_size, -1).to(mu_q.device) for k, v in prior_params.items()}
+            mu_p = prior_params["mu"]
+            Sigma_p = self.create_covariance_matrix(prior_params)
+        
+        # Use analytical KL for multivariate Gaussians
+        try:
+            dist_q = torch.distributions.MultivariateNormal(loc=mu_q, covariance_matrix=Sigma_q)
+            dist_p = torch.distributions.MultivariateNormal(loc=mu_p, covariance_matrix=Sigma_p)
+            return torch.distributions.kl.kl_divergence(dist_q, dist_p)
+        except Exception as e:
+            print(f"Warning: Analytical KL failed, using Monte Carlo: {e}")
+            # Monte Carlo estimation: KL ≈ log q(z) - log p(z)
+            z = self.reparameterize(param_dict_q, num_samples=1).squeeze(0)  # [B, D]
+            
+            # log q(z|x)
+            dist_q = torch.distributions.MultivariateNormal(
+                loc=mu_q, 
+                covariance_matrix=Sigma_q + torch.eye(self.output_dim, device=Sigma_q.device) * (self.marginal_std_lim ** 2)
+            )
+            log_q = dist_q.log_prob(z)
+            
+            # log p(z) - use prior's log_prob method
+            if prior is None:
+                log_p = -0.5 * torch.sum(z ** 2 + torch.log(torch.tensor(2 * torch.pi)), dim=-1)
+            else:
+                log_p = prior.log_prob(z)
+            
+            return log_q - log_p
+
 
     def create_covariance_matrix(self, param_dict):
         # THis is the spot that is interesting 
         # First get the U (sigma mapper)
         U = self.get_SigmaMapper()  # Output_dim x Dictionary_size
         # Then scale by the sigma parameters (learned per sample)
-        S = U*param_dict["sigma"][...,None,:]  # Batch_size x Dictionary_size x Output_dim
-        # Finally return the covariance matrix by S @ S^T + marginal_std_lim^2 * I
+        # sigma has shape [batch_size, dictionary_size], we need [batch_size, dictionary_size, 1]
+        # U has shape [output_dim, dictionary_size], we need it transposed to [dictionary_size, output_dim]
+        S = param_dict["sigma"][..., None] * U.T  # Batch_size x Dictionary_size x Output_dim
+        # Finally return the covariance matrix by S^T @ S + marginal_std_lim^2 * I
         # where S is the scaled U matrix
         # This ensures positive definiteness and adds marginal noise
-        return (S @ S.mT) + torch.eye(self.output_dim, device=param_dict["mu"].device) * (self.marginal_std_lim ** 2)  # Batch_size x Output_dim x Output_dim
+        return (S.mT @ S) + torch.eye(self.output_dim, device=param_dict["mu"].device) * (self.marginal_std_lim ** 2)  # Batch_size x Output_dim x Output_dim
 
     def get_marginal_sigmas(self,param_dict):
         return torch.sqrt(torch.diagonal(self.create_covariance_matrix(param_dict), dim1=-2, dim2=-1))
@@ -276,22 +356,31 @@ class Parameterizer(nn.Module):
 
 
     
-def get_encoder_model(input_dim, latent_dim, **kwargs):
-    return GaussianCoder(
-        input_dim=input_dim,
-        output_dim=latent_dim,
-        learn_sigma=True,
-        **kwargs
-    )
-def get_decoder_model(latent_dim, output_dim, **kwargs):
-    return GaussianCoder(
-        input_dim=latent_dim,
-        output_dim=output_dim,
-        learn_sigma=True,
-        **kwargs
-    )
-def get_prior_params(latent_dim, device, **kwargs):
-    # Standard normal prior N(0, I)
-    mu = torch.zeros((1, latent_dim)).to(device)
-    sigma = torch.ones((1, latent_dim)).to(device)
-    return {"mu": mu, "sigma": sigma}
+def get_encoder_model(input_dim, latent_dim, type, **kwargs):
+    if type == "dictionary":
+        return DictionaryCoder(
+            input_dim=input_dim,
+            output_dim=latent_dim,
+            **kwargs
+        )
+    else:
+        return GaussianCoder(
+            input_dim=input_dim,
+            output_dim=latent_dim,
+            learn_sigma=True,
+            **kwargs
+        )
+def get_decoder_model(latent_dim, output_dim, type, **kwargs):
+    if type == "dictionary":
+        return DictionaryCoder(
+            input_dim=latent_dim,
+            output_dim=output_dim,
+            **kwargs
+        )
+    else:
+        return GaussianCoder(
+            input_dim=latent_dim,
+            output_dim=output_dim,
+            learn_sigma=True,
+            **kwargs
+        )
