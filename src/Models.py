@@ -25,7 +25,6 @@ from src.priors import *
 # - Implement autocast with GradScaler for mixed precision training (Much faster training on GPUs)
 # - Make sure everything works with CPU and GPU seamlessly
 # - Fix the logging so that it is not too cluttered
-# - Move graphs and stuff to another file
 # - Implement learning rate finder utility
 # - Implement model checkpointing and resuming training
 # - Implement unit tests for all components
@@ -54,8 +53,14 @@ class EarlyStopping:
         self.best_epoch = 0
         self.mode = mode
 
-    def __call__(self, val_metric, epoch=None):
+    def __call__(self, train_metric, val_metric, epoch=None):
         score = -val_metric if self.mode == 'min' else val_metric
+
+        if train_metric is not None and val_metric is not None:
+            if abs(train_metric - val_metric) < self.min_delta * 10:
+                # Overfitting detected - Stop training
+                self.early_stop = True
+                return False
 
         if self.best_score is None:
             # First time call
@@ -295,14 +300,38 @@ class VAE(nn.Module):
         return batch
 
     def save_model(self, save_path=None, model_name="trained_model",device="cpu"):
+        """
+        Save model with dynamic prior serialization.
+        Works with any prior type without modification.
+        """
         if save_path is None: save_path = "./models/" # TODO: Should be determined by config file
         model_path = os.path.join(save_path, f"{model_name}.pt")
         self.eval() # Set model to evaluation mode
         self.to("cpu") # Move model to CPU for saving
         self.prior.to("cpu")
+
+        # Serialize prior
+        prior_state = {
+            'prior_type': self.prior.__class__.__name__,
+            'module': self.prior.__class__.__module__,
+            'state_dict': self.prior.state_dict(),
+            'init_args': {},
+        }
+        # dynamically extract init args (latent_dim, dict_size, etc.)
+        for attr_name in dir(self.prior):
+            if not attr_name.startswith('_') and not callable(getattr(self.prior, attr_name)):
+                attr = getattr(self.prior, attr_name)
+                try:
+                    if isinstance(attr,(int,float,str,bool,list,tuple,dict)):
+                        prior_state['init_args'][attr_name] = attr
+                    elif isinstance(attr, torch.dtype):
+                        prior_state['init_args'][attr_name] = str(attr)
+                except:
+                    pass            
+
         torch.save({
             'model_state_dict': self.state_dict(),
-            'prior': self.prior,
+            'prior_state': prior_state,
             'model_kwargs': self.model_kwargs
         }, model_path)
         self.to(device) # Move model back to original device
@@ -310,10 +339,30 @@ class VAE(nn.Module):
         print(f"Model saved to {model_path}")
 
     def load_model(self, load_path, device="cpu"):
-        checkpoint = torch.load(load_path, map_location=device)
+        """
+        Load model with dynamic prior reconstruction.
+        Works with any prior type without modification.
+        TODO: should probably be handled in the BasePrior class
+        """
+        checkpoint = torch.load(load_path, map_location=device, weights_only=True)
+
+        prior_state = checkpoint['prior_state']
+
+        import importlib
+        module = importlib.import_module(prior_state['module'])
+        PriorClass = getattr(module, prior_state['prior_type'])
+
+        init_args = prior_state.get('init_args', {})
+
+        try:
+            self.prior = PriorClass(**init_args)
+        except Exception as e:
+            print(f"Error initializing prior {prior_state['prior_type']} with args {init_args}: {e}")
+
+        self.prior.load_state_dict(prior_state['state_dict'])
         self.load_state_dict(checkpoint['model_state_dict'])
-        self.prior = checkpoint['prior']
         self.to(device)
+        self.prior.to(device)
         print(f"Model loaded from {load_path}")
 
     def fit(self,
@@ -500,7 +549,7 @@ class VAE(nn.Module):
 
                 # Early stopping check
                 if early_stopping:
-                    is_best = earlystopping(val_loss_dict["loss"], epoch=epoch)
+                    is_best = earlystopping(val_metric=val_loss_dict["loss"],train_metric=epoch_train_loss, epoch=epoch)
                     if earlystopping.early_stop:
                         print(f"\n{'='*60}")
                         print(f"Early stopping triggered at epoch {epoch+1}")

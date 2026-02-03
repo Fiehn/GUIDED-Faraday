@@ -118,7 +118,7 @@ class UserProfiler(LatentDirichletAllocation):
     
     def get_user_profiles(self, X, retrain=False):
         # If this model has not been trained and a model already exists on disk then load it and return the user profiles for the input data
-        if os.path.exists(self.path) and not retrain and self.lambda_matrix is not None:
+        if os.path.exists(self.path) and not retrain and self.lambda_matrix is None:
             with open(self.path, "rb") as f:
                 obj = pickle.load(f)
             return obj.transform(X)
