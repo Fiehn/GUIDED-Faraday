@@ -12,11 +12,12 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 from src.train_utils import *
+from src.test.run_validation import run_validation
 
 # Set up device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def run_test(model_type: str = "vae"):
+def run_test(model_type: str = "vae", skip_validation: bool = False):
     model_type = model_type.lower()
     assert model_type in {"vae", "cvae"}
 
@@ -24,6 +25,25 @@ def run_test(model_type: str = "vae"):
 
     # Up the recursion limit for deep models
     sys.setrecursionlimit(5000) # default seems to bbe 999
+
+    ##############################
+    # Validate model before training
+    if not skip_validation:
+        print("\nStarting model validation before training...\n")
+        validation_passed = run_validation(
+            model_type=model_type,
+            use_test_data=True,  # use small test data for fast validation
+            verbose=False
+        )
+        
+        if not validation_passed:
+            print("\n!! Validation failed! Please fix issues before training.")
+            print("To skip validation, use: run_test(model_type='cvae', skip_validation=True)")
+            return
+        
+        print("\nValidation passed! Proceeding to training...\n")
+    else:
+        print("\n!!  Skipping validation (not recommended)\n")
 
     ##############################
     # load data
@@ -85,12 +105,22 @@ def run_test(model_type: str = "vae"):
     input_dim = 24 * num_features  # flattened window dim
     print("input_dim:", input_dim)
 
+    if os.path.exists("models/UserProfiles/user_profiler.pkl"):
+        print("UserProfiler model found on disk.")
+    else:
+        print("UserProfiler model not found on disk. Creating..")
+        os.makedirs("models/UserProfiles", exist_ok=True)
+        UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True).fit(train_loader)
+
     # Test conditioner - pass timestamps instead of x
     conditioner = Conditioner()
     conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
-    cond = conditioner.get_conditions(timestamps)  # Pass timestamps, not x
-    print("Condition shape (day of week):", cond.shape)  # should be [batch_size, 7]
-    print("Condition example (first 3):\n", cond[:3])
+    conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
+    cond = conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)  # Pass all data (x, meter, timestamps)
+    
+    print("Condition shape:", cond.shape)
+
+
 
     ##############################
     # use chosen model
@@ -99,9 +129,10 @@ def run_test(model_type: str = "vae"):
         model = VAE(input_dim=input_dim)
         log_dir = "./runs/VAE_training"
     else:
-        print("Initializing CVAE model (condition = day-of-week)...")
-        model = CVAE(input_dim=input_dim, condition_dim=7, latent_dim=10, conditioner=conditioner, coder_type="dictionary", prior_type="standard_dictionary")
+        print("Initializing CVAE model (condition = day-of-week + user-profile)...")
+        model = CVAE(input_dim=input_dim, latent_dim=10, conditioner=conditioner, coder_type="dictionary", prior_type="standard_dictionary")
         log_dir = "./runs/CVAE_training"
+
 
     ##############################
     # Train
@@ -151,7 +182,9 @@ def run_test(model_type: str = "vae"):
 if __name__ == "__main__":
     # choose: "vae" or "cvae"
     # run_test(model_type="vae")
-    run_test(model_type="cvae")
+    # run_test(model_type="vae", skip_validation=False)  # VAE with validation
+    run_test(model_type="cvae", skip_validation=False)  # CVAE with validation
+    # run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
 
 
 

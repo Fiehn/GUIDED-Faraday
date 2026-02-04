@@ -140,6 +140,15 @@ def load_model_and_visualize(
     )
     viz_path.update(latent_space_path)
 
+    user_dict_path = _visualize_user_dictionary(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        output_dir=output_dir,
+        model_tag=model_tag,
+    )
+    viz_path.update(user_dict_path)
+
     summary_path = _save_model_summary(
         model=model,
         model_kwargs=model_kwargs,
@@ -223,6 +232,14 @@ def visualize_trained_model(
         output_dir=output_dir,
         model_tag=model_tag,
     )
+    user_profile_path = _visualize_user_dictionary(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        output_dir=output_dir,
+        model_tag=model_tag,
+    )
+    viz_path.update(user_profile_path)
     viz_path['model_summary'] = summary_path
     print("All visualizations saved.")
     print(viz_path)
@@ -247,7 +264,7 @@ def _visualize_reconstructions(
         x_original = x  # This is normalized
         x_flat = x.reshape(x.shape[0], -1)
         if is_cvae:
-            recon_params, _ = model.reconstruct(x_flat, timestamps, num_samples=num_samples)
+            recon_params, _ = model.reconstruct(x_flat,meter_ids=meter_id, timestamps=timestamps, num_samples=num_samples)
             day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
             condition_labels = []
             for ts in timestamps.cpu():
@@ -328,21 +345,28 @@ def _visualize_synthetic_samples(
             samples_per_day = max(1, num_samples // 7)
             
             # Create timestamps for a full week
-            base_date = pd.Timestamp("2023-01-02")  # A Monday
             all_synthetic_data = []
             day_labels = []
             
-            for day_idx in range(7):
-                target_date = base_date + pd.Timedelta(days=day_idx)
-                fake_ts = torch.tensor([target_date.timestamp()] * samples_per_day, dtype=torch.float64)
-                fake_conditions = model.conditioner.get_conditions(fake_ts).to(device)
+            fake_conditions = model.conditioner.get_random_conditions(batch_size=samples_per_day).to(device)
+            
+            # Extract day of week from one-hot encoded conditions
+            # Assuming conditions are [batch_size, 7] one-hot vectors
+            if fake_conditions.shape[1] == 7:  # day-of-week only
+                day_indices = fake_conditions.argmax(dim=1).cpu().numpy()
+                day_labels = [day_names[idx] for idx in day_indices]
+            else:
+                # If multiple conditions concatenated, extract first 7 dims
+                dow_part = fake_conditions[:, :7]
+                day_indices = dow_part.argmax(dim=1).cpu().numpy()
+                day_labels = [day_names[idx] for idx in day_indices]
+
+
+            # Sample from model
+            samples = model.sample(fake_conditions, num_prior_samples=1, num_x_samples=1, device=device)
+            synthetic_flat = samples[0, 0]  # [samples_per_day, input_dim]
                 
-                # Sample from model
-                samples = model.sample(fake_conditions, num_prior_samples=1, num_x_samples=1, device=device)
-                synthetic_flat = samples[0, 0]  # [samples_per_day, input_dim]
-                
-                all_synthetic_data.append(synthetic_flat)
-                day_labels.extend([day_names[day_idx]] * samples_per_day)
+            all_synthetic_data.append(synthetic_flat)
             
             # Concatenate all samples
             synthetic_flat = torch.cat(all_synthetic_data, dim=0)  # [total_samples, input_dim]
@@ -441,7 +465,7 @@ def _visualize_latent_space(model, test_loader, device, output_dir, model_tag):
             x_flat = x.reshape(x.shape[0], -1)
             
             if hasattr(model, 'conditioner'):
-                c = model.conditioner.get_conditions(timestamps).to(device)
+                c = model.conditioner.get_conditions(x,meter_id,timestamps).to(device)
                 enc_in = torch.cat([x_flat, c], dim=-1)
             else:
                 enc_in = x_flat
@@ -492,6 +516,44 @@ def _visualize_latent_space(model, test_loader, device, output_dir, model_tag):
     plt.close(fig)
     
     return {'latent_space': save_path}
+
+def _visualize_user_dictionary(model, test_loader, device, output_dir, model_tag):
+    """Plot the cached user profiles in the UserProfiler conditioner."""
+    if not hasattr(model, 'conditioner'):
+        return {}
+    if "user_profile" not in model.conditioner.get_condition_tags():
+        return {}
+    # Access the UserProfiler from condition_items dictionary
+    user_profiler: UserProfiler = model.conditioner.condition_items["user_profile"]
+    
+    # Get profiles from cache
+    if not user_profiler.user_profiles_cache:
+        print("No user profiles cached, skipping visualization.")
+        return {}
+    # Convert cache to matrix
+    meter_ids = sorted(user_profiler.user_profiles_cache.keys())
+    profiles = np.array([user_profiler.user_profiles_cache[m_id] for m_id in meter_ids])
+    
+    # [num_users, n_topics]
+    fig, ax = plt.subplots(figsize=(12, 8))
+    cax = ax.matshow(profiles, cmap='plasma', aspect='auto')
+    fig.colorbar(cax, label='Topic Probability')
+    ax.set_title(f"User Profiles (Topic Distributions) - {len(meter_ids)} users", fontsize=13, fontweight='bold')
+    ax.set_xlabel("Topic Index", fontsize=11)
+    ax.set_ylabel("User (Meter ID)", fontsize=11)
+    
+    # Optionally add some meter IDs as y-tick labels (sample if too many)
+    if len(meter_ids) <= 20:
+        ax.set_yticks(range(len(meter_ids)))
+        ax.set_yticklabels(meter_ids, fontsize=8)
+    
+    user_dict_path = os.path.join(output_dir, f"{model_tag}_user_profiles.png")
+    plt.tight_layout()
+    plt.savefig(user_dict_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved User Profiles visualization to {user_dict_path}")
+    return {"user_profiles": user_dict_path}
+
 
 def _save_model_summary(
         model,

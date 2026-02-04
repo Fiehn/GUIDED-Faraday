@@ -221,23 +221,40 @@ class VAE(nn.Module):
         # TODO: MMD (mean maximum discrepancy) has been shown to be useful for smart meter data by one of the papers
         return {"loss": loss, "recon_loglikelihood": recon_loglikelihood, "kl_divergence": kl_div}
 
-    def train_core(self, inputs, optim, gradient_clip=None, gradient_clip_kwargs=None, beta=1.0, **_):
+    def train_core(self, x, optim, gradient_clip=None, gradient_clip_kwargs=None, beta=1.0, **_):
         # batch can be x OR (x, meter_id, timeStamp)
-        if isinstance(inputs, (list, tuple)):
-            inputs = inputs[0]
-        else:
-            inputs = inputs
+        self.train()  # Set model to training mode
+        optim.zero_grad()  # Zero gradients
 
-        # x: [B, L, F] -> [B, L*F]
-        if inputs.dim() == 3:
-            inputs = inputs.reshape(inputs.shape[0], -1)
+        if isinstance(x, tuple) or isinstance(x, list):
+            # Unpack if dataloader returns (x, meter_id, timestamps)
+            if len(x) == 3:
+                x_data, meter_id, timestamps = x
+            elif len(x) == 2:
+                x_data, meter_id = x
+                timestamps = None
+            else:
+                x_data = x[0]
+                meter_id = None
+                timestamps = None
+        else:
+            x_data = x
+            meter_id = None
+            timestamps = None
+
+       # Flatten x if needed
+        if x_data.dim() == 3:  # [B, L, F]
+            x_flat = x_data.reshape(x_data.shape[0], -1)
+        else:
+            x_flat = x_data
+
+        x_flat = x_flat.to(self.device)
         
         # Forward pass
-        recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=1)
+        recon_params_dict, posterior_params_dict = self.forward(x_flat, num_samples=1)
 
         # Compute loss (negative ELBO)
-        optim.zero_grad() # Zero gradients
-        loss_dict = self.loss(inputs, recon_params_dict, posterior_params_dict, beta=beta)
+        loss_dict = self.loss(x_flat, recon_params_dict, posterior_params_dict, beta=beta)
         loss_dict["loss"].backward() # Backpropagate
         if gradient_clip is not None:
             torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_kwargs.get("max_norm", 1.0))
@@ -637,34 +654,34 @@ class CVAE(VAE):
         distribution_dict = dict(distribution_dict)
         distribution_dict["latent_dim"] = latent_dim
 
-        super().__init__(input_dim=input_dim, distribution_dict=distribution_dict, **kwargs)
-
         self.conditioner = conditioner
         self.condition_dim = conditioner.get_condition_dim()
         self.latent_dim = int(latent_dim)
 
-        # Define encoder and decoder networks
+        # Pass prior_type to parent so it creates the prior
+        super().__init__(input_dim=input_dim, distribution_dict=distribution_dict, prior_type=prior_type, **kwargs)
+
+        # NOW override encoder and decoder with conditioned versions
+        # Encoder takes [x, c] as input
         self.encoder = get_encoder_model(
             input_dim=input_dim + self.condition_dim,
             latent_dim=latent_dim,
             type=kwargs.get("coder_type", "dictionary"),
+            prior=self.prior,
             **kwargs,
-        ) # encoder takes [x, c]
+        )
 
+        # Decoder takes [z, c] as input
         self.decoder = get_decoder_model(
             latent_dim=latent_dim + self.condition_dim,
             output_dim=input_dim,
             type=kwargs.get("coder_type", "dictionary"),
+            prior=self.prior,
             **kwargs,
-        ) # decoder takes [z, c]
-
-        # Prior parameters for latent spaces
-        self.prior = get_prior(
-            prior_type=prior_type if prior_type is not None else "standard_dictionary",
-            latent_dim=latent_dim,
-            device="cpu",
-            dictionary_size=distribution_dict.get("dictionary_size", 100),
         )
+
+        # Recalculate num_parameters after overriding encoder/decoder
+        self.num_parameters = self.encoder._num_parameters() + self.decoder._num_parameters()
 
     def _prep_inputs(self, x: torch.Tensor) -> torch.Tensor:
         """ Flatten [B, L, F] to [B, D] if needed """
@@ -720,13 +737,14 @@ class CVAE(VAE):
         return super().loss(x, recon_params_squeezed, posterior_params, beta=beta)
 
     def train_core(self, batch, optim, beta=1.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
+        self.train()
         x, meter_id, timestamps = batch
 
         # Prep inputs: [B, L, F] -> [B, D] if needed
         x = self._prep_inputs(x)
 
         # Compute conditions
-        c = self.conditioner.get_conditions(timestamps)
+        c = self.conditioner.get_conditions(x, meter_id, timestamps)
         c = self.move_to_device(c, device=x.device)
 
         # Forward pass
@@ -750,16 +768,19 @@ class CVAE(VAE):
         n = 0
 
         for x, meter_id, timestamps in valloader:
-            x = x.to(device)
+            # Keep original 3D shape for conditioning
+            x_3d = x.to(device)
+            
+            # Flatten for model
+            x_flat = self._prep_inputs(x_3d)  # [B, D]
 
-            # Prep inputs and conditions
-            x = self._prep_inputs(x)
-            c = self.conditioner.get_conditions(timestamps)
+            # Get conditions - PASS 3D tensor
+            c = self.conditioner.get_conditions(x_3d, meter_id=meter_id, timestamps=timestamps)
             c = self.move_to_device(c, device=device)
 
             # Forward pass
-            recon_params, q_params = self.forward(x, c, num_samples=1)
-            loss_dict = self.loss(x, recon_params, q_params, beta=beta)
+            recon_params, q_params = self.forward(x_flat, c, num_samples=1)
+            loss_dict = self.loss(x_flat, recon_params, q_params, beta=beta)
 
             bs = x.size(0)
             for k in agg:
@@ -806,9 +827,9 @@ class CVAE(VAE):
         return torch.stack(xs_all, dim=0)  # [S, num_x_samples, B, D]
     
     @torch.no_grad()
-    def reconstruct(self, x: torch.Tensor, timestamps: torch.Tensor, num_samples: int = 1):
+    def reconstruct(self, x: torch.Tensor, meter_ids: torch.Tensor, timestamps: torch.Tensor, num_samples: int = 1):
         self.eval()
         x = self._prep_inputs(x)
-        c = self.conditioner.get_conditions(timestamps) # TODO : neeeds to be general so that it works with other conditions
+        c = self.conditioner.get_conditions(x, meter_id=meter_ids, timestamps=timestamps)
         c = self.move_to_device(c, device=x.device)
         return self.forward(x, c, num_samples=num_samples)
