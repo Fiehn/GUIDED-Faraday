@@ -71,29 +71,29 @@ class GaussianCoder(torch.nn.Module):
             prior: BasePrior object (if None, uses standard normal)
         """
         # KL(q||p) = 0.5 * sum(sigma_p^2/sigma_q^2 + (mu_q - mu_p)^2/sigma_q^2 - 1 + log(sigma_q^2/sigma_p^2)) TODO: Check back in later
-        
-        # Sample from q(z|x)
-        z = self.reparameterize(param_dict_q, num_samples=1)  # [1, B, D]
-        z = z.squeeze(0)  # [B, D]
-
-        # Compute log q(z|x) - log probability under posterior
         mu_q = param_dict_q["mu"]
         sigma_q = param_dict_q["sigma"]
+        
+        if prior is None:
+            # KL divergence with standard normal N(0,I)
+            mu_p = torch.zeros_like(mu_q)
+            sigma_p = torch.ones_like(sigma_q)
+        else:
+            # Get prior parameters
+            prior_params = prior.get_params()
+            batch_size = mu_q.shape[0]
+            prior_params = {k: v.expand(batch_size, -1).to(mu_q.device) for k, v in prior_params.items()}
+            mu_p = prior_params["mu"]
+            sigma_p = prior_params["sigma"]
+        
         var_q = sigma_q ** 2
-        log_q = -0.5 * torch.sum(
-            ((z - mu_q) ** 2) / var_q + torch.log(2 * torch.pi * var_q),
+        var_p = sigma_p ** 2
+        
+        # Analytical KL: KL(q||p) = 0.5 * sum(var_p/var_q + (mu_q - mu_p)^2/var_p - 1 + log(var_q/var_p))
+        kl = 0.5 * torch.sum(
+            var_q / var_p + ((mu_q - mu_p) ** 2) / var_p - 1 + torch.log(var_p / var_q),
             dim=-1
         )
-        
-       # Compute log p(z) - log probability under prior
-        if prior is None:
-            # Standard normal prior
-            log_p = -0.5 * torch.sum(z ** 2 + torch.log(torch.tensor(2 * torch.pi)), dim=-1)
-        else:
-            log_p = prior.log_prob(z)
-        
-        # KL = E_q[log q(z|x) - log p(z)]
-        kl = log_q - log_p
         return kl
     
     def create_covariance_matrix(self, param_dict):
@@ -227,7 +227,7 @@ class DictionaryCoder(torch.nn.Module):
         """
         mu_q = param_dict_q["mu"]
         Sigma_q = self.create_covariance_matrix(param_dict_q)
-
+        # TODO: Check back in here, the prior assumption is a bit odd
         if prior is None:
             # Default to standard normal in dictionary space
             mu_p = torch.zeros_like(mu_q)

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 
 # =============
 # Prior Dsitribution Classes
@@ -47,7 +48,7 @@ class StandardGaussianPrior(BasePrior):
     
     def log_prob(self, z):
         # log prob of standard normal
-        return -0.5 * (z ** 2 + torch.log(2 * torch.pi)).sum(dim=-1)
+        return torch.tensor(-0.5 * (z ** 2 + np.log(2 * np.pi)).mean(dim=-1), dtype=z.dtype, device=z.device)
     
     def forward(self, batch_size):
         return {"mu": self.mu.expand(batch_size, -1), "sigma": self.sigma.expand(batch_size, -1)}
@@ -103,10 +104,11 @@ class StandardDictionaryPrior(BasePrior):
     def log_prob(self, z):
         """
         Compute log prob in OUTPUT space.
-        For standard dictionary prior: p(z) = N(z | 0, I) in output space
         """
-        # z is in output space [B, latent_dim]
-        return -0.5 * torch.sum(z ** 2 + torch.log(torch.tensor(2 * torch.pi)), dim=-1)
+        
+        return torch.tensor(-0.5 * (z ** 2 + np.log(2 * np.pi)).mean(dim=-1), dtype=z.dtype, device=z.device)
+        #covariance_matrix = torch.diag(self.sigma.squeeze(0) ** 2).to(self.device)
+        #return torch.distributions.MultivariateNormal(self.mu.squeeze(0), covariance_matrix).log_prob(z)
     
     def forward(self, batch_size):
         return {"mu": self.mu.expand(batch_size, -1), "sigma": self.sigma.expand(batch_size, -1)}

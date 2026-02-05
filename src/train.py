@@ -29,7 +29,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
     ##############################
     # Validate model before training
     if not skip_validation:
-        print("\nStarting model validation before training...\n")
+        print("\nStarting model validation before training...\n") 
         validation_passed = run_validation(
             model_type=model_type,
             use_test_data=True,  # use small test data for fast validation
@@ -57,13 +57,22 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
 
     window = WindowSpec(input_len=24, stride=24)  # full day windows
 
-    batch_size = 256 # 256 # tried smaller batch size for CVAE
+    batch_size = 512 # 256 # tried smaller batch size for CVAE
     num_workers = 0
     shuffle_train = False
     seed = 42
     train_frac = 0.8
     val_frac = 0.1
     normalizer = Normalizer(method='zero_preserved_log')
+    normalizer = None
+    # TODO: check without normalizer
+    # TODO: maybe go with a log normal decoder? should be better for energy data
+    #        Would I then have to change the prior? 
+    #        Or just keep prior as normal?
+    #        I don't think so, since prior is in latent space
+    #        Decoder would output log-normal params
+    #       Encoder would map to latent space as normal
+    #      Loss would be log-normal likelihood
 
     print("Initializing DataModule...")
     dm = SmartMeterDataModule(
@@ -80,8 +89,8 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
         seed=seed,
         train_frac=train_frac,
         val_frac=val_frac,
-        max_meters=10, # None # tried smaller number for CVAE
-        normalizer=normalizer,
+        max_meters=None, # None # tried smaller number for CVAE
+        normalizer=None, # normalizer # try without normalizer
     )
     
     dm.setup()
@@ -121,7 +130,6 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
     print("Condition shape:", cond.shape)
 
 
-
     ##############################
     # use chosen model
     if model_type == "vae":
@@ -148,7 +156,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
         lr_scheduler_kwargs={"step_size": 10, "gamma": 0.9},
         beta=1.0,
         num_samples=1,
-        epochs=2,
+        epochs=20,
         validation_freq=1,
         validation_num_samples=1,
         device=device,

@@ -44,7 +44,43 @@ def load_model_and_visualize(
     model_kwargs = checkpoint.get("model_kwargs", {})
     model_tag = checkpoint.get("model_tag", "loaded_model")
 
-    is_cvae = 'condition_dim' in model_kwargs or 'conditioner' in model_kwargs
+    state_dict = checkpoint['model_state_dict']
+
+    # === Infer dimensions from state_dict ===
+    # Decoder output dimension
+    if 'decoder.SigmaMapper' in state_dict:
+        input_dim = state_dict['decoder.SigmaMapper'].shape[0]
+    elif 'decoder.parameterizer.param_heads.mu.3.bias' in state_dict:
+        input_dim = state_dict['decoder.parameterizer.param_heads.mu.3.bias'].shape[0]
+    else:
+        raise ValueError("Cannot infer input_dim from state_dict")
+    
+    # Encoder and decoder input dimensions
+    encoder_input_dim = state_dict['encoder.parameterizer.shared_block.0.weight'].shape[1]
+    decoder_input_dim = state_dict['decoder.parameterizer.shared_block.0.weight'].shape[1]
+    
+    # Latent dimension (from model_kwargs or infer)
+    latent_dim = model_kwargs.get('latent_dim', 10)
+    
+    # Detect CVAE: decoder_input_dim = latent_dim + condition_dim
+    # For VAE: decoder_input_dim = latent_dim
+    is_cvae = (decoder_input_dim > latent_dim)
+
+    if is_cvae:
+        condition_dim = decoder_input_dim - latent_dim
+        # Verify with encoder: encoder_input_dim should = input_dim + condition_dim
+        expected_encoder_input = input_dim + condition_dim
+        if encoder_input_dim != expected_encoder_input:
+            print(f"Warning: encoder_input_dim ({encoder_input_dim}) != "
+                  f"input_dim + condition_dim ({expected_encoder_input})")
+    else:
+        condition_dim = 0
+    
+    print(f"Inferred dimensions:")
+    print(f"  - input_dim: {input_dim}")
+    print(f"  - latent_dim: {latent_dim}")
+    print(f"  - condition_dim: {condition_dim}")
+    print(f"  - is_cvae: {is_cvae}")
 
     if data_config is None:
         data_config = {
@@ -61,8 +97,8 @@ def load_model_and_visualize(
             "train_frac": 0.8,
             "val_frac": 0.1,
         }
-        normalizer = Normalizer(method='zero_preserved_log') # THIS SHOULD MATCH TRAINING NORMALIZER TODO
-
+        #normalizer = Normalizer(method='zero_preserved_log') # THIS SHOULD MATCH TRAINING NORMALIZER TODO
+        normalizer = None
         # load data
         dm = SmartMeterDataModule(
             normalizer=normalizer,
@@ -72,22 +108,60 @@ def load_model_and_visualize(
         test_loader = dm.test_dataloader()
 
         if is_cvae:
+            print("\nCreating CVAE model...")
+        
+            # Recreate conditioner (must match training!)
             conditioner = Conditioner()
             conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
+            conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=False))
+            condition_dim = conditioner.get_condition_dim()
             
-            input_dim = checkpoint['model_state_dict']['encoder.parameterizer.shared_block.0.weight'].shape[1] - conditioner.get_condition_dim()
-
+            # For CVAE: encoder_input_dim = input_dim + condition_dim
+            # So: input_dim = encoder_input_dim - condition_dim
+            input_dim = encoder_input_dim - condition_dim
+            
+            print(f"  - input_dim: {input_dim}")
+            print(f"  - condition_dim: {condition_dim}")
+            print(f"  - encoder sees: {input_dim} + {condition_dim} = {encoder_input_dim}")
+            
+            # Extract model creation kwargs
+            coder_type = model_kwargs.get('coder_type', 'dictionary')
+            prior_type = model_kwargs.get('prior_type', 'standard_dictionary')
+            dictionary_size = model_kwargs.get('dictionary_size', 100)
+            
             model = CVAE(
                 input_dim=input_dim,
-                condition_dim=conditioner.get_condition_dim(),
+                latent_dim=latent_dim,
                 conditioner=conditioner,
-                **{k: v for k, v in model_kwargs.items() if k not in ['self', '__class__', 'conditioner']}
+                coder_type=coder_type,
+                prior_type=prior_type,
+                dictionary_size=dictionary_size,
+                # Pass other kwargs but exclude specific ones
+                **{k: v for k, v in model_kwargs.items() 
+                if k not in ['self', '__class__', 'input_dim', 'latent_dim', 
+                            'conditioner', 'condition_dim', 'coder_type', 'prior_type']}
             )
         else:
-            input_dim = checkpoint['model_state_dict']['encoder.parameterizer.shared_block.0.weight'].shape[1]
+            print("\nCreating VAE model...")
+        
+            # For VAE: encoder_input_dim = input_dim (no conditions)
+            input_dim = encoder_input_dim
+            
+            print(f"  - input_dim: {input_dim}")
+            
+            coder_type = model_kwargs.get('coder_type', 'gaussian')
+            prior_type = model_kwargs.get('prior_type', 'standard_gaussian')
+            dictionary_size = model_kwargs.get('dictionary_size', 100)
+            
             model = VAE(
                 input_dim=input_dim,
-                **{k: v for k, v in model_kwargs.items() if k not in ['self', '__class__']}
+                latent_dim=latent_dim,
+                coder_type=coder_type,
+                prior_type=prior_type,
+                dictionary_size=dictionary_size,
+                **{k: v for k, v in model_kwargs.items() 
+                if k not in ['self', '__class__', 'input_dim', 'latent_dim', 
+                            'coder_type', 'prior_type']}
             )
     model.load_state_dict(checkpoint['model_state_dict'])
     model.prior = checkpoint.get('prior', model.prior)
@@ -187,6 +261,7 @@ def visualize_trained_model(
     os.makedirs(output_dir, exist_ok=True)
     is_cvae = hasattr(model, 'condition_dim') and model.condition_dim > 0
     viz_path = {}
+    
     recon_path = _visualize_reconstructions(
         model=model,
         test_loader=test_loader,
@@ -279,8 +354,12 @@ def _visualize_reconstructions(
         S, B, D = recon_mu.shape
         L, F = x_original.shape[1], x_original.shape[2]
         recon_reshaped = recon_mu.reshape(S, B, L, F)  # [num_samples, batch, length, features]
-        x_original_denorm = normalizer.inverse_transform(x_original.cpu())
-        recon_denorm = normalizer.inverse_transform(recon_reshaped.cpu())
+        if normalizer is not None:
+            x_original_denorm = normalizer.inverse_transform(x_original.cpu())
+            recon_denorm = normalizer.inverse_transform(recon_reshaped.cpu())
+        else:
+            x_original_denorm = x_original.cpu()
+            recon_denorm = recon_reshaped.cpu()
 
     num_to_plot = min(num_samples, B)
     fig, axes = plt.subplots(num_to_plot, 1, figsize=(14, 5 * num_to_plot))
@@ -392,7 +471,10 @@ def _visualize_synthetic_samples(
             day_labels = [None] * num_samples
         
         # Denormalize
-        synthetic_data_denorm = normalizer.inverse_transform(synthetic_data.cpu())
+        if normalizer is not None:
+            synthetic_data_denorm = normalizer.inverse_transform(synthetic_data.cpu())
+        else:
+            synthetic_data_denorm = synthetic_data.cpu()
     
     # Plot
     num_to_plot = synthetic_data.shape[0]
@@ -441,9 +523,14 @@ def _visualize_sigma_mapper(
         output_dir: str,
         model_tag: str,
     ) -> dict:
-    sigma_mapper = model.get_SigmaMapper().cpu().detach().numpy()
+    
+    sigma_mapper = model.get_SigmaMapper()
+    if sigma_mapper is None:
+        print("Model does not have a Sigma Mapper, skipping visualization.")
+        return {}
+    sigma_mapper = sigma_mapper.cpu().detach().numpy()
     fig, ax = plt.subplots(figsize=(8, 6))
-    cax = ax.matshow(sigma_mapper, cmap='viridis')
+    cax = ax.matshow(sigma_mapper, cmap='RdBu_r', vmin=-np.abs(sigma_mapper).max(), vmax=np.abs(sigma_mapper).max())
     fig.colorbar(cax)
     ax.set_title("Sigma Mapper Matrix")
     sigma_mapper_path = os.path.join(output_dir, f"{model_tag}_sigma_mapper.png")
@@ -590,7 +677,7 @@ def _save_model_summary(
 
 if __name__ == "__main__":
     # Example usage
-    model_path = "models/CVAE_DictionaryCoder_20260202_145755_final.pt"
+    model_path = "models/CVAE_DictionaryCoder_20260205_150539_final.pt"
     load_model_and_visualize(
         model_path=model_path,
         output_dir="Output/Plots",

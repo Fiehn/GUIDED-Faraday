@@ -102,16 +102,17 @@ def run_validation(model_type: str = "cvae", use_test_data: bool = True, verbose
     
     # Create or load UserProfiler if needed
     if model_type == "cvae":
-        if not os.path.exists("models/UserProfiles/user_profiler.pkl"):
+        if not os.path.exists("models/UserProfiles/user_profiler_test.pkl"):
             if verbose:
                 print("UserProfiler not found, creating...")
             os.makedirs("models/UserProfiles", exist_ok=True)
-            UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True).fit(train_loader)
+            UserProfiler(num_clusters=3, path="models/UserProfiles/user_profiler_test.pkl", verbose=verbose).fit(train_loader)
         
         # Create conditioner
         conditioner = Conditioner()
         conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
-        conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=False))
+        conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=3, path="models/UserProfiles/user_profiler_test.pkl", verbose=False))
+        
     
     # Create model
     print(f"Creating {model_type.upper()} model...")

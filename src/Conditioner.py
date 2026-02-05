@@ -33,7 +33,8 @@ class UserProfiler(LatentDirichletAllocation):
         self.lambda_matrix = None  # To hold the learned topic-word distributions
         self.cluster_centers_ = None  # To hold KMeans cluster centers
 
-        self.user_profiles_cache = {}  # Cache for user profiles {meter_id: topic_distribution}
+        self.user_profiles_cache = {}  # Cache for user profiles {meter_id: sampled_theta}
+        self.gamma_cache = {}  # Cache for concentration parameters {meter_id: gamma_u}
 
         self.random_state = random_state
         self.model_kwargs = locals()
@@ -94,6 +95,7 @@ class UserProfiler(LatentDirichletAllocation):
             batch_size, seq_len, num_features = x.shape
             x_batch = x.cpu().numpy().reshape(batch_size, seq_len * num_features)  # [B*T, F]
             meter_id_flat = meter_id.cpu().numpy() 
+
             # Remove missing data
             missing_idx = np.isnan(x_batch).any(axis=1)
             x_fit = x_batch[~missing_idx]
@@ -130,75 +132,24 @@ class UserProfiler(LatentDirichletAllocation):
         self.lambda_matrix = self.components_
         self.is_fitted = True
 
+        # === Phase 4: Cache gamma parameters for all users ===
+        if self.verbose:
+            print("Phase 4: Caching gamma parameters for all users...")
+
+        self.meter_id_to_idx = {m_id: idx for idx, m_id in enumerate(meter_ids_sorted)}
+        all_gamma = super(UserProfiler, self).transform(X_corpus, normalize=False)
+
+        # Cache gamma values and smaple profiles
+        for m_id, gamma_u in zip(meter_ids_sorted, all_gamma):
+            self.gamma_cache[m_id] = gamma_u
+            self.user_profiles_cache[m_id] = np.random.dirichlet(gamma_u)
+
         if self.path is not None:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             self.save(self.path)
             if self.verbose:
                 print(f"UserProfiler model saved to {self.path}.")
         return self
-        
-    
-    def transform(self, train_loader):
-        """
-        Transform data from DataLoader to topic distributions.
-        Returns topic distributions for each meter_id and caches them.
-        """
-        if self.cluster_centers_ is None:
-            raise ValueError("Model has not been fitted yet. Call fit() before transform().")
-        if self.verbose:
-            print("Transforming data to user profiles...")
-
-        meter_corpus = {}
-        for x, meter_id, timestamps in tqdm(train_loader, desc="Transforming", disable=not self.verbose):
-            batch_size, seq_len, num_features = x.shape
-            x_batch = x.cpu().numpy().reshape(batch_size, seq_len * num_features)
-            meter_ids = meter_id.cpu().numpy()
-
-            # Remove missing data
-            missing_mask = np.isnan(x_batch).any(axis=1)
-            x_fit = x_batch[~missing_mask]
-            meter_ids_valid = meter_ids[~missing_mask]
-
-            if len(x_fit) == 0:
-                continue
-
-            # Assign clusters
-            labels = cdist(x_fit, self.cluster_centers_).argmin(axis=1)
-            
-            for m_id, label in zip(meter_ids_valid, labels):
-                if m_id not in meter_corpus:
-                    meter_corpus[m_id] = np.zeros(self.num_clusters, dtype=np.int32)
-                meter_corpus[m_id][label] += 1
-        
-        # Convert to matrix
-        meter_ids_sorted = sorted(meter_corpus.keys())
-        X_corpus = np.array([meter_corpus[m_id] for m_id in meter_ids_sorted])
-
-        # Transform to topic distributions
-        topic_distributions = super(UserProfiler, self)._unnormalized_transform(X_corpus)
-
-        # Cache the profiles by meter_id
-        for m_id, profile in zip(meter_ids_sorted, topic_distributions):
-            self.user_profiles_cache[m_id] = profile
-        
-        if self.verbose:
-            print(f"Cached profiles for {len(self.user_profiles_cache)} meters")
-
-        return topic_distributions, meter_ids_sorted
-
-    def get_user_profiles(self, X, retrain=False):
-        """ Get user profiles from DataLoader X"""
-        if os.path.exists(self.path) and not retrain and self.lambda_matrix is None:
-            with open(self.path, "rb") as f:
-                obj = pickle.load(f)
-            return obj.transform(X)
-        elif retrain or self.lambda_matrix is None:
-            self.fit(X, self.fit_kwargs)
-            return self.transform(X)
-        else:
-            # Lambda matrix is already computed and stored in self.lambda_matrix
-            # We can use it to transform the input data without retraining or loading from disk
-            return self.transform(X)
 
     def get_conditions(self, x, meter_id=None, timestamps=None):
         """
@@ -215,20 +166,9 @@ class UserProfiler(LatentDirichletAllocation):
         """
         if self.cluster_centers_ is None or not hasattr(self, 'is_fitted') or not self.is_fitted:
             try:
-                if self.verbose:
-                    print(f"Loading model from {self.path}")
-                loaded_obj = self.load(self.path)
-                
-                # Copy ALL attributes from loaded object
-                self.__dict__.update(loaded_obj.__dict__)
-                
-                if self.verbose:
-                    print(f"Loaded model from {self.path}")
-                    print(f"Cluster centers shape: {self.cluster_centers_.shape}")
-                    print(f"Cached profiles: {len(self.user_profiles_cache)}")
-                    print(f"Has exp_dirichlet_component_: {hasattr(self, 'exp_dirichlet_component_')}")
+                self.load(self.path)
             except Exception as e:
-                raise ValueError(f"Model must be fitted before getting conditions. Error loading: {e}")
+                raise ValueError("UserProfiler model is not fitted or cluster centers missing.") from e
             
          # Validate cluster_centers_ shape
         if self.cluster_centers_.ndim != 2:
@@ -242,30 +182,25 @@ class UserProfiler(LatentDirichletAllocation):
             x = x.cpu().numpy()
         if isinstance(meter_id, torch.Tensor):
             meter_id = meter_id.cpu().numpy()
+        
+        # === Cached Gamma Parameters Retrieval ===
+        missing_meters = [m for m in meter_id if m not in self.gamma_cache]
 
-        batch_size = len(meter_id)
-        # Look up profiles from cache
-        profiles = np.zeros((batch_size, self.n_topics))
-        missing_meters = []
-
-        for i, m_id in enumerate(meter_id):
-            if m_id in self.user_profiles_cache:
-                profiles[i] = self.user_profiles_cache[m_id]
-            else:
-                missing_meters.append(m_id)
-        # If some meters are missing, compute them on-the-fly
         if missing_meters:
-            if self.verbose:
-                print(f"Warning: {len(missing_meters)} meters not in cache, computing profiles...")
-            
-            # Compute profiles for missing meters using current batch data
-            profiles_computed = self._compute_profiles_for_batch(x, meter_id, missing_meters)
-            
-            # Fill in the missing profiles and cache them
-            for m_id, profile in zip(missing_meters, profiles_computed):
-                idx = np.where(meter_id == m_id)[0][0]
-                profiles[idx] = profile
-                self.user_profiles_cache[m_id] = profile  # Cache for future use
+            self._compute_profiles_for_batch(x, meter_id, missing_meters)
+        
+        # === Cached Sample Profile Retrieval ===
+        profiles = np.zeros((len(meter_id), self.n_topics), dtype=np.float32)
+        missing_meters = [m for m in meter_id if m not in self.user_profiles_cache]
+
+        # If some meters are missing, compute them on-the-fly (by sampling from cached gamma params)
+        if missing_meters:
+            for m_id in missing_meters:
+                self.resample_user_vector(meter_id=m_id)
+        
+        # === Assemble profiles ===
+        for i, m_id in enumerate(meter_id):
+            profiles[i] = self.user_profiles_cache[m_id]
         
         return profiles
 
@@ -289,41 +224,62 @@ class UserProfiler(LatentDirichletAllocation):
             x_batch = x
         else:
             raise ValueError(f"Expected x to have 2 or 3 dimensions, got {x.ndim}")
-         # Remove missing
+        
+        # Remove missing
         missing_mask = np.isnan(x_batch).any(axis=1)
         x_fit = x_batch[~missing_mask]
         meter_id_valid = meter_id[~missing_mask]
-
-        # Validate inputs before cdist
-        if self.verbose:
-            print(f"X_valid shape: {x_fit.shape}")
-            print(f"cluster_centers_ shape: {self.cluster_centers_.shape}")
         
         if x_fit.shape[1] != self.cluster_centers_.shape[1]:
             raise ValueError(
                 f"Feature dimension mismatch: X_valid has {x_fit.shape[1]} features, "
                 f"but cluster_centers_ has {self.cluster_centers_.shape[1]} features"
             )
-        # Build corpus only for target meters
+        
+        # Select rows for target_meter_ids
+        selected_indices = [i for i, m_id in enumerate(meter_id_valid) if
+                            m_id in target_meter_ids]
+        x_selected = x_fit[selected_indices]
+        meter_id_selected = meter_id_valid[selected_indices]
+
+        # Cluster into "words"
+        labels = cdist(x_selected, self.cluster_centers_).argmin(axis=1)
+        
+        # Create document-term matrix for target meters
         meter_corpus = {}
-        if len(x_fit) > 0:
-            labels = cdist(x_fit, self.cluster_centers_).argmin(axis=1)
-            
-            for m_id, cluster_label in zip(meter_id_valid, labels):
-                if m_id in target_meter_ids:
-                    if m_id not in meter_corpus:
-                        meter_corpus[m_id] = np.zeros(self.num_clusters, dtype=np.float64)
-                    meter_corpus[m_id][cluster_label] += 1
+        for m_id, label in zip(meter_id_selected, labels):
+            if m_id not in meter_corpus:
+                meter_corpus[m_id] = np.zeros(self.num_clusters, dtype=np.int32)
+            meter_corpus[m_id][label] += 1
         
-        # Create corpus matrix for target meters only
-        X_corpus = np.array([meter_corpus.get(m_id, np.zeros(self.num_clusters, dtype=np.float64))
-                         for m_id in target_meter_ids], dtype=np.float64)
+        X_corpus = np.array([meter_corpus[m_id] for m_id in target_meter_ids], dtype=np.int32)
         
-        # Transform to topics
-        topic_distributions = super(UserProfiler, self)._unnormalized_transform(X_corpus)
+        # Get posterior parameters (gamma) from LDA
+        # _unnormalized_transform returns the unnormalized Dirichlet parameters
+        posterior = super(UserProfiler, self).transform(X_corpus,normalize=False)
         
-        return topic_distributions
+        # Cache gamma values (these are the Dirichlet concentration parameters)
+        for m_id, gamma_u in zip(target_meter_ids, posterior):
+            self.gamma_cache[m_id] = gamma_u
+            # TODO: make streaming compatible
+        return posterior
     
+    def resample_user_vector(self, meter_id=None):
+        """Sample new user profiles from stored gamma parameters."""
+        if not self.gamma_cache:
+            raise ValueError("No gamma parameters cached. Cannot resample user vectors.")
+        if meter_id is None:
+            # Resample for all cached meters
+            for m_id, gamma_u in self.gamma_cache.items():
+                sampled_theta = np.random.dirichlet(gamma_u)
+                self.user_profiles_cache[m_id] = sampled_theta
+        else:
+            if meter_id not in self.gamma_cache:
+                raise ValueError(f"Meter ID {meter_id} not found in gamma cache.")
+            gamma_u = self.gamma_cache[meter_id]
+            sampled_theta = np.random.dirichlet(gamma_u)
+            self.user_profiles_cache[meter_id] = sampled_theta
+
     def get_random_conditions(self, batch_size):
         """Generate random user profiles for testing."""
         random_profiles = np.random.dirichlet(alpha=np.ones(self.n_topics), size=batch_size)
@@ -345,13 +301,23 @@ class UserProfiler(LatentDirichletAllocation):
         """Load model with cached profiles."""
         with open(path, "rb") as f:
             obj = pickle.load(f)
+            
         
         if hasattr(obj, 'verbose') and obj.verbose:
             print(f"Loaded model with {len(obj.user_profiles_cache)} cached profiles")
             print(f"Cluster centers shape: {obj.cluster_centers_.shape}")
         
         return obj
-    
+    def load(self,path):
+        """Load model with cached profiles."""
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+            self.__dict__.update(obj.__dict__)
+            if hasattr(self, 'verbose') and self.verbose:
+                print(f"Loaded model with {len(self.user_profiles_cache)} cached profiles")
+                print(f"Cluster centers shape: {self.cluster_centers_.shape}")
+
+
 # === Day of week conditioning ===
 class DayOfWeekConditioner():
     def __init__(self):

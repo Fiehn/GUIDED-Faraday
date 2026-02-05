@@ -184,26 +184,18 @@ class VAE(nn.Module):
         return recon_params_dict, posterior_params_dict
     def reconstruction_loglikelihood(self, inputs, recon_params_dict):
         # Compute reconstruction log-likelihood
-        return self.decoder.loglikelihood(inputs, recon_params_dict)
+        return self.decoder.loglikelihood(inputs, recon_params_dict).mean(dim=0)
     @torch.no_grad()
-    def loglikelihood(self, inputs, num_samples=1):
-        """Compute log-likelihood via ELBO."""
-        recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=num_samples)
-
-        # Get prior params
-        prior_params = self.prior.get_params()
-        batch_size = inputs.shape[0]
-        prior_params = {k: v.expand(batch_size, -1).to(inputs.device) for k, v in prior_params.items()}
+    def loglikelihood(self, inputs, num_mc_samples=1):
+        """Compute log-likelihood"""
+        recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=num_mc_samples)
 
         # Reconstruction log-likelihood
-        recon_loglikelihood = self.decoder.loglikelihood(inputs, recon_params_dict)
-
-        # KL divergence
-        kl_div = self.encoder.kl_divergence(posterior_params_dict, prior_params)
-
-        # ELBO = recon_loglikelihood - KL
-        elbo = recon_loglikelihood - kl_div
-        return elbo.mean(0)
+        recon_loglikelihood = self.reconstruction_loglikelihood(inputs, recon_params_dict)
+        posterior_loglikelihood = self.encoder.loglikelihood(posterior_params_dict)
+        prior_loglikelihood = self.prior.log_prob(posterior_params_dict['z'])
+        
+        return (posterior_loglikelihood.sum(-1) + recon_loglikelihood.sum(-1) - prior_loglikelihood.sum(-1)).mean(dim=0)
     
     def loss(self, inputs, recon_params_dict, posterior_params_dict, beta=1.0, **_):
         # Compute reconstruction log-likelihood (we use reconstruction only because of VAE structure)
@@ -224,7 +216,6 @@ class VAE(nn.Module):
     def train_core(self, x, optim, gradient_clip=None, gradient_clip_kwargs=None, beta=1.0, **_):
         # batch can be x OR (x, meter_id, timeStamp)
         self.train()  # Set model to training mode
-        optim.zero_grad()  # Zero gradients
 
         if isinstance(x, tuple) or isinstance(x, list):
             # Unpack if dataloader returns (x, meter_id, timestamps)
@@ -253,7 +244,9 @@ class VAE(nn.Module):
         # Forward pass
         recon_params_dict, posterior_params_dict = self.forward(x_flat, num_samples=1)
 
-        # Compute loss (negative ELBO)
+        optim.zero_grad(set_to_none=True)  # Zero gradients
+
+        # Compute loss
         loss_dict = self.loss(x_flat, recon_params_dict, posterior_params_dict, beta=beta)
         loss_dict["loss"].backward() # Backpropagate
         if gradient_clip is not None:
@@ -478,7 +471,7 @@ class VAE(nn.Module):
             epoch_train_loss = 0.0
             epoch_train_recon = 0.0
             epoch_train_kl = 0.0
-            num_batches = 0
+            num_samples = 0
 
             for batch in trainloader:
                 global_step += 1
@@ -490,12 +483,16 @@ class VAE(nn.Module):
                     gradient_clip=gradient_clip, 
                     gradient_clip_kwargs=gradient_clip_kwargs
                 )
-                
+                if isinstance(batch, (list, tuple)):
+                    bs = batch[0].size(0)
+                else:
+                    bs = batch.size(0)
+                    
                 # Accumulate epoch losses
                 epoch_train_loss += loss_dict["loss"].item()
                 epoch_train_recon += loss_dict["recon_loglikelihood"].item()
                 epoch_train_kl += loss_dict["kl_divergence"].item()
-                num_batches += 1
+                num_samples += bs
                 
                 # Log training metrics per iteration
                 writer.add_scalar('Train/loss_step', loss_dict["loss"].item(), global_step)
@@ -511,9 +508,9 @@ class VAE(nn.Module):
                         writer.add_histogram(f'Parameters/{name}', param, global_step)
 
             # Compute average epoch losses
-            avg_train_loss = epoch_train_loss / num_batches
-            avg_train_recon = epoch_train_recon / num_batches
-            avg_train_kl = epoch_train_kl / num_batches
+            avg_train_loss = epoch_train_loss / num_samples
+            avg_train_recon = epoch_train_recon / num_samples
+            avg_train_kl = epoch_train_kl / num_samples
             
             # Log epoch-level training metrics
             writer.add_scalar('Train/loss_epoch', avg_train_loss, epoch)
@@ -566,7 +563,7 @@ class VAE(nn.Module):
 
                 # Early stopping check
                 if early_stopping:
-                    is_best = earlystopping(val_metric=val_loss_dict["loss"],train_metric=epoch_train_loss, epoch=epoch)
+                    is_best = earlystopping(val_metric=val_loss_dict["loss"],train_metric=avg_train_loss, epoch=epoch)
                     if earlystopping.early_stop:
                         print(f"\n{'='*60}")
                         print(f"Early stopping triggered at epoch {epoch+1}")
