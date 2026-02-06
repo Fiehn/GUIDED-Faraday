@@ -56,11 +56,11 @@ def load_model_and_visualize(
         raise ValueError("Cannot infer input_dim from state_dict")
     
     # Encoder and decoder input dimensions
-    encoder_input_dim = state_dict['encoder.parameterizer.shared_block.0.weight'].shape[1]
-    decoder_input_dim = state_dict['decoder.parameterizer.shared_block.0.weight'].shape[1]
+    encoder_input_dim = state_dict['encoder.input_dim'].shape[1] if 'encoder.input_dim' in state_dict else 24
+    decoder_input_dim = state_dict['decoder.output_dim'].shape[1] if 'decoder.output_dim' in state_dict else 24
     
     # Latent dimension (from model_kwargs or infer)
-    latent_dim = model_kwargs.get('latent_dim', 24)
+    latent_dim = model_kwargs.get('latent_dim', 32)
     
     # Detect CVAE: decoder_input_dim = latent_dim + condition_dim
     # For VAE: decoder_input_dim = latent_dim
@@ -867,7 +867,7 @@ def _save_model_summary(
 
 if __name__ == "__main__":
     # Example usage
-    model_path = "models/CVAE_DictionaryCoder_20260205_203329_best.pt"
+    model_path = "models/CVAE_DictionaryStudentTCoder_20260206_123443_epoch_10.pt"
     load_model_and_visualize(
         model_path=model_path,
         output_dir="Output/Plots",

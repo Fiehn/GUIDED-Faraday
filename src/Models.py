@@ -115,7 +115,7 @@ class VAE(nn.Module):
 
         # === VAE Components ===
         self.input_dim = input_dim
-        latent_dim = distribution_dict.get("latent_dim", 10)
+        latent_dim = distribution_dict.get("latent_dim", 32)
 
         # Prior
         if prior_type is None:
@@ -198,7 +198,7 @@ class VAE(nn.Module):
         
         return (posterior_loglikelihood.sum(-1) + recon_loglikelihood.sum(-1) - prior_loglikelihood.sum(-1)).mean(dim=0)
     
-    def loss(self, inputs, recon_params_dict, posterior_params_dict, beta=1.0, **_):
+    def loss(self, inputs, recon_params_dict, posterior_params_dict, beta: float = 1.0, weighted_loss: float = 0.0, **_):
         # Compute reconstruction log-likelihood (we use reconstruction only because of VAE structure)
         recon_loglikelihood = self.reconstruction_loglikelihood(inputs, recon_params_dict)
 
@@ -206,16 +206,17 @@ class VAE(nn.Module):
         kl_div = self.encoder.kl_divergence(posterior_params_dict, self.prior)
         kl_div = kl_div.mean()
 
-        # Ensure recon_loglikelihood is also a scalar
-        if recon_loglikelihood.dim() > 0:
-            recon_loglikelihood = recon_loglikelihood.mean()
+        # Weighted loss (set weighted_loss > 0 to enable) - gives more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
+        weights = 1.0 + weighted_loss * torch.abs(inputs).mean(dim=-1)
+        recon_loglikelihood = (recon_loglikelihood * weights).mean() 
 
+        # TODO: beta annealing during training (currently fixed beta)
         loss = -(recon_loglikelihood - beta * kl_div)
 
         # TODO: MMD (mean maximum discrepancy) has been shown to be useful for smart meter data by one of the papers
         return {"loss": loss, "recon_loglikelihood": recon_loglikelihood, "kl_divergence": kl_div}
 
-    def train_core(self, x, optim, gradient_clip=None, gradient_clip_kwargs=None, beta=1.0, **_):
+    def train_core(self, x, optim, gradient_clip=None, gradient_clip_kwargs=None, beta=1.0, weighted_loss =0.0, **_):
         # batch can be x OR (x, meter_id, timeStamp)
         self.train()  # Set model to training mode
 
@@ -249,7 +250,7 @@ class VAE(nn.Module):
         optim.zero_grad(set_to_none=True)  # Zero gradients
 
         # Compute loss
-        loss_dict = self.loss(x_flat, recon_params_dict, posterior_params_dict, beta=beta)
+        loss_dict = self.loss(x_flat, recon_params_dict, posterior_params_dict, beta=beta, weighted_loss=weighted_loss)
         loss_dict["loss"].backward() # Backpropagate
         if gradient_clip is not None:
             torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_kwargs.get("max_norm", 1.0))
@@ -393,7 +394,7 @@ class VAE(nn.Module):
             epochs = 1000,
             validation_freq = 1,
             validation_num_samples = 10,
-            device = "cpu",  # Add device parameter
+            device = "cpu", 
             early_stopping = True,
             early_stopping_kwargs = {"patience": 10, "min_delta": 0.001},
             save_epoch_freq = 10,
@@ -401,6 +402,7 @@ class VAE(nn.Module):
             log_dir = './runs/VAE_training',
             model_name = None, # Optionally specify model name for saving
             save_dir = './models/',
+            weighted_loss = 0.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
             **_):
         
         # DEBUG:
@@ -438,6 +440,7 @@ class VAE(nn.Module):
                 'gradient_clip': gradient_clip,
                 'lr_scheduler': lr_scheduler,
                 'early_stopping': early_stopping,
+                'weighted_loss': weighted_loss,
             },
             'model_architecture': {
                 'class_name': self.__class__.__name__,
@@ -491,7 +494,8 @@ class VAE(nn.Module):
                     optim, 
                     beta=beta, 
                     gradient_clip=gradient_clip, 
-                    gradient_clip_kwargs=gradient_clip_kwargs
+                    gradient_clip_kwargs=gradient_clip_kwargs,
+                    weighted_loss=weighted_loss
                 )
                 
                 # Accumulate epoch losses
@@ -647,7 +651,7 @@ class CVAE(VAE):
         input_dim: int,
         *,
         conditioner: Conditioner,
-        latent_dim: int = 10,
+        latent_dim: int = 32,
         distribution_dict: dict = None,
         prior_type: str = None,
         **kwargs,
@@ -729,7 +733,7 @@ class CVAE(VAE):
 
         return recon_params, q_params 
 
-    def loss(self, x: torch.Tensor, recon_params, posterior_params, beta=1.0, **_):
+    def loss(self, x: torch.Tensor, recon_params, posterior_params, beta=1.0, weighted_loss=0.0,**_):
         """Compute ELBO loss."""
         # recon_params: dict of [S, B, D] -> use first sample for training
         if recon_params["mu"].dim() == 3:
@@ -737,9 +741,9 @@ class CVAE(VAE):
         else:
             recon_params_squeezed = recon_params
 
-        return super().loss(x, recon_params_squeezed, posterior_params, beta=beta)
+        return super().loss(x, recon_params_squeezed, posterior_params, beta=beta, weighted_loss=weighted_loss)
 
-    def train_core(self, batch, optim, beta=1.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
+    def train_core(self, batch, optim, beta=1.0,weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
         self.train()
         x, meter_id, timestamps = batch
 
@@ -755,7 +759,7 @@ class CVAE(VAE):
 
         # Backward pass
         optim.zero_grad(set_to_none=True)
-        loss_dict = self.loss(x, recon_params, q_params, beta=beta)
+        loss_dict = self.loss(x, recon_params, q_params, beta=beta, weighted_loss=weighted_loss)
         loss_dict["loss"].backward()
 
         if gradient_clip is not None:

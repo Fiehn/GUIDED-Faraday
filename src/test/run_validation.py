@@ -121,7 +121,7 @@ def run_validation(model_type: str = "cvae", use_test_data: bool = True, verbose
     else:
         model = CVAE(
             input_dim=input_dim,
-            latent_dim=10,
+            latent_dim=4, # smaller latent dim for faster validation
             conditioner=conditioner,
             encoder_type="dictionary",
             decoder_type="dictionary",
