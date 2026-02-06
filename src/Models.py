@@ -94,7 +94,8 @@ class VAE(nn.Module):
     def __init__(self,
                  input_dim=24,
                  distribution_dict = {},
-                 coder_type = "dictionary",
+                 encoder_type = "dictionary",
+                 decoder_type = "dictionary",
                  prior_type = None,
                  **_):
         super(VAE, self).__init__()
@@ -118,13 +119,13 @@ class VAE(nn.Module):
 
         # Prior
         if prior_type is None:
-            prior_type = "standard_dictionary" if coder_type == "dictionary" else "standard_gaussian"
+            prior_type = "standard_dictionary" if encoder_type == "dictionary" else "standard_gaussian"
         
         self.prior = get_prior(prior_type=prior_type, latent_dim=latent_dim, device="cpu", dictionary_size=distribution_dict.get("dictionary_size", 100))
 
         # Define encoder and decoder networks - don't pass model_kwargs to avoid circular references
-        self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim, type=coder_type, prior=self.prior)
-        self.decoder = get_decoder_model(latent_dim=latent_dim, output_dim=input_dim, type=coder_type, prior=self.prior)
+        self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim, type=encoder_type, prior=self.prior)
+        self.decoder = get_decoder_model(latent_dim=latent_dim, output_dim=input_dim, type=decoder_type, prior=self.prior)
 
         # Calculate and store the number of parameters
         self.num_parameters = self.encoder._num_parameters() + self.decoder._num_parameters()
@@ -184,7 +185,7 @@ class VAE(nn.Module):
         return recon_params_dict, posterior_params_dict
     def reconstruction_loglikelihood(self, inputs, recon_params_dict):
         # Compute reconstruction log-likelihood
-        return self.decoder.loglikelihood(inputs, recon_params_dict).mean(dim=0)
+        return self.decoder.loglikelihood(inputs, recon_params_dict)
     @torch.no_grad()
     def loglikelihood(self, inputs, num_mc_samples=1):
         """Compute log-likelihood"""
@@ -210,6 +211,7 @@ class VAE(nn.Module):
             recon_loglikelihood = recon_loglikelihood.mean()
 
         loss = -(recon_loglikelihood - beta * kl_div)
+
         # TODO: MMD (mean maximum discrepancy) has been shown to be useful for smart meter data by one of the papers
         return {"loss": loss, "recon_loglikelihood": recon_loglikelihood, "kl_divergence": kl_div}
 
@@ -254,10 +256,11 @@ class VAE(nn.Module):
         optim.step() # Update parameters
         return loss_dict
     
-    def validate(self, valloader, num_samples = 1, device = "cpu"):
+    def validate(self, valloader, num_samples = 1, beta=1, device = "cpu"):
         self.eval() # Set model to evaluation mode
         # Validation loop
         val_loss = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
+        num_batch = 0
         # Disable gradient computation
         with torch.no_grad():
             # Iterate over validation data
@@ -279,13 +282,14 @@ class VAE(nn.Module):
                 batch_size = batch.shape[0]
                 prior_params = {k: v.expand(batch_size, -1).to(device) for k, v in prior_params.items()}
                 # Get loss
-                loss_dict = self.loss(batch, recon_params_dict, posterior_params_dict, beta=1.0, prior_params=prior_params)
+                loss_dict = self.loss(batch, recon_params_dict, posterior_params_dict, beta=beta, prior_params=prior_params)
                 # Accumulate losses
                 for key in val_loss:
-                    val_loss[key] += loss_dict[key].item() * batch.size(0)
+                    val_loss[key] += loss_dict[key].item()
+                num_batch += 1
         # Average losses over dataset
         for key in val_loss:
-            val_loss[key] /= len(valloader.dataset)
+            val_loss[key] /= num_batch
 
         return val_loss
     
@@ -398,6 +402,12 @@ class VAE(nn.Module):
             model_name = None, # Optionally specify model name for saving
             save_dir = './models/',
             **_):
+        
+        # DEBUG:
+        print(f"Train loader: {len(trainloader)} batches, {len(trainloader.dataset)} samples")
+        if valloader:
+            print(f"Val loader: {len(valloader)} batches, {len(valloader.dataset)} samples")
+
         # === Generate a model tag ===
         time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         if model_name is None:
@@ -471,7 +481,7 @@ class VAE(nn.Module):
             epoch_train_loss = 0.0
             epoch_train_recon = 0.0
             epoch_train_kl = 0.0
-            num_samples = 0
+            num_batches = 0
 
             for batch in trainloader:
                 global_step += 1
@@ -483,16 +493,12 @@ class VAE(nn.Module):
                     gradient_clip=gradient_clip, 
                     gradient_clip_kwargs=gradient_clip_kwargs
                 )
-                if isinstance(batch, (list, tuple)):
-                    bs = batch[0].size(0)
-                else:
-                    bs = batch.size(0)
-                    
+                
                 # Accumulate epoch losses
                 epoch_train_loss += loss_dict["loss"].item()
                 epoch_train_recon += loss_dict["recon_loglikelihood"].item()
                 epoch_train_kl += loss_dict["kl_divergence"].item()
-                num_samples += bs
+                num_batches += 1
                 
                 # Log training metrics per iteration
                 writer.add_scalar('Train/loss_step', loss_dict["loss"].item(), global_step)
@@ -508,9 +514,9 @@ class VAE(nn.Module):
                         writer.add_histogram(f'Parameters/{name}', param, global_step)
 
             # Compute average epoch losses
-            avg_train_loss = epoch_train_loss / num_samples
-            avg_train_recon = epoch_train_recon / num_samples
-            avg_train_kl = epoch_train_kl / num_samples
+            avg_train_loss = epoch_train_loss / num_batches
+            avg_train_recon = epoch_train_recon / num_batches
+            avg_train_kl = epoch_train_kl / num_batches
             
             # Log epoch-level training metrics
             writer.add_scalar('Train/loss_epoch', avg_train_loss, epoch)
@@ -663,7 +669,7 @@ class CVAE(VAE):
         self.encoder = get_encoder_model(
             input_dim=input_dim + self.condition_dim,
             latent_dim=latent_dim,
-            type=kwargs.get("coder_type", "dictionary"),
+            type=kwargs.get("encoder_type", "dictionary"),
             prior=self.prior,
             **kwargs,
         )
@@ -672,7 +678,7 @@ class CVAE(VAE):
         self.decoder = get_decoder_model(
             latent_dim=latent_dim + self.condition_dim,
             output_dim=input_dim,
-            type=kwargs.get("coder_type", "dictionary"),
+            type=kwargs.get("decoder_type", "dictionary"),
             prior=self.prior,
             **kwargs,
         )
@@ -762,7 +768,7 @@ class CVAE(VAE):
     def validate(self, valloader, num_samples: int = 1, beta: float = 1.0, device: str = "cpu"):
         self.eval()
         agg = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
-        n = 0
+        num_batches = 0
 
         for x, meter_id, timestamps in valloader:
             # Keep original 3D shape for conditioning
@@ -779,13 +785,12 @@ class CVAE(VAE):
             recon_params, q_params = self.forward(x_flat, c, num_samples=1)
             loss_dict = self.loss(x_flat, recon_params, q_params, beta=beta)
 
-            bs = x.size(0)
             for k in agg:
-                agg[k] += float(loss_dict[k]) * bs
-            n += bs
+                agg[k] += float(loss_dict[k])
+            num_batches += 1
 
         for k in agg:
-            agg[k] /= max(n, 1)
+            agg[k] /= max(num_batches, 1)
         return agg
 
     @torch.no_grad()

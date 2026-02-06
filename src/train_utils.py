@@ -60,7 +60,7 @@ def load_model_and_visualize(
     decoder_input_dim = state_dict['decoder.parameterizer.shared_block.0.weight'].shape[1]
     
     # Latent dimension (from model_kwargs or infer)
-    latent_dim = model_kwargs.get('latent_dim', 10)
+    latent_dim = model_kwargs.get('latent_dim', 24)
     
     # Detect CVAE: decoder_input_dim = latent_dim + condition_dim
     # For VAE: decoder_input_dim = latent_dim
@@ -98,7 +98,7 @@ def load_model_and_visualize(
             "val_frac": 0.1,
         }
         #normalizer = Normalizer(method='zero_preserved_log') # THIS SHOULD MATCH TRAINING NORMALIZER TODO
-        normalizer = None
+        normalizer = Normalizer(method='log1p') # THIS SHOULD MATCH TRAINING NORMALIZER TODO
         # load data
         dm = SmartMeterDataModule(
             normalizer=normalizer,
@@ -125,7 +125,8 @@ def load_model_and_visualize(
             print(f"  - encoder sees: {input_dim} + {condition_dim} = {encoder_input_dim}")
             
             # Extract model creation kwargs
-            coder_type = model_kwargs.get('coder_type', 'dictionary')
+            encoder_type = model_kwargs.get('encoder_type', 'dictionary')
+            decoder_type = model_kwargs.get('decoder_type', 'dictionary')
             prior_type = model_kwargs.get('prior_type', 'standard_dictionary')
             dictionary_size = model_kwargs.get('dictionary_size', 100)
             
@@ -133,13 +134,14 @@ def load_model_and_visualize(
                 input_dim=input_dim,
                 latent_dim=latent_dim,
                 conditioner=conditioner,
-                coder_type=coder_type,
+                encoder_type=encoder_type,
+                decoder_type=decoder_type,
                 prior_type=prior_type,
                 dictionary_size=dictionary_size,
                 # Pass other kwargs but exclude specific ones
                 **{k: v for k, v in model_kwargs.items() 
                 if k not in ['self', '__class__', 'input_dim', 'latent_dim', 
-                            'conditioner', 'condition_dim', 'coder_type', 'prior_type']}
+                            'conditioner', 'condition_dim', 'encoder_type','decoder_type', 'prior_type']}
             )
         else:
             print("\nCreating VAE model...")
@@ -149,19 +151,21 @@ def load_model_and_visualize(
             
             print(f"  - input_dim: {input_dim}")
             
-            coder_type = model_kwargs.get('coder_type', 'gaussian')
+            encoder_type = model_kwargs.get('encoder_type', 'gaussian')
+            decoder_type = model_kwargs.get('decoder_type', 'gaussian')
             prior_type = model_kwargs.get('prior_type', 'standard_gaussian')
             dictionary_size = model_kwargs.get('dictionary_size', 100)
             
             model = VAE(
                 input_dim=input_dim,
                 latent_dim=latent_dim,
-                coder_type=coder_type,
+                encoder_type=encoder_type,
+                decoder_type=decoder_type,
                 prior_type=prior_type,
                 dictionary_size=dictionary_size,
                 **{k: v for k, v in model_kwargs.items() 
                 if k not in ['self', '__class__', 'input_dim', 'latent_dim', 
-                            'coder_type', 'prior_type']}
+                            'encoder_type','decoder_type' 'prior_type']}
             )
     model.load_state_dict(checkpoint['model_state_dict'])
     model.prior = checkpoint.get('prior', model.prior)
@@ -222,7 +226,15 @@ def load_model_and_visualize(
         model_tag=model_tag,
     )
     viz_path.update(user_dict_path)
-
+    synth_recreation_path = _visualize_synthetic_recreations(
+        model=model,
+        test_loader=test_loader,
+        normalizer=normalizer,
+        device=device,
+        output_dir=output_dir,
+        model_tag=model_tag,
+    )
+    viz_path.update(synth_recreation_path)
     summary_path = _save_model_summary(
         model=model,
         model_kwargs=model_kwargs,
@@ -301,12 +313,17 @@ def visualize_trained_model(
         model_tag=model_tag,
     )
     viz_path.update(latent_space_path)
-    summary_path = _save_model_summary(
+    synth_recreation_path = _visualize_synthetic_recreations(
         model=model,
-        model_kwargs={},
+        test_loader=test_loader,
+        normalizer=normalizer,
+        device=device,
         output_dir=output_dir,
         model_tag=model_tag,
     )
+    viz_path.update(synth_recreation_path)
+    
+    
     user_profile_path = _visualize_user_dictionary(
         model=model,
         test_loader=test_loader,
@@ -315,6 +332,13 @@ def visualize_trained_model(
         model_tag=model_tag,
     )
     viz_path.update(user_profile_path)
+
+    summary_path = _save_model_summary(
+        model=model,
+        model_kwargs={},
+        output_dir=output_dir,
+        model_tag=model_tag,
+    )
     viz_path['model_summary'] = summary_path
     print("All visualizations saved.")
     print(viz_path)
@@ -604,6 +628,172 @@ def _visualize_latent_space(model, test_loader, device, output_dir, model_tag):
     
     return {'latent_space': save_path}
 
+def _visualize_synthetic_recreations(model, test_loader, normalizer, device, output_dir, model_tag):
+    """
+    Pick a few test samples, generate multiple synthetic samples with the same conditions, 
+    and plot them together. Also plot the original for comparison and a mean synthetic 
+    recreation to see how well the model captures the original.
+    """
+    if not hasattr(model, 'conditioner'):
+        print("Model does not have a conditioner, skipping synthetic recreation visualization.")
+        return {}
+    if "day_of_week" not in model.conditioner.get_condition_tags():
+        print("Model conditioner does not include 'day_of_week', skipping synthetic recreation visualization.")
+        return {}
+    if "user_profile" not in model.conditioner.get_condition_tags():
+        print("Model conditioner does not include 'user_profile', skipping synthetic recreation visualization.")
+        return {}
+    
+    model.eval()
+    num_originals = 4  # Number of original samples to visualize
+    num_synthetic_per = 50  # Number of synthetic samples per original
+    
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    
+    with torch.no_grad():
+        # Get a batch from test loader
+        x, meter_id, timestamps = next(iter(test_loader))
+        x = x.to(device)
+        timestamps = timestamps.to(device)
+        
+        # Select a few samples
+        num_originals = min(num_originals, x.shape[0])
+        x_selected = x[:num_originals]
+        meter_id_selected = meter_id[:num_originals]
+        timestamps_selected = timestamps[:num_originals]
+        
+        # Get conditions for selected samples
+        c = model.conditioner.get_conditions(
+            x_selected, 
+            meter_id=meter_id_selected, 
+            timestamps=timestamps_selected
+        )
+        c = model.move_to_device(c, device=device)
+        
+        # Generate synthetic samples with the SAME conditions
+        # Shape: [num_prior_samples, num_x_samples, B, D]
+        synthetic_samples = model.sample(
+            conditions=c,
+            num_prior_samples=num_synthetic_per,
+            num_x_samples=1,
+            device=device
+        )
+        
+        # Reshape: [num_synthetic_per, 1, num_originals, D] -> [num_synthetic_per, num_originals, D]
+        synthetic_samples = synthetic_samples.squeeze(1)  # [num_synthetic_per, num_originals, D]
+        
+        # Reshape to [num_synthetic_per, num_originals, L, F]
+        L, F = x_selected.shape[1], x_selected.shape[2]
+        synthetic_reshaped = synthetic_samples.reshape(num_synthetic_per, num_originals, L, F)
+        
+        # Compute mean synthetic sample
+        mean_synthetic = synthetic_reshaped.mean(dim=0)  # [num_originals, L, F]
+        
+        # Denormalize
+        if normalizer is not None:
+            x_denorm = normalizer.inverse_transform(x_selected.cpu())
+            synthetic_denorm = normalizer.inverse_transform(synthetic_reshaped.cpu())
+            mean_synthetic_denorm = normalizer.inverse_transform(mean_synthetic.cpu())
+        else:
+            x_denorm = x_selected.cpu()
+            synthetic_denorm = synthetic_reshaped.cpu()
+            mean_synthetic_denorm = mean_synthetic.cpu()
+        
+        # Get condition labels
+        condition_labels = []
+        for i in range(num_originals):
+            ts = timestamps_selected[i].cpu().item()
+            dt = pd.Timestamp(ts, unit='s')
+            day_name = day_names[dt.dayofweek]
+            date_str = dt.strftime("%Y-%m-%d")
+            m_id = meter_id_selected[i].item()
+            condition_labels.append(f"Meter {m_id} | {day_name} ({date_str})")
+    
+    # Create figure
+    fig, axes = plt.subplots(num_originals, 1, figsize=(14, 5 * num_originals))
+    if num_originals == 1:
+        axes = [axes]
+    
+    hours = np.arange(L)
+    synthetic_colors = plt.cm.Blues(np.linspace(0.3, 0.7, num_synthetic_per))
+    
+    for i in range(num_originals):
+        ax = axes[i]
+        
+        # Plot synthetic samples (thin, semi-transparent)
+        for s in range(num_synthetic_per):
+            synth_data = synthetic_denorm[s, i, :, 0]
+            if isinstance(synth_data, torch.Tensor):
+                synth_data = synth_data.numpy()
+            ax.plot(
+                hours, synth_data,
+                color=synthetic_colors[s],
+                alpha=0.4,
+                linewidth=1,
+                label='Synthetic' if s == 0 else None
+            )
+        
+        # Plot mean synthetic (dashed, prominent)
+        mean_data = mean_synthetic_denorm[i, :, 0]
+        if isinstance(mean_data, torch.Tensor):
+            mean_data = mean_data.numpy()
+        ax.plot(
+            hours, mean_data,
+            color='#e74c3c',
+            linewidth=2.5,
+            linestyle='--',
+            label='Mean Synthetic',
+            marker='s',
+            markersize=4,
+            alpha=0.9
+        )
+        
+        # Plot original (solid, on top)
+        orig_data = x_denorm[i, :, 0]
+        if isinstance(orig_data, torch.Tensor):
+            orig_data = orig_data.numpy()
+        ax.plot(
+            hours, orig_data,
+            color='black',
+            linewidth=2.5,
+            label='Original',
+            marker='o',
+            markersize=5,
+            alpha=1.0
+        )
+        
+        # Compute reconstruction error (RMSE between original and mean synthetic)
+        rmse = np.sqrt(np.mean((orig_data - mean_data) ** 2))
+        
+        ax.set_title(
+            f"{condition_labels[i]} | RMSE: {rmse:.3f} kWh",
+            fontsize=12,
+            fontweight='bold'
+        )
+        ax.set_xlabel("Hour", fontsize=10)
+        ax.set_ylabel("Energy Consumption (kWh)", fontsize=10)
+        ax.legend(loc='upper right', fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.set_xticks(hours[::2])
+        ax.set_xlim(0, L - 1)
+    
+    fig.suptitle(
+        f"Synthetic Recreation with Same Conditions ({num_synthetic_per} samples per original)",
+        fontsize=14,
+        fontweight='bold',
+        y=1.02
+    )
+    plt.tight_layout()
+    
+    save_path = os.path.join(output_dir, f"{model_tag}_synthetic_recreations.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved synthetic recreations to {save_path}")
+    
+    return {"synthetic_recreations": save_path}
+    
+
+
 def _visualize_user_dictionary(model, test_loader, device, output_dir, model_tag):
     """Plot the cached user profiles in the UserProfiler conditioner."""
     if not hasattr(model, 'conditioner'):
@@ -677,7 +867,7 @@ def _save_model_summary(
 
 if __name__ == "__main__":
     # Example usage
-    model_path = "models/CVAE_DictionaryCoder_20260205_150539_final.pt"
+    model_path = "models/CVAE_DictionaryCoder_20260205_203329_best.pt"
     load_model_and_visualize(
         model_path=model_path,
         output_dir="Output/Plots",

@@ -123,11 +123,11 @@ class DictionaryCoder(torch.nn.Module):
                  output_dim,
                  dictionary_size=100,
                  sigma_lim=0.1,
-                 marginal_std_lim=0.01,
+                 marginal_std_lim=0.05,
                  average_max_std=1.0,
                  num_hidden_layers=2,
                  num_neurons=64,
-                 dropout=True,
+                 dropout=False,
                  dropout_rate=0.2,
                  batch_norm=False,
                  **_):
@@ -170,6 +170,9 @@ class DictionaryCoder(torch.nn.Module):
         param_dict = self.parameterizer(inputs)
         param_dict["sigma"] = torch.nn.functional.relu(param_dict["sigma"]).clamp(self.sigma_lower_lim, self.sigma_upper_lim)
         # TODO: They clamp mu as well?? Check later
+
+        # TODO: this should be a more stable approach?:
+        # param_dict["sigma"] = F.softplus(param_dict["sigma"]).clamp(self.sigma_lower_lim, self.sigma_upper_lim)
         return param_dict
 
     def reparameterize(self, param_dict, num_samples=1, **_):
@@ -204,8 +207,17 @@ class DictionaryCoder(torch.nn.Module):
         """Compute log likelihood under multivariate Gaussian with PDCC covariance."""
         mu = param_dict["mu"]
         Sigma = self.create_covariance_matrix(param_dict)
+
+        # Stability?: jitter adds a small value to the diagonal to ensure positive definiteness, but it can also bias the likelihood. The marginal_std_lim should already ensure positive definiteness, so we can try without jitter first and only add it if we encounter issues.
+        # jitter = 1e-6 * torch.eye(Sigma.shape[-1], device=Sigma.device)
+        # Sigma = Sigma + jitter
+
         # Use PyTorch's MultivariateNormal distribution
         try:
+            # Stability? cholesky should be more stable than direct covariance matrix, but it can still fail if Sigma is not positive definite
+            #L = torch.cholesky(Sigma)
+            #dist = torch.distributions.MultivariateNormal(loc=mu, scale_tril=L)
+
             dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=Sigma)
             return dist.log_prob(inputs)
         except Exception as e:
@@ -282,6 +294,45 @@ class DictionaryCoder(torch.nn.Module):
     def get_marginal_sigmas(self,param_dict):
         return torch.sqrt(torch.diagonal(self.create_covariance_matrix(param_dict), dim1=-2, dim2=-1))
 
+class DictionaryLogNormalCoder(DictionaryCoder):
+    def reparameterize(self, param_dict, num_samples=1, **_):
+        # Sample from the underlying Gaussian
+        z_gaussian = super().reparameterize(param_dict, num_samples=num_samples, **_)
+        # Exponentiate to get log-normal samples
+        z = torch.exp(z_gaussian)
+        return z
+    
+    def loglikelihood(self, inputs, param_dict, **_):
+        """
+        Log-likelihood for log-normal distribution with dictionary-based covariance.
+        If log(X) ~ N(mu, Sigma), then:
+        log p(x) = log p_normal(log(x)) - sum(log(x_i))
+                 = -0.5 * (log(x) - mu)^T Sigma^-1 (log(x) - mu) 
+                   - 0.5 * log|Sigma| - d/2 * log(2*pi) - sum(log(x_i))
+        """
+        mu = param_dict["mu"]
+
+        # transform inputs to log space
+        x_safe = torch.clamp(inputs, min=self.eps)  # Avoid log(0)
+        log_x = torch.log(x_safe)
+
+        Sigma = self.create_covariance_matrix(param_dict)
+
+        try:
+            dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=Sigma)
+            log_prob_normal = dist.log_prob(log_x)
+        except Exception as e:
+            print(f"Warning: Covariance matrix issue in loglikelihood: {e}")
+            # Add the marginal std lim to diagonal for stability again
+            Sigma_stable = Sigma + torch.eye(self.output_dim, device=Sigma.device) * (self.marginal_std_lim ** 2)
+            dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=Sigma_stable)
+            log_prob_normal = dist.log_prob(log_x)
+
+        log_prob = log_prob_normal - torch.sum(log_x, dim=-1)  # Jacobian adjustment for log transform
+        return log_prob
+    
+
+
 
 # === This is the actual network structure ===
 class Parameterizer(nn.Module):
@@ -291,7 +342,7 @@ class Parameterizer(nn.Module):
                  dist_parameters,
                  num_hidden_layers=2,
                  num_neurons=64,
-                 dropout=True,
+                 dropout=False,
                  dropout_rate=0.2,
                  batch_norm=False,
                  **_):
@@ -305,7 +356,7 @@ class Parameterizer(nn.Module):
         if batch_norm:
             layers.append(nn.BatchNorm1d(num_neurons))
         if dropout:
-            layers.append(nn.Dropout(dropout_rate))
+            layers.append(nn.Dropout(dropout_rate * 0.5))  # Less dropout in the first layer
         
         for _ in range(num_hidden_layers):
             layers.append(nn.Linear(num_neurons, num_neurons))
@@ -313,7 +364,7 @@ class Parameterizer(nn.Module):
             if batch_norm:
                 layers.append(nn.BatchNorm1d(num_neurons))
             if dropout:
-                layers.append(nn.Dropout(dropout_rate))
+                layers.append(nn.Dropout(dropout_rate * 0.5))  # Less dropout in hidden layers
         
         self.shared_block = nn.Sequential(*layers)
         
@@ -363,6 +414,12 @@ def get_encoder_model(input_dim, latent_dim, type, **kwargs):
             output_dim=latent_dim,
             **kwargs
         )
+    elif type == "log_normal_dictionary":
+        return DictionaryLogNormalCoder(
+            input_dim=input_dim,
+            output_dim=latent_dim,
+            **kwargs
+        )
     else:
         return GaussianCoder(
             input_dim=input_dim,
@@ -373,6 +430,12 @@ def get_encoder_model(input_dim, latent_dim, type, **kwargs):
 def get_decoder_model(latent_dim, output_dim, type, **kwargs):
     if type == "dictionary":
         return DictionaryCoder(
+            input_dim=latent_dim,
+            output_dim=output_dim,
+            **kwargs
+        )
+    elif type == "log_normal_dictionary":
+        return DictionaryLogNormalCoder(
             input_dim=latent_dim,
             output_dim=output_dim,
             **kwargs

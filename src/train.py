@@ -63,16 +63,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
     seed = 42
     train_frac = 0.8
     val_frac = 0.1
-    normalizer = Normalizer(method='zero_preserved_log')
-    normalizer = None
-    # TODO: check without normalizer
-    # TODO: maybe go with a log normal decoder? should be better for energy data
-    #        Would I then have to change the prior? 
-    #        Or just keep prior as normal?
-    #        I don't think so, since prior is in latent space
-    #        Decoder would output log-normal params
-    #       Encoder would map to latent space as normal
-    #      Loss would be log-normal likelihood
+    normalizer = Normalizer(method='log1p')
 
     print("Initializing DataModule...")
     dm = SmartMeterDataModule(
@@ -90,7 +81,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
         train_frac=train_frac,
         val_frac=val_frac,
         max_meters=None, # None # tried smaller number for CVAE
-        normalizer=None, # normalizer # try without normalizer
+        normalizer=normalizer, # normalizer # try without normalizer
     )
     
     dm.setup()
@@ -138,7 +129,9 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
         log_dir = "./runs/VAE_training"
     else:
         print("Initializing CVAE model (condition = day-of-week + user-profile)...")
-        model = CVAE(input_dim=input_dim, latent_dim=10, conditioner=conditioner, coder_type="dictionary", prior_type="standard_dictionary")
+        model = CVAE(input_dim=input_dim, latent_dim=24, conditioner=conditioner, 
+                     encoder_type="dictionary",decoder_type='dictionary', 
+                     prior_type="standard_dictionary")
         log_dir = "./runs/CVAE_training"
 
 
@@ -154,7 +147,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
         gradient_clip_kwargs={"max_norm": 1.0},
         lr_scheduler=True,
         lr_scheduler_kwargs={"step_size": 10, "gamma": 0.9},
-        beta=1.0,
+        beta=0.75, # Going for more reconstruction quality, jsut to see how it looks. Can tune later. (TODO: make beta annealing, as we are observing posterior collapse initially)
         num_samples=1,
         epochs=20,
         validation_freq=1,

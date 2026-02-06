@@ -68,7 +68,7 @@ def run_validation(model_type: str = "cvae", use_test_data: bool = True, verbose
     seed = 42
     train_frac = 0.8
     val_frac = 0.1
-    normalizer = Normalizer(method='zero_preserved_log')
+    normalizer = Normalizer(method='log1p') # THIS SHOULD MATCH TRAINING NORMALIZER TODO
     
     if verbose: 
         print("Loading data...")
@@ -123,7 +123,8 @@ def run_validation(model_type: str = "cvae", use_test_data: bool = True, verbose
             input_dim=input_dim,
             latent_dim=10,
             conditioner=conditioner,
-            coder_type="dictionary",
+            encoder_type="dictionary",
+            decoder_type="dictionary",
             prior_type="standard_dictionary"
         )
     

@@ -20,6 +20,11 @@ class Normalizer:
         self.non_zero_std = None
         self.zero_id = -3
         self.shift = 1.0
+
+        # for log1p normalization, we can use standard mean/std but with log1p transform
+        self.mean = None
+        self.std = None
+        self.epsilon = 1e-8  # for numerical stability in standard normalization
     
     def _zero_preserved_log_transform(self, X: torch.Tensor) -> torch.Tensor:
         """Zero-preserved log normalization."""
@@ -56,6 +61,13 @@ class Normalizer:
         
         return Y  # Returns torch.Tensor, not numpy
     
+    def _log1p_transform(self, X: torch.Tensor) -> torch.Tensor:
+        """Log1p normalization."""
+        return (torch.log1p(X) - self.mean) / (self.std + self.epsilon)
+    def _log1p_inverse(self, X: torch.Tensor) -> torch.Tensor:
+        """Inverse of log1p normalization."""
+        return torch.clamp(torch.expm1(X * (self.std + self.epsilon) + self.mean),min=0.0)
+
     def fit(self, X):
         if isinstance(X, np.ndarray):
             X = torch.from_numpy(X)
@@ -69,6 +81,12 @@ class Normalizer:
         elif self.method == 'standard':
             self.mean = torch.mean(X, dim=0, keepdim=True)
             self.std = torch.std(X, dim=0, keepdim=True)
+            self.fitted = True
+        elif self.method == 'log1p':
+            log1p_values = torch.log1p(X)
+            self.mean = log1p_values.mean(dim=0, keepdim=True)
+            self.std = log1p_values.std(dim=0, keepdim=True)
+            self.std[self.std == 0] = 1.0 # Avoid division by zero
             self.fitted = True
         else:
             raise ValueError(f"Normalization method {self.method} not recognized.")
@@ -85,6 +103,8 @@ class Normalizer:
             return self._zero_preserved_log_transform(X)
         elif self.method == 'standard':
             return (X - self.mean) / self.std
+        elif self.method == 'log1p':
+            return self._log1p_transform(X)
         else:
             raise ValueError(f"Normalization method '{self.method}' not recognized.")
 
@@ -101,5 +121,7 @@ class Normalizer:
             return self._zero_preserved_log_inverse(X)
         elif self.method == 'standard':
             return X * self.std + self.mean
+        elif self.method == 'log1p':
+            return self._log1p_inverse(X)
         else:
             raise ValueError(f"Normalization method '{self.method}' not recognized.")
