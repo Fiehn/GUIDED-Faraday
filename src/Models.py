@@ -37,11 +37,79 @@ from src.priors import *
 # - Hyperparameter tuning utilities (for optimizers, architectures, etc.)
 # - Make sure the model works with variable length sequences (padding/masking)
 # - IMPORTANT: Streaming algorithm for user profiles (online LDA) and normalization (running mean/std) and for the training (online/streaming VAE training)
-# - Implement scheduler for beta (KL weight) during training (KL annealing)
 # - Implement different priors (sparse, mixture of Gaussians, VampPrior, etc.)
 # - Fix the conditioner to properly handle conditions
 # - Test loading of models and make sure it is possible and reliable
 # - Test different loss functions and double check the current implementation against the literature
+
+
+# ==============
+# Cyclical Beta Annealing Scheduler
+# Reference: "Cyclical Annealing Schedule: A Simple Approach to Mitigating KL Vanishing"
+#            (Fu et al., 2019) https://arxiv.org/abs/1903.10145
+# ==============
+class CyclicalBetaScheduler:
+    """Cyclical annealing schedule for the KL weight (beta) in VAE training.
+
+    Each cycle consists of a linear warmup from 0 to *beta_max* followed by a
+    constant phase at *beta_max*.  The proportion of each cycle spent warming
+    up is controlled by *ratio* (default 0.5 = half warmup, half constant).
+
+    Parameters
+    ----------
+    total_steps : int
+        Total number of training steps (epochs * batches_per_epoch).
+    n_cycles : int
+        Number of full annealing cycles over training (default 4).
+    ratio : float
+        Fraction of each cycle devoted to the linear warmup (0-1, default 0.5).
+    beta_max : float
+        Maximum beta value reached at the top of each cycle (default 1.0).
+    """
+
+    def __init__(self, total_steps: int, n_cycles: int = 4, ratio: float = 0.5, beta_max: float = 1.0):
+        assert total_steps > 0, "total_steps must be > 0"
+        assert n_cycles >= 1, "n_cycles must be >= 1"
+        assert 0.0 < ratio <= 1.0, "ratio must be in (0, 1]"
+        self.total_steps = total_steps
+        self.n_cycles = n_cycles
+        self.ratio = ratio
+        self.beta_max = beta_max
+        self._step = 0
+
+    def step(self) -> float:
+        """Advance one step and return the current beta value."""
+        beta = self._get_beta(self._step)
+        self._step += 1
+        return beta
+
+    def _get_beta(self, step: int) -> float:
+        """Compute beta for a given global step."""
+        # How far through training are we (0..1)
+        tau = step / self.total_steps
+        # Which cycle are we in, and where inside that cycle (0..1)
+        cycle_progress = (tau * self.n_cycles) % 1.0
+        if cycle_progress < self.ratio:
+            # Linear warmup phase
+            return self.beta_max * (cycle_progress / self.ratio)
+        else:
+            # Constant phase
+            return self.beta_max
+
+    def state_dict(self):
+        return {"step": self._step, "total_steps": self.total_steps,
+                "n_cycles": self.n_cycles, "ratio": self.ratio, "beta_max": self.beta_max}
+
+    @classmethod
+    def from_state_dict(cls, d):
+        obj = cls(d["total_steps"], d["n_cycles"], d["ratio"], d["beta_max"])
+        obj._step = d["step"]
+        return obj
+
+    def __repr__(self):
+        return (f"CyclicalBetaScheduler(total_steps={self.total_steps}, n_cycles={self.n_cycles}, "
+                f"ratio={self.ratio}, beta_max={self.beta_max}, current_step={self._step})")
+
 
 class EarlyStopping:
     def __init__(self, patience=10, min_delta=0.001, mode='min'):
@@ -210,7 +278,6 @@ class VAE(nn.Module):
         weights = 1.0 + weighted_loss * torch.abs(inputs).mean(dim=-1)
         recon_loglikelihood = (recon_loglikelihood * weights).mean() 
 
-        # TODO: beta annealing during training (currently fixed beta)
         loss = -(recon_loglikelihood - beta * kl_div)
 
         # TODO: MMD (mean maximum discrepancy) has been shown to be useful for smart meter data by one of the papers
@@ -390,6 +457,8 @@ class VAE(nn.Module):
             lr_scheduler = False,
             lr_scheduler_kwargs = {"step_size": 10, "gamma": 0.9},
             beta = 1.0,
+            beta_annealing = False,  # Enable cyclical beta annealing to avoid posterior collapse
+            beta_annealing_kwargs = {"n_cycles": 4, "ratio": 0.5},  # kwargs for CyclicalBetaScheduler
             num_samples = 1,
             epochs = 1000,
             validation_freq = 1,
@@ -435,6 +504,8 @@ class VAE(nn.Module):
                 'lr': lr,
                 'weight_decay': weight_decay,
                 'beta': beta,
+                'beta_annealing': beta_annealing,
+                'beta_annealing_kwargs': beta_annealing_kwargs if beta_annealing else None,
                 'epochs': epochs,
                 'batch_size': trainloader.batch_size,
                 'gradient_clip': gradient_clip,
@@ -475,6 +546,16 @@ class VAE(nn.Module):
         if early_stopping:
             earlystopping = EarlyStopping(**early_stopping_kwargs)
 
+        # === Beta Annealing Scheduler ===
+        if beta_annealing:
+            total_steps = epochs * len(trainloader)
+            beta_scheduler = CyclicalBetaScheduler(
+                total_steps=total_steps,
+                beta_max=beta,  # use the provided beta as the ceiling
+                **beta_annealing_kwargs,
+            )
+            print(f"Cyclical beta annealing enabled: {beta_scheduler}")
+
         # === Training Loop ===
         self.train()
         global_step = 0
@@ -488,11 +569,15 @@ class VAE(nn.Module):
 
             for batch in trainloader:
                 global_step += 1
+
+                # Get current beta (annealed or fixed)
+                current_beta = beta_scheduler.step() if beta_annealing else beta
+
                 batch = self.move_to_device(batch, device)
                 loss_dict = self.train_core(
                     batch, 
                     optim, 
-                    beta=beta, 
+                    beta=current_beta, 
                     gradient_clip=gradient_clip, 
                     gradient_clip_kwargs=gradient_clip_kwargs,
                     weighted_loss=weighted_loss
@@ -508,6 +593,7 @@ class VAE(nn.Module):
                 writer.add_scalar('Train/loss_step', loss_dict["loss"].item(), global_step)
                 writer.add_scalar('Train/recon_loglikelihood_step', loss_dict["recon_loglikelihood"].item(), global_step)
                 writer.add_scalar('Train/kl_divergence_step', loss_dict["kl_divergence"].item(), global_step)
+                writer.add_scalar('Train/beta', current_beta, global_step)
                 
                 # Log gradients and parameters periodically
                 if global_step % 100 == 0:

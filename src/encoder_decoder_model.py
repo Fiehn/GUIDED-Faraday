@@ -86,7 +86,7 @@ class GaussianCoder(torch.nn.Module):
                  sigma_fixed=1.0,
                  num_hidden_layers=2,
                  num_neurons = 64,
-                 dropout = True,
+                 dropout = False,
                  dropout_rate = 0.2,
                  batch_norm = False,
                  **_):
@@ -198,7 +198,7 @@ class DictionaryCoder(torch.nn.Module):
                  average_max_std=1.0,
                  num_hidden_layers=2,
                  num_neurons=64,
-                 dropout=True,
+                 dropout=False,
                  dropout_rate=0.2,
                  batch_norm=False,
                  **_):
@@ -412,7 +412,7 @@ class DictionaryStudentTCoder(DictionaryCoder):
     This means that if log(X) ~ t(mu, Sigma, df), then X follows a log-Student's t distribution with parameters mu, Sigma, and degrees of freedom df.
     The reparameterization and log-likelihood are adjusted accordingly.
     """
-    def __init__(self, *args, df=3.0, **kwargs):
+    def __init__(self, *args, df=10.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.register_buffer('df', torch.tensor(df, device=self.SigmaMapper.device))  # Degrees of freedom for the Student's t-distribution
 

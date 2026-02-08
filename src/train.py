@@ -130,7 +130,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
     else:
         print("Initializing CVAE model (condition = day-of-week + user-profile)...")
         model = CVAE(input_dim=input_dim, latent_dim=32, conditioner=conditioner, 
-                     encoder_type="dictionary",decoder_type='student_t_dictionary', 
+                     encoder_type="dictionary",decoder_type='dictionary', 
                      prior_type="standard_dictionary")
         log_dir = "./runs/CVAE_training"
 
@@ -147,7 +147,9 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
         gradient_clip_kwargs={"max_norm": 1.0},
         lr_scheduler=True,
         lr_scheduler_kwargs={"step_size": 10, "gamma": 0.9},
-        beta=0.75, # Going for more reconstruction quality, jsut to see how it looks. Can tune later. (TODO: make beta annealing, as we are observing posterior collapse initially)
+        beta=1.0, # beta_max when annealing is on; fixed beta otherwise
+        beta_annealing=True,  # cyclical annealing to avoid posterior collapse
+        beta_annealing_kwargs={"n_cycles": 4, "ratio": 0.5},
         num_samples=1,
         epochs=20,
         validation_freq=1,
