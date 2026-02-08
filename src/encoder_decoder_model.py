@@ -86,7 +86,7 @@ class GaussianCoder(torch.nn.Module):
                  sigma_fixed=1.0,
                  num_hidden_layers=2,
                  num_neurons = 64,
-                 dropout = False,
+                 dropout = True,
                  dropout_rate = 0.2,
                  batch_norm = False,
                  **_):
@@ -135,13 +135,24 @@ class GaussianCoder(torch.nn.Module):
 
     def kl_divergence(self, param_dict_q, prior=None, **_):
         """
-        Compute KL divergence KL(q||p) using log probabilities.
+        Compute KL divergence KL(q||p).
+
+        For priors that support analytical KL (diagonal Gaussians), uses the
+        closed-form expression.  For non-analytical priors (VampPrior), uses
+        single-sample Monte Carlo:  KL ≈ log q(z|x) - log p(z).
         
         Args:
             param_dict_q: Posterior parameters
             prior: BasePrior object (if None, uses standard normal)
         """
-        # KL(q||p) = 0.5 * sum(sigma_p^2/sigma_q^2 + (mu_q - mu_p)^2/sigma_q^2 - 1 + log(sigma_q^2/sigma_p^2)) TODO: Check back in later
+        # === Monte Carlo path (VampPrior, etc.) ===
+        if prior is not None and not getattr(prior, 'supports_analytical_kl', True):
+            z = self.reparameterize(param_dict_q, num_samples=1).squeeze(0)  # [B, D]
+            log_q = self.loglikelihood(z, param_dict_q)  # [B]
+            log_p = prior.log_prob(z)                     # [B]
+            return log_q - log_p
+
+        # === Analytical path (diagonal Gaussian priors) ===
         mu_q = param_dict_q["mu"]
         sigma_q = param_dict_q["sigma"]
         
@@ -150,7 +161,6 @@ class GaussianCoder(torch.nn.Module):
             mu_p = torch.zeros_like(mu_q)
             sigma_p = torch.ones_like(sigma_q)
         else:
-            # Get prior parameters
             prior_params = prior.get_params()
             batch_size = mu_q.shape[0]
             prior_params = {k: v.expand(batch_size, -1).to(mu_q.device) for k, v in prior_params.items()}
@@ -198,7 +208,7 @@ class DictionaryCoder(torch.nn.Module):
                  average_max_std=1.0,
                  num_hidden_layers=2,
                  num_neurons=64,
-                 dropout=False,
+                 dropout=True,
                  dropout_rate=0.2,
                  batch_norm=False,
                  **_):
@@ -301,18 +311,31 @@ class DictionaryCoder(torch.nn.Module):
     
     def kl_divergence(self, param_dict_q, prior=None, **_):
         """
-        Compute KL divergence KL(q||p) using the prior's log_prob method.
-        For multivariate Gaussians, we can use the analytical form or Monte Carlo.
+        Compute KL divergence KL(q||p).
+
+        For priors that support analytical KL (e.g. StandardDictionaryPrior),
+        uses the closed-form multivariate-Gaussian KL.
+
+        For priors that do NOT (e.g. VampPrior), falls back to single-sample
+        Monte Carlo:  KL ≈ E_q[log q(z|x) - log p(z)].
         
         Args:
-            param_dict_q: Posterior parameters
+            param_dict_q: Posterior parameters from the encoder
             prior: BasePrior object
         """
+        # --- Monte Carlo path (VampPrior and other non-analytical priors) ---
+        if prior is not None and not getattr(prior, 'supports_analytical_kl', True):
+            z = self.reparameterize(param_dict_q, num_samples=1).squeeze(0)  # [B, D]
+            log_q = self.loglikelihood(z, param_dict_q)  # [B]  — uses PDCC covariance
+            log_p = prior.log_prob(z)                     # [B]
+            return log_q - log_p
+
+        # --- Analytical path (Gaussian priors) ---
         mu_q = param_dict_q["mu"]
         Sigma_q = self.create_covariance_matrix(param_dict_q)
-        # TODO: Check back in here, the prior assumption is a bit odd
+
         if prior is None:
-            # Default to standard normal in dictionary space
+            # Default to standard normal in output space
             mu_p = torch.zeros_like(mu_q)
             Sigma_p = torch.eye(self.output_dim, device=mu_q.device).unsqueeze(0).expand(mu_q.shape[0], -1, -1)
         else:
@@ -330,22 +353,12 @@ class DictionaryCoder(torch.nn.Module):
             return torch.distributions.kl.kl_divergence(dist_q, dist_p)
         except Exception as e:
             print(f"Warning: Analytical KL failed, using Monte Carlo: {e}")
-            # Monte Carlo estimation: KL ≈ log q(z) - log p(z)
             z = self.reparameterize(param_dict_q, num_samples=1).squeeze(0)  # [B, D]
-            
-            # log q(z|x)
-            dist_q = torch.distributions.MultivariateNormal(
-                loc=mu_q, 
-                covariance_matrix=Sigma_q + torch.eye(self.output_dim, device=Sigma_q.device) * (self.marginal_std_lim ** 2)
-            )
-            log_q = dist_q.log_prob(z)
-            
-            # log p(z) - use prior's log_prob method
+            log_q = self.loglikelihood(z, param_dict_q)
             if prior is None:
                 log_p = -0.5 * torch.sum(z ** 2 + torch.log(torch.tensor(2 * torch.pi)), dim=-1)
             else:
                 log_p = prior.log_prob(z)
-            
             return log_q - log_p
 
 

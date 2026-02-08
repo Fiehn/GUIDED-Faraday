@@ -125,13 +125,13 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
     # use chosen model
     if model_type == "vae":
         print("Initializing VAE model...")
-        model = VAE(input_dim=input_dim)
+        model = VAE(input_dim=input_dim, latent_dim=32, device=device)
         log_dir = "./runs/VAE_training"
     else:
         print("Initializing CVAE model (condition = day-of-week + user-profile)...")
         model = CVAE(input_dim=input_dim, latent_dim=32, conditioner=conditioner, 
                      encoder_type="dictionary",decoder_type='dictionary', 
-                     prior_type="standard_dictionary")
+                     prior_type="vampprior", device=device)
         log_dir = "./runs/CVAE_training"
 
 
@@ -159,7 +159,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
         early_stopping_kwargs={"patience": 3, "min_delta": 0.001},
         save_epoch_freq=10,
         log_dir=log_dir,
-        weighted_loss=1.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
+        weighted_loss=15.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
     )
 
     print("Training complete. Model saved as ", model_tag)

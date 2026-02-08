@@ -39,49 +39,39 @@ def load_model_and_visualize(
     
     os.makedirs(output_dir, exist_ok=True)
 
-    checkpoint = torch.load(model_path, map_location=device)
-
-    model_kwargs = checkpoint.get("model_kwargs", {})
-    model_tag = checkpoint.get("model_tag", "loaded_model")
-
-    state_dict = checkpoint['model_state_dict']
-
-    # === Infer dimensions from state_dict ===
-    # Decoder output dimension
-    if 'decoder.SigmaMapper' in state_dict:
-        input_dim = state_dict['decoder.SigmaMapper'].shape[0]
-    elif 'decoder.parameterizer.param_heads.mu.3.bias' in state_dict:
-        input_dim = state_dict['decoder.parameterizer.param_heads.mu.3.bias'].shape[0]
-    else:
-        raise ValueError("Cannot infer input_dim from state_dict")
+    print(f"Loading model from: {model_path}")
     
-    # Encoder and decoder input dimensions
-    encoder_input_dim = state_dict['encoder.input_dim'].shape[1] if 'encoder.input_dim' in state_dict else 24
-    decoder_input_dim = state_dict['decoder.output_dim'].shape[1] if 'decoder.output_dim' in state_dict else 24
+    # Use the new unified loading method
+    try:
+        from src.Models import VAE, CVAE
+        
+        # The load_from_checkpoint method automatically handles both new and legacy formats
+        model = VAE.load_from_checkpoint(model_path, device)
+        
+        # Get model tag from checkpoint
+        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+        model_tag = checkpoint.get('model_kwargs', {}).get('model_tag', 'loaded_model')
+        is_cvae = isinstance(model, CVAE)
+        
+        print(f"Successfully loaded {model.__class__.__name__}")
+        print(f"  - Input dim: {model.input_dim}")
+        if hasattr(model, 'condition_dim'):
+            print(f"  - Condition dim: {model.condition_dim}")
+            print(f"  - Conditioner tags: {model.conditioner.get_condition_tags()}")
     
-    # Latent dimension (from model_kwargs or infer)
-    latent_dim = model_kwargs.get('latent_dim', 32)
-    
-    # Detect CVAE: decoder_input_dim = latent_dim + condition_dim
-    # For VAE: decoder_input_dim = latent_dim
-    is_cvae = (decoder_input_dim > latent_dim)
+    except Exception as e:
+        print(f"Error with unified loader: {e}")
+        print("Attempting legacy inference-based loading...")
+        return _load_model_legacy(model_path, data_config, output_dir, device,
+                                num_reconstructions, num_synthetic_samples, num_samples_per_original)
 
-    if is_cvae:
-        condition_dim = decoder_input_dim - latent_dim
-        # Verify with encoder: encoder_input_dim should = input_dim + condition_dim
-        expected_encoder_input = input_dim + condition_dim
-        if encoder_input_dim != expected_encoder_input:
-            print(f"Warning: encoder_input_dim ({encoder_input_dim}) != "
-                  f"input_dim + condition_dim ({expected_encoder_input})")
-    else:
-        condition_dim = 0
-    
-    print(f"Inferred dimensions:")
-    print(f"  - input_dim: {input_dim}")
-    print(f"  - latent_dim: {latent_dim}")
-    print(f"  - condition_dim: {condition_dim}")
-    print(f"  - is_cvae: {is_cvae}")
+    print(f"Successfully loaded {model.__class__.__name__}")
+    print(f"  - Input dim: {model.input_dim}")
+    if hasattr(model, 'condition_dim'):
+        print(f"  - Condition dim: {model.condition_dim}")
+        print(f"  - Conditioner tags: {model.conditioner.get_condition_tags()}")
 
+    # Setup data if not provided
     if data_config is None:
         data_config = {
             "data_dir": "data/",
@@ -97,84 +87,15 @@ def load_model_and_visualize(
             "train_frac": 0.8,
             "val_frac": 0.1,
         }
-        #normalizer = Normalizer(method='zero_preserved_log') # THIS SHOULD MATCH TRAINING NORMALIZER TODO
-        normalizer = Normalizer(method='log1p') # THIS SHOULD MATCH TRAINING NORMALIZER TODO
-        # load data
-        dm = SmartMeterDataModule(
-            normalizer=normalizer,
-            **data_config
-        )
+        
+        normalizer = Normalizer(method='log1p')  # TODO: This should match training normalizer
+        dm = SmartMeterDataModule(normalizer=normalizer, **data_config)
         dm.setup()
         test_loader = dm.test_dataloader()
 
-        if is_cvae:
-            print("\nCreating CVAE model...")
-        
-            # Recreate conditioner (must match training!)
-            conditioner = Conditioner()
-            conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
-            conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=False))
-            condition_dim = conditioner.get_condition_dim()
-            
-            # For CVAE: encoder_input_dim = input_dim + condition_dim
-            # So: input_dim = encoder_input_dim - condition_dim
-            input_dim = encoder_input_dim - condition_dim
-            
-            print(f"  - input_dim: {input_dim}")
-            print(f"  - condition_dim: {condition_dim}")
-            print(f"  - encoder sees: {input_dim} + {condition_dim} = {encoder_input_dim}")
-            
-            # Extract model creation kwargs
-            encoder_type = model_kwargs.get('encoder_type', 'dictionary')
-            decoder_type = model_kwargs.get('decoder_type', 'dictionary')
-            prior_type = model_kwargs.get('prior_type', 'standard_dictionary')
-            dictionary_size = model_kwargs.get('dictionary_size', 100)
-            
-            model = CVAE(
-                input_dim=input_dim,
-                latent_dim=latent_dim,
-                conditioner=conditioner,
-                encoder_type=encoder_type,
-                decoder_type=decoder_type,
-                prior_type=prior_type,
-                dictionary_size=dictionary_size,
-                # Pass other kwargs but exclude specific ones
-                **{k: v for k, v in model_kwargs.items() 
-                if k not in ['self', '__class__', 'input_dim', 'latent_dim', 
-                            'conditioner', 'condition_dim', 'encoder_type','decoder_type', 'prior_type']}
-            )
-        else:
-            print("\nCreating VAE model...")
-        
-            # For VAE: encoder_input_dim = input_dim (no conditions)
-            input_dim = encoder_input_dim
-            
-            print(f"  - input_dim: {input_dim}")
-            
-            encoder_type = model_kwargs.get('encoder_type', 'gaussian')
-            decoder_type = model_kwargs.get('decoder_type', 'gaussian')
-            prior_type = model_kwargs.get('prior_type', 'standard_gaussian')
-            dictionary_size = model_kwargs.get('dictionary_size', 100)
-            
-            model = VAE(
-                input_dim=input_dim,
-                latent_dim=latent_dim,
-                encoder_type=encoder_type,
-                decoder_type=decoder_type,
-                prior_type=prior_type,
-                dictionary_size=dictionary_size,
-                **{k: v for k, v in model_kwargs.items() 
-                if k not in ['self', '__class__', 'input_dim', 'latent_dim', 
-                            'encoder_type','decoder_type' 'prior_type']}
-            )
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.prior = checkpoint.get('prior', model.prior)
-    model.to(device)
-    model.prior.to(device)
-    model.eval()
-
     print(f"Model loaded: {model.__class__.__name__} with tag '{model_tag}'")
     
+    # Generate all visualizations
     viz_path = {}
 
     recon_path = _visualize_reconstructions(
@@ -189,6 +110,7 @@ def load_model_and_visualize(
         is_cvae=is_cvae,
     )
     viz_path['reconstructions'] = recon_path
+    
     synth_path = _visualize_synthetic_samples(
         model=model,
         normalizer=normalizer,
@@ -199,6 +121,7 @@ def load_model_and_visualize(
         is_cvae=is_cvae,
     )
     viz_path['synthetic_samples'] = synth_path
+    
     if hasattr(model, 'get_SigmaMapper'):
         sigma_mapper_path = _visualize_sigma_mapper(
             model=model,
@@ -217,6 +140,277 @@ def load_model_and_visualize(
         model_tag=model_tag,
     )
     viz_path.update(latent_space_path)
+
+    user_dict_path = _visualize_user_dictionary(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        output_dir=output_dir,
+        model_tag=model_tag,
+    )
+    viz_path.update(user_dict_path)
+    
+    synth_recreation_path = _visualize_synthetic_recreations(
+        model=model,
+        test_loader=test_loader,
+        normalizer=normalizer,
+        device=device,
+        output_dir=output_dir,
+        model_tag=model_tag,
+    )
+    viz_path.update(synth_recreation_path)
+    
+    summary_path = _save_model_summary(
+        model=model,
+        model_kwargs=checkpoint.get('model_kwargs', {}),
+        output_dir=output_dir,
+        model_tag=model_tag,
+    )
+    viz_path['model_summary'] = summary_path
+
+    print("All visualizations saved.")
+    print(viz_path)
+    return viz_path
+
+
+def _load_model_legacy(model_path, data_config, output_dir, device, num_reconstructions, num_synthetic_samples, num_samples_per_original):
+    """
+    Legacy model loading for old checkpoint format.
+    Uses parameter inference from state_dict (fragile but needed for backward compatibility).
+    """
+    print("⚠ Using legacy parameter inference - recommend re-saving models with new format")
+    
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    model_kwargs = checkpoint.get("model_kwargs", {})
+    model_tag = checkpoint.get("model_tag", "loaded_model")
+    state_dict = checkpoint['model_state_dict']
+
+    # === Improved dimension inference ===
+    # Look at encoder input to determine if it's CVAE
+    encoder_weight_key = 'encoder.parameterizer.shared_block.input_layer.0.weight'
+    decoder_weight_key = 'decoder.parameterizer.shared_block.input_layer.0.weight'
+    
+    if encoder_weight_key in state_dict:
+        encoder_input_dim = state_dict[encoder_weight_key].shape[1]  # Should be input_dim + condition_dim for CVAE
+    else:
+        encoder_input_dim = 24  # fallback
+    
+    if decoder_weight_key in state_dict:
+        decoder_input_dim = state_dict[decoder_weight_key].shape[1]  # Should be latent_dim + condition_dim for CVAE
+    else:
+        decoder_input_dim = 32  # fallback
+    
+    # Decoder output dimension
+    if 'decoder.SigmaMapper' in state_dict:
+        input_dim = state_dict['decoder.SigmaMapper'].shape[0]
+    elif 'decoder.parameterizer.param_heads.mu.3.bias' in state_dict:
+        input_dim = state_dict['decoder.parameterizer.param_heads.mu.3.bias'].shape[0]
+    else:
+        input_dim = 24  # fallback
+    
+    # Latent dimension (from model_kwargs or infer)
+    latent_dim = model_kwargs.get('latent_dim', 32)
+    
+    # Better CVAE detection: encoder_input_dim > input_dim indicates conditioning
+    is_cvae = encoder_input_dim > input_dim
+    
+    # Detect prior type from state_dict
+    prior_type = "standard_dictionary"  # default
+    if 'prior.pseudo_inputs' in state_dict:
+        prior_type = "vampprior"  # Note: use "vampprior" not "vamp" 
+        print("Detected VampPrior from state_dict")
+    elif 'prior.dict_size' in state_dict or any('prior.dict' in key for key in state_dict.keys()):
+        prior_type = "standard_dictionary"
+    elif 'prior.mu' in state_dict and 'prior.sigma' in state_dict:
+        prior_type = "standard_gaussian"
+
+    if is_cvae:
+        condition_dim = encoder_input_dim - input_dim
+        print(f"Detected CVAE:")
+        print(f"  - Encoder input: {encoder_input_dim} = {input_dim}(input) + {condition_dim}(condition)")
+        print(f"  - Decoder input: {decoder_input_dim} = {latent_dim}(latent) + {condition_dim}(condition)")
+        print(f"  - Prior type: {prior_type}")
+        
+        # Recreate conditioner (must match training!)
+        from src.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
+        conditioner = Conditioner()
+        conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
+        conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=False))
+        
+        distribution_dict = {
+            "latent_dim": latent_dim,
+            "dictionary_size": model_kwargs.get("dictionary_size", 100),
+            "vamp_num_components": model_kwargs.get("vamp_num_components", 20),
+        }
+        
+        model = CVAE(
+            input_dim=input_dim,
+            conditioner=conditioner,
+            latent_dim=latent_dim,
+            distribution_dict=distribution_dict,
+            encoder_type="dictionary",
+            decoder_type="dictionary",
+            prior_type=prior_type,
+            device=device,
+        )
+    else:
+        condition_dim = 0
+        print(f"Detected VAE:")
+        print(f"  - Input dim: {input_dim}")
+        print(f"  - Latent dim: {latent_dim}")
+        print(f"  - Prior type: {prior_type}")
+        
+        distribution_dict = {
+            "latent_dim": latent_dim,
+            "dictionary_size": model_kwargs.get("dictionary_size", 100),
+            "vamp_num_components": model_kwargs.get("vamp_num_components", 20),
+        }
+        
+        model = VAE(
+            input_dim=input_dim,
+            distribution_dict=distribution_dict,
+            encoder_type="dictionary",
+            decoder_type="dictionary", 
+            prior_type=prior_type,
+            device=device,
+        )
+    
+    print(f"Final dimensions:")
+    print(f"  - input_dim: {input_dim}")
+    print(f"  - latent_dim: {latent_dim}")
+    print(f"  - condition_dim: {condition_dim}")
+    print(f"  - is_cvae: {is_cvae}")
+
+    # Load model state and prior from checkpoint
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print("Successfully loaded model state_dict")
+    except Exception as e:
+        print(f"Error loading model state_dict: {e}")
+        print("Attempting to load prior separately...")
+        
+        # Try to load prior separately if it exists in checkpoint
+        prior_state = checkpoint.get('prior_state')
+        if prior_state:
+            try:
+                model.prior.load_state_dict(prior_state['state_dict'])
+                print("Successfully loaded prior from prior_state")
+            except Exception as pe:
+                print(f"Error loading prior: {pe}")
+        
+        # Load the rest of the model without the prior
+        try:
+            model_state_without_prior = {k: v for k, v in checkpoint['model_state_dict'].items() if not k.startswith('prior.')}
+            model.load_state_dict(model_state_without_prior, strict=False)
+            print("Successfully loaded model state_dict (excluding prior)")
+        except Exception as e2:
+            print(f"Error loading model without prior: {e2}")
+            raise
+    
+    model.to(device)
+    model.prior.to(device) 
+    model.eval()
+
+    # Setup data if needed
+    if data_config is None:
+        data_config = {
+            "data_dir": "data/",
+            "filename": "hourly_measurements_2023_10.csv",
+            "meter_col": "meter_number",
+            "timestamp_dst_col": "timestamp_dst",
+            "timestamp_utc_col": "timestamp_utc",
+            "feature_cols": ("hourly_energy_consumption",),
+            "window": WindowSpec(input_len=24, stride=24),
+            "batch_size": 256,
+            "num_workers": 0,
+            "seed": 42,
+            "train_frac": 0.8,
+            "val_frac": 0.1,
+        }
+        
+        normalizer = Normalizer(method='log1p')  # TODO: Should match training normalizer
+        dm = SmartMeterDataModule(normalizer=normalizer, **data_config)
+        dm.setup()
+        test_loader = dm.test_dataloader()
+
+    is_cvae = isinstance(model, CVAE)
+    
+    # Generate all visualizations
+    viz_path = {}
+
+    recon_path = _visualize_reconstructions(
+        model=model,
+        test_loader=test_loader,
+        normalizer=normalizer,
+        device=device,
+        num_samples=num_reconstructions,
+        num_recon_per=num_samples_per_original,
+        output_dir=output_dir,
+        model_tag=model_tag,
+        is_cvae=is_cvae,
+    )
+    viz_path['reconstructions'] = recon_path
+    
+    synth_path = _visualize_synthetic_samples(
+        model=model,
+        normalizer=normalizer,
+        device=device,
+        num_samples=num_synthetic_samples,
+        output_dir=output_dir,
+        model_tag=model_tag,
+        is_cvae=is_cvae,
+    )
+    viz_path['synthetic_samples'] = synth_path
+    
+    if hasattr(model, 'get_SigmaMapper'):
+        sigma_mapper_path = _visualize_sigma_mapper(
+            model=model,
+            test_loader=test_loader,
+            device=device,
+            output_dir=output_dir,
+            model_tag=model_tag,
+        )
+        viz_path.update(sigma_mapper_path)
+    
+    latent_space_path = _visualize_latent_space(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        output_dir=output_dir,
+        model_tag=model_tag,
+    )
+    viz_path.update(latent_space_path)
+
+    user_dict_path = _visualize_user_dictionary(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        output_dir=output_dir,
+        model_tag=model_tag,
+    )
+    viz_path.update(user_dict_path)
+    
+    synth_recreation_path = _visualize_synthetic_recreations(
+        model=model,
+        test_loader=test_loader,
+        normalizer=normalizer,
+        device=device,
+        output_dir=output_dir,
+        model_tag=model_tag,
+    )
+    viz_path.update(synth_recreation_path)
+    
+    summary_path = _save_model_summary(
+        model=model,
+        model_kwargs=model_kwargs,
+        output_dir=output_dir,
+        model_tag=model_tag,
+    )
+    viz_path['model_summary'] = summary_path
+
+    print("Legacy model loaded and visualizations saved.")
+    print(viz_path)
+    return viz_path
 
     user_dict_path = _visualize_user_dictionary(
         model=model,
@@ -363,7 +557,8 @@ def _visualize_reconstructions(
         x_original = x  # This is normalized
         x_flat = x.reshape(x.shape[0], -1)
         if is_cvae:
-            recon_params, _ = model.reconstruct(x_flat,meter_ids=meter_id, timestamps=timestamps, num_samples=num_samples)
+            # Get reconstruction parameters (no extra sampling dimension)
+            recon_params, _ = model.reconstruct(x_flat,meter_ids=meter_id, timestamps=timestamps, num_samples=1)
             day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
             condition_labels = []
             for ts in timestamps.cpu():
@@ -372,12 +567,25 @@ def _visualize_reconstructions(
                 date_str = dt.strftime("%Y-%m-%d")
                 condition_labels.append(f"{day_name} ({date_str})")
         else:
-            recon_params, _ = model.forward(x_flat, num_samples=num_samples)
+            recon_params, _ = model.forward(x_flat, num_samples=1)
             condition_labels = None
-        recon_mu = recon_params["mu"]  # [S, B, D]
-        S, B, D = recon_mu.shape
+        
+        # Remove the samples dimension from recon_params (they have shape [1, B, D])
+        # and then sample multiple times from the decoder distribution
+        recon_params_single = {}
+        for key, value in recon_params.items():
+            if value.dim() == 3 and value.shape[0] == 1:
+                recon_params_single[key] = value.squeeze(0)  # [B, D]
+            else:
+                recon_params_single[key] = value
+        
+        # Now sample from decoder distribution multiple times
+        recon_samples = model.decoder.sample(recon_params_single, num_samples=num_recon_per)  # [num_recon_per, B, D]
+        
+        S, B, D = recon_samples.shape
         L, F = x_original.shape[1], x_original.shape[2]
-        recon_reshaped = recon_mu.reshape(S, B, L, F)  # [num_samples, batch, length, features]
+        recon_reshaped = recon_samples.reshape(S, B, L, F)  # [num_recon_per, batch, length, features]
+        
         if normalizer is not None:
             x_original_denorm = normalizer.inverse_transform(x_original.cpu())
             recon_denorm = normalizer.inverse_transform(recon_reshaped.cpu())
@@ -401,11 +609,11 @@ def _visualize_reconstructions(
             linewidth=2,
             markersize=4
         )
-        # reconstructions
-        for s in range(num_samples):
+        # reconstructed samples from decoder distribution
+        for s in range(num_recon_per):
             axes[i].plot(
                 recon_denorm[s, i, :, 0].numpy() if isinstance(recon_denorm, torch.Tensor) else recon_denorm[s, i, :, 0],
-                label=f"Recon {s+1}",
+                label=f"Recon Sample {s+1}",
                 marker="s",
                 color=recon_colors[s % len(recon_colors)],
                 alpha=0.6,
@@ -421,7 +629,7 @@ def _visualize_reconstructions(
         axes[i].set_ylabel("Energy (kWh)")
         axes[i].legend(loc="upper right")
         axes[i].grid(True, alpha=0.3)
-    fig_title = f"{'CVAE' if is_cvae else 'VAE'} Reconstruction ({num_samples} samples per original)"
+    fig_title = f"{'CVAE' if is_cvae else 'VAE'} Reconstruction ({num_recon_per} decoder samples per original)"
     if is_cvae:
         fig_title += " - Conditioned on Day of Week"
     fig.suptitle(fig_title, fontsize=14, fontweight='bold', y=1.02)
@@ -839,6 +1047,12 @@ def _save_model_summary(
         model_tag: str,
     ) -> str:
     import json
+    if model_kwargs is None:
+        model_kwargs = {}
+        for attr in dir(model):
+            if not attr.startswith('_') and not callable(getattr(model, attr)):
+                model_kwargs[attr] = getattr(model, attr)
+    hyperparameters = {k: v for k, v in model_kwargs.items() if isinstance(v, (int, float, str, bool))}
 
     summary = {
         "model_tag": model_tag,
@@ -856,7 +1070,7 @@ def _save_model_summary(
             "total_params": sum(p.numel() for p in model.parameters()),
             "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
         },
-        "hyperparameters": {k: v for k, v in model_kwargs.items() if not k.startswith('_')},
+        "hyperparameters": hyperparameters,
     }
     summary_path = os.path.join(output_dir, f"{model_tag}_model_summary.json")
     with open(summary_path, 'w') as f:
@@ -867,7 +1081,7 @@ def _save_model_summary(
 
 if __name__ == "__main__":
     # Example usage
-    model_path = "models/CVAE_DictionaryStudentTCoder_20260206_123443_epoch_10.pt"
+    model_path = "models/CVAE_DictionaryCoder_20260208_170554_best.pt"
     load_model_and_visualize(
         model_path=model_path,
         output_dir="Output/Plots",

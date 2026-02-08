@@ -165,6 +165,7 @@ class VAE(nn.Module):
                  encoder_type = "dictionary",
                  decoder_type = "dictionary",
                  prior_type = None,
+                 device="cpu",
                  **_):
         super(VAE, self).__init__()
 
@@ -183,17 +184,31 @@ class VAE(nn.Module):
 
         # === VAE Components ===
         self.input_dim = input_dim
+        self.encoder_type = encoder_type
+        self.decoder_type = decoder_type 
+        self.prior_type = prior_type
+        
         latent_dim = distribution_dict.get("latent_dim", 32)
+        self.latent_dim = latent_dim
 
-        # Prior
+        # 1. Create encoder and decoder first (they don't need the prior at construction time)
+        self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim, type=encoder_type)
+        self.decoder = get_decoder_model(latent_dim=latent_dim, output_dim=input_dim, type=decoder_type)
+
+        # 2. Create prior AFTER encoder (VampPrior needs a reference to the encoder)
         if prior_type is None:
             prior_type = "standard_dictionary" if encoder_type == "dictionary" else "standard_gaussian"
+            self.prior_type = prior_type
         
-        self.prior = get_prior(prior_type=prior_type, latent_dim=latent_dim, device="cpu", dictionary_size=distribution_dict.get("dictionary_size", 100))
-
-        # Define encoder and decoder networks - don't pass model_kwargs to avoid circular references
-        self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim, type=encoder_type, prior=self.prior)
-        self.decoder = get_decoder_model(latent_dim=latent_dim, output_dim=input_dim, type=decoder_type, prior=self.prior)
+        self.prior = get_prior(
+            prior_type=prior_type,
+            latent_dim=latent_dim,
+            device=self.device,
+            dictionary_size=distribution_dict.get("dictionary_size", 100),
+            input_shape=input_dim,
+            encoder=self.encoder,
+            num_components=distribution_dict.get("vamp_num_components", 20),
+        )
 
         # Calculate and store the number of parameters
         self.num_parameters = self.encoder._num_parameters() + self.decoder._num_parameters()
@@ -381,71 +396,368 @@ class VAE(nn.Module):
             }
         return batch
 
-    def save_model(self, save_path=None, model_name="trained_model",device="cpu"):
+    def save_model(self, save_path=None, model_name="trained_model", device="cpu"):
         """
-        Save model with dynamic prior serialization.
-        Works with any prior type without modification.
+        Save model with complete reconstruction information.
+        Stores all parameters needed to recreate the model from scratch.
         """
-        if save_path is None: save_path = "./models/" # TODO: Should be determined by config file
+        if save_path is None: 
+            save_path = "./models/"
         model_path = os.path.join(save_path, f"{model_name}.pt")
-        self.eval() # Set model to evaluation mode
-        self.to("cpu") # Move model to CPU for saving
+        self.eval()
+        self.to("cpu")
         self.prior.to("cpu")
 
-        # Serialize prior
+        # === Core Model Information ===
+        model_info = {
+            'model_class': self.__class__.__name__,
+            'model_module': self.__class__.__module__,
+            'input_dim': self.input_dim,
+        }
+
+        # === Constructor Arguments for VAE ===
+        constructor_args = {
+            'input_dim': self.input_dim,
+            'encoder_type': getattr(self, 'encoder_type', 'dictionary'),
+            'decoder_type': getattr(self, 'decoder_type', 'dictionary'), 
+            'prior_type': getattr(self, 'prior_type', type(self.prior).__name__.lower().replace('prior', '')),
+            'device': str(self.device),
+        }
+
+        # === Distribution Dictionary ===
+        distribution_dict = {
+            'latent_dim': getattr(self, 'latent_dim', getattr(self.encoder, 'latent_dim', 32)),
+        }
+        
+        # Extract distribution parameters from model attributes and model_kwargs
+        for key in ['dictionary_size', 'vamp_num_components', 'num_topics', 'sigma_min', 'sigma_max']:
+            if hasattr(self, key):
+                distribution_dict[key] = getattr(self, key)
+            elif key in self.model_kwargs:
+                distribution_dict[key] = self.model_kwargs[key]
+
+        # Add latent_dim to distribution_dict
+        constructor_args['distribution_dict'] = distribution_dict
+
+        # === CVAE Specific Information ===
+        if isinstance(self, CVAE):
+            model_info['condition_dim'] = self.condition_dim
+            constructor_args['latent_dim'] = self.latent_dim
+            
+            # Save conditioner information
+            conditioner_state = {
+                'condition_items': {},
+                'condition_tags': self.conditioner.get_condition_tags(),
+                'condition_dim': self.conditioner.get_condition_dim(),
+            }
+            
+            # Save each condition item
+            for tag, condition_item in self.conditioner.condition_items.items():
+                item_state = {
+                    'class_name': condition_item.__class__.__name__,
+                    'module': condition_item.__class__.__module__,
+                    'state_dict': condition_item.state_dict() if hasattr(condition_item, 'state_dict') else {},
+                }
+                
+                # Save constructor arguments for condition items - use specific logic per class
+                item_args = {}
+                class_name = condition_item.__class__.__name__
+                
+                if class_name == 'DayOfWeekConditioner':
+                    # DayOfWeekConditioner takes no constructor arguments except self
+                    pass
+                elif class_name == 'UserProfiler':
+                    # UserProfiler constructor args
+                    for attr in ['num_clusters', 'path', 'verbose']:
+                        if hasattr(condition_item, attr):
+                            item_args[attr] = getattr(condition_item, attr)
+                else:
+                    # Generic fallback for unknown condition types - be more selective
+                    for attr_name in ['num_clusters', 'path', 'verbose', 'input_dim', 'output_dim']:
+                        if hasattr(condition_item, attr_name):
+                            try:
+                                attr = getattr(condition_item, attr_name)
+                                if isinstance(attr, (int, float, str, bool)):
+                                    item_args[attr_name] = attr
+                            except:
+                                pass
+                
+                item_state['constructor_args'] = item_args
+                conditioner_state['condition_items'][tag] = item_state
+                
+            model_info['conditioner_state'] = conditioner_state
+
+        # === Prior Serialization ===
         prior_state = {
             'prior_type': self.prior.__class__.__name__,
             'module': self.prior.__class__.__module__,
             'state_dict': self.prior.state_dict(),
             'init_args': {},
         }
-        # dynamically extract init args (latent_dim, dict_size, etc.)
-        for attr_name in dir(self.prior):
-            if not attr_name.startswith('_') and not callable(getattr(self.prior, attr_name)):
-                attr = getattr(self.prior, attr_name)
-                try:
-                    if isinstance(attr,(int,float,str,bool,list,tuple,dict)):
-                        prior_state['init_args'][attr_name] = attr
-                    elif isinstance(attr, torch.dtype):
-                        prior_state['init_args'][attr_name] = str(attr)
-                except:
-                    pass            
+        
+        # Extract prior initialization arguments - use specific logic per class
+        prior_class_name = self.prior.__class__.__name__
+        
+        if prior_class_name == 'VampPrior':
+            # VampPrior constructor: (latent_dim, input_shape, encoder=None, num_components=20, device='cpu')
+            prior_state['init_args'] = {
+                'latent_dim': getattr(self.prior, 'latent_dim', self.latent_dim),
+                'input_shape': getattr(self.prior, 'input_shape', self.input_dim + getattr(self, 'condition_dim', 0)),
+                'num_components': getattr(self.prior, 'num_components', 20),
+            }
+        elif prior_class_name in ['StandardGaussianPrior', 'LearnableGaussianPrior']:
+            # Gaussian priors: (latent_dim, device)
+            prior_state['init_args'] = {
+                'latent_dim': getattr(self.prior, 'latent_dim', self.latent_dim),
+            }
+        elif prior_class_name in ['StandardDictionaryPrior', 'LearnableDictionaryPrior']:
+            # Dictionary priors: (latent_dim, dictionary_size, device)
+            prior_state['init_args'] = {
+                'latent_dim': getattr(self.prior, 'latent_dim', self.latent_dim),
+                'dictionary_size': getattr(self.prior, 'dictionary_size', 100),
+            }
+        else:
+            # Generic fallback for unknown prior types
+            for attr_name in ['latent_dim', 'dictionary_size', 'input_shape', 'num_components']:
+                if hasattr(self.prior, attr_name):
+                    try:
+                        attr = getattr(self.prior, attr_name)
+                        if isinstance(attr, (int, float, str, bool)):
+                            prior_state['init_args'][attr_name] = attr
+                        elif isinstance(attr, torch.dtype):
+                            prior_state['init_args'][attr_name] = str(attr)
+                    except:
+                        pass
 
-        torch.save({
+        # === Save Everything ===
+        checkpoint = {
             'model_state_dict': self.state_dict(),
+            'model_info': model_info,
+            'constructor_args': constructor_args,
             'prior_state': prior_state,
-            'model_kwargs': self.model_kwargs
-        }, model_path)
-        self.to(device) # Move model back to original device
+            'model_kwargs': self.model_kwargs,  # Keep for backward compatibility
+        }
+
+        torch.save(checkpoint, model_path)
+        self.to(device)
         self.prior.to(device)
         print(f"Model saved to {model_path}")
+        print(f"Model class: {model_info['model_class']}")
+        if isinstance(self, CVAE):
+            print(f"Conditioner tags: {conditioner_state['condition_tags']}")
 
     def load_model(self, load_path, device="cpu"):
         """
-        Load model with dynamic prior reconstruction.
-        Works with any prior type without modification.
-        TODO: should probably be handled in the BasePrior class
+        Load model with complete reconstruction from saved information.
+        Works with both old and new save formats.
         """
-        checkpoint = torch.load(load_path, map_location=device, weights_only=True)
+        checkpoint = torch.load(load_path, map_location=device, weights_only=False)
+        
+        # Handle new format with complete model info
+        if 'model_info' in checkpoint:
+            print(f"Loading model using new format: {checkpoint['model_info']['model_class']}")
+            
+            # Load prior
+            prior_state = checkpoint['prior_state']
+            import importlib
+            module = importlib.import_module(prior_state['module'])
+            PriorClass = getattr(module, prior_state['prior_type'])
+            init_args = prior_state.get('init_args', {})
+            
+            try:
+                self.prior = PriorClass(**init_args)
+                self.prior.load_state_dict(prior_state['state_dict'])
+                
+                # Special handling for VampPrior - set encoder reference after loading
+                if prior_state['prior_type'] == 'VampPrior':
+                    self.prior.set_encoder(self.encoder, init_args.get('input_shape', self.input_dim))
+                    
+            except Exception as e:
+                print(f"Error loading prior {prior_state['prior_type']}: {e}")
 
-        prior_state = checkpoint['prior_state']
+            # Load CVAE conditioner if present
+            if isinstance(self, CVAE) and 'conditioner_state' in checkpoint['model_info']:
+                conditioner_state = checkpoint['model_info']['conditioner_state']
+                print(f"Reconstructing conditioner with tags: {conditioner_state['condition_tags']}")
+                
+                from src.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
+                self.conditioner = Conditioner()
+                
+                for tag, item_state in conditioner_state['condition_items'].items():
+                    # Import the condition item class
+                    item_module = importlib.import_module(item_state['module'])
+                    ItemClass = getattr(item_module, item_state['class_name'])
+                    
+                    # Create instance with saved constructor args
+                    constructor_args = item_state.get('constructor_args', {})
+                    try:
+                        condition_item = ItemClass(**constructor_args)
+                        # Load state if available
+                        if item_state['state_dict']:
+                            condition_item.load_state_dict(item_state['state_dict'])
+                        self.conditioner.add_condition_item(tag, condition_item)
+                        print(f"  Reconstructed: {tag} ({item_state['class_name']})")
+                    except Exception as e:
+                        print(f"  Error reconstructing {tag}: {e}")
+                
+                self.condition_dim = conditioner_state['condition_dim']
 
-        import importlib
-        module = importlib.import_module(prior_state['module'])
-        PriorClass = getattr(module, prior_state['prior_type'])
+        else:
+            # Handle old format (backward compatibility)
+            print("Loading model using legacy format")
+            prior_state = checkpoint['prior_state']
+            import importlib
+            module = importlib.import_module(prior_state['module'])
+            PriorClass = getattr(module, prior_state['prior_type'])
+            init_args = prior_state.get('init_args', {})
+            
+            try:
+                self.prior = PriorClass(**init_args)
+                self.prior.load_state_dict(prior_state['state_dict'])
+            except Exception as e:
+                print(f"Error initializing prior {prior_state['prior_type']} with args {init_args}: {e}")
 
-        init_args = prior_state.get('init_args', {})
-
-        try:
-            self.prior = PriorClass(**init_args)
-        except Exception as e:
-            print(f"Error initializing prior {prior_state['prior_type']} with args {init_args}: {e}")
-
-        self.prior.load_state_dict(prior_state['state_dict'])
+        # Load model state
         self.load_state_dict(checkpoint['model_state_dict'])
         self.to(device)
         self.prior.to(device)
         print(f"Model loaded from {load_path}")
+
+    @classmethod
+    def load_from_checkpoint(cls, load_path, device="cpu"):
+        """
+        Recommended method to load a saved model.
+        Automatically handles both new and legacy checkpoint formats.
+        
+        Returns:
+            Loaded model instance
+        """
+        checkpoint = torch.load(load_path, map_location="cpu", weights_only=False)
+        
+        if 'model_info' in checkpoint:
+            # New format - use create_from_checkpoint
+            model_class_name = checkpoint['model_info']['model_class']
+            if model_class_name == 'CVAE':
+                return CVAE.create_from_checkpoint(load_path, device)
+            else:
+                return cls.create_from_checkpoint(load_path, device)
+        else:
+            # Legacy format - requires manual model creation first
+            print("Legacy checkpoint format detected")
+            print("Consider re-saving the model with current version for better compatibility")
+            
+            # For legacy, we need to create model first then load into it
+            # This is less reliable but needed for backward compatibility
+            model_kwargs = checkpoint.get("model_kwargs", {})
+            
+            if "conditioner" in model_kwargs or "condition_dim" in model_kwargs:
+                # Looks like CVAE - this will require manual conditioner recreation
+                raise ValueError("Legacy CVAE checkpoints require manual loading. "
+                               "Please use the _load_model_legacy function or re-save with current version.")
+            else:
+                # VAE - try to create with minimal parameters
+                state_dict = checkpoint['model_state_dict']
+                
+                # Infer basic parameters
+                if 'decoder.SigmaMapper' in state_dict:
+                    input_dim = state_dict['decoder.SigmaMapper'].shape[0]
+                elif 'decoder.parameterizer.param_heads.mu.3.bias' in state_dict:
+                    input_dim = state_dict['decoder.parameterizer.param_heads.mu.3.bias'].shape[0]
+                else:
+                    input_dim = 24  # Default fallback
+                
+                latent_dim = model_kwargs.get('latent_dim', 32)
+                
+                model = cls(input_dim=input_dim, distribution_dict={"latent_dim": latent_dim})
+                model.load_model(load_path, device)
+                return model
+
+    @classmethod
+    def create_from_checkpoint(cls, load_path, device="cpu"):
+        """
+        Create a model instance completely from a saved checkpoint.
+        This is the recommended way to load models saved with the new format.
+        """
+        checkpoint = torch.load(load_path, map_location=device, weights_only=False)
+        
+        if 'model_info' not in checkpoint:
+            raise ValueError("Checkpoint was saved with legacy format. Use load_model() on an existing instance instead.")
+        
+        model_info = checkpoint['model_info']
+        constructor_args = checkpoint['constructor_args']
+        
+        print(f"Creating {model_info['model_class']} from checkpoint...")
+        
+        # Handle CVAE reconstruction
+        if model_info['model_class'] == 'CVAE':
+            # Reconstruct conditioner first
+            conditioner_state = model_info['conditioner_state']
+            
+            import importlib
+            from src.Conditioner import Conditioner
+            conditioner = Conditioner()
+            
+            print(f"Reconstructing conditioner with {len(conditioner_state['condition_items'])} items...")
+            for tag, item_state in conditioner_state['condition_items'].items():
+                # Import and create condition item
+                item_module = importlib.import_module(item_state['module'])
+                ItemClass = getattr(item_module, item_state['class_name'])
+                
+                constructor_args_item = item_state.get('constructor_args', {})
+                try:
+                    condition_item = ItemClass(**constructor_args_item)
+                    if item_state['state_dict']:
+                        condition_item.load_state_dict(item_state['state_dict'])
+                    conditioner.add_condition_item(tag, condition_item)
+                    print(f"  {tag}: {item_state['class_name']}")
+                except Exception as e:
+                    print(f"  {tag}: {e}")
+            
+            # Create CVAE instance
+            constructor_args['conditioner'] = conditioner
+            model = cls(**constructor_args)
+            
+        else:
+            # Create VAE instance
+            model = cls(**constructor_args)
+        
+        # Load the saved state - need to handle VampPrior specially
+        if 'prior_state' in checkpoint and checkpoint['prior_state']['prior_type'] == 'VampPrior':
+            # For VampPrior, we need to recreate it with encoder reference after model is created
+            prior_state = checkpoint['prior_state']
+            init_args = prior_state.get('init_args', {})
+            
+            import importlib
+            from src.priors import VampPrior
+            
+            # Create VampPrior with encoder reference 
+            model.prior = VampPrior(
+                latent_dim=init_args.get('latent_dim', model.latent_dim),
+                input_shape=init_args.get('input_shape', model.input_dim + getattr(model, 'condition_dim', 0)),
+                encoder=model.encoder,
+                num_components=init_args.get('num_components', 20),
+                device=device
+            )
+            
+            # Load the state dict
+            try:
+                model.prior.load_state_dict(prior_state['state_dict'])
+            except Exception as e:
+                print(f"Warning: Could not load VampPrior state_dict: {e}")
+            
+            # Move to device
+            model.to(device)
+            model.prior.to(device)
+            
+            # Load the rest of the model (excluding the prior since we handled it above)
+            model_state_without_prior = {k: v for k, v in checkpoint['model_state_dict'].items() 
+                                       if not k.startswith('prior.')}
+            model.load_state_dict(model_state_without_prior, strict=False)
+        else:
+            # Normal loading for other prior types
+            model.load_model(load_path, device)
+            
+        return model
 
     def fit(self,
             trainloader,
@@ -760,7 +1072,6 @@ class CVAE(VAE):
             input_dim=input_dim + self.condition_dim,
             latent_dim=latent_dim,
             type=kwargs.get("encoder_type", "dictionary"),
-            prior=self.prior,
             **kwargs,
         )
 
@@ -769,9 +1080,12 @@ class CVAE(VAE):
             latent_dim=latent_dim + self.condition_dim,
             output_dim=input_dim,
             type=kwargs.get("decoder_type", "dictionary"),
-            prior=self.prior,
             **kwargs,
         )
+
+        # If VampPrior, re-point it to the new (conditioned) encoder and resize pseudo-inputs
+        if isinstance(self.prior, VampPrior):
+            self.prior.set_encoder(self.encoder, input_shape=input_dim + self.condition_dim)
 
         # Recalculate num_parameters after overriding encoder/decoder
         self.num_parameters = self.encoder._num_parameters() + self.decoder._num_parameters()
@@ -890,15 +1204,33 @@ class CVAE(VAE):
         c = self.move_to_device(conditions, device=device)
         B = c.size(0)
 
-        # Get prior params and expand to batch
-        prior_params = self.prior.get_params()
-        prior_params = {k: v.expand(B, -1).to(device) for k, v in prior_params.items()}
-
-        # Sample z: [S, B, latent_dim]
-        z = self.encoder.sample(prior_params, num_samples=num_prior_samples)  # [S, B, latent_dim]
+        # Sample z from prior: handle different prior return shapes
+        z = self.prior.sample(batch_size=B, num_samples=num_prior_samples)
+        
+        # Ensure z has the correct shape [S, B, latent_dim]
+        if z.dim() == 3:
+            if z.shape[0] == B and z.shape[1] == num_prior_samples:
+                # Shape is [B, S, latent_dim] - transpose to [S, B, latent_dim]
+                z = z.transpose(0, 1)
+            elif z.shape[0] == num_prior_samples and z.shape[1] == B:
+                # Shape is already [S, B, latent_dim]
+                pass
+            else:
+                # Unexpected shape - try to reshape
+                print(f"Warning: Unexpected prior sample shape {z.shape}, attempting to reshape...")
+                z = z.view(num_prior_samples, B, -1)
+        elif z.dim() == 2:
+            # Shape is [B, latent_dim] - add sample dimension
+            z = z.unsqueeze(0).expand(num_prior_samples, B, -1)
+        else:
+            raise ValueError(f"Unexpected prior sample tensor dimensions: {z.shape}")
 
         # Expand c to [S, B, C]
         c_expanded = c.unsqueeze(0).expand(num_prior_samples, B, -1)
+        
+        # Verify shapes before concatenation
+        if z.shape[:2] != c_expanded.shape[:2]:
+            raise ValueError(f"Shape mismatch: z.shape={z.shape}, c_expanded.shape={c_expanded.shape}")
 
         # decode 
         dec_in = torch.cat([z, c_expanded], dim=-1)  # [S, B, latent_dim + C]
