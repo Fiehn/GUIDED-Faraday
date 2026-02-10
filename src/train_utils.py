@@ -419,9 +419,9 @@ def visualize_trained_model(
         device,
         output_dir: str,
         model_tag: str,
-        num_reconstructions: int = 10,
-        num_synthetic_samples: int = 5,
-        num_samples_per_original: int = 3,
+        num_reconstructions: int = 4,
+        num_synthetic_samples: int = 15,
+        num_samples_per_original: int = 15,
     ) -> dict:
     """
     Generates reconstruction and synthetic data visualizations for a trained model.

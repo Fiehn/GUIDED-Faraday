@@ -318,6 +318,185 @@ class UserProfiler(LatentDirichletAllocation):
                 print(f"Cluster centers shape: {self.cluster_centers_.shape}")
 
 
+class OnlineUserProfiler(UserProfiler):
+    """
+    Online version of UserProfiler that updates profiles incrementally during training.
+    """
+    def __init__(self, decay=0.9, update_frequency=10, **kwargs):
+        super().__init__(**kwargs)
+        self.decay = decay  # Exponential forgetting factor (0 < decay <= 1)
+        self.update_frequency = update_frequency  # Update model every N batches
+        self.batch_counter = 0
+        self.last_update_batch = 0
+        
+        # Initialize MiniBatchKMeans for incremental clustering
+        self.kmeans = MiniBatchKMeans(
+            n_clusters=self.num_clusters,
+            random_state=self.random_state,
+            verbose=1 if self.verbose else 0,
+            batch_size=1024,
+            n_init='auto'
+        )
+        self.kmeans_initialized = False
+        
+        # Track user activity for decay
+        self.user_last_seen = {}  # meter_id -> batch_number
+        
+    def get_conditions(self, x, meter_id=None, timestamps=None):
+        """
+        Get conditions for a batch, with automatic online updating.
+        This maintains compatibility with the Conditioner interface.
+        """
+        if meter_id is None:
+            raise ValueError("meter_id is required for OnlineUserProfiler.get_conditions()")
+        
+        # Update model if needed
+        self._maybe_update_model(x, meter_id)
+        
+        # Get profiles using parent class logic but with online updates
+        return self._get_profiles_with_decay(x, meter_id, timestamps)
+    
+    def _maybe_update_model(self, x, meter_ids):
+        """Update the model if enough batches have passed."""
+        self.batch_counter += 1
+        
+        if (self.batch_counter - self.last_update_batch) >= self.update_frequency:
+            self.update_model_incremental(x, meter_ids)
+            self.last_update_batch = self.batch_counter
+    
+    def update_model_incremental(self, x_batch, meter_ids):
+        """
+        Incrementally update the clustering and topic model with new data.
+        This separates the update logic from profile retrieval.
+        """
+        # Convert inputs
+        if isinstance(x_batch, torch.Tensor):
+            x_batch = x_batch.cpu().numpy()
+        if isinstance(meter_ids, torch.Tensor):
+            meter_ids = meter_ids.cpu().numpy()
+        
+        # Handle both 2D [B, D] and 3D [B, L, F] inputs
+        if x_batch.ndim == 3:
+            batch_size, seq_len, num_features = x_batch.shape
+            x_flat = x_batch.reshape(batch_size, seq_len * num_features)
+        elif x_batch.ndim == 2:
+            x_flat = x_batch
+        else:
+            raise ValueError(f"Expected x to have 2 or 3 dimensions, got {x_batch.ndim}")
+        
+        # Remove invalid data
+        valid_mask = ~np.isnan(x_flat).any(axis=1)
+        x_valid = x_flat[valid_mask]
+        meter_ids_valid = meter_ids[valid_mask]
+        
+        if len(x_valid) == 0:
+            return  # No valid data to update with
+        
+        # Update cluster centers incrementally
+        self.kmeans.partial_fit(x_valid)
+        self.cluster_centers_ = self.kmeans.cluster_centers_
+        self.kmeans_initialized = True
+        
+        # Create corpus for this batch
+        if self.cluster_centers_ is not None:
+            labels = cdist(x_valid, self.cluster_centers_).argmin(axis=1)
+            
+            # Count clusters per user
+            meter_corpus = {}
+            for m_id, label in zip(meter_ids_valid, labels):
+                if m_id not in meter_corpus:
+                    meter_corpus[m_id] = np.zeros(self.num_clusters, dtype=np.int32)
+                meter_corpus[m_id][label] += 1
+            
+            # Update topic model if we have LDA fitted
+            if hasattr(self, 'is_fitted') and self.is_fitted:
+                # Convert to document-term matrix
+                unique_meters = sorted(meter_corpus.keys())
+                if len(unique_meters) > 0:
+                    X_corpus = np.array([meter_corpus[m_id] for m_id in unique_meters])
+                    
+                    # Update LDA incrementally
+                    super(UserProfiler, self).partial_fit(X_corpus)
+                    
+                    # Update cached gamma parameters with decay
+                    new_gamma = super(UserProfiler, self).transform(X_corpus, normalize=False)
+                    for m_id, gamma_new in zip(unique_meters, new_gamma):
+                        if m_id in self.gamma_cache:
+                            # Apply exponential decay to old gamma values
+                            gamma_old = self.gamma_cache[m_id]
+                            self.gamma_cache[m_id] = self.decay * gamma_old + (1 - self.decay) * gamma_new
+                        else:
+                            # New user
+                            self.gamma_cache[m_id] = gamma_new
+                        
+                        # Update user activity tracking
+                        self.user_last_seen[m_id] = self.batch_counter
+            
+            # If LDA not fitted yet, need initial fit
+            elif len(meter_corpus) > 0:
+                unique_meters = sorted(meter_corpus.keys())
+                X_corpus = np.array([meter_corpus[m_id] for m_id in unique_meters])
+                
+                # Initial fit
+                super(UserProfiler, self).fit(X_corpus)
+                self.is_fitted = True
+                
+                # Initialize caches
+                initial_gamma = super(UserProfiler, self).transform(X_corpus, normalize=False)
+                for m_id, gamma_u in zip(unique_meters, initial_gamma):
+                    self.gamma_cache[m_id] = gamma_u
+                    self.user_last_seen[m_id] = self.batch_counter
+    
+    def _get_profiles_with_decay(self, x, meter_ids, timestamps=None):
+        """
+        Get user profiles with decay applied to inactive users.
+        """
+        if isinstance(meter_ids, torch.Tensor):
+            meter_ids = meter_ids.cpu().numpy()
+        
+        profiles = np.zeros((len(meter_ids), self.n_topics), dtype=np.float32)
+        
+        # Apply decay to users based on when they were last seen
+        for m_id in set(meter_ids):
+            if m_id in self.gamma_cache:
+                # Calculate decay factor based on inactivity
+                batches_since_seen = self.batch_counter - self.user_last_seen.get(m_id, self.batch_counter)
+                decay_factor = self.decay ** batches_since_seen
+                
+                # Apply decay to gamma parameters
+                if decay_factor < 0.1:  # If too much decay, reset to prior
+                    self.gamma_cache[m_id] = np.ones(self.n_topics)
+                else:
+                    self.gamma_cache[m_id] *= decay_factor
+                    self.gamma_cache[m_id] += (1 - decay_factor) * np.ones(self.n_topics)  # Add prior
+                
+                # Resample profile from updated gamma
+                self.user_profiles_cache[m_id] = np.random.dirichlet(self.gamma_cache[m_id])
+        
+        # Handle missing profiles by computing them on-the-fly or using defaults
+        missing_meters = [m for m in meter_ids if m not in self.user_profiles_cache]
+        if missing_meters and hasattr(self, 'cluster_centers_') and self.cluster_centers_ is not None:
+            self._compute_profiles_for_batch(x, meter_ids, missing_meters)
+        
+        # Assemble final profiles
+        for i, m_id in enumerate(meter_ids):
+            if m_id in self.user_profiles_cache:
+                profiles[i] = self.user_profiles_cache[m_id]
+            else:
+                # Default to uniform distribution for unknown users (should not really happen if we compute on-the-fly)
+                profiles[i] = np.ones(self.n_topics) / self.n_topics
+        
+        return torch.tensor(profiles, dtype=torch.float32)
+    
+    def update_and_get_profile(self, x_batch, meter_ids):
+        """
+        Legacy method for backward compatibility.
+        Updates model and returns profiles in one call.
+        """
+        self.update_model_incremental(x_batch, meter_ids)
+        return self._get_profiles_with_decay(x_batch, meter_ids)
+
+            
 # === Day of week conditioning ===
 class DayOfWeekConditioner():
     def __init__(self):

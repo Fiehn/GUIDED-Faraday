@@ -15,6 +15,7 @@ sys.path.append(parent_dir)
 from src.encoder_decoder_model import *
 from src.Conditioner import *
 from src.priors import *
+from src.normalizer import *
 
 # https://arxiv.org/pdf/2411.03936
 # GuideVAE model implementation
@@ -31,7 +32,7 @@ from src.priors import *
 # - IMPORTANT: Streaming algorithm for user profiles (online LDA) and normalization (running mean/std) and for the training (online/streaming VAE training)
 # - Test different loss functions and double check the current implementation against the literature
 # - Make sure loading and saving is robust
-
+# - Config file for all parameters and settings (e.g., YAML or JSON) and make sure it works with the current code structure
 
 # ==============
 # Cyclical Beta Annealing Scheduler
@@ -1133,6 +1134,17 @@ class CVAE(VAE):
         # Sample z from prior: handle different prior return shapes
         z = self.prior.sample(batch_size=B, num_samples=num_prior_samples)
         
+        # Dictionary priors sample in dictionary space (dim=dictionary_size).
+        # Map to latent space via the encoder's SigmaMapper so the decoder
+        # receives the correct dimensionality (latent_dim).
+        if hasattr(self.prior, 'dictionary_size') and z.shape[-1] != self.latent_dim:
+            U = self.encoder.get_SigmaMapper()          # [latent_dim, dictionary_size]
+            if U is not None:
+                z = torch.einsum('sbd,do->sbo', z, U.T) # [S, B, latent_dim]
+                # Add prior mean (zeros for standard, learned for learnable)
+                prior_params = self.prior.get_params()
+                z = z + prior_params['mu'].to(z.device)
+        
         # Ensure z has the correct shape [S, B, latent_dim]
         if z.dim() == 3:
             if z.shape[0] == B and z.shape[1] == num_prior_samples:
@@ -1183,3 +1195,131 @@ class CVAE(VAE):
         c = self.conditioner.get_conditions(x, meter_id=meter_ids, timestamps=timestamps)
         c = self.move_to_device(c, device=x.device)
         return self.forward(x, c, num_samples=num_samples)
+    
+
+# ==============
+# Online CVAE class for streaming data - inherits from CVAE but adds online updating capabilities
+# ==============
+class OnlineCVAE(CVAE):
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        conditioner: Conditioner,
+        latent_dim: int = 32,
+        distribution_dict: dict = None,
+        prior_type: str = None,
+        **kwargs,
+    ):
+        super().__init__(input_dim=input_dim, conditioner=conditioner, latent_dim=latent_dim, distribution_dict=distribution_dict, prior_type=prior_type, **kwargs)
+        
+        # For online learning, we need RevIN that works with the actual feature dimension
+        # Assuming input is flattened from [B, L, F] to [B, L*F], we need to determine F
+        # For smart meter data, typically L=24 (hours) and F=1 (energy consumption)
+        self.sequence_length = 24  # This should be configurable
+        self.num_features = input_dim // self.sequence_length if input_dim % 24 == 0 else 1
+        
+        self.revin_normalizer = IndexedLogRevIN(
+            num_features=self.num_features, 
+            affine=True, 
+            device=str(next(self.parameters()).device)
+        )
+        
+        # Convert conditioners to online versions
+        self._convert_to_online_conditioners()
+    
+    def _convert_to_online_conditioners(self):
+        """Convert regular UserProfiler conditioners to online versions."""
+        from src.Conditioner import OnlineUserProfiler, UserProfiler
+        
+        for tag, item in self.conditioner.condition_items.items():
+            if isinstance(item, UserProfiler) and not isinstance(item, OnlineUserProfiler):
+                # Convert to online version
+                online_profiler = OnlineUserProfiler(
+                    n_topics=item.n_topics,
+                    num_clusters=item.num_clusters,
+                    decay=0.95,  # Set reasonable default
+                    update_frequency=3,  # Update every 10 batches
+                    random_state=item.random_state,
+                    path=item.path,
+                    verbose=item.verbose
+                )
+                
+                # Transfer any existing state
+                if hasattr(item, 'cluster_centers_') and item.cluster_centers_ is not None:
+                    online_profiler.cluster_centers_ = item.cluster_centers_
+                    online_profiler.kmeans_initialized = True
+                if hasattr(item, 'gamma_cache'):
+                    online_profiler.gamma_cache = item.gamma_cache.copy()
+                if hasattr(item, 'user_profiles_cache'):
+                    online_profiler.user_profiles_cache = item.user_profiles_cache.copy()
+                if hasattr(item, 'is_fitted'):
+                    online_profiler.is_fitted = item.is_fitted
+                
+                # Replace in conditioner
+                self.conditioner.condition_items[tag] = online_profiler
+    
+    def train_core(self, batch, optim, beta=1.0, weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
+        self.train()
+
+        # 1. Unpack batch
+        x, meter_id, timestamps = batch
+        
+        # 2. Handle input shapes: convert to 3D for RevIN if needed
+        if x.dim() == 2:
+            # Assume input is [B, L*F] and reshape to [B, L, F] 
+            B = x.shape[0]
+            x_3d = x.reshape(B, self.sequence_length, self.num_features)
+        elif x.dim() == 3:
+            x_3d = x
+            B, L, F = x_3d.shape
+            # Update dimensions if they don't match initialization
+            if F != self.num_features:
+                self.num_features = F
+        else:
+            raise ValueError(f"Unexpected input dimension: {x.dim()}")
+
+        # 3. Apply RevIN normalization 
+        x_normalized = self.revin_normalizer(x_3d, mode='norm', timestamp=timestamps)
+        
+        # 4. Flatten normalized input for the model
+        if x_normalized.dim() == 3:
+            B, L, F = x_normalized.shape  
+            x_flat = x_normalized.reshape(B, L * F)
+        else:
+            x_flat = x_normalized
+            
+        # 5. Compute conditions using ORIGINAL (unnormalized) input
+        # This is important because user profilers expect original energy patterns
+        if x.dim() == 2:
+            x_for_conditions = x.reshape(B, self.sequence_length, self.num_features)
+        else:
+            x_for_conditions = x
+            
+        c = self.conditioner.get_conditions(x_for_conditions, meter_id=meter_id, timestamps=timestamps)
+        c = self.move_to_device(c, device=x.device)
+
+        # 6. Forward pass on normalized data
+        recon_params, q_params = self.forward(x_flat, c, num_samples=1)
+
+        # 7. Compute loss on normalized data
+        optim.zero_grad(set_to_none=True)
+        loss_dict = self.loss(x_flat, recon_params, q_params, beta=beta, weighted_loss=weighted_loss)
+        loss_dict["loss"].backward()
+
+        # 8. Gradient clipping
+        if gradient_clip is not None:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_kwargs.get("max_norm", 1.0))
+
+        # 9. Optimizer step
+        optim.step()
+        return loss_dict
+    
+    @torch.no_grad()
+    def sample(self, conditions: torch.Tensor, num_prior_samples: int = 1, num_x_samples: int = 1, device: str = "cpu", timestamps: torch.Tensor = None, month: int = None):
+        x = super().sample(conditions, num_prior_samples, num_x_samples, device)
+        # Now apply inverse RevIN to the samples
+        x = x.reshape(-1, self.sequence_length, self.num_features)  # [S*num_x_samples*B, L, F]
+        x_denormalized = self.revin_normalizer(x, mode='denorm', timestamp=timestamps, month=month)
+        return x_denormalized.reshape(num_prior_samples, num_x_samples, -1, self.sequence_length * self.num_features)
+

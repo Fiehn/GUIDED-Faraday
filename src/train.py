@@ -24,7 +24,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
     print("Using device: ", device)
 
     # Up the recursion limit for deep models
-    sys.setrecursionlimit(5000) # default seems to bbe 999
+    sys.setrecursionlimit(5000) # default seems to be 999
 
     ##############################
     # Validate model before training
@@ -33,7 +33,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
         validation_passed = run_validation(
             model_type=model_type,
             use_test_data=True,  # use small test data for fast validation
-            verbose=False
+            verbose=True
         )
         
         if not validation_passed:

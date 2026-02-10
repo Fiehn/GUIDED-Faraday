@@ -8,4 +8,5 @@ Then cyclical beta annealing was implemented as it would prevent KL collapse and
 Then looking at the prior, an experiment with VAMP prior was run, visually it gave some upsides on performance but computationally it was also heavier.
 
 Streaming Algorithms:
-RevIN normalization with a value history
+RevIN normalization with a value history to denormalize properly
+Online user profiles, It will update every n batches with that specific batch, It would be nice to have the full data but not gonna happen. Will also decay as time goes on for users, so We assume implicitly that users evolve their profiles over time and after a while they will change their habits.

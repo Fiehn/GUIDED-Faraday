@@ -76,6 +76,9 @@ class ModelValidator:
         self._test_device_placement()
         self._test_full_training_step()
         self._test_regression_bugs()
+        self._test_RevIn()
+        self._test_online_user_profiler()
+        self._test_online_cvae()
         
         # Generate report
         all_passed = self._generate_report()
@@ -801,6 +804,499 @@ class ModelValidator:
             except Exception as e:
                 self._add_result("Regression: Random Conditions", False, str(e))
     
+    def _test_RevIn(self):
+        """Test reversible instance normalization (RevIN)."""
+        if self.verbose:
+            print("\n[11] Testing RevIN...")
+        
+        try:
+            from src.normalizer import IndexedLogRevIN
+            
+            # Test parameters
+            batch_size = 8
+            num_features = 5
+            sequence_length = 24
+            eps = 1e-5
+            
+            # Create RevIN instance
+            revin = IndexedLogRevIN(num_features=num_features, eps=eps, affine=True)
+            
+            # Create test data - make it realistic with some variance
+            torch.manual_seed(42)  # For reproducible tests
+            x_original = torch.randn(batch_size, num_features, sequence_length) * 2.0 + 5.0
+            x_original = torch.abs(x_original)  # Ensure positive values for log1p
+            
+            # Create timestamps (different dates for different samples)
+            base_time = 1640995200  # Jan 1, 2022 00:00:00 UTC
+            timestamps = torch.tensor([base_time + i * 24 * 3600 for i in range(batch_size)])  # Different days
+            
+            # Test 1: Basic normalization
+            x_norm = revin(x_original.clone(), mode='norm', timestamp=timestamps)
+            
+            if x_norm.shape != x_original.shape:
+                self._add_result("RevIN: Normalization Shape", False,
+                               f"Expected {x_original.shape}, got {x_norm.shape}")
+                return
+            else:
+                self._add_result("RevIN: Normalization Shape", True,
+                               f"Shape preserved: {x_norm.shape}")
+            
+            # Test 2: Check that normalized data has reasonable statistical properties
+            # After normalization, data should be log1p transformed and normalized
+            norm_mean = torch.mean(x_norm, dim=(0, 2))  # Mean across batch and sequence
+            norm_std = torch.std(x_norm, dim=(0, 2))   # Std across batch and sequence
+            
+            # The normalized data should have some variance (not all zeros)
+            if torch.allclose(norm_std, torch.zeros_like(norm_std), atol=1e-6):
+                self._add_result("RevIN: Normalized Variance", False,
+                               "Normalized data has zero variance")
+            else:
+                self._add_result("RevIN: Normalized Variance", True,
+                               f"Normalized std range: [{norm_std.min().item():.4f}, {norm_std.max().item():.4f}]")
+            
+            # Test 3: Test denormalization without timestamps (should use last computed stats)
+            x_denorm = revin(x_norm.clone(), mode='denorm')
+            
+            if x_denorm.shape != x_original.shape:
+                self._add_result("RevIN: Denormalization Shape", False,
+                               f"Expected {x_original.shape}, got {x_denorm.shape}")
+            else:
+                self._add_result("RevIN: Denormalization Shape", True,
+                               f"Shape preserved: {x_denorm.shape}")
+            
+            # Test 4: Round-trip test (normalize then denormalize)
+            max_error = torch.max(torch.abs(x_original - x_denorm)).item()
+            relative_error = max_error / torch.max(torch.abs(x_original)).item()
+            
+            if relative_error > 1e-3:  # Allow some numerical error
+                self._add_result("RevIN: Round-trip Accuracy", False,
+                               f"High reconstruction error: {relative_error:.6f}")
+            else:
+                self._add_result("RevIN: Round-trip Accuracy", True,
+                               f"Max relative error: {relative_error:.6f}")
+            
+            # Test 5: Test timestamp indexing functionality
+            # Check that daily_stats are being updated
+            if len(revin.daily_stats) == 0:
+                self._add_result("RevIN: Timestamp Indexing", False,
+                               "No daily stats were stored")
+            else:
+                expected_dates = len(torch.unique(timestamps))
+                actual_dates = len(revin.daily_stats)
+                if actual_dates != expected_dates:
+                    self._add_result("RevIN: Timestamp Indexing", False,
+                                   f"Expected {expected_dates} unique dates, got {actual_dates}")
+                else:
+                    self._add_result("RevIN: Timestamp Indexing", True,
+                                   f"Correctly stored stats for {actual_dates} dates")
+            
+            # Test 6: Test denormalization with specific timestamp
+            test_timestamp = timestamps[0]  # Use first timestamp
+            x_test = torch.randn(1, num_features, sequence_length)
+            try:
+                x_denorm_specific = revin(x_test, mode='denorm', timestamp=test_timestamp)
+                self._add_result("RevIN: Timestamp-specific Denorm", True,
+                               f"Successfully denormalized with timestamp")
+            except Exception as e:
+                self._add_result("RevIN: Timestamp-specific Denorm", False, str(e))
+            
+            # Test 7: Test with month parameter
+            try:
+                month_val = 1  # January
+                x_denorm_month = revin(x_test, mode='denorm', timestamp=test_timestamp, month=month_val)
+                self._add_result("RevIN: Month-based Denorm", True,
+                               f"Successfully denormalized with month parameter")
+            except Exception as e:
+                self._add_result("RevIN: Month-based Denorm", False, str(e))
+            
+            # Test 8: Test affine parameters (if affine=True)
+            if revin.affine:
+                if not hasattr(revin, 'weight') or not hasattr(revin, 'bias'):
+                    self._add_result("RevIN: Affine Parameters", False,
+                                   "Missing weight or bias parameters")
+                elif revin.weight.shape != torch.Size([num_features]) or revin.bias.shape != torch.Size([num_features]):
+                    self._add_result("RevIN: Affine Parameters", False,
+                                   f"Incorrect parameter shapes: weight {revin.weight.shape}, bias {revin.bias.shape}")
+                else:
+                    self._add_result("RevIN: Affine Parameters", True,
+                                   f"Correct affine parameter shapes")
+            
+            # Test 9: Test with batch containing multiple samples from same date
+            same_day_timestamps = torch.full((batch_size,), base_time, dtype=torch.long)
+            x_same_day = revin(x_original.clone(), mode='norm', timestamp=same_day_timestamps)
+            
+            # Should still work and update the same date's stats
+            target_date = base_time // (24 * 3600)
+            if target_date not in revin.daily_stats:
+                self._add_result("RevIN: Same-date Batch", False,
+                               "Failed to update stats for same-date batch")
+            else:
+                count_after = revin.daily_stats[target_date]['count']
+                self._add_result("RevIN: Same-date Batch", True,
+                               f"Updated stats, count: {count_after}")
+            
+            # Test 10: Edge case - empty timestamp (should work without indexing)
+            try:
+                x_no_timestamp = revin(x_original.clone(), mode='norm', timestamp=None)
+                self._add_result("RevIN: No Timestamp", True,
+                               "Normalization works without timestamp")
+            except Exception as e:
+                self._add_result("RevIN: No Timestamp", False, str(e))
+                
+        except ImportError:
+            self._add_result("RevIN: Import", False, "Could not import IndexedLogRevIN")
+        except Exception as e:
+            self._add_result("RevIN: Overall", False, f"{type(e).__name__}: {str(e)}")
+            if self.verbose:
+                traceback.print_exc()
+    
+    def _test_online_user_profiler(self):
+        """Test online user profiler functionality."""
+        if self.verbose:
+            print("\n[12] Testing Online User Profiler...")
+        
+        try:
+            from src.Conditioner import OnlineUserProfiler
+            
+            # Test parameters
+            batch_size = 16
+            sequence_length = 24
+            num_features = 2
+            n_topics = 5
+            num_clusters = 10
+            
+            # Create OnlineUserProfiler instance
+            online_profiler = OnlineUserProfiler(
+                n_topics=n_topics,
+                num_clusters=num_clusters,
+                decay=0.8,
+                random_state=42,
+                verbose=False
+            )
+            
+            # Test 1: Basic initialization
+            if not hasattr(online_profiler, 'kmeans'):
+                self._add_result("Online Profiler: Initialization", False, "Missing kmeans attribute")
+                return
+            else:
+                self._add_result("Online Profiler: Initialization", True,
+                               f"Initialized with {n_topics} topics, {num_clusters} clusters")
+            
+            # Create test data batches
+            torch.manual_seed(42)
+            batch1_x = torch.abs(torch.randn(batch_size, sequence_length, num_features)) + 1.0
+            batch1_ids = torch.randint(0, 10, (batch_size,))
+            
+            batch2_x = torch.abs(torch.randn(batch_size, sequence_length, num_features)) + 1.0  
+            batch2_ids = torch.randint(5, 15, (batch_size,))  # Some overlap, some new users
+            
+            # Test 2: First batch processing
+            try:
+                profiles1 = online_profiler.update_and_get_profile(batch1_x, batch1_ids)
+                
+                expected_shape = (batch_size, n_topics)
+                if profiles1.shape != expected_shape:
+                    self._add_result("Online Profiler: First Batch Shape", False,
+                                   f"Expected {expected_shape}, got {profiles1.shape}")
+                else:
+                    self._add_result("Online Profiler: First Batch Shape", True,
+                                   f"Shape: {profiles1.shape}")
+                
+                # Check that profiles are valid probability distributions
+                profile_sums = torch.sum(profiles1, dim=1)
+                if not torch.allclose(profile_sums, torch.ones(batch_size), atol=1e-4):
+                    self._add_result("Online Profiler: Profile Normalization", False,
+                                   f"Profiles don't sum to 1: {profile_sums[:5]}")
+                else:
+                    self._add_result("Online Profiler: Profile Normalization", True,
+                                   "All profiles properly normalized")
+                    
+            except Exception as e:
+                self._add_result("Online Profiler: First Batch", False, str(e))
+                return
+            
+            # Test 3: KMeans was updated
+            if not online_profiler.kmeans_initialized:
+                self._add_result("Online Profiler: KMeans Update", False,
+                               "KMeans not marked as initialized after first batch")
+            else:
+                cluster_centers_shape = online_profiler.cluster_centers_.shape
+                expected_centers_shape = (num_clusters, sequence_length * num_features)
+                if cluster_centers_shape != expected_centers_shape:
+                    self._add_result("Online Profiler: KMeans Centers", False,
+                                   f"Expected {expected_centers_shape}, got {cluster_centers_shape}")
+                else:
+                    self._add_result("Online Profiler: KMeans Centers", True,
+                                   f"Cluster centers shape: {cluster_centers_shape}")
+            
+            # Test 4: Second batch processing (incremental learning)
+            try:
+                profiles2 = online_profiler.update_and_get_profile(batch2_x, batch2_ids)
+                
+                if profiles2.shape != expected_shape:
+                    self._add_result("Online Profiler: Second Batch Shape", False,
+                                   f"Expected {expected_shape}, got {profiles2.shape}")
+                else:
+                    self._add_result("Online Profiler: Second Batch Shape", True,
+                                   "Incremental update successful")
+                
+                # Check that the model has learned from both batches
+                # The cluster centers should be different after the second batch
+                if torch.allclose(torch.tensor(online_profiler.cluster_centers_), 
+                                torch.zeros_like(torch.tensor(online_profiler.cluster_centers_))):
+                    self._add_result("Online Profiler: Incremental Learning", False,
+                                   "Cluster centers appear to be zeros")
+                else:
+                    self._add_result("Online Profiler: Incremental Learning", True,
+                                   "Model successfully updated with second batch")
+                    
+            except Exception as e:
+                self._add_result("Online Profiler: Second Batch", False, str(e))
+            
+            # Test 5: Handling empty/invalid data
+            try:
+                empty_x = torch.full((batch_size, sequence_length, num_features), float('nan'))
+                empty_ids = torch.randint(0, 5, (batch_size,))
+                
+                profiles_empty = online_profiler.update_and_get_profile(empty_x, empty_ids)
+                self._add_result("Online Profiler: Empty Data Handling", True,
+                               "Successfully handled batch with NaN values")
+            except Exception as e:
+                self._add_result("Online Profiler: Empty Data Handling", False, str(e))
+            
+            # Test 6: Interface compatibility with base UserProfiler
+            try:
+                # Test that it has the expected methods
+                if not hasattr(online_profiler, 'get_conditions'):
+                    self._add_result("Online Profiler: Interface Compatibility", False,
+                                   "Missing get_conditions method")
+                elif not hasattr(online_profiler, 'get_random_conditions'):
+                    self._add_result("Online Profiler: Interface Compatibility", False,
+                                   "Missing get_random_conditions method")
+                else:
+                    # Test get_random_conditions
+                    random_conds = online_profiler.get_random_conditions(8)
+                    if random_conds.shape != (8, n_topics):
+                        self._add_result("Online Profiler: Interface Compatibility", False,
+                                       f"get_random_conditions returned wrong shape: {random_conds.shape}")
+                    else:
+                        self._add_result("Online Profiler: Interface Compatibility", True,
+                                       "Interface compatible with base UserProfiler")
+            except Exception as e:
+                self._add_result("Online Profiler: Interface Compatibility", False, str(e))
+            
+            # Test 7: Check for proper decay/forgetting mechanism
+            if hasattr(online_profiler, 'decay') and online_profiler.decay != 1.0:
+                self._add_result("Online Profiler: Decay Parameter", True,
+                               f"Decay parameter set to {online_profiler.decay}")
+            else:
+                self._add_result("Online Profiler: Decay Parameter", False,
+                               "No decay/forgetting mechanism implemented")
+                
+        except ImportError:
+            self._add_result("Online Profiler: Import", False, "Could not import OnlineUserProfiler")
+        except Exception as e:
+            self._add_result("Online Profiler: Overall", False, f"{type(e).__name__}: {str(e)}")
+            if self.verbose:
+                traceback.print_exc()
+    
+    def _test_online_cvae(self):
+        """Test OnlineCVAE functionality and online learning capabilities."""
+        if self.verbose:
+            print("\n[13] Testing Online CVAE...")
+        
+        try:
+            from src.Models import OnlineCVAE
+            from src.Conditioner import Conditioner, DayOfWeekConditioner, OnlineUserProfiler
+            from src.normalizer import IndexedLogRevIN
+            
+            # Test parameters
+            input_dim = 24  # 24-hour sequences
+            latent_dim = 8
+            batch_size = 16
+            
+            # Create online conditioner with OnlineUserProfiler
+            online_conditioner = Conditioner()
+            online_conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
+            online_conditioner.add_condition_item("user_profile", OnlineUserProfiler(
+                n_topics=5, 
+                num_clusters=10,
+                decay=0.9,
+                update_frequency=5,
+                random_state=42,
+                verbose=False
+            ))
+            
+            # Test 1: OnlineCVAE initialization
+            try:
+                online_cvae = OnlineCVAE(
+                    input_dim=input_dim,
+                    conditioner=online_conditioner,
+                    latent_dim=latent_dim,
+                    prior_type="standard_dictionary",
+                    device=self.device
+                )
+                online_cvae.to(self.device)
+                
+                if not hasattr(online_cvae, 'revin_normalizer'):
+                    self._add_result("Online CVAE: Initialization", False, "Missing RevIN normalizer")
+                    return
+                else:
+                    self._add_result("Online CVAE: Initialization", True,
+                                f"Successfully initialized with RevIN normalizer")
+                    
+            except Exception as e:
+                self._add_result("Online CVAE: Initialization", False, str(e))
+                return
+            
+            # Create test data in correct format for OnlineCVAE
+            # OnlineCVAE expects 3D input [batch, seq_len, features]
+            test_data = torch.abs(torch.randn(batch_size, 24, 1, device=self.device)) + 1.0  # Positive values for energy
+            test_meter_ids = torch.randint(1, 11, (batch_size,), device=self.device)
+            test_timestamps = torch.randint(0, 365*24, (batch_size,), device=self.device)
+            
+            # Test 2: First batch training using train_core
+            try:
+                online_cvae.train()
+                optimizer = torch.optim.Adam(online_cvae.parameters(), lr=1e-3)
+                
+                # Create batch tuple in the format expected by train_core
+                batch = (test_data, test_meter_ids, test_timestamps)
+                
+                loss_dict = online_cvae.train_core(batch, optimizer, beta=1.0)
+                
+                # Check for the correct loss keys (based on VAE loss method)
+                expected_keys = ['loss', 'recon_loglikelihood', 'kl_divergence']
+                for key in expected_keys:
+                    if key not in loss_dict:
+                        self._add_result("Online CVAE: First Batch Training", False, 
+                                    f"Missing key '{key}' in train_core result")
+                        return
+                
+                # Check that losses are reasonable
+                total_loss = loss_dict['loss'].item()
+                if torch.isnan(torch.tensor(total_loss)) or torch.isinf(torch.tensor(total_loss)):
+                    self._add_result("Online CVAE: First Batch Training", False,
+                                f"Invalid loss: {total_loss}")
+                    return
+                    
+                self._add_result("Online CVAE: First Batch Training", True,
+                            f"First batch training successful, loss: {total_loss:.4f}")
+                    
+            except Exception as e:
+                self._add_result("Online CVAE: First Batch Training", False, str(e))
+                return
+            
+            # Test 3: Sampling
+            try:
+                online_cvae.eval()
+                
+                # Create conditions for sampling
+                sample_batch = 2
+                sample_conditions = online_cvae.conditioner.get_random_conditions(sample_batch)
+                if isinstance(sample_conditions, torch.Tensor):
+                    sample_conditions = sample_conditions.to(self.device)
+                else:
+                    sample_conditions = torch.tensor(sample_conditions, dtype=torch.float32).to(self.device)
+                
+                samples = online_cvae.sample(
+                    conditions=sample_conditions,
+                    num_prior_samples=4, 
+                    num_x_samples=1, 
+                    device=str(self.device),
+                    timestamps=torch.tensor([100, 200], device=self.device)
+                )
+                
+                # samples shape should be [S, num_x_samples, B, D] = [4, 1, 2, 24]
+                expected_sample_shape = (4, 1, sample_batch, input_dim)
+                if samples.shape == expected_sample_shape:
+                    self._add_result("Online CVAE: Sampling", True,
+                                f"Sampling successful, shape: {samples.shape}")
+                else:
+                    self._add_result("Online CVAE: Sampling", False,
+                                f"Sample shape {samples.shape} != expected {expected_sample_shape}")
+                    
+            except Exception as e:
+                self._add_result("Online CVAE: Sampling", False, str(e))
+            
+            # Test 4: Check RevIN normalization updates
+            normalizer_stats_after_batch1 = len(online_cvae.revin_normalizer.daily_stats)
+            if normalizer_stats_after_batch1 == 0:
+                self._add_result("Online CVAE: RevIN Updates", False,
+                            "RevIN not updating daily stats")
+            else:
+                self._add_result("Online CVAE: RevIN Updates", True,
+                            f"RevIN tracking {normalizer_stats_after_batch1} dates")
+            
+            # Test 5: Second batch (incremental learning)
+            try:
+                # Create a second batch with some overlap and new data
+                batch2_data = torch.abs(torch.randn(batch_size, 24, 1, device=self.device)) + 1.0
+                batch2_ids = torch.randint(5, 15, (batch_size,), device=self.device)  # Some overlap, some new
+                batch2_timestamps = test_timestamps + 24*3600  # Next day
+                
+                batch2 = (batch2_data, batch2_ids, batch2_timestamps)
+                loss2_dict = online_cvae.train_core(batch2, optimizer, beta=1.0)
+                
+                second_loss = loss2_dict['loss'].item()
+                self._add_result("Online CVAE: Second Batch Training", True,
+                            f"Second batch successful, loss: {second_loss:.4f}")
+                
+                # Check RevIN learned new dates
+                normalizer_stats_after_batch2 = len(online_cvae.revin_normalizer.daily_stats)
+                if normalizer_stats_after_batch2 > normalizer_stats_after_batch1:
+                    self._add_result("Online CVAE: Incremental Learning", True,
+                                f"RevIN learned new dates: {normalizer_stats_after_batch1} → {normalizer_stats_after_batch2}")
+                else:
+                    self._add_result("Online CVAE: Incremental Learning", False,
+                                f"RevIN not learning: {normalizer_stats_after_batch1} → {normalizer_stats_after_batch2}")
+                    
+            except Exception as e:
+                self._add_result("Online CVAE: Second Batch Training", False, str(e))
+            
+            # Test 6: Interface compatibility
+            try:
+                # Test that it still works like regular CVAE for reconstruction
+                online_cvae.eval()
+                test_x = test_data[:4]  # [4, 24, 1]
+                test_ids = test_meter_ids[:4]
+                test_ts = test_timestamps[:4]
+                
+                with torch.no_grad():
+                    recon_params, posterior_params = online_cvae.reconstruct(
+                        test_x, test_ids, test_ts, num_samples=1
+                    )
+                    expected_recon_shape = (1, 4, 24)  # [samples, batch, input_dim]
+                    actual_shape = recon_params['mu'].shape
+                    
+                    if actual_shape == expected_recon_shape:
+                        self._add_result("Online CVAE: Interface Compatibility", True,
+                                    f"Compatible interface, recon shape: {actual_shape}")
+                    else:
+                        self._add_result("Online CVAE: Interface Compatibility", False,
+                                    f"Shape mismatch: got {actual_shape}, expected {expected_recon_shape}")
+                        
+            except Exception as e:
+                self._add_result("Online CVAE: Interface Compatibility", False, str(e))
+                
+            # Test 7: Memory efficiency
+            user_profiler = online_cvae.conditioner.condition_items.get("user_profile")
+            if hasattr(user_profiler, 'user_profiles_cache'):
+                num_cached = len(user_profiler.user_profiles_cache)
+                num_dates = len(online_cvae.revin_normalizer.daily_stats)
+                self._add_result("Online CVAE: Memory Efficiency", True,
+                            f"Cached users: {num_cached}, tracked dates: {num_dates}")
+            else:
+                self._add_result("Online CVAE: Memory Efficiency", False,
+                            "User profiler not caching profiles")
+                
+        except ImportError:
+            self._add_result("Online CVAE: Import", False, "Could not import OnlineCVAE")
+        except Exception as e:
+            self._add_result("Online CVAE: Overall", False, f"{type(e).__name__}: {str(e)}")
+            if self.verbose:
+                traceback.print_exc()
+    
     def _generate_report(self) -> bool:
         """Generate and print validation report."""
         if self.verbose:
@@ -834,6 +1330,7 @@ class ModelValidator:
             print("=" * 80 + "\n")
         
         return len(failed) == 0
+    
 
 
 def validate_before_training(
