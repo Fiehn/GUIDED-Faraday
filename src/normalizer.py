@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 
+# === Normalizer class that will use the entire data ===
 class Normalizer:
     """
     Normalizes data using specified methods.
@@ -125,3 +126,4 @@ class Normalizer:
             return self._log1p_inverse(X)
         else:
             raise ValueError(f"Normalization method '{self.method}' not recognized.")
+        

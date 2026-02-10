@@ -412,35 +412,6 @@ def _load_model_legacy(model_path, data_config, output_dir, device, num_reconstr
     print(viz_path)
     return viz_path
 
-    user_dict_path = _visualize_user_dictionary(
-        model=model,
-        test_loader=test_loader,
-        device=device,
-        output_dir=output_dir,
-        model_tag=model_tag,
-    )
-    viz_path.update(user_dict_path)
-    synth_recreation_path = _visualize_synthetic_recreations(
-        model=model,
-        test_loader=test_loader,
-        normalizer=normalizer,
-        device=device,
-        output_dir=output_dir,
-        model_tag=model_tag,
-    )
-    viz_path.update(synth_recreation_path)
-    summary_path = _save_model_summary(
-        model=model,
-        model_kwargs=model_kwargs,
-        output_dir=output_dir,
-        model_tag=model_tag,
-    )
-    viz_path['model_summary'] = summary_path
-
-    print("All visualizations saved.")
-    print(viz_path)
-    return viz_path
-
 def visualize_trained_model(
         model,
         test_loader,
@@ -448,7 +419,7 @@ def visualize_trained_model(
         device,
         output_dir: str,
         model_tag: str,
-        num_reconstructions: int = 3,
+        num_reconstructions: int = 10,
         num_synthetic_samples: int = 5,
         num_samples_per_original: int = 3,
     ) -> dict:

@@ -24,29 +24,19 @@ from src.priors import *
 # TODO:
 # - Implement autocast with GradScaler for mixed precision training (Much faster training on GPUs)
 # - Make sure everything works with CPU and GPU seamlessly
-# - Fix the logging so that it is not too cluttered
-# - Implement learning rate finder utility
-# - Implement model checkpointing and resuming training
-# - Implement unit tests for all components
-# - Implement the user profile conditioning properly
-# - Ensure PDCC works as intended
-# - Declutter the code and add more comments/docstrings
 # - Optimize data loading and preprocessing pipeline
-# - Enhance the model saving/loading mechanism
 # - Add more conditions
 # - Hyperparameter tuning utilities (for optimizers, architectures, etc.)
 # - Make sure the model works with variable length sequences (padding/masking)
 # - IMPORTANT: Streaming algorithm for user profiles (online LDA) and normalization (running mean/std) and for the training (online/streaming VAE training)
-# - Implement different priors (sparse, mixture of Gaussians, VampPrior, etc.)
-# - Fix the conditioner to properly handle conditions
-# - Test loading of models and make sure it is possible and reliable
 # - Test different loss functions and double check the current implementation against the literature
+# - Make sure loading and saving is robust
 
 
 # ==============
 # Cyclical Beta Annealing Scheduler
 # Reference: "Cyclical Annealing Schedule: A Simple Approach to Mitigating KL Vanishing"
-#            (Fu et al., 2019) https://arxiv.org/abs/1903.10145
+# (Fu et al., 2019) https://arxiv.org/abs/1903.10145
 # ==============
 class CyclicalBetaScheduler:
     """Cyclical annealing schedule for the KL weight (beta) in VAE training.
@@ -156,7 +146,7 @@ class EarlyStopping:
 # ==============
 # Define a base VAE class that CVAE will inherit from
 #   - should be the base that contains all core aspects
-#   - encoder and decoder are modular and can be swapped out (which means they need to be implemented independently)
+#   - encoder and decoder are modular and can be swapped out
 # ==============
 class VAE(nn.Module):
     def __init__(self,
@@ -169,7 +159,7 @@ class VAE(nn.Module):
                  **_):
         super(VAE, self).__init__()
 
-        # === Argument Handling === (Allows for flexible passing of arguments)
+        # === Argument Handling ===
         # Capture all local variables in kwargs
         kwargs = dict(locals())
 
@@ -191,11 +181,11 @@ class VAE(nn.Module):
         latent_dim = distribution_dict.get("latent_dim", 32)
         self.latent_dim = latent_dim
 
-        # 1. Create encoder and decoder first (they don't need the prior at construction time)
+        # 1. Create encoder and decoder
         self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim, type=encoder_type)
         self.decoder = get_decoder_model(latent_dim=latent_dim, output_dim=input_dim, type=decoder_type)
 
-        # 2. Create prior AFTER encoder (VampPrior needs a reference to the encoder)
+        # 2. Create prior after encoder (VampPrior needs a reference to the encoder)
         if prior_type is None:
             prior_type = "standard_dictionary" if encoder_type == "dictionary" else "standard_gaussian"
             self.prior_type = prior_type
@@ -266,9 +256,11 @@ class VAE(nn.Module):
         # Run a single forward pass to get reconstruction parameters
         recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=num_samples)
         return recon_params_dict, posterior_params_dict
+    
     def reconstruction_loglikelihood(self, inputs, recon_params_dict):
         # Compute reconstruction log-likelihood
         return self.decoder.loglikelihood(inputs, recon_params_dict)
+    
     @torch.no_grad()
     def loglikelihood(self, inputs, num_mc_samples=1):
         """Compute log-likelihood"""
@@ -282,7 +274,7 @@ class VAE(nn.Module):
         return (posterior_loglikelihood.sum(-1) + recon_loglikelihood.sum(-1) - prior_loglikelihood.sum(-1)).mean(dim=0)
     
     def loss(self, inputs, recon_params_dict, posterior_params_dict, beta: float = 1.0, weighted_loss: float = 0.0, **_):
-        # Compute reconstruction log-likelihood (we use reconstruction only because of VAE structure)
+        # Compute reconstruction log-likelihood
         recon_loglikelihood = self.reconstruction_loglikelihood(inputs, recon_params_dict)
 
         # Compute KL divergence between posterior and prior
@@ -381,7 +373,7 @@ class VAE(nn.Module):
         # TODO: Allow for different optimizers and parameter settings
         return torch.optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay) # TODO: Parameters should be inputted
 
-    def move_to_device(self, batch, device): # Handles: Tensor, tuple/list of tensors, dict of tensors
+    def move_to_device(self, batch, device):
         if torch.is_tensor(batch):
             return batch.to(device)
         if isinstance(batch, (list, tuple)):
@@ -626,57 +618,7 @@ class VAE(nn.Module):
     @classmethod
     def load_from_checkpoint(cls, load_path, device="cpu"):
         """
-        Recommended method to load a saved model.
-        Automatically handles both new and legacy checkpoint formats.
-        
-        Returns:
-            Loaded model instance
-        """
-        checkpoint = torch.load(load_path, map_location="cpu", weights_only=False)
-        
-        if 'model_info' in checkpoint:
-            # New format - use create_from_checkpoint
-            model_class_name = checkpoint['model_info']['model_class']
-            if model_class_name == 'CVAE':
-                return CVAE.create_from_checkpoint(load_path, device)
-            else:
-                return cls.create_from_checkpoint(load_path, device)
-        else:
-            # Legacy format - requires manual model creation first
-            print("Legacy checkpoint format detected")
-            print("Consider re-saving the model with current version for better compatibility")
-            
-            # For legacy, we need to create model first then load into it
-            # This is less reliable but needed for backward compatibility
-            model_kwargs = checkpoint.get("model_kwargs", {})
-            
-            if "conditioner" in model_kwargs or "condition_dim" in model_kwargs:
-                # Looks like CVAE - this will require manual conditioner recreation
-                raise ValueError("Legacy CVAE checkpoints require manual loading. "
-                               "Please use the _load_model_legacy function or re-save with current version.")
-            else:
-                # VAE - try to create with minimal parameters
-                state_dict = checkpoint['model_state_dict']
-                
-                # Infer basic parameters
-                if 'decoder.SigmaMapper' in state_dict:
-                    input_dim = state_dict['decoder.SigmaMapper'].shape[0]
-                elif 'decoder.parameterizer.param_heads.mu.3.bias' in state_dict:
-                    input_dim = state_dict['decoder.parameterizer.param_heads.mu.3.bias'].shape[0]
-                else:
-                    input_dim = 24  # Default fallback
-                
-                latent_dim = model_kwargs.get('latent_dim', 32)
-                
-                model = cls(input_dim=input_dim, distribution_dict={"latent_dim": latent_dim})
-                model.load_model(load_path, device)
-                return model
-
-    @classmethod
-    def create_from_checkpoint(cls, load_path, device="cpu"):
-        """
-        Create a model instance completely from a saved checkpoint.
-        This is the recommended way to load models saved with the new format.
+        Load a model instance completely from a saved checkpoint.
         """
         checkpoint = torch.load(load_path, map_location=device, weights_only=False)
         
@@ -785,11 +727,6 @@ class VAE(nn.Module):
             save_dir = './models/',
             weighted_loss = 0.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
             **_):
-        
-        # DEBUG:
-        print(f"Train loader: {len(trainloader)} batches, {len(trainloader.dataset)} samples")
-        if valloader:
-            print(f"Val loader: {len(valloader)} batches, {len(valloader.dataset)} samples")
 
         # === Generate a model tag ===
         time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -906,14 +843,6 @@ class VAE(nn.Module):
                 writer.add_scalar('Train/recon_loglikelihood_step', loss_dict["recon_loglikelihood"].item(), global_step)
                 writer.add_scalar('Train/kl_divergence_step', loss_dict["kl_divergence"].item(), global_step)
                 writer.add_scalar('Train/beta', current_beta, global_step)
-                
-                # Log gradients and parameters periodically
-                if global_step % 100 == 0:
-                    for name, param in self.named_parameters():
-                        if param.grad is not None:
-                            writer.add_histogram(f'Gradients/{name}', param.grad, global_step)
-                            writer.add_scalar(f'Gradients_norm/{name}', param.grad.norm().item(), global_step)
-                        writer.add_histogram(f'Parameters/{name}', param, global_step)
 
             # Compute average epoch losses
             avg_train_loss = epoch_train_loss / num_batches
@@ -960,7 +889,6 @@ class VAE(nn.Module):
                     best_model_path = os.path.join(save_dir, f"{model_tag}_best.pt")
                     self.save_model(save_path=save_dir, model_name=f"{model_tag}_best", device=device)
                     print(f"    New best model saved (Val Loss: {best_val_loss:.4f})")
-                    writer.add_text('Training/best_model', f'New best at epoch {epoch+1}, Val Loss: {best_val_loss:.4f}', epoch)
 
                 # Print progress
                 print(f"Epoch [{epoch+1:4d}/{epochs}] "
@@ -996,7 +924,6 @@ class VAE(nn.Module):
             if (epoch + 1) % save_epoch_freq == 0:
                 checkpoint_path = os.path.join(save_dir, f"{model_tag}_epoch_{epoch+1}.pt")
                 self.save_model(save_path=save_dir, model_name=f"{model_tag}_epoch_{epoch+1}", device=device)
-                writer.add_text('Training/checkpoint', f'Checkpoint saved at epoch {epoch+1}', epoch)
                 print(f"    Checkpoint saved: epoch_{epoch+1}")
         
         # === Training Complete ===
@@ -1063,10 +990,9 @@ class CVAE(VAE):
         self.condition_dim = conditioner.get_condition_dim()
         self.latent_dim = int(latent_dim)
 
-        # Pass prior_type to parent so it creates the prior
         super().__init__(input_dim=input_dim, distribution_dict=distribution_dict, prior_type=prior_type, **kwargs)
 
-        # NOW override encoder and decoder with conditioned versions
+        # Now override encoder and decoder with conditioned versions
         # Encoder takes [x, c] as input
         self.encoder = get_encoder_model(
             input_dim=input_dim + self.condition_dim,
