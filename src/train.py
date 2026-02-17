@@ -181,6 +181,107 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
     print("\nDone.")
     print(f"TensorBoard: tensorboard --logdir={log_dir}/{model_tag}")
 
+def online_train(model_type: str = "vae", skip_validation: bool = False):
+    if not skip_validation:
+        print("\nStarting model validation before online training...\n") 
+        validation_passed = run_validation(
+            model_type=model_type,
+            use_test_data=True,  # use small test data for fast validation
+            verbose=True
+        )
+        
+        if not validation_passed:
+            print("\n!! Validation failed! Please fix issues before training.")
+            print("To skip validation, use: online_train(model_type='cvae', skip_validation=True)")
+            return
+        
+        print("\nValidation passed! Proceeding to online training...\n")
+    else:
+        print("\n!!  Skipping validation (not recommended)\n")
+
+    # Load data sequentially based on what is in the folder and train the model in an online fashion
+    data_files = sorted([f for f in os.listdir("data/") if f.endswith(".csv")])
+    # remove data files that are already trained on (check runs folder for existing models)
+    # TODO: Check runs and find and remove already trained files in the list.
+    
+    # Create the model and normalizer and conditioner once
+    if model_type == "vae":
+        print("Initializing VAE model...")
+        model = VAE(input_dim=24 * 1, latent_dim=32, device=device)  # input_dim will be updated based on data
+        log_dir = "./runs/VAE_online_training"
+    else:
+        print("Initializing CVAE model (condition = day-of-week + user-profile)...")
+        conditioner = Conditioner()
+        conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
+        conditioner.add_condition_item("user_profile", OnlineUserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
+        model = CVAE(input_dim=24 * 1, latent_dim=32, conditioner=conditioner, 
+                     encoder_type="dictionary",decoder_type='dictionary', 
+                     prior_type="vampprior", device=device)  # input_dim will be updated based on data
+        log_dir = "./runs/CVAE_online_training"
+    normalizer = IndexedLogRevIN(24 * 1, device=device)
+    
+    for data_file in data_files:
+        print(f"\nProcessing {data_file}")
+        # Load data for this file
+        dm = SmartMeterDataModule(
+            data_dir="data/",
+            filename=data_file,
+            meter_col="meter_number",
+            timestamp_dst_col="timestamp_dst",
+            timestamp_utc_col="timestamp_utc",
+            feature_cols=("hourly_energy_consumption",),
+            window=WindowSpec(input_len=24, stride=24),
+            batch_size=512,
+            num_workers=0,
+            shuffle_train=False,
+            seed=42,
+            train_frac=0.8,
+            val_frac=0.1,
+            max_meters=None,
+            normalizer=normalizer,
+        )
+        dm.setup()
+        train_loader = dm.train_dataloader()
+        val_loader = dm.val_dataloader()
+        test_loader = dm.test_dataloader()
+        
+        # Update model input_dim if needed
+        if model.encoder.input_dim != 24 * len(dm.feature_cols):
+            print(f"Updating model input_dim from {model.encoder.input_dim} to {24 * len(dm.feature_cols)}")
+            model.encoder.input_dim = 24 * len(dm.feature_cols)
+            model.decoder.input_dim = 24 * len(dm.feature_cols)
+            if isinstance(model, CVAE):
+                model.conditioner.update_input_dim(24 * len(dm.feature_cols))
+        
+        # Train on this data
+        model.fit(
+            trainloader=train_loader,
+            valloader=val_loader,
+            lr=1e-3,
+            weight_decay=1e-4,
+            gradient_clip=1.0,
+            gradient_clip_kwargs={"max_norm": 1.0},
+            lr_scheduler=True,
+            lr_scheduler_kwargs={"step_size": 10, "gamma": 0.9},
+            beta=1.0,
+            beta_annealing=True,
+            beta_annealing_kwargs={"n_cycles": 4, "ratio": 0.5},
+            num_samples=1,
+            epochs=20,
+            validation_freq=1,
+            validation_num_samples=1,
+            device=device,
+            early_stopping=True,
+            early_stopping_kwargs={"patience": 3, "min_delta": 0.001},
+            save_epoch_freq=10,
+            log_dir=os.path.join(log_dir, data_file.replace(".csv", "")),
+        )
+        print(f"Finished training on {data_file} advancing to next file...\n")
+
+        # Visualize each step of the model 
+        visualize_trained_model(model=model, test_loader=test_loader, normalizer=normalizer, device=device,output_dir="Output/Plots", model_tag="online_" + data_file.replace(".csv", ""))
+
+
 
 # now we can run either VAE or CVAE test
 if __name__ == "__main__":

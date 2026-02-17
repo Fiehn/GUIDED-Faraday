@@ -487,8 +487,7 @@ def visualize_trained_model(
         model_tag=model_tag,
     )
     viz_path.update(synth_recreation_path)
-    
-    
+
     user_profile_path = _visualize_user_dictionary(
         model=model,
         test_loader=test_loader,
@@ -508,7 +507,6 @@ def visualize_trained_model(
     print("All visualizations saved.")
     print(viz_path)
     return viz_path
-
 
 def _visualize_reconstructions(
         model,

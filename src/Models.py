@@ -33,6 +33,14 @@ from src.normalizer import *
 # - Test different loss functions and double check the current implementation against the literature
 # - Make sure loading and saving is robust
 # - Config file for all parameters and settings (e.g., YAML or JSON) and make sure it works with the current code structure
+# - Visualize RevIN normalization effects and user profile clusters
+# - Add more visualization and analysis tools for the learned latent space and reconstructions
+
+# TODO: Ideas
+# - Add a discriminator network and adversarial training to improve reconstruction quality (VAE-GAN style) (might not work)
+# - Make NNBlock transformers
+# - Latent Diffusion model instead of VAE
+# - Diffusion priors for sampling ? 
 
 # ==============
 # Cyclical Beta Annealing Scheduler
