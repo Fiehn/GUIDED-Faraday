@@ -397,155 +397,264 @@ class VAE(nn.Module):
             }
         return batch
 
+
     def save_model(self, save_path=None, model_name="trained_model", device="cpu"):
         """
-        Save model with complete reconstruction information.
+        Save model with complete reconstruction information and validation.
         Stores all parameters needed to recreate the model from scratch.
+        Includes error recovery and integrity checking.
         """
         if save_path is None: 
             save_path = "./models/"
+        
         model_path = os.path.join(save_path, f"{model_name}.pt")
+        os.makedirs(save_path, exist_ok=True)
+        
+        # Move to CPU for serialization
         self.eval()
         self.to("cpu")
-        self.prior.to("cpu")
+        if hasattr(self, 'prior'):
+            self.prior.to("cpu")
+        
+        try:
+            # === Core Model Information ===
+            model_info = {
+                'model_class': self.__class__.__name__,
+                'model_module': self.__class__.__module__,
+                'input_dim': self.input_dim,
+                'save_format_version': 2,  # Track format for future compatibility
+            }
 
-        # === Core Model Information ===
-        model_info = {
-            'model_class': self.__class__.__name__,
-            'model_module': self.__class__.__module__,
-            'input_dim': self.input_dim,
-        }
+            # === Constructor Arguments ===
+            constructor_args = self._extract_constructor_args()
+            
+            # === Distribution Dictionary ===
+            distribution_dict = self._extract_distribution_dict()
+            constructor_args['distribution_dict'] = distribution_dict
 
-        # === Constructor Arguments for VAE ===
-        constructor_args = {
+            # === CVAE-Specific Information ===
+            if isinstance(self, CVAE):
+                model_info = self._serialize_cvae_info(model_info)
+
+            # === Prior Serialization ===
+            prior_state = self._serialize_prior()
+
+            # === Build Checkpoint ===
+            checkpoint = {
+                'model_state_dict': self.state_dict(),
+                'model_info': model_info,
+                'constructor_args': constructor_args,
+                'prior_state': prior_state,
+                'model_kwargs': self.model_kwargs,
+            }
+
+            # === Validate Before Saving ===
+            self._validate_checkpoint(checkpoint)
+
+            # === Save to Temp File First (Atomic Write) ===
+            temp_path = model_path + ".tmp"
+            torch.save(checkpoint, temp_path)
+            
+            # === Verify Temp File Can Be Loaded ===
+            try:
+                test_load = torch.load(temp_path, map_location="cpu", weights_only=False)
+                assert 'model_state_dict' in test_load, "Checkpoint missing model_state_dict"
+            except Exception as e:
+                os.remove(temp_path)
+                raise RuntimeError(f"Checkpoint validation failed: {e}")
+
+            # === Atomic Move (Replace Old File) ===
+            if os.path.exists(model_path):
+                backup_path = model_path + ".backup"
+                os.replace(model_path, backup_path)
+            os.replace(temp_path, model_path)
+
+            print(f"✓ Model saved successfully: {model_path}")
+            print(f"  - Model class: {model_info['model_class']}")
+            print(f"  - Parameters: {self.num_parameters:,}")
+            if isinstance(self, CVAE):
+                print(f"  - Condition dim: {self.condition_dim}")
+                
+        except Exception as e:
+            # Cleanup temp file if it exists
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            print(f"✗ Save failed: {e}", file=sys.stderr)
+            raise
+        finally:
+            # Move back to original device
+            self.to(device)
+            if hasattr(self, 'prior'):
+                self.prior.to(device)
+
+    def _extract_constructor_args(self):
+        """Safely extract and validate constructor arguments."""
+        return {
             'input_dim': self.input_dim,
             'encoder_type': getattr(self, 'encoder_type', 'dictionary'),
             'decoder_type': getattr(self, 'decoder_type', 'dictionary'), 
-            'prior_type': getattr(self, 'prior_type', type(self.prior).__name__.lower().replace('prior', '')),
+            'prior_type': getattr(self, 'prior_type', self._infer_prior_type()),
             'device': str(self.device),
         }
 
-        # === Distribution Dictionary ===
+    def _infer_prior_type(self):
+        """Safely infer prior type from class name."""
+        if not hasattr(self, 'prior'):
+            return 'standard_gaussian'
+        prior_class = self.prior.__class__.__name__
+        return prior_class.lower().replace('prior', '').replace('standard_', '')
+
+    def _extract_distribution_dict(self):
+        """Extract distribution parameters with validation."""
         distribution_dict = {
-            'latent_dim': getattr(self, 'latent_dim', getattr(self.encoder, 'latent_dim', 32)),
+            'latent_dim': getattr(self, 'latent_dim', 
+                                getattr(self.encoder, 'latent_dim', 32)),
         }
         
-        # Extract distribution parameters from model attributes and model_kwargs
-        for key in ['dictionary_size', 'vamp_num_components', 'num_topics', 'sigma_min', 'sigma_max']:
+        # Safe extraction of optional keys
+        optional_keys = {
+            'dictionary_size': int,
+            'vamp_num_components': int,
+            'num_topics': int,
+            'sigma_min': float,
+            'sigma_max': float,
+        }
+        
+        for key, expected_type in optional_keys.items():
+            value = None
             if hasattr(self, key):
-                distribution_dict[key] = getattr(self, key)
+                value = getattr(self, key)
             elif key in self.model_kwargs:
-                distribution_dict[key] = self.model_kwargs[key]
-
-        # Add latent_dim to distribution_dict
-        constructor_args['distribution_dict'] = distribution_dict
-
-        # === CVAE Specific Information ===
-        if isinstance(self, CVAE):
-            model_info['condition_dim'] = self.condition_dim
-            constructor_args['latent_dim'] = self.latent_dim
+                value = self.model_kwargs[key]
             
-            # Save conditioner information
-            conditioner_state = {
-                'condition_items': {},
-                'condition_tags': self.conditioner.get_condition_tags(),
-                'condition_dim': self.conditioner.get_condition_dim(),
-            }
-            
-            # Save each condition item
-            for tag, condition_item in self.conditioner.condition_items.items():
-                item_state = {
-                    'class_name': condition_item.__class__.__name__,
-                    'module': condition_item.__class__.__module__,
-                    'state_dict': condition_item.state_dict() if hasattr(condition_item, 'state_dict') else {},
-                }
-                
-                # Save constructor arguments for condition items - use specific logic per class
-                item_args = {}
-                class_name = condition_item.__class__.__name__
-                
-                if class_name == 'DayOfWeekConditioner':
-                    # DayOfWeekConditioner takes no constructor arguments except self
-                    pass
-                elif class_name == 'UserProfiler':
-                    # UserProfiler constructor args
-                    for attr in ['num_clusters', 'path', 'verbose']:
-                        if hasattr(condition_item, attr):
-                            item_args[attr] = getattr(condition_item, attr)
-                else:
-                    # Generic fallback for unknown condition types - be more selective
-                    for attr_name in ['num_clusters', 'path', 'verbose', 'input_dim', 'output_dim']:
-                        if hasattr(condition_item, attr_name):
-                            try:
-                                attr = getattr(condition_item, attr_name)
-                                if isinstance(attr, (int, float, str, bool)):
-                                    item_args[attr_name] = attr
-                            except:
-                                pass
-                
-                item_state['constructor_args'] = item_args
-                conditioner_state['condition_items'][tag] = item_state
-                
-            model_info['conditioner_state'] = conditioner_state
+            if value is not None:
+                try:
+                    distribution_dict[key] = expected_type(value)
+                except (ValueError, TypeError) as e:
+                    print(f"Warning: Could not convert {key}={value} to {expected_type.__name__}: {e}")
+        
+        return distribution_dict
 
-        # === Prior Serialization ===
+    def _serialize_prior(self):
+        """Serialize prior with fallback error handling."""
+        if not hasattr(self, 'prior'):
+            return {'prior_type': 'StandardGaussianPrior', 'init_args': {}, 'state_dict': {}}
+        
+        prior = self.prior
+        prior_class_name = prior.__class__.__name__
+        
         prior_state = {
-            'prior_type': self.prior.__class__.__name__,
-            'module': self.prior.__class__.__module__,
-            'state_dict': self.prior.state_dict(),
+            'prior_type': prior_class_name,
+            'module': prior.__class__.__module__,
+            'state_dict': prior.state_dict() if hasattr(prior, 'state_dict') else {},
             'init_args': {},
         }
         
-        # Extract prior initialization arguments - use specific logic per class
-        prior_class_name = self.prior.__class__.__name__
+        # Use isinstance checks instead of string matching
+        try:
+            if isinstance(prior, VampPrior):
+                prior_state['init_args'] = {
+                    'latent_dim': getattr(prior, 'latent_dim', self.latent_dim),
+                    'input_shape': getattr(prior, 'input_shape', 
+                                        self.input_dim + getattr(self, 'condition_dim', 0)),
+                    'num_components': getattr(prior, 'num_components', 20),
+                }
+            elif isinstance(prior, (StandardGaussianPrior, LearnableGaussianPrior)):
+                prior_state['init_args'] = {
+                    'latent_dim': getattr(prior, 'latent_dim', self.latent_dim),
+                }
+            elif isinstance(prior, (StandardDictionaryPrior, LearnableDictionaryPrior)):
+                prior_state['init_args'] = {
+                    'latent_dim': getattr(prior, 'latent_dim', self.latent_dim),
+                    'dictionary_size': getattr(prior, 'dictionary_size', 100),
+                }
+            else:
+                # Generic fallback - extract any serializable attributes
+                for attr_name in ['latent_dim', 'dictionary_size', 'input_shape', 'num_components']:
+                    if hasattr(prior, attr_name):
+                        val = getattr(prior, attr_name)
+                        if isinstance(val, (int, float, str, bool)):
+                            prior_state['init_args'][attr_name] = val
+        except Exception as e:
+            print(f"Warning: Error extracting prior args: {e}")
         
-        if prior_class_name == 'VampPrior':
-            # VampPrior constructor: (latent_dim, input_shape, encoder=None, num_components=20, device='cpu')
-            prior_state['init_args'] = {
-                'latent_dim': getattr(self.prior, 'latent_dim', self.latent_dim),
-                'input_shape': getattr(self.prior, 'input_shape', self.input_dim + getattr(self, 'condition_dim', 0)),
-                'num_components': getattr(self.prior, 'num_components', 20),
-            }
-        elif prior_class_name in ['StandardGaussianPrior', 'LearnableGaussianPrior']:
-            # Gaussian priors: (latent_dim, device)
-            prior_state['init_args'] = {
-                'latent_dim': getattr(self.prior, 'latent_dim', self.latent_dim),
-            }
-        elif prior_class_name in ['StandardDictionaryPrior', 'LearnableDictionaryPrior']:
-            # Dictionary priors: (latent_dim, dictionary_size, device)
-            prior_state['init_args'] = {
-                'latent_dim': getattr(self.prior, 'latent_dim', self.latent_dim),
-                'dictionary_size': getattr(self.prior, 'dictionary_size', 100),
-            }
-        else:
-            # Generic fallback for unknown prior types
-            for attr_name in ['latent_dim', 'dictionary_size', 'input_shape', 'num_components']:
-                if hasattr(self.prior, attr_name):
-                    try:
-                        attr = getattr(self.prior, attr_name)
-                        if isinstance(attr, (int, float, str, bool)):
-                            prior_state['init_args'][attr_name] = attr
-                        elif isinstance(attr, torch.dtype):
-                            prior_state['init_args'][attr_name] = str(attr)
-                    except:
-                        pass
+        return prior_state
 
-        # === Save Everything ===
-        checkpoint = {
-            'model_state_dict': self.state_dict(),
-            'model_info': model_info,
-            'constructor_args': constructor_args,
-            'prior_state': prior_state,
-            'model_kwargs': self.model_kwargs,  # Keep for backward compatibility
+    def _serialize_cvae_info(self, model_info):
+        """Serialize CVAE-specific info with error handling."""
+        model_info['condition_dim'] = self.condition_dim
+        
+        conditioner_state = {
+            'condition_items': {},
+            'condition_tags': self.conditioner.get_condition_tags(),
+            'condition_dim': self.conditioner.get_condition_dim(),
         }
+        
+        for tag, condition_item in self.conditioner.condition_items.items():
+            try:
+                item_state = {
+                    'class_name': condition_item.__class__.__name__,
+                    'module': condition_item.__class__.__module__,
+                    'state_dict': condition_item.state_dict() 
+                                if hasattr(condition_item, 'state_dict') else {},
+                    'constructor_args': self._extract_conditioner_args(condition_item),
+                }
+                conditioner_state['condition_items'][tag] = item_state
+            except Exception as e:
+                print(f"Warning: Could not serialize conditioner '{tag}': {e}")
+                # Save minimal info for recovery
+                conditioner_state['condition_items'][tag] = {
+                    'class_name': condition_item.__class__.__name__,
+                    'module': condition_item.__class__.__module__,
+                    'error': str(e),
+                }
+        
+        model_info['conditioner_state'] = conditioner_state
+        return model_info
 
-        torch.save(checkpoint, model_path)
-        self.to(device)
-        self.prior.to(device)
-        print(f"Model saved to {model_path}")
-        print(f"Model class: {model_info['model_class']}")
-        if isinstance(self, CVAE):
-            print(f"Conditioner tags: {conditioner_state['condition_tags']}")
+    def _extract_conditioner_args(self, condition_item):
+        """Extract constructor args for a condition item."""
+        item_args = {}
+        class_name = condition_item.__class__.__name__
+        
+        # Use isinstance checks where possible
+        if isinstance(condition_item, DayOfWeekConditioner):
+            pass  # No constructor args needed
+        elif isinstance(condition_item, UserProfiler):
+            for attr in ['n_topics', 'num_clusters', 'random_state', 'path', 'verbose']:
+                if hasattr(condition_item, attr):
+                    item_args[attr] = getattr(condition_item, attr)
+        else:
+            # Generic extraction for unknown types
+            safe_attrs = ['n_topics', 'num_clusters', 'path', 'verbose', 'input_dim', 'output_dim']
+            for attr_name in safe_attrs:
+                if hasattr(condition_item, attr_name):
+                    try:
+                        val = getattr(condition_item, attr_name)
+                        if isinstance(val, (int, float, str, bool, type(None))):
+                            item_args[attr_name] = val
+                    except Exception:
+                        pass
+        
+        return item_args
+
+    def _validate_checkpoint(self, checkpoint):
+        """Validate checkpoint structure and content."""
+        required_keys = ['model_state_dict', 'model_info', 'constructor_args', 'prior_state']
+        for key in required_keys:
+            if key not in checkpoint:
+                raise ValueError(f"Checkpoint missing required key: {key}")
+        
+        # Validate model_state_dict is non-empty
+        if not checkpoint['model_state_dict']:
+            raise ValueError("model_state_dict is empty")
+        
+        # Validate model_info
+        info = checkpoint['model_info']
+        if not isinstance(info.get('model_class'), str):
+            raise ValueError("model_info['model_class'] must be a string")
+        
+        print(f"✓ Checkpoint validation passed")
 
     def load_model(self, load_path, device="cpu"):
         """

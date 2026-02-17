@@ -535,13 +535,30 @@ class NNBlock(nn.Module):
         self.input_layer = self._build_input_layer()
         self.hidden_layer = self._build_hidden_layer()
         self.output_layer = self._build_output_layer()
+        
+        # Projection layer for residual connection if dimensions don't match
+        if self.resnet and input_dim != output_dim:
+            self.residual_proj = nn.Linear(input_dim, output_dim)
+        else:
+            self.residual_proj = None
 
     def forward(self, x):
         h = self.input_layer(x)
         h = self.hidden_layer(h)
         out = self.output_layer(h)
-        if self.resnet and self.output_dim <= self.num_neurons:
-            return out + h[:, :self.output_dim]
+        
+        # Add residual connection with proper dimension handling
+        if self.resnet:
+            if self.residual_proj is not None:
+                # Use projection layer for dimension mismatch
+                residual = self.residual_proj(x)
+            elif x.shape[-1] == out.shape[-1]:
+                # Direct residual if dimensions match
+                residual = x
+            else:
+                # Slice residual if possible (backward compat)
+                residual = x[:, :out.shape[-1]] if x.shape[-1] >= out.shape[-1] else x
+            return out + residual
         else:
             return out
     
