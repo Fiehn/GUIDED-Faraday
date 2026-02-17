@@ -844,6 +844,7 @@ class VAE(nn.Module):
             model_name = None, # Optionally specify model name for saving
             save_dir = './models/',
             weighted_loss = 0.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
+            month_key=None, # Used in RevIN normalization
             **_):
 
         # === Generate a model tag ===
@@ -947,7 +948,8 @@ class VAE(nn.Module):
                     beta=current_beta, 
                     gradient_clip=gradient_clip, 
                     gradient_clip_kwargs=gradient_clip_kwargs,
-                    weighted_loss=weighted_loss
+                    weighted_loss=weighted_loss,
+                    month_key=month_key,
                 )
                 
                 # Accumulate epoch losses
@@ -979,7 +981,7 @@ class VAE(nn.Module):
             # === Validation Phase ===
             val_loss_dict = None
             if valloader is not None and ((epoch + 1) % validation_freq == 0):
-                val_loss_dict = self.validate(valloader, num_samples=validation_num_samples, device=device)
+                val_loss_dict = self.validate(valloader, num_samples=validation_num_samples, device=device, month_key=month_key)
                 
                 # Log validation metrics
                 writer.add_scalar('Val/Epoch/loss', val_loss_dict["loss"], epoch)
@@ -1326,21 +1328,24 @@ class OnlineCVAE(CVAE):
         latent_dim: int = 32,
         distribution_dict: dict = None,
         prior_type: str = None,
+        normalizer: IndexedLogRevIN = None,
         **kwargs,
     ):
         super().__init__(input_dim=input_dim, conditioner=conditioner, latent_dim=latent_dim, distribution_dict=distribution_dict, prior_type=prior_type, **kwargs)
         
-        # For online learning, we need RevIN that works with the actual feature dimension
-        # Assuming input is flattened from [B, L, F] to [B, L*F], we need to determine F
-        # For smart meter data, typically L=24 (hours) and F=1 (energy consumption)
-        self.sequence_length = 24  # This should be configurable
-        self.num_features = input_dim // self.sequence_length if input_dim % 24 == 0 else 1
+        # For smart meter data: L=24 hours, F=1 feature
+        # input_dim = L * F = 24
+        self.sequence_length = 24
+        self.num_features = max(1, input_dim // self.sequence_length)
         
-        self.revin_normalizer = IndexedLogRevIN(
-            num_features=self.num_features, 
-            affine=True, 
-            device=str(next(self.parameters()).device)
-        )
+        if normalizer is not None:
+            self.revin_normalizer = normalizer
+        else:
+            self.revin_normalizer = IndexedLogRevIN(
+                num_features=self.num_features,  # Should be 1, not 24
+                affine=True,
+                device=str(next(self.parameters()).device)
+            )
         
         # Convert conditioners to online versions
         self._convert_to_online_conditioners()

@@ -203,7 +203,8 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
     data_files = sorted([f for f in os.listdir("data/") if f.endswith(".csv") and not f.startswith("test")])
     # remove data files that are already trained on (check runs folder for existing models)
     # TODO: Check runs and find and remove already trained files in the list.
-    
+
+    normalizer = IndexedLogRevIN(1, device=device, affine=False) # Affine false as it will just compensate and attempt to destroy PDCC through this
     # Create the model and normalizer and conditioner once
     if model_type == "vae":
         print("Initializing VAE model...")
@@ -216,9 +217,9 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         conditioner.add_condition_item("user_profile", OnlineUserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
         model = OnlineCVAE(input_dim=24, latent_dim=32, conditioner=conditioner, 
                      encoder_type="dictionary",decoder_type='dictionary', 
-                     prior_type="vampprior", device=device)  # input_dim will be updated based on data
+                     prior_type="vampprior", device=device,
+                     normalizer=normalizer)  # input_dim will be updated based on data
         log_dir = "./runs/CVAE_online_training"
-    normalizer = IndexedLogRevIN(24 * 1, device=device)
     
     i = 0
     last_dm = None
@@ -255,7 +256,7 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
             train_frac=0.8,
             val_frac=0.1,
             max_meters=None,
-            normalizer=normalizer,
+            normalizer=None,
         )
         dm.setup()
         train_loader = dm.train_dataloader()
