@@ -821,9 +821,9 @@ class ModelValidator:
             # Create RevIN instance
             revin = IndexedLogRevIN(num_features=num_features, eps=eps, affine=True)
             
-            # Create test data - make it realistic with some variance
+            # Create test data - [B, L, F] format (batch, sequence_length, num_features)
             torch.manual_seed(42)  # For reproducible tests
-            x_original = torch.randn(batch_size, num_features, sequence_length) * 2.0 + 5.0
+            x_original = torch.randn(batch_size, sequence_length, num_features) * 2.0 + 5.0
             x_original = torch.abs(x_original)  # Ensure positive values for log1p
             
             # Create timestamps (different dates for different samples)
@@ -843,8 +843,9 @@ class ModelValidator:
             
             # Test 2: Check that normalized data has reasonable statistical properties
             # After normalization, data should be log1p transformed and normalized
-            norm_mean = torch.mean(x_norm, dim=(0, 2))  # Mean across batch and sequence
-            norm_std = torch.std(x_norm, dim=(0, 2))   # Std across batch and sequence
+            # Stats over time dimension (dim=1) for each sample should be ~N(0,1) before affine
+            norm_mean = torch.mean(x_norm, dim=1)  # [B, F] - mean over time
+            norm_std = torch.std(x_norm, dim=1)    # [B, F] - std over time
             
             # The normalized data should have some variance (not all zeros)
             if torch.allclose(norm_std, torch.zeros_like(norm_std), atol=1e-6):
@@ -854,7 +855,7 @@ class ModelValidator:
                 self._add_result("RevIN: Normalized Variance", True,
                                f"Normalized std range: [{norm_std.min().item():.4f}, {norm_std.max().item():.4f}]")
             
-            # Test 3: Test denormalization without timestamps (should use last computed stats)
+            # Test 3: Test denormalization without timestamps (should use cached stats)
             x_denorm = revin(x_norm.clone(), mode='denorm')
             
             if x_denorm.shape != x_original.shape:
@@ -866,7 +867,7 @@ class ModelValidator:
             
             # Test 4: Round-trip test (normalize then denormalize)
             max_error = torch.max(torch.abs(x_original - x_denorm)).item()
-            relative_error = max_error / torch.max(torch.abs(x_original)).item()
+            relative_error = max_error / (torch.max(torch.abs(x_original)).item() + 1e-8)
             
             if relative_error > 1e-3:  # Allow some numerical error
                 self._add_result("RevIN: Round-trip Accuracy", False,
@@ -875,24 +876,23 @@ class ModelValidator:
                 self._add_result("RevIN: Round-trip Accuracy", True,
                                f"Max relative error: {relative_error:.6f}")
             
-            # Test 5: Test timestamp indexing functionality
-            # Check that daily_stats are being updated
-            if len(revin.daily_stats) == 0:
-                self._add_result("RevIN: Timestamp Indexing", False,
-                               "No daily stats were stored")
+            # Test 5: Test monthly stats update via update_monthly_stats
+            from torch.utils.data import TensorDataset, DataLoader
+            test_dataset = TensorDataset(x_original, timestamps, timestamps)  # (x, meter_id, timestamps)
+            test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
+            revin.update_monthly_stats(test_dataloader, month_key=202201)
+            
+            if 202201 in revin.monthly_stats:
+                stats = revin.monthly_stats[202201]
+                self._add_result("RevIN: Monthly Stats Update", True,
+                               f"Stored stats for month 202201, count={stats['count']}")
             else:
-                expected_dates = len(torch.unique(timestamps))
-                actual_dates = len(revin.daily_stats)
-                if actual_dates != expected_dates:
-                    self._add_result("RevIN: Timestamp Indexing", False,
-                                   f"Expected {expected_dates} unique dates, got {actual_dates}")
-                else:
-                    self._add_result("RevIN: Timestamp Indexing", True,
-                                   f"Correctly stored stats for {actual_dates} dates")
+                self._add_result("RevIN: Monthly Stats Update", False,
+                               "update_monthly_stats did not store stats")
             
             # Test 6: Test denormalization with specific timestamp
-            test_timestamp = timestamps[0]  # Use first timestamp
-            x_test = torch.randn(1, num_features, sequence_length)
+            test_timestamp = timestamps[0]
+            x_test = torch.randn(1, sequence_length, num_features)
             try:
                 x_denorm_specific = revin(x_test, mode='denorm', timestamp=test_timestamp)
                 self._add_result("RevIN: Timestamp-specific Denorm", True,
@@ -921,19 +921,19 @@ class ModelValidator:
                     self._add_result("RevIN: Affine Parameters", True,
                                    f"Correct affine parameter shapes")
             
-            # Test 9: Test with batch containing multiple samples from same date
-            same_day_timestamps = torch.full((batch_size,), base_time, dtype=torch.long)
-            x_same_day = revin(x_original.clone(), mode='norm', timestamp=same_day_timestamps)
+            # Test 9: Test update_monthly_stats with second month
+            batch2_x = torch.abs(torch.randn(batch_size, sequence_length, num_features)) + 2.0
+            batch2_ts = timestamps + 31 * 24 * 3600  # ~1 month later
+            test_dataset2 = TensorDataset(batch2_x, batch2_ts, batch2_ts)
+            test_dataloader2 = DataLoader(test_dataset2, batch_size=batch_size)
+            revin.update_monthly_stats(test_dataloader2, month_key=202202)
             
-            # Should still work and update the same date's stats
-            target_date = base_time // (24 * 3600)
-            if target_date not in revin.daily_stats:
-                self._add_result("RevIN: Same-date Batch", False,
-                               "Failed to update stats for same-date batch")
+            if len(revin.monthly_stats) == 2:
+                self._add_result("RevIN: Multiple Months", True,
+                               f"Tracking {len(revin.monthly_stats)} months: {list(revin.monthly_stats.keys())}")
             else:
-                count_after = revin.daily_stats[target_date]['count']
-                self._add_result("RevIN: Same-date Batch", True,
-                               f"Updated stats, count: {count_after}")
+                self._add_result("RevIN: Multiple Months", False,
+                               f"Expected 2 months, got {len(revin.monthly_stats)}")
             
             # Test 10: Edge case - empty timestamp (should work without indexing)
             try:
@@ -942,6 +942,32 @@ class ModelValidator:
                                "Normalization works without timestamp")
             except Exception as e:
                 self._add_result("RevIN: No Timestamp", False, str(e))
+            
+            # Test 11: Edge case - constant window (all same value)
+            x_constant = torch.ones(2, sequence_length, num_features) * 3.0
+            try:
+                x_const_norm = revin(x_constant.clone(), mode='norm')
+                if torch.isnan(x_const_norm).any() or torch.isinf(x_const_norm).any():
+                    self._add_result("RevIN: Constant Window", False,
+                                   "NaN or Inf in output for constant input")
+                else:
+                    self._add_result("RevIN: Constant Window", True,
+                                   "Handled constant window without NaN/Inf")
+            except Exception as e:
+                self._add_result("RevIN: Constant Window", False, str(e))
+            
+            # Test 12: Edge case - zero window
+            x_zero = torch.zeros(2, sequence_length, num_features)
+            try:
+                x_zero_norm = revin(x_zero.clone(), mode='norm')
+                if torch.isnan(x_zero_norm).any() or torch.isinf(x_zero_norm).any():
+                    self._add_result("RevIN: Zero Window", False,
+                                   "NaN or Inf in output for zero input")
+                else:
+                    self._add_result("RevIN: Zero Window", True,
+                                   "Handled zero window without NaN/Inf")
+            except Exception as e:
+                self._add_result("RevIN: Zero Window", False, str(e))
                 
         except ImportError:
             self._add_result("RevIN: Import", False, "Could not import IndexedLogRevIN")
@@ -1220,13 +1246,11 @@ class ModelValidator:
                 self._add_result("Online CVAE: Sampling", False, str(e))
             
             # Test 4: Check RevIN normalization updates
-            normalizer_stats_after_batch1 = len(online_cvae.revin_normalizer.daily_stats)
-            if normalizer_stats_after_batch1 == 0:
-                self._add_result("Online CVAE: RevIN Updates", False,
-                            "RevIN not updating daily stats")
-            else:
-                self._add_result("Online CVAE: RevIN Updates", True,
-                            f"RevIN tracking {normalizer_stats_after_batch1} dates")
+            normalizer_stats = len(online_cvae.revin_normalizer.monthly_stats)
+            # Monthly stats are updated via update_monthly_stats(), not per-batch,
+            # so it's expected to be 0 after individual training steps
+            self._add_result("Online CVAE: RevIN Updates", True,
+                        f"RevIN tracking {normalizer_stats} months (updated via update_monthly_stats)")
             
             # Test 5: Second batch (incremental learning)
             try:
@@ -1242,14 +1266,23 @@ class ModelValidator:
                 self._add_result("Online CVAE: Second Batch Training", True,
                             f"Second batch successful, loss: {second_loss:.4f}")
                 
-                # Check RevIN learned new dates
-                normalizer_stats_after_batch2 = len(online_cvae.revin_normalizer.daily_stats)
-                if normalizer_stats_after_batch2 > normalizer_stats_after_batch1:
+                # Test update_monthly_stats explicitly
+                from torch.utils.data import TensorDataset, DataLoader
+                combined_data = torch.cat([test_data, batch2_data], dim=0)
+                combined_ids = torch.cat([test_meter_ids, batch2_ids], dim=0)
+                combined_ts = torch.cat([test_timestamps, batch2_timestamps], dim=0)
+                test_dataset = TensorDataset(combined_data, combined_ids, combined_ts)
+                test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
+                
+                online_cvae.revin_normalizer.update_monthly_stats(test_dataloader, month_key=202301)
+                
+                if 202301 in online_cvae.revin_normalizer.monthly_stats:
+                    stats = online_cvae.revin_normalizer.monthly_stats[202301]
                     self._add_result("Online CVAE: Incremental Learning", True,
-                                f"RevIN learned new dates: {normalizer_stats_after_batch1} → {normalizer_stats_after_batch2}")
+                                f"Monthly stats updated: mean={stats['mean']}, count={stats['count']}")
                 else:
                     self._add_result("Online CVAE: Incremental Learning", False,
-                                f"RevIN not learning: {normalizer_stats_after_batch1} → {normalizer_stats_after_batch2}")
+                                "update_monthly_stats did not store stats")
                     
             except Exception as e:
                 self._add_result("Online CVAE: Second Batch Training", False, str(e))
@@ -1283,9 +1316,9 @@ class ModelValidator:
             user_profiler = online_cvae.conditioner.condition_items.get("user_profile")
             if hasattr(user_profiler, 'user_profiles_cache'):
                 num_cached = len(user_profiler.user_profiles_cache)
-                num_dates = len(online_cvae.revin_normalizer.daily_stats)
+                num_months = len(online_cvae.revin_normalizer.monthly_stats)
                 self._add_result("Online CVAE: Memory Efficiency", True,
-                            f"Cached users: {num_cached}, tracked dates: {num_dates}")
+                            f"Cached users: {num_cached}, tracked months: {num_months}")
             else:
                 self._add_result("Online CVAE: Memory Efficiency", False,
                             "User profiler not caching profiles")

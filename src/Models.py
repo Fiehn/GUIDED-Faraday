@@ -1376,7 +1376,7 @@ class OnlineCVAE(CVAE):
                 # Replace in conditioner
                 self.conditioner.condition_items[tag] = online_profiler
     
-    def train_core(self, batch, optim, beta=1.0, weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
+    def train_core(self, batch, optim, beta=1.0, weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None,month_key=None, **_):
         self.train()
 
         # 1. Unpack batch
@@ -1397,7 +1397,7 @@ class OnlineCVAE(CVAE):
             raise ValueError(f"Unexpected input dimension: {x.dim()}")
 
         # 3. Apply RevIN normalization 
-        x_normalized = self.revin_normalizer(x_3d, mode='norm', timestamp=timestamps)
+        x_normalized = self.revin_normalizer(x_3d, mode='norm', month_key=month_key)
         
         # 4. Flatten normalized input for the model
         if x_normalized.dim() == 3:
@@ -1440,3 +1440,39 @@ class OnlineCVAE(CVAE):
         x_denormalized = self.revin_normalizer(x, mode='denorm', timestamp=timestamps, month=month)
         return x_denormalized.reshape(num_prior_samples, num_x_samples, -1, self.sequence_length * self.num_features)
 
+    @torch.no_grad()
+    def validate(self, valloader, num_samples=1, beta=1.0, device="cpu", month_key=None):
+        self.eval()
+        agg = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
+        num_batches = 0
+
+        for x, meter_id, timestamps in valloader:
+            x = x.to(device)
+            
+            if x.dim() == 2:
+                B = x.shape[0]
+                x_3d = x.reshape(B, self.sequence_length, self.num_features)
+            else:
+                x_3d = x
+
+            x_normalized = self.revin_normalizer(x_3d, mode='norm', month_key=month_key)
+            
+            if x_normalized.dim() == 3:
+                B, L, F = x_normalized.shape
+                x_flat = x_normalized.reshape(B, L * F)
+            else:
+                x_flat = x_normalized
+
+            c = self.conditioner.get_conditions(x_3d, meter_id=meter_id, timestamps=timestamps)
+            c = self.move_to_device(c, device=device)
+
+            recon_params, q_params = self.forward(x_flat, c, num_samples=1)
+            loss_dict = self.loss(x_flat, recon_params, q_params, beta=beta)
+
+            for k in agg:
+                agg[k] += float(loss_dict[k])
+            num_batches += 1
+
+        for k in agg:
+            agg[k] /= max(num_batches, 1)
+        return agg

@@ -67,10 +67,10 @@ normalization:
 # ============================================================================
 model:
   # Model type: "vae" or "cvae"
-  type: "vae"
+  type: "cvae"
   
   # Device for training: "cpu" or "cuda"
-  device: "cpu"
+  device: "cuda"
   
   # Input dimension (will be auto-calculated: 24 hours * num_features)
   # Set to null to auto-detect from data, or specify manually
@@ -106,7 +106,7 @@ model:
 # ============================================================================
 conditioning:
   # Enable/disable conditioning
-  enabled: false
+  enabled: true
   
   # User profiling (based on LDA)
   user_profile:
@@ -221,10 +221,10 @@ sampling:
 # ============================================================================
 advanced:
   # Mixed precision training
-  mixed_precision: false
+  mixed_precision: true
   
   # Number of CPU threads for PyTorch
-  num_threads: 4
+  num_threads: 0
   
   # Deterministic training
   deterministic: true

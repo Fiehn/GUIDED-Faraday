@@ -187,7 +187,7 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         validation_passed = run_validation(
             model_type=model_type,
             use_test_data=True,  # use small test data for fast validation
-            verbose=True
+            verbose=False
         )
         
         if not validation_passed:
@@ -200,7 +200,7 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         print("\n!!  Skipping validation (not recommended)\n")
 
     # Load data sequentially based on what is in the folder and train the model in an online fashion
-    data_files = sorted([f for f in os.listdir("data/") if f.endswith(".csv")])
+    data_files = sorted([f for f in os.listdir("data/") if f.endswith(".csv") and not f.startswith("test")])
     # remove data files that are already trained on (check runs folder for existing models)
     # TODO: Check runs and find and remove already trained files in the list.
     
@@ -214,14 +214,31 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         conditioner = Conditioner()
         conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
         conditioner.add_condition_item("user_profile", OnlineUserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
-        model = CVAE(input_dim=24 * 1, latent_dim=32, conditioner=conditioner, 
+        model = OnlineCVAE(input_dim=24, latent_dim=32, conditioner=conditioner, 
                      encoder_type="dictionary",decoder_type='dictionary', 
                      prior_type="vampprior", device=device)  # input_dim will be updated based on data
         log_dir = "./runs/CVAE_online_training"
     normalizer = IndexedLogRevIN(24 * 1, device=device)
     
+    i = 0
+    last_dm = None
+    last_test_loader = None
+    last_data_file = None
+
     for data_file in data_files:
         print(f"\nProcessing {data_file}")
+        i += 1
+
+        # Free previous iteration's resources before loading new data
+        if last_dm is not None and i > 1:
+            del last_dm
+            if last_test_loader is not None:
+                del last_test_loader
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         # Load data for this file
         dm = SmartMeterDataModule(
             data_dir="data/",
@@ -245,14 +262,9 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         val_loader = dm.val_dataloader()
         test_loader = dm.test_dataloader()
         
-        # Update model input_dim if needed
-        if model.encoder.input_dim != 24 * len(dm.feature_cols):
-            print(f"Updating model input_dim from {model.encoder.input_dim} to {24 * len(dm.feature_cols)}")
-            model.encoder.input_dim = 24 * len(dm.feature_cols)
-            model.decoder.input_dim = 24 * len(dm.feature_cols)
-            if isinstance(model, CVAE):
-                model.conditioner.update_input_dim(24 * len(dm.feature_cols))
-        
+        month_key = int(data_file.replace("hourly_measurements_", "").replace(".csv", "").replace("_", ""))
+        normalizer.update_monthly_stats(train_loader, month_key=month_key)
+
         # Train on this data
         model.fit(
             trainloader=train_loader,
@@ -267,7 +279,7 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
             beta_annealing=True,
             beta_annealing_kwargs={"n_cycles": 4, "ratio": 0.5},
             num_samples=1,
-            epochs=20,
+            epochs=5,
             validation_freq=1,
             validation_num_samples=1,
             device=device,
@@ -275,11 +287,39 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
             early_stopping_kwargs={"patience": 3, "min_delta": 0.001},
             save_epoch_freq=10,
             log_dir=os.path.join(log_dir, data_file.replace(".csv", "")),
+            month_key=month_key,
         )
         print(f"Finished training on {data_file} advancing to next file...\n")
 
-        # Visualize each step of the model 
-        visualize_trained_model(model=model, test_loader=test_loader, normalizer=normalizer, device=device,output_dir="Output/Plots", model_tag="online_" + data_file.replace(".csv", ""))
+        # Free train/val loaders but keep dm and test_loader for potential visualization
+        del train_loader, val_loader
+        last_dm = dm
+        last_test_loader = test_loader
+        last_data_file = data_file
+
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Visualize using the last file's test set
+    if last_test_loader is not None and last_data_file is not None:
+        model.to('cpu')
+        model.eval()
+        visualize_trained_model(
+            model=model,
+            test_loader=last_test_loader,
+            normalizer=normalizer,
+            device='cpu',
+            output_dir="Output/Plots",
+            model_tag="online_" + last_data_file.replace(".csv", ""),
+        )
+    else:
+        print("No data files found — skipping visualization.")
+
+    # Final cleanup
+    if last_dm is not None:
+        del last_dm, last_test_loader
 
 
 
@@ -288,8 +328,9 @@ if __name__ == "__main__":
     # choose: "vae" or "cvae"
     # run_test(model_type="vae")
     # run_test(model_type="vae", skip_validation=False)  # VAE with validation
-    run_test(model_type="cvae", skip_validation=False)  # CVAE with validation
+    # run_test(model_type="cvae", skip_validation=False)  # CVAE with validation
     # run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
+    online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
 
 
 

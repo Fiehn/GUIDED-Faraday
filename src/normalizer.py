@@ -134,168 +134,320 @@ class Normalizer:
 # Refrence: https://openreview.net/forum?id=cGDAkQo1C0p
 # With refrence dict to dates seen 
 class IndexedLogRevIN(nn.Module):
-    def __init__(self, num_features, eps=1e-5, affine=True, device='cpu'):
+    """
+    Reversible Instance Normalization with log1p transform for non-negative time series.
+    
+    Input shape: [B, L, F]  (batch, sequence_length, num_features)
+    
+    Normalization pipeline:
+        1. x_log = log1p(clamp(x, min=0))
+        2. mean, std = per-instance stats over time dim (dim=1)
+        3. x_norm = (x_log - mean) / std
+        4. x_norm = x_norm * gamma + beta  (if affine)
+    
+    Denormalization pipeline:
+        1. x = (x - beta) / gamma  (if affine)
+        2. x_log = x * std + mean
+        3. x = expm1(x_log)
+        4. x = clamp(x, min=0)
+    
+    Index:
+        Stores running mean/std of the log1p-transformed data per calendar date,
+        enabling denormalization during generation when we don't have the original
+        instance stats.
+    """
+    def __init__(self, num_features, eps=1e-5, affine=True, device='cpu', 
+                 ema_alpha=0.05, min_std=0.1):
         """
-        Reversible Instance Normalization (RevIN) for time series data.
         Args:
-            num_features: Number of features in the input data (e.g., number of channels).
-            eps: Small constant for numerical stability.
-            affine: If True, applies learnable affine transformation after normalization.
+            num_features: Number of features (F) in [B, L, F] input.
+            eps: Numerical stability constant.
+            affine: If True, applies learnable affine transform after normalization.
+            device: Device for parameters.
+            ema_alpha: EMA smoothing factor for daily stats (0 = no update, 1 = full replace).
+                       Higher values give more weight to recent observations.
+            min_std: Minimum standard deviation to prevent division by near-zero.
+                     This is critical for constant or near-constant windows.
         """
         super(IndexedLogRevIN, self).__init__()
         self.num_features = num_features
         self.eps = eps
         self.affine = affine
         self.device = device # TODO: get everything to device 
+        self.ema_alpha = ema_alpha
+        self.min_std = min_std
 
         if self.affine:
-            self.__init_params()
+            # Learnable affine parameters: gamma (scale) and beta (shift)
+            # Initialized to identity transform (gamma=1, beta=0)
+            self.weight = nn.Parameter(torch.ones(num_features, device=device))
+            self.bias = nn.Parameter(torch.zeros(num_features, device=device))
 
-        # === Indexing for storing stats per date ===
-        # Will store the mean and std for each date (or other time period) to allow for proper denormalization later
-        self.daily_stats = defaultdict(lambda: {'sum_mean': 0.0, 'sum_std': 0.0, 'count': 0})
+        # === Per-date index for generation-time denormalization ===
+        # Stores EMA of mean/std of log1p-transformed data per calendar month
+        self.monthly_stats = {}  # Key: int (month 1-12 or year*12+month), Value: dict with mean, std, count
 
-        # Global stats for fallback (if we encounter a date we haven't seen before during denormalization)
-        self.global_stats = {'mean': 0.0, 'std': 0.0, 'count': 0}
+        # Global running stats as fallback
+        self._global_mean_sum = np.zeros(num_features, dtype=np.float64)
+        self._global_std_sum = np.zeros(num_features, dtype=np.float64)
+        self._global_count = 0
 
+        # Per-instance stats cached for denormalization in the same forward pass
+        # These are set during _normalize and used during _denormalize
+        self._cached_mean = None  # [B, 1, F]
+        self._cached_std = None   # [B, 1, F]
 
-    def __init_params(self):
-        # Learnable parameters for affine transformation
-        self.weight = nn.Parameter(torch.ones(self.num_features))
-        self.bias = nn.Parameter(torch.zeros(self.num_features))
-
-    def forward(self, x, mode: str = 'norm', timestamp=None, month=None):
+    def forward(self, x, mode='norm', timestamp=None, month=None, month_key=None):
         """
-        Forward pass for RevIN.
         Args:
-            x: Input tensor of shape (batch_size, num_features, sequence_length).
-            mode: 'norm' for normalization, 'denorm' for denormalization.
+            x: [B, L, F] tensor.
+            mode: 'norm' to normalize, 'denorm' to denormalize.
+            timestamp: Optional timestamps for stat retrieval during generation.
+            month: Optional month (1-12) for generation denorm.
+            month_key: Optional int (e.g., 202310) to select which monthly stats 
+                       to normalize/denormalize with. If None, uses the most recent.
         Returns:
-            Normalized or denormalized tensor of the same shape as input.
+            Transformed tensor of same shape [B, L, F].
         """
         if mode == 'norm':
-            # For online normalization, we compute stats on the fly for each batch
-            self._get_stats(x)
-            x = self._normalize(x)
-
-            if timestamp is not None:
-                self._update_index(x, timestamp)
-            return x
+            return self._normalize(x, month_key=month_key)
         elif mode == 'denorm':
-            # Ensure we have stats for denormalization
-            if timestamp is not None:
-                mean, std = self._get_scale_for_generation(timestamp, month)
-                self.mean = mean.view(1, -1, 1).to(x.device)
-                self.std = std.view(1, -1, 1).to(x.device)
-            elif not hasattr(self, 'mean') or not hasattr(self, 'std'):
-                # Use default stats if no timestamp and no cached stats
-                self.mean = torch.zeros(1, self.num_features, 1).to(x.device)
-                self.std = torch.ones(1, self.num_features, 1).to(x.device)
-            
-            x = self._denormalize(x)
+            return self._denormalize(x, timestamp=timestamp, month=month, month_key=month_key)
         else:
-            raise ValueError("Mode must be 'norm' or 'denorm'")
-        return x
-    
-    def _update_index(self, x, timestamp):
-        """ Update the index with the mean and std for the given timestamp (e.g., date).
-        This allows us to store the normalization parameters for each date, which can be used later for proper denormalization.
-        """
-        # Handle case where timestamp is a tensor with multiple values (batch)
-        if isinstance(timestamp, torch.Tensor):
-            timestamps_cpu = timestamp.detach().cpu().numpy()
-        else:
-            timestamps_cpu = np.array(timestamp) if not isinstance(timestamp, np.ndarray) else timestamp
-        
-        # Ensure timestamps_cpu is 1D
-        if timestamps_cpu.ndim == 0:
-            timestamps_cpu = np.array([timestamps_cpu])
-        elif timestamps_cpu.ndim > 1:
-            timestamps_cpu = timestamps_cpu.flatten()
-        
-        # Convert timestamps to dates (remove time component)
-        dates = timestamps_cpu // (24 * 3600)
-        
-        # Get unique dates in this batch
-        unique_dates = np.unique(dates)
-        
-        # Process each unique date separately
-        for date_val in unique_dates:
-            # Find indices for this date
-            date_indices = np.where(dates == date_val)[0]
-            
-            # Extract data for this date only
-            if isinstance(x, torch.Tensor):
-                x_date = x[date_indices]
-                date_mean = torch.mean(x_date, dim=[0, 2]).detach().cpu().numpy()  # Mean per feature
-                date_std = torch.sqrt(torch.var(x_date, dim=[0, 2], unbiased=False) + self.eps).detach().cpu().numpy()  # Std per feature
-            else:
-                x_date = x[date_indices]
-                date_mean = np.mean(x_date, axis=(0, 2))  # Mean per feature
-                date_std = np.sqrt(np.var(x_date, axis=(0, 2), ddof=0) + self.eps)  # Std per feature
-            
-            # Update the index for this specific date
-            stats = self.daily_stats[int(date_val)]
-            stats['sum_mean'] += date_mean
-            stats['sum_std'] += date_std
-            stats['count'] += 1
-            
-            # Update global stats as well
-            self.global_stats['mean'] += date_mean
-            self.global_stats['std'] += date_std
-            self.global_stats['count'] += 1
+            raise ValueError(f"Mode must be 'norm' or 'denorm', got '{mode}'")
 
-    def _get_scale_for_generation(self, timestamp, month=None):
-        """ Get the mean and std for the given timestamp (date) to use for proper denormalization during generation.
-        If we haven't seen this date before, we can fall back to global mean/std or some default values.
+    def _normalize(self, x, month_key=None):
         """
-        if month is None:
-            target_date = timestamp // (24 * 3600)
-            if target_date in self.daily_stats and self.daily_stats[target_date]['count'] > 0:
-                stats = self.daily_stats[target_date]
-                mean = stats['sum_mean'] / stats['count']
-                std = stats['sum_std'] / stats['count']
-            elif self.global_stats['count'] > 0:
-                mean = self.global_stats['mean'] / self.global_stats['count']
-                std = self.global_stats['std'] / self.global_stats['count']
-            else:
-                # If we have no data at all, return default values (e.g., mean=0, std=1)
-                mean = np.zeros(self.num_features)
-                std = np.ones(self.num_features)
-            return torch.tensor(mean), torch.tensor(std)
-        else:
-            # Average over all dates in the same month
-            month_dates = [date for date in self.daily_stats if (date // 30) == month]
-            if month_dates:
-                mean = np.mean([self.daily_stats[date]['sum_mean'] / self.daily_stats[date]['count'] for date in month_dates], axis=0)
-                std = np.mean([self.daily_stats[date]['sum_std'] / self.daily_stats[date]['count'] for date in month_dates], axis=0)
-            elif self.global_stats['count'] > 0:
-                mean = self.global_stats['mean'] / self.global_stats['count']
-                std = self.global_stats['std'] / self.global_stats['count']
-            else:
-                mean = np.zeros(self.num_features)
-                std = np.ones(self.num_features)
-            return torch.tensor(mean), torch.tensor(std)
+        Normalize: log1p -> z-score using monthly population stats -> affine.
+        
+        Uses monthly stats instead of per-instance stats so the model
+        can see relative scale differences between meters.
+        """
+        # 1. Log1p transform
+        x_log = torch.log1p(torch.clamp(x, min=0.0))  # [B, L, F]
 
-    def _get_stats(self, x):
-        # For log1p normalization, we need to compute stats on log-transformed data
-        x_log = torch.log1p(torch.clamp(x, min=0.0))  # Ensure non-negative input for log1p
-        self.mean = torch.mean(x_log, dim=1, keepdim=True).detach()
-        self.std = torch.sqrt(torch.var(x_log, dim=1, keepdim=True, unbiased=False) + self.eps).detach()
-    
-    def _normalize(self, x):
-        # Apply log1p transformation first, then normalize
-        x_log = torch.log1p(torch.clamp(x, min=0.0))  # Ensure non-negative input
-        x_norm = (x_log - self.mean) / (self.std + self.eps)  # Add eps to avoid division by zero
+        # 2. Get population-level stats (monthly or global)
+        mean, std = self._get_normalization_stats(month_key)  # [1, 1, F]
+        mean = mean.to(x.device)
+        std = std.to(x.device)
+
+        # 3. Cache for denormalization in same pass
+        self._cached_mean = mean
+        self._cached_std = std
+
+        # 4. Z-score with population stats
+        x_norm = (x_log - mean) / std
+
+        # 5. Learnable affine
         if self.affine:
-            x_norm = x_norm * self.weight.view(1, -1, 1) + self.bias.view(1, -1, 1)
+            x_norm = x_norm * self.weight.view(1, 1, -1) + self.bias.view(1, 1, -1)
+
         return x_norm
-    
-    def _denormalize(self, x):
-        if self.affine:
-            x = (x - self.bias.view(1, -1, 1)) / (self.weight.view(1, -1, 1) + self.eps)
-        # Denormalize then apply expm1 to inverse log1p
-        x_denorm = x * (self.std + self.eps) + self.mean
-        x_original = torch.expm1(x_denorm)
-        return torch.clamp(x_original, min=0.0)  # Ensure non-negative output
 
+    def _denormalize(self, x, timestamp=None, month=None, month_key=None):
+        """
+        Inverse of _normalize.
+        
+        If month_key is provided or cached stats exist, uses those.
+        Otherwise falls back to timestamp/month lookup -> global.
+        """
+        # 1. Determine which mean/std to use
+        if month_key is not None:
+            mean, std = self._get_normalization_stats(month_key)
+            mean = mean.to(x.device)
+            std = std.to(x.device)
+        elif self._cached_mean is not None and timestamp is None and month is None:
+            # Same-pass denormalization
+            mean = self._cached_mean.to(x.device)
+            std = self._cached_std.to(x.device)
+        elif timestamp is not None or month is not None:
+            mean, std = self._get_stats_for_generation(timestamp, month)
+            mean = mean.to(x.device)
+            std = std.to(x.device)
+        else:
+            mean, std = self._get_global_stats()
+            mean = mean.to(x.device)
+            std = std.to(x.device)
+
+        # 2. Inverse affine
+        if self.affine:
+            x = (x - self.bias.view(1, 1, -1)) / (self.weight.view(1, 1, -1) + self.eps)
+
+        # 3. Inverse z-score
+        x_log = x * std + mean
+
+        # 4. Inverse log1p
+        x_original = torch.expm1(x_log)
+
+        # 5. Clamp to non-negative
+        return torch.clamp(x_original, min=0.0)
+
+    def _get_normalization_stats(self, month_key=None):
+        """
+        Get the stats to use for normalization.
+        
+        Priority:
+            1. Specific month_key if provided
+            2. Most recently added monthly stats
+            3. Global stats
+            4. Default (mean=0, std=1)
+            
+        Returns:
+            mean, std: tensors of shape [1, 1, F]
+        """
+        # Try specific month
+        if month_key is not None and month_key in self.monthly_stats:
+            stats = self.monthly_stats[month_key]
+            mean = torch.tensor(stats['mean'], dtype=torch.float32).view(1, 1, -1)
+            std = torch.tensor(np.maximum(stats['std'], self.min_std), dtype=torch.float32).view(1, 1, -1)
+            return mean, std
+
+        # Try most recent month
+        if len(self.monthly_stats) > 0:
+            latest_key = max(self.monthly_stats.keys())
+            stats = self.monthly_stats[latest_key]
+            mean = torch.tensor(stats['mean'], dtype=torch.float32).view(1, 1, -1)
+            std = torch.tensor(np.maximum(stats['std'], self.min_std), dtype=torch.float32).view(1, 1, -1)
+            return mean, std
+
+        # Global fallback
+        return self._get_global_stats()
+
+    def update_monthly_stats(self, data_loader, month_key=None):
+        """
+        Compute and store normalization stats for an entire month of data.
+        Call this once per monthly data file, e.g., during DataModule setup.
+        
+        Args:
+            data_loader: DataLoader yielding (x, meter_id, timestamps) batches
+            month_key: Optional int identifier (e.g., 202310 for Oct 2023).
+                       If None, inferred from first batch timestamps.
+        """
+        # Collect ALL log1p values to compute true population mean/std
+        all_log_values = []
+        total_samples = 0
+
+        for x, meter_id, timestamps in data_loader:
+            if x.dim() == 3:
+                # x: [B, L, F] -> log1p transform
+                x_log = torch.log1p(torch.clamp(x, min=0.0))
+                # Flatten time dim: [B, L, F] -> [B*L, F]
+                x_log_flat = x_log.reshape(-1, x_log.shape[-1])
+                all_log_values.append(x_log_flat.detach().cpu().numpy())
+                total_samples += x.shape[0]
+
+                # Infer month_key from timestamps if not provided
+                if month_key is None and timestamps is not None:
+                    from datetime import datetime, timezone
+                    ts_val = timestamps[0].item() if isinstance(timestamps, torch.Tensor) else timestamps[0]
+                    dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+                    month_key = dt.year * 100 + dt.month  # e.g., 202310
+
+        if total_samples == 0:
+            return
+
+        # Concatenate all log1p values: [N_total, F]
+        all_log_values = np.concatenate(all_log_values, axis=0)
+
+        # Compute TRUE population mean and std across all observations
+        month_mean = all_log_values.mean(axis=0)  # [F]
+        month_std = np.maximum(all_log_values.std(axis=0), self.min_std)  # [F]
+
+        self.monthly_stats[month_key] = {
+            'mean': month_mean,
+            'std': month_std,
+            'count': total_samples,
+        }
+
+        # Update global running stats
+        self._global_mean_sum += month_mean * total_samples
+        self._global_std_sum += month_std * total_samples
+        self._global_count += total_samples
+
+    def _get_stats_for_generation(self, timestamp, month=None):
+        """Retrieve stats: month key → global fallback."""
+        if month is not None:
+            # Direct month lookup (1-12)
+            for key, stats in self.monthly_stats.items():
+                if key % 100 == month:
+                    mean = torch.tensor(stats['mean'], dtype=torch.float32).view(1, 1, -1)
+                    std = torch.tensor(stats['std'], dtype=torch.float32).view(1, 1, -1)
+                    return mean, std
+
+        # Infer month_key from timestamp
+        if timestamp is not None:
+            from datetime import datetime, timezone
+            if isinstance(timestamp, torch.Tensor):
+                ts_val = timestamp.detach().cpu().item() if timestamp.numel() == 1 else timestamp[0].detach().cpu().item()
+            else:
+                ts_val = int(timestamp[0]) if hasattr(timestamp, '__len__') else int(timestamp)
+
+            try:
+                dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+                month_key = dt.year * 100 + dt.month
+                if month_key in self.monthly_stats:
+                    stats = self.monthly_stats[month_key]
+                    mean = torch.tensor(stats['mean'], dtype=torch.float32).view(1, 1, -1)
+                    std = torch.tensor(stats['std'], dtype=torch.float32).view(1, 1, -1)
+                    return mean, std
+            except (ValueError, OSError, OverflowError):
+                pass
+
+        return self._get_global_stats()
+
+    def _get_monthly_stats(self, month):
+        """
+        Compute average mean/std across all daily stats that fall in the given month.
+        
+        Args:
+            month: int (1-12) representing the calendar month.
+        
+        Returns:
+            mean, std: tensors of shape [1, 1, F], or falls back to global stats.
+        """
+        from datetime import datetime, timezone
+        
+        monthly_means = []
+        monthly_stds = []
+        
+        for date_key, stats in self.daily_stats.items():
+            try:
+                # Convert date_key (days since epoch) back to datetime
+                dt = datetime.fromtimestamp(date_key * 24 * 3600, tz=timezone.utc)
+                if dt.month == month:
+                    monthly_means.append(stats['mean'])
+                    monthly_stds.append(stats['std'])
+            except (ValueError, OSError, OverflowError):
+                continue
+        
+        if len(monthly_means) > 0:
+            avg_mean = np.mean(monthly_means, axis=0)  # [F]
+            avg_std = np.mean(monthly_stds, axis=0)     # [F]
+            mean = torch.tensor(avg_mean, dtype=torch.float32).view(1, 1, -1)
+            std = torch.tensor(np.maximum(avg_std, self.min_std), dtype=torch.float32).view(1, 1, -1)
+            return mean, std
+        else:
+            # No data for this month, fall back to global
+            return self._get_global_stats()
+
+    def _get_global_stats(self):
+        """
+        Compute global average mean/std from all observed data.
+        
+        Returns:
+            mean, std: tensors of shape [1, 1, F].
+            Falls back to (mean=0, std=1) if no data has been observed.
+        """
+        if self._global_count > 0:
+            global_mean = self._global_mean_sum / self._global_count  # [F]
+            global_std = self._global_std_sum / self._global_count    # [F]
+            # Clamp std to minimum
+            global_std = np.maximum(global_std, self.min_std)
+            mean = torch.tensor(global_mean, dtype=torch.float32).view(1, 1, -1)
+            std = torch.tensor(global_std, dtype=torch.float32).view(1, 1, -1)
+        else:
+            # No data observed yet — identity transform (no-op denormalization)
+            mean = torch.zeros(1, 1, self.num_features, dtype=torch.float32)
+            std = torch.ones(1, 1, self.num_features, dtype=torch.float32)
+        return mean, std
+        

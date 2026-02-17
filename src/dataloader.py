@@ -131,7 +131,7 @@ class SmartMeterWindowDataset(Dataset):
 
         # Converting to tensor here for efficiency
         values = meter_df[self.feature_cols].to_numpy(dtype=np.float32)
-        if normalizer is not None:
+        if normalizer is not None and hasattr(normalizer, "transform"):
             values = normalizer.transform(values)
             if isinstance(values, np.ndarray):
                 self.values = torch.from_numpy(values).to(dtype)
@@ -254,7 +254,7 @@ class SmartMeterDataModule:
         self.test_ids = meter_ids[n_train + n_val :]
 
         # fit normalizer if provided
-        if self.normalizer is not None:
+        if self.normalizer is not None and hasattr(self.normalizer, "fit"):
             self._fit_normalizer()
 
         self._train_ds = self._make_dataset(self.train_ids)
@@ -307,7 +307,7 @@ class SmartMeterDataModule:
             batch_size=self.batch_size,
             shuffle=self.shuffle_train,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=False,
             persistent_workers=True if self.num_workers > 0 else False,
         )
 
@@ -317,7 +317,7 @@ class SmartMeterDataModule:
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=False,
             persistent_workers=True if self.num_workers > 0 else False,
         )
 
