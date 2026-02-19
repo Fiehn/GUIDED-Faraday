@@ -9,6 +9,7 @@ from src.Models import *
 from src.dataloader import *
 from src.normalizer import *
 import matplotlib.pyplot as plt
+import yaml
 
 
 # Set up device
@@ -22,6 +23,7 @@ def load_model_and_visualize(
         num_reconstructions: int = 3,
         num_synthetic_samples: int = 5,
         num_samples_per_original: int = 3,
+    normalizer_method: str = "log1p",
     ):
     """
     Loads a trained model from disk and generates reconstruction and synthetic data visualizations.
@@ -71,7 +73,7 @@ def load_model_and_visualize(
         print(f"  - Condition dim: {model.condition_dim}")
         print(f"  - Conditioner tags: {model.conditioner.get_condition_tags()}")
 
-    # Setup data if not provided
+    # Setup data
     if data_config is None:
         data_config = {
             "data_dir": "data/",
@@ -87,11 +89,11 @@ def load_model_and_visualize(
             "train_frac": 0.8,
             "val_frac": 0.1,
         }
-        
-        normalizer = Normalizer(method='log1p')  # TODO: This should match training normalizer
-        dm = SmartMeterDataModule(normalizer=normalizer, **data_config)
-        dm.setup()
-        test_loader = dm.test_dataloader()
+    
+    normalizer = Normalizer(method=normalizer_method)  # TODO: Match training normalizer if different
+    dm = SmartMeterDataModule(normalizer=normalizer, **data_config)
+    dm.setup()
+    test_loader = dm.test_dataloader()
 
     print(f"Model loaded: {model.__class__.__name__} with tag '{model_tag}'")
     
@@ -487,7 +489,8 @@ def visualize_trained_model(
         model_tag=model_tag,
     )
     viz_path.update(synth_recreation_path)
-
+    
+    
     user_profile_path = _visualize_user_dictionary(
         model=model,
         test_loader=test_loader,
@@ -507,6 +510,7 @@ def visualize_trained_model(
     print("All visualizations saved.")
     print(viz_path)
     return viz_path
+
 
 def _visualize_reconstructions(
         model,
@@ -1049,12 +1053,67 @@ def _save_model_summary(
 
 
 if __name__ == "__main__":
-    # Example usage
-    model_path = "models/CVAE_DictionaryCoder_20260208_170554_best.pt"
+    import argparse
+
+    def _build_data_config_from_yaml(config_path: str):
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        data_cfg = cfg.get("data", {})
+        columns = data_cfg.get("columns", {})
+        window_cfg = data_cfg.get("window", {})
+        splits_cfg = data_cfg.get("splits", {})
+        dl_cfg = data_cfg.get("dataloader", {})
+
+        data_config = {
+            "data_dir": data_cfg.get("data_dir", "data/"),
+            "filename": data_cfg.get("filename", "hourly_measurements_2023_10.csv"),
+            "meter_col": columns.get("meter_id", "meter_number"),
+            "timestamp_dst_col": columns.get("timestamp_dst", "timestamp_dst"),
+            "timestamp_utc_col": columns.get("timestamp_utc", "timestamp_utc"),
+            "feature_cols": tuple(columns.get("value_cols", ["hourly_energy_consumption"])),
+            "window": WindowSpec(
+                input_len=window_cfg.get("input_len", 24),
+                stride=window_cfg.get("stride", 24),
+            ),
+            "batch_size": dl_cfg.get("batch_size", 256),
+            "num_workers": dl_cfg.get("num_workers", 0),
+            "seed": splits_cfg.get("random_seed", 42),
+            "train_frac": splits_cfg.get("train_ratio", 0.8),
+            "val_frac": splits_cfg.get("val_ratio", 0.1),
+        }
+
+        normalizer_method = cfg.get("normalization", {}).get("method", "log1p")
+        return data_config, normalizer_method
+
+    parser = argparse.ArgumentParser(
+        description="Load a saved model and generate visualizations.",
+    )
+    parser.add_argument("--model-path", required=True, help="Path to saved .pt model file")
+    parser.add_argument("--config", default=None, help="Optional path to config.yaml for data settings")
+    parser.add_argument("--output-dir", default="Output/Plots", help="Directory to save plots")
+    parser.add_argument("--device", default="auto", help="cpu, cuda, or auto")
+    parser.add_argument("--num-reconstructions", type=int, default=3)
+    parser.add_argument("--num-synthetic-samples", type=int, default=5)
+    parser.add_argument("--num-samples-per-original", type=int, default=3)
+    parser.add_argument("--normalizer-method", default=None, help="Override normalizer method (e.g., log1p)")
+
+    args = parser.parse_args()
+
+    data_config = None
+    normalizer_method = "log1p"
+    if args.config:
+        data_config, normalizer_method = _build_data_config_from_yaml(args.config)
+    if args.normalizer_method:
+        normalizer_method = args.normalizer_method
+
     load_model_and_visualize(
-        model_path=model_path,
-        output_dir="Output/Plots",
-        num_reconstructions=3,
-        num_synthetic_samples=5,
-        num_samples_per_original=3,
+        model_path=args.model_path,
+        data_config=data_config,
+        output_dir=args.output_dir,
+        device=args.device,
+        num_reconstructions=args.num_reconstructions,
+        num_synthetic_samples=args.num_synthetic_samples,
+        num_samples_per_original=args.num_samples_per_original,
+        normalizer_method=normalizer_method,
     )
