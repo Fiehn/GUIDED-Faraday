@@ -252,11 +252,19 @@ class SmartMeterDataModule:
         rng = np.random.default_rng(self.seed)
         rng.shuffle(meter_ids)
 
-        n       = len(meter_ids)
-        n_train = max(1, int(n * self.train_frac))
-        n_val   = max(1, int(n * self.val_frac))
-        if n_train + n_val >= n: # dont exceed n
-            n_val = max(0, n - n_train - 1) # leave at least 1 for test if possible
+        n = len(meter_ids)
+        if n == 0:
+            self.train_ids, self.val_ids, self.test_ids = [], [], []
+        else:
+            n_train = max(1, int(n * self.train_frac))
+            n_val = max(0, int(n * self.val_frac))
+
+            # Ensure we leave at least one meter for test when possible
+            if n >= 2 and (n_train + n_val) >= n:
+                # Reduce validation first, then training if needed
+                n_val = max(0, n - n_train - 1)
+                if n_train >= n:
+                    n_train = n - 1
 
         self.train_ids  = meter_ids[:n_train]
         self.val_ids    = meter_ids[n_train : n_train + n_val]
