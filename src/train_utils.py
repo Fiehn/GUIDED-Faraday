@@ -520,7 +520,7 @@ def _visualize_reconstructions(
         is_cvae: bool,
     ) -> str:
     with torch.no_grad():
-        x, meter_id, timestamps = next(iter(test_loader))
+        x, meter_id, timestamps, _ = next(iter(test_loader))
         x = x.to(device)
         timestamps = timestamps.to(device)
         x_original = x  # This is normalized
@@ -748,7 +748,7 @@ def _visualize_latent_space(model, test_loader, device, output_dir, model_tag):
     labels = []
     
     with torch.no_grad():
-        for x, meter_id, timestamps in test_loader:
+        for x, meter_id, timestamps, month_key in test_loader:
             x = x.to(device)
             x_flat = x.reshape(x.shape[0], -1)
             
@@ -829,7 +829,7 @@ def _visualize_synthetic_recreations(model, test_loader, normalizer, device, out
     
     with torch.no_grad():
         # Get a batch from test loader
-        x, meter_id, timestamps = next(iter(test_loader))
+        x, meter_id, timestamps, _ = next(iter(test_loader))
         x = x.to(device)
         timestamps = timestamps.to(device)
         
@@ -1015,42 +1015,46 @@ def _save_model_summary(
         output_dir: str,
         model_tag: str,
     ) -> str:
-    import json
-    if model_kwargs is None:
-        model_kwargs = {}
-        for attr in dir(model):
-            if not attr.startswith('_') and not callable(getattr(model, attr)):
-                model_kwargs[attr] = getattr(model, attr)
-    hyperparameters = {k: v for k, v in model_kwargs.items() if isinstance(v, (int, float, str, bool))}
+    try:
+        import json
+        if model_kwargs is None:
+            model_kwargs = {}
+            for attr in dir(model):
+                if not attr.startswith('_') and not callable(getattr(model, attr)):
+                    model_kwargs[attr] = getattr(model, attr)
+        hyperparameters = {k: v for k, v in model_kwargs.items() if isinstance(v, (int, float, str, bool))}
 
-    summary = {
-        "model_tag": model_tag,
-        "model_class": model.__class__.__name__,
-        "model_kwargs": model_kwargs,
-        "architecture": {
-            "encoder": model.encoder.__class__.__name__,
-            "decoder": model.decoder.__class__.__name__,
-            "prior": model.prior.__class__.__name__,
-        },
-        "dimensions": {
-            "input_dim": model.input_dim,
-            "latent_dim": model.latent_dim,
-            "condition_dim": model.condition_dim if hasattr(model, 'condition_dim') else None,
-            "total_params": sum(p.numel() for p in model.parameters()),
-            "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
-        },
-        "hyperparameters": hyperparameters,
-    }
-    summary_path = os.path.join(output_dir, f"{model_tag}_model_summary.json")
-    with open(summary_path, 'w') as f:
-        json.dump(summary, f, indent=4)
-    print(f"Saved model summary to {summary_path}")
-    return summary_path
+        summary = {
+            "model_tag": model_tag,
+            "model_class": model.__class__.__name__,
+            "model_kwargs": model_kwargs,
+            "architecture": {
+                "encoder": model.encoder.__class__.__name__,
+                "decoder": model.decoder.__class__.__name__,
+                "prior": model.prior.__class__.__name__,
+            },
+            "dimensions": {
+                "input_dim": model.input_dim,
+                "latent_dim": model.latent_dim,
+                "condition_dim": model.condition_dim if hasattr(model, 'condition_dim') else None,
+                "total_params": sum(p.numel() for p in model.parameters()),
+                "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            },
+            "hyperparameters": hyperparameters,
+        }
+        summary_path = os.path.join(output_dir, f"{model_tag}_model_summary.json")
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=4)
+        print(f"Saved model summary to {summary_path}")
+        return summary_path
+    except:
+        print("Model Summary Failed")
+        return ""
 
 
 if __name__ == "__main__":
     # Example usage
-    model_path = "models/CVAE_DictionaryCoder_20260208_170554_best.pt"
+    model_path = "models/OnlineCVAE_DictionaryCoder_20260219_111046_best.pt"
     load_model_and_visualize(
         model_path=model_path,
         output_dir="Output/Plots",

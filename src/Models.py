@@ -305,7 +305,9 @@ class VAE(nn.Module):
 
         if isinstance(x, tuple) or isinstance(x, list):
             # Unpack if dataloader returns (x, meter_id, timestamps)
-            if len(x) == 3:
+            if len(x) == 4:
+                x_data, meter_id, timestamps, month_key = x
+            elif len(x) == 3:
                 x_data, meter_id, timestamps = x
             elif len(x) == 2:
                 x_data, meter_id = x
@@ -745,11 +747,12 @@ class VAE(nn.Module):
         
         model_info = checkpoint['model_info']
         constructor_args = checkpoint['constructor_args']
+        model_class_name = model_info['model_class']
         
         print(f"Creating {model_info['model_class']} from checkpoint...")
         
         # Handle CVAE reconstruction
-        if model_info['model_class'] == 'CVAE':
+        if model_info['model_class'] == 'CVAE' or 'OnlineCVAE':
             # Reconstruct conditioner first
             conditioner_state = model_info['conditioner_state']
             
@@ -949,7 +952,6 @@ class VAE(nn.Module):
                     gradient_clip=gradient_clip, 
                     gradient_clip_kwargs=gradient_clip_kwargs,
                     weighted_loss=weighted_loss,
-                    month_key=month_key,
                 )
                 
                 # Accumulate epoch losses
@@ -1191,7 +1193,14 @@ class CVAE(VAE):
 
     def train_core(self, batch, optim, beta=1.0,weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
         self.train()
-        x, meter_id, timestamps = batch
+        if len(batch) == 4:
+            x, meter_id, timestamps, month_key = batch
+        elif len(batch) == 3:
+            x, meter_id, timestamps = batch
+        elif len(batch) == 2:
+             x, meter_id = batch
+        else:
+            x = batch
 
         # Prep inputs: [B, L, F] -> [B, D] if needed
         x = self._prep_inputs(x)
@@ -1220,7 +1229,7 @@ class CVAE(VAE):
         agg = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
         num_batches = 0
 
-        for x, meter_id, timestamps in valloader:
+        for x, meter_id, timestamps, _ in valloader:
             # Keep original 3D shape for conditioning
             x_3d = x.to(device)
             
@@ -1328,7 +1337,7 @@ class OnlineCVAE(CVAE):
         latent_dim: int = 32,
         distribution_dict: dict = None,
         prior_type: str = None,
-        normalizer: IndexedLogRevIN = None,
+        normalizer: Normalizer = None,
         **kwargs,
     ):
         super().__init__(input_dim=input_dim, conditioner=conditioner, latent_dim=latent_dim, distribution_dict=distribution_dict, prior_type=prior_type, **kwargs)
@@ -1339,13 +1348,9 @@ class OnlineCVAE(CVAE):
         self.num_features = max(1, input_dim // self.sequence_length)
         
         if normalizer is not None:
-            self.revin_normalizer = normalizer
+            self.normalizer = normalizer
         else:
-            self.revin_normalizer = IndexedLogRevIN(
-                num_features=self.num_features,  # Should be 1, not 24
-                affine=True,
-                device=str(next(self.parameters()).device)
-            )
+            self.normalizer = Normalizer('online_log1p')
         
         # Convert conditioners to online versions
         self._convert_to_online_conditioners()
@@ -1381,11 +1386,18 @@ class OnlineCVAE(CVAE):
                 # Replace in conditioner
                 self.conditioner.condition_items[tag] = online_profiler
     
-    def train_core(self, batch, optim, beta=1.0, weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None,month_key=None, **_):
+    def train_core(self, batch, optim, beta=1.0, weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
         self.train()
 
         # 1. Unpack batch
-        x, meter_id, timestamps = batch
+        if len(batch) == 4:
+            x, meter_id, timestamps, month_key = batch
+        elif len(batch) == 3:
+            x, meter_id, timestamps = batch
+        elif len(batch) == 2:
+             x, meter_id = batch
+        else:
+            x = batch
         
         # 2. Handle input shapes: convert to 3D for RevIN if needed
         if x.dim() == 2:
@@ -1401,15 +1413,12 @@ class OnlineCVAE(CVAE):
         else:
             raise ValueError(f"Unexpected input dimension: {x.dim()}")
 
-        # 3. Apply RevIN normalization 
-        x_normalized = self.revin_normalizer(x_3d, mode='norm', month_key=month_key)
-        
         # 4. Flatten normalized input for the model
-        if x_normalized.dim() == 3:
-            B, L, F = x_normalized.shape  
-            x_flat = x_normalized.reshape(B, L * F)
+        if x_3d.dim() == 3:
+            B, L, F = x_3d.shape  
+            x_flat = x_3d.reshape(B, L * F)
         else:
-            x_flat = x_normalized
+            x_flat = x_3d
             
         # 5. Compute conditions using ORIGINAL (unnormalized) input
         # This is important because user profilers expect original energy patterns
@@ -1442,7 +1451,7 @@ class OnlineCVAE(CVAE):
         x = super().sample(conditions, num_prior_samples, num_x_samples, device)
         # Now apply inverse RevIN to the samples
         x = x.reshape(-1, self.sequence_length, self.num_features)  # [S*num_x_samples*B, L, F]
-        x_denormalized = self.revin_normalizer(x, mode='denorm', timestamp=timestamps, month=month)
+        x_denormalized = self.normalizer.inverse_transform(x, month_key=month)
         return x_denormalized.reshape(num_prior_samples, num_x_samples, -1, self.sequence_length * self.num_features)
 
     @torch.no_grad()
@@ -1451,7 +1460,7 @@ class OnlineCVAE(CVAE):
         agg = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
         num_batches = 0
 
-        for x, meter_id, timestamps in valloader:
+        for x, meter_id, timestamps, _ in valloader:
             x = x.to(device)
             
             if x.dim() == 2:
@@ -1460,13 +1469,11 @@ class OnlineCVAE(CVAE):
             else:
                 x_3d = x
 
-            x_normalized = self.revin_normalizer(x_3d, mode='norm', month_key=month_key)
-            
-            if x_normalized.dim() == 3:
-                B, L, F = x_normalized.shape
-                x_flat = x_normalized.reshape(B, L * F)
+            if x_3d.dim() == 3:
+                B, L, F = x_3d.shape
+                x_flat = x_3d.reshape(B, L * F)
             else:
-                x_flat = x_normalized
+                x_flat = x_3d
 
             c = self.conditioner.get_conditions(x_3d, meter_id=meter_id, timestamps=timestamps)
             c = self.move_to_device(c, device=device)

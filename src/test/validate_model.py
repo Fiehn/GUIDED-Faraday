@@ -144,7 +144,7 @@ class ModelValidator:
         try:
             # Get a batch
             batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
+            x, meter_id, timestamps, month_key = batch
             
             # Test shapes
             expected_batch_dim = 3  # [B, L, F]
@@ -209,7 +209,7 @@ class ModelValidator:
         
         try:
             batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
+            x, meter_id, timestamps, month_key = batch
             x = x.to(self.device)
             meter_id = meter_id.to(self.device)
             timestamps = timestamps.to(self.device)
@@ -275,7 +275,7 @@ class ModelValidator:
         
         try:
             batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
+            x, meter_id, timestamps, month_key = batch
             x = x.to(self.device)
             B, L, F = x.shape
             x_flat = x.reshape(B, -1)
@@ -433,7 +433,7 @@ class ModelValidator:
         try:
             self.model.train()
             batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
+            x, meter_id, timestamps, month_key = batch
             x = x.to(self.device)
             meter_id = meter_id.to(self.device)
             timestamps = timestamps.to(self.device)
@@ -508,7 +508,7 @@ class ModelValidator:
         try:
             self.model.eval()
             batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
+            x, meter_id, timestamps, month_key = batch
             x = x.to(self.device)
             meter_id = meter_id.to(self.device)
             timestamps = timestamps.to(self.device)
@@ -619,7 +619,7 @@ class ModelValidator:
             
             # Test forward pass with data on device
             batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
+            x, meter_id, timestamps, month_key = batch
             x = x.to(self.device)
             
             if self.is_cvae:
@@ -653,7 +653,7 @@ class ModelValidator:
             
             # Get a batch
             batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
+            x, meter_id, timestamps, month_key = batch
             x = x.to(self.device)
             meter_id = meter_id.to(self.device)
             timestamps = timestamps.to(self.device)
@@ -766,7 +766,7 @@ class ModelValidator:
         if self.is_cvae and "user_profile" in self.model.conditioner.get_condition_tags():
             try:
                 batch = next(iter(self.train_loader))
-                x, meter_id, timestamps = batch
+                x, meter_id, timestamps, month_key = batch
                 x_3d = x  # [B, L, F]
                 x_2d = x.reshape(x.shape[0], -1)  # [B, D]
                 
@@ -1154,17 +1154,19 @@ class ModelValidator:
             ))
             
             # Test 1: OnlineCVAE initialization
+            normalizer = Normalizer('online_log1p')
             try:
                 online_cvae = OnlineCVAE(
                     input_dim=input_dim,
                     conditioner=online_conditioner,
                     latent_dim=latent_dim,
                     prior_type="standard_dictionary",
-                    device=self.device
+                    device=self.device,
+                    normalizer = normalizer
                 )
                 online_cvae.to(self.device)
                 
-                if not hasattr(online_cvae, 'revin_normalizer'):
+                if not hasattr(online_cvae, 'normalizer'):
                     self._add_result("Online CVAE: Initialization", False, "Missing RevIN normalizer")
                     return
                 else:
@@ -1180,6 +1182,8 @@ class ModelValidator:
             test_data = torch.abs(torch.randn(batch_size, 24, 1, device=self.device)) + 1.0  # Positive values for energy
             test_meter_ids = torch.randint(1, 11, (batch_size,), device=self.device)
             test_timestamps = torch.randint(0, 365*24, (batch_size,), device=self.device)
+
+            normalizer.fit(test_data)
             
             # Test 2: First batch training using train_core
             try:
@@ -1245,13 +1249,6 @@ class ModelValidator:
             except Exception as e:
                 self._add_result("Online CVAE: Sampling", False, str(e))
             
-            # Test 4: Check RevIN normalization updates
-            normalizer_stats = len(online_cvae.revin_normalizer.monthly_stats)
-            # Monthly stats are updated via update_monthly_stats(), not per-batch,
-            # so it's expected to be 0 after individual training steps
-            self._add_result("Online CVAE: RevIN Updates", True,
-                        f"RevIN tracking {normalizer_stats} months (updated via update_monthly_stats)")
-            
             # Test 5: Second batch (incremental learning)
             try:
                 # Create a second batch with some overlap and new data
@@ -1265,24 +1262,7 @@ class ModelValidator:
                 second_loss = loss2_dict['loss'].item()
                 self._add_result("Online CVAE: Second Batch Training", True,
                             f"Second batch successful, loss: {second_loss:.4f}")
-                
-                # Test update_monthly_stats explicitly
-                from torch.utils.data import TensorDataset, DataLoader
-                combined_data = torch.cat([test_data, batch2_data], dim=0)
-                combined_ids = torch.cat([test_meter_ids, batch2_ids], dim=0)
-                combined_ts = torch.cat([test_timestamps, batch2_timestamps], dim=0)
-                test_dataset = TensorDataset(combined_data, combined_ids, combined_ts)
-                test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
-                
-                online_cvae.revin_normalizer.update_monthly_stats(test_dataloader, month_key=202301)
-                
-                if 202301 in online_cvae.revin_normalizer.monthly_stats:
-                    stats = online_cvae.revin_normalizer.monthly_stats[202301]
-                    self._add_result("Online CVAE: Incremental Learning", True,
-                                f"Monthly stats updated: mean={stats['mean']}, count={stats['count']}")
-                else:
-                    self._add_result("Online CVAE: Incremental Learning", False,
-                                "update_monthly_stats did not store stats")
+
                     
             except Exception as e:
                 self._add_result("Online CVAE: Second Batch Training", False, str(e))
@@ -1316,7 +1296,7 @@ class ModelValidator:
             user_profiler = online_cvae.conditioner.condition_items.get("user_profile")
             if hasattr(user_profiler, 'user_profiles_cache'):
                 num_cached = len(user_profiler.user_profiles_cache)
-                num_months = len(online_cvae.revin_normalizer.monthly_stats)
+                num_months = len(online_cvae.normalizer.monthly_stats)
                 self._add_result("Online CVAE: Memory Efficiency", True,
                             f"Cached users: {num_cached}, tracked months: {num_months}")
             else:
