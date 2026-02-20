@@ -12,6 +12,8 @@ class Normalizer:
     Methods:
       - zero_preserved_log: Log-transform non-zero values, mark zeros with special ID
       - standard: Standard z-score normalization
+      - log1p: log1p(x) - mean / std
+      - online_log1p: stores and recalculates normalization stats per month
     """
     def __init__(self, method='zero_preserved_log'):
         self.method = method
@@ -28,113 +30,228 @@ class Normalizer:
         self.mean = None
         self.std = None
         self.epsilon = 1e-8  # for numerical stability in standard normalization
+
+        # for online log1p normalization
+        self.monthly_stats = {}
+        self._global_mean_sum = 0
+        self._global_std_sum = 0
+        self._global_count = 0
     
-    def _zero_preserved_log_transform(self, X: torch.Tensor) -> torch.Tensor:
-        """Zero-preserved log normalization."""
-        is_zero = (X == 0)
-        Y = X.clone()
-        # Apply log transform to non-zero values
-        if is_zero.any():
+    # === Helpers ===
+    def to(self, device: str | torch.device) -> 'Normalizer':
+        """Move everything to device"""
+        self.device = torch.device(device)
 
-            Y_nonzero = Y[~is_zero]
-            Y_log = torch.log(Y_nonzero)
-            Y_normalized = (Y_log - self.non_zero_mean) / self.non_zero_std + self.shift
+        def _move(t):
+            return t.to(self.device) if isinstance(t, torch.Tensor) else t
         
-            # Put back
-            Y[~is_zero] = Y_normalized
-            Y[is_zero] = self.zero_id
-        else:
-            Y = (torch.log(Y) - self.non_zero_mean) / self.non_zero_std + self.shift
-        
-        return Y
+        self.non_zero_mean = _move(self.non_zero_mean)
+        self.non_zero_std = _move(self.non_zero_std)
+        self.mean = _move(self.mean)
+        self.std = _move(self.std)
+        self._global_mean = _move(self._global_mean)
+        self._global_std = _move(self._global_std)
 
-    def _zero_preserved_log_inverse(self, X: torch.Tensor) -> torch.Tensor:
-        """Inverse of zero-preserved log normalization. Returns torch.Tensor."""
-        Y = X.clone()
-        is_zero = torch.isclose(Y, torch.tensor(self.zero_id, dtype=Y.dtype, device=Y.device), atol=0.1)
-        
-        # Inverse transform non-zero values
-        Y_nonzero = Y[~is_zero]
-        Y_log = (Y_nonzero - self.shift) * self.non_zero_std + self.non_zero_mean
-        Y_original = torch.exp(Y_log)
-        
-        # Put back
-        Y[~is_zero] = Y_original
-        Y[is_zero] = 0.0
-        
-        return Y  # Returns torch.Tensor, not numpy
-    
-    def _log1p_transform(self, X: torch.Tensor) -> torch.Tensor:
-        """Log1p normalization."""
-        return (torch.log1p(X) - self.mean) / (self.std + self.epsilon)
-    def _log1p_inverse(self, X: torch.Tensor) -> torch.Tensor:
-        """Inverse of log1p normalization."""
-        return torch.clamp(torch.expm1(X * (self.std + self.epsilon) + self.mean),min=0.0)
+        for m, stats in self.monthly_stats.items():
+            stats['mean'] = _move(stats['mean'])
+            stats['std']  = _move(stats['std'])
 
-    def fit(self, X):
+        return self
+
+    def _to_tensor(self, X) -> torch.Tensor:
+        """ Convert X to float32 on self.device"""
         if isinstance(X, np.ndarray):
-            X = torch.from_numpy(X)
+            return torch.from_numpy(X.astype(np.float32)).to(self.device)
+        return X.float().to(self.device)
+    
+    def _mk_to_tensor(self, month_key, n_rows: int) -> torch.Tensor | None:
+        """Convert month_key to a LongTensor of shape (n_rows,) on self.device.
+        Returns None when keys are none."""
+        if month_key is None:
+            return None
+        if isinstance(month_key, torch.Tensor):
+            mk = month_key.long().to(self.device)
+        else:
+            mk = torch.from_numpy(np.asarray(month_key, dtype=np.int64)).to(self.device)
+        if mk.ndim == 0:
+            mk = mk.expand(n_rows)
+        if mk.shape[0] != n_rows:
+            raise ValueError(f"month_key length {mk.shape[0]} != X rows {n_rows}")
+        return mk 
+
+    def fit(self, X, month_key = None):
+        """Fit the normalizer.
+        Parameters:
+        X : array-like (N,F)
+        month_key : 1-D int array (N,) of YYYYMM values
+                    Only required for method=='online_log1p'"""
+        Xt = self._to_tensor(X) # (N,F)
 
         if self.method == 'zero_preserved_log':
-            non_zero_values = X[X != 0]
+            non_zero_values = Xt[Xt != 0]
             log_values = torch.log(non_zero_values)
             self.non_zero_mean = log_values.mean().item()
             self.non_zero_std = log_values.std().item()
             self.fitted = True
         elif self.method == 'standard':
-            self.mean = torch.mean(X, dim=0, keepdim=True)
-            self.std = torch.std(X, dim=0, keepdim=True)
+            self.mean = torch.mean(Xt, dim=0, keepdim=True)
+            self.std = torch.std(Xt, dim=0, keepdim=True)
+            self.std[self.std == 0] = 1.0
             self.fitted = True
         elif self.method == 'log1p':
-            log1p_values = torch.log1p(X)
+            log1p_values = torch.log1p(Xt)
             self.mean = log1p_values.mean(dim=0, keepdim=True)
             self.std = log1p_values.std(dim=0, keepdim=True)
             self.std[self.std == 0] = 1.0 # Avoid division by zero
             self.fitted = True
+        elif self.method == 'online_log1p':
+            X_log = torch.log1p(Xt.clamp(min=0.0))
+            # Store values on monthly basis
+            if month_key is not None:
+                mk = self._mk_to_tensor(month_key, Xt.shape[0])
+                for m in mk.unique():
+                    m_int = int(m.item())
+                    mask  = mk == m
+                    vals  = X_log[mask]                     # (K, F)
+                    mean_m = vals.mean(dim=0, keepdim=True) # (1, F)
+                    std_m  = vals.std(dim=0,  keepdim=True) # (1, F)
+                    std_m[std_m == 0] = 1.0
+                    self.monthly_stats[m_int] = {
+                        'mean':  mean_m,
+                        'std':   std_m,
+                        'count': int(mask.sum().item()),
+                    }
+
+            # global fallback 
+            self._global_mean = X_log.mean(dim=0, keepdim=True)  # (1, F)
+            self._global_std  = X_log.std(dim=0,  keepdim=True)  # (1, F)
+            self._global_std[self._global_std == 0] = 1.0
+            self.fitted = True
+            
         else:
             raise ValueError(f"Normalization method {self.method} not recognized.")
     
-    def transform(self, X: torch.Tensor) -> torch.Tensor:
-        """Transform data using fitted parameters."""
+    def _zero_preserved_log_transform(self, X: torch.Tensor) -> torch.Tensor:
+        is_zero = X == 0
+        Y = X.clone()
+        if is_zero.any():
+            Y[~is_zero] = (torch.log(Y[~is_zero]) - self.non_zero_mean) / (self.non_zero_std + self.epsilon) + self.shift
+            Y[is_zero]  = self.zero_id
+        else:
+            Y = (torch.log(Y) - self.non_zero_mean) / (self.non_zero_std + self.epsilon) + self.shift
+        return Y
+
+    def _zero_preserved_log_inverse(self, X: torch.Tensor) -> torch.Tensor:
+        Y       = X.clone()
+        is_zero = torch.isclose(Y, torch.tensor(float(self.zero_id), dtype=Y.dtype, device=Y.device), atol=0.1)
+        Y[~is_zero] = torch.exp((Y[~is_zero] - self.shift) * (self.non_zero_std + self.epsilon) + self.non_zero_mean)
+        Y[is_zero]  = 0.0
+        return Y
+    
+    def _get_month_stats(self, m_int: int):
+        """Return (mean (1,F), std (1,F)) tensors for a single YYYYMM key."""
+        stats = self.monthly_stats.get(m_int)
+        if stats is not None:
+            return stats['mean'], stats['std']
+        return self._global_mean, self._global_std
+    
+    def _apply_online_log1p(self, X: torch.Tensor, mk: torch.Tensor | None, inverse: bool) -> torch.Tensor:
+        """
+        Per-row normalise (inverse=False) or denormalise (inverse=True).
+        X is already log1p-transformed when inverse=False.
+        """
+        out = torch.empty_like(X)
+
+        if mk is None:
+            mean, std = self._global_mean, self._global_std
+            out = torch.expm1(X * (std + self.epsilon) + mean) if inverse \
+                  else (torch.log1p(X) - mean) / (std + self.epsilon)
+            return out
+
+        for m in mk.unique():
+            m_int   = int(m.item())
+            mask    = mk == m
+            mean, std = self._get_month_stats(m_int)
+            if inverse:
+                out[mask] = torch.expm1(X[mask] * (std + self.epsilon) + mean)
+            else:
+                out[mask] = (torch.log1p(X[mask]) - mean) / (std + self.epsilon)
+        return out
+    
+    def transform(self, X, month_key = None) -> torch.Tensor:
+        """
+        Normalise X.  Always returns a torch.Tensor on self.device.
+
+        Parameters
+        ----------
+        X          : array-like or Tensor (N, F)
+        month_key  : 1-D int array/Tensor (N,) of YYYYMM.
+                     Only used for method=='online_log1p'.
+        """
         if not self.fitted:
             raise RuntimeError("Normalizer not fitted. Call fit() first.")
         
-        if isinstance(X, np.ndarray):
-            X = torch.from_numpy(X)
+        Xt = self._to_tensor(X)
         
         if self.method == 'zero_preserved_log':
-            return self._zero_preserved_log_transform(X)
+            return self._zero_preserved_log_transform(Xt)
+
         elif self.method == 'standard':
-            return (X - self.mean) / self.std
+            return (Xt - self.mean) / (self.std + self.epsilon)
+
         elif self.method == 'log1p':
-            return self._log1p_transform(X)
+            return (torch.log1p(Xt) - self.mean) / (self.std + self.epsilon)
+
+        elif self.method == 'online_log1p':
+            mk    = self._mk_to_tensor(month_key, Xt.shape[0])
+            return self._apply_online_log1p(Xt, mk, inverse=False)
         else:
             raise ValueError(f"Normalization method '{self.method}' not recognized.")
 
-    def inverse_transform(self, X: torch.Tensor) -> torch.Tensor:
-        """Inverse transform to original scale. Returns torch.Tensor."""
+    def inverse_transform(self, X, month_key=None) -> torch.Tensor:
+        """
+        Denormalise X back to original scale. Always returns a torch.Tensor on self.device.
+
+        Parameters
+        ----------
+        X          : array-like or Tensor (N, F)
+        month_key  : 1-D int array/Tensor (N,) of YYYYMM.
+                     Only used for method=='online_log1p'.
+        """
         if not self.fitted:
-            raise RuntimeError("Normalizer not fitted. Call fit() first.")
-        
-        # Convert to torch if needed
-        if isinstance(X, np.ndarray):
-            X = torch.from_numpy(X)
-            
+            raise RuntimeError("Normalizer not fitted – call fit() first.")
+
+        Xt = self._to_tensor(X)
+
         if self.method == 'zero_preserved_log':
-            return self._zero_preserved_log_inverse(X)
+            return self._zero_preserved_log_inverse(Xt)
+
         elif self.method == 'standard':
-            return X * self.std + self.mean
+            return Xt * self.std + self.mean
+
         elif self.method == 'log1p':
-            return self._log1p_inverse(X)
+            return torch.clamp(torch.expm1(Xt * (self.std + self.epsilon) + self.mean), min=0.0)
+
+        elif self.method == 'online_log1p':
+            mk  = self._mk_to_tensor(month_key, Xt.shape[0])
+            out = self._apply_online_log1p(Xt, mk, inverse=True)
+            return out.clamp(min=0.0)
+
         else:
-            raise ValueError(f"Normalization method '{self.method}' not recognized.")
-        
+            raise ValueError(f"Unknown normalization method: '{self.method}'")
+    
+    def _get_monthly_stats(self, month_key: int):
+        """Public alias kept for backward compatibility."""
+        mean, std = self._get_month_stats(int(month_key))
+        return {'mean': mean, 'std': std}
 
 # === RevIN (reversible instance normalization) for online normalization ===
 # Refrence: https://openreview.net/forum?id=cGDAkQo1C0p
-# With refrence dict to dates seen 
+# With refrence dict to dates seen
 class IndexedLogRevIN(nn.Module):
     """
+    DEPRECATED: moved back to Normalizer class since Affine parameters have a negative influence on the model performance.
+
     Reversible Instance Normalization with log1p transform for non-negative time series.
     
     Input shape: [B, L, F]  (batch, sequence_length, num_features)

@@ -96,7 +96,7 @@ def run_validation(model_type: str = "cvae", use_test_data: bool = True, verbose
     test_loader = dm.test_dataloader()
     
     # Get dimensions
-    x, meter_id, timestamps = next(iter(train_loader))
+    x, meter_id, timestamps, _ = next(iter(train_loader))
     num_features = x.shape[2]
     input_dim = 24 * num_features
     

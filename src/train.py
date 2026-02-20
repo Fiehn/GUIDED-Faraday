@@ -92,7 +92,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
 
     ##############################
     # get one batch
-    x, meter_id, timestamps = next(iter(train_loader))  # Now also get timestamps
+    x, meter_id, timestamps, _ = next(iter(train_loader))  # Now also get timestamps
     print("x shape:", x.shape)
     print("meter_id shape:", meter_id.shape, "example:", meter_id[:5])
     print("timestamps shape:", len(timestamps))
@@ -187,7 +187,7 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         validation_passed = run_validation(
             model_type=model_type,
             use_test_data=True,  # use small test data for fast validation
-            verbose=False
+            verbose=True
         )
         
         if not validation_passed:
@@ -204,7 +204,7 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
     # remove data files that are already trained on (check runs folder for existing models)
     # TODO: Check runs and find and remove already trained files in the list.
 
-    normalizer = IndexedLogRevIN(1, device=device, affine=False) # Affine false as it will just compensate and attempt to destroy PDCC through this
+    normalizer = Normalizer('online_log1p')
     # Create the model and normalizer and conditioner once
     if model_type == "vae":
         print("Initializing VAE model...")
@@ -256,16 +256,13 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
             train_frac=0.8,
             val_frac=0.1,
             max_meters=None,
-            normalizer=None,
+            normalizer=normalizer,
         )
         dm.setup()
         train_loader = dm.train_dataloader()
         val_loader = dm.val_dataloader()
         test_loader = dm.test_dataloader()
         
-        month_key = int(data_file.replace("hourly_measurements_", "").replace(".csv", "").replace("_", ""))
-        normalizer.update_monthly_stats(train_loader, month_key=month_key)
-
         # Train on this data
         model.fit(
             trainloader=train_loader,
@@ -288,7 +285,6 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
             early_stopping_kwargs={"patience": 3, "min_delta": 0.001},
             save_epoch_freq=10,
             log_dir=os.path.join(log_dir, data_file.replace(".csv", "")),
-            month_key=month_key,
         )
         print(f"Finished training on {data_file} advancing to next file...\n")
 
