@@ -17,6 +17,10 @@ from src.Conditioner import *
 from src.priors import *
 from src.normalizer import *
 
+from src.Hierarchical.config import HierarchicalConfig
+from src.Hierarchical.registry import StrategyRegistry
+from src.Hierarchical.core import HierarchicalLatentModule
+
 # https://arxiv.org/pdf/2411.03936
 # GuideVAE model implementation
 # Conditional VAE with conditioning on user profiles
@@ -53,7 +57,8 @@ from src.normalizer import *
 #       Seems like multiple ways to incorporate diffusion models into the VAE framework (https://xyfjason.top/blog-main/2023/07/29/Diffusion+VAE/)
 #       
 # - Add a flow-based prior (e.g., RealNVP or Glow) to allow for more flexible latent distributions (instead of just Gaussian or dictionary) 
-#       
+# - Add a hierarchical VAE structure (e.g., Ladder VAE) to capture more complex dependencies in the data and improve reconstruction quality
+#       This has been shown to be one of the most effective ways to improve VAE performance in general, and could be especially useful for smart meter data which has complex temporal and user-level dependencies
 
 # ==============
 # Cyclical Beta Annealing Scheduler
@@ -178,6 +183,7 @@ class VAE(nn.Module):
                  decoder_type = "dictionary",
                  prior_type = None,
                  device="cpu",
+                 hierarchy_config: HierarchicalConfig = None,
                  **_):
         super(VAE, self).__init__()
 
@@ -203,9 +209,20 @@ class VAE(nn.Module):
         latent_dim = distribution_dict.get("latent_dim", 32)
         self.latent_dim = latent_dim
 
-        # 1. Create encoder and decoder
+        # 1. Create encoder and decoder and the latent module for the hierarchy if specified
         self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim, type=encoder_type)
-        self.decoder = get_decoder_model(latent_dim=latent_dim, output_dim=input_dim, type=decoder_type)
+
+        # Hierarchical latent module (optional) - can be used to add multiple levels of latent variables with different strategies and connections between them
+        self.hierarchy = None
+        self.decoder_input_dim = latent_dim # By default, the decoder takes the latent variable as input, but if we have a hierarchy, it will take the output of the hierarchy instead
+        if hierarchy_config is not None:
+            self.hierarchy = HierarchicalLatentModule(
+                config=hierarchy_config,
+                encoder_latent_dim=latent_dim,
+            )
+            self.decoder_input_dim = self.hierarchy.output_dim
+            
+        self.decoder = get_decoder_model(latent_dim=self.decoder_input_dim, output_dim=input_dim, type=decoder_type)
 
         # 2. Create prior after encoder (VampPrior needs a reference to the encoder)
         if prior_type is None:
@@ -214,7 +231,7 @@ class VAE(nn.Module):
         
         self.prior = get_prior(
             prior_type=prior_type,
-            latent_dim=latent_dim,
+            latent_dim=self.decoder_input_dim,
             device=self.device,
             dictionary_size=distribution_dict.get("dictionary_size", 100),
             input_shape=input_dim,
@@ -230,8 +247,23 @@ class VAE(nn.Module):
         posterior_params_dict = self.encoder(inputs)
         # Sample latent variables using reparameterization trick 
         z = self.encoder.reparameterize(posterior_params_dict, num_samples=num_samples)
+        
+        # If we have a hierarchy, pass z through it
+        hierarchy_results = None
+        if self.hierarchy is not None:
+            # z shape: [S, B, latent_dim]
+            S,B,D = z.shape
+            z_flat = z.reshape(S * B, D)  # Flatten for hierarchy: [S*B, latent_dim]
+            hierarchy_results = self.hierarchy(z_flat)  # Pass through hierarchy
+            z_for_decoder = hierarchy_results["z"].reshape(S, B, -1)  # Reshape back to [S, B, output_dim]
+        else:
+            z_for_decoder = z
+        
         # Decode latent samples to get reconstruction parameters
-        recon_params_dict = self.decoder(z)
+        recon_params_dict = self.decoder(z_for_decoder)
+
+        self._last_hierarchy_results = hierarchy_results  # Store for later use in loss calculation or analysis
+
         return recon_params_dict, posterior_params_dict
     
     @torch.no_grad()
@@ -308,6 +340,10 @@ class VAE(nn.Module):
         recon_loglikelihood = (recon_loglikelihood * weights).mean() 
 
         loss = -(recon_loglikelihood - beta * kl_div)
+
+        if self._last_hierarchy_results is not None:
+            hierarchy_loss = self._last_hierarchy_results["loss"]
+            loss = loss + hierarchy_loss
 
         # TODO: MMD (mean maximum discrepancy) has been shown to be useful for smart meter data by one of the papers
         return {"loss": loss, "recon_loglikelihood": recon_loglikelihood, "kl_divergence": kl_div}
@@ -504,13 +540,19 @@ class VAE(nn.Module):
 
     def _extract_constructor_args(self):
         """Safely extract and validate constructor arguments."""
-        return {
+        args =  {
             'input_dim': self.input_dim,
             'encoder_type': getattr(self, 'encoder_type', 'dictionary'),
             'decoder_type': getattr(self, 'decoder_type', 'dictionary'), 
             'prior_type': getattr(self, 'prior_type', self._infer_prior_type()),
             'device': str(self.device),
         }
+        if self.hierarchy is not None:
+            args['hierarchy_config'] = self.hierarchy.config.to_dict()
+        else:
+            args['hierarchy_config'] = None
+        return args
+        
 
     def _infer_prior_type(self):
         """Safely infer prior type from class name."""
@@ -682,6 +724,13 @@ class VAE(nn.Module):
         if 'model_info' in checkpoint:
             print(f"Loading model using new format: {checkpoint['model_info']['model_class']}")
             
+            # Hierarchy config handling
+            hier_raw = checkpoint.get('constructor_args', {}).get('hierarchy_config', None)
+            if hier_raw is not None and isinstance(hier_raw, dict) and self.hierarchy is None:
+                hier_cfg = HierarchicalConfig.from_dict(hier_raw)
+                self.hierarchy = HierarchicalLatentModule(config=hier_cfg, encoder_latent_dim=self.latent_dim)
+                self.decoder_input_dim = self.hierarchy.output_dim
+            
             # Load prior
             prior_state = checkpoint['prior_state']
             import importlib
@@ -761,11 +810,17 @@ class VAE(nn.Module):
         model_info = checkpoint['model_info']
         constructor_args = checkpoint['constructor_args']
         model_class_name = model_info['model_class']
+
+        hier_raw = constructor_args.get('hierarchy_config', None)
+        if hier_raw is not None and isinstance(hier_raw, dict):
+            constructor_args['hierarchy_config'] = HierarchicalConfig.from_dict(hier_raw)
+        else:
+            constructor_args['hierarchy_config'] = None
         
         print(f"Creating {model_info['model_class']} from checkpoint...")
         
         # Handle CVAE reconstruction
-        if model_info['model_class'] == 'CVAE' or 'OnlineCVAE':
+        if model_info['model_class'] in ("CVAE", "HierarchicalCVAE"):
             # Reconstruct conditioner first
             conditioner_state = model_info['conditioner_state']
             
@@ -791,6 +846,12 @@ class VAE(nn.Module):
             
             # Create CVAE instance
             constructor_args['conditioner'] = conditioner
+            # CVAE expects latent_dim as a top-level kwarg, but it's also stored
+            # inside distribution_dict.  Extract it so the constructor sees it.
+            if 'latent_dim' not in constructor_args:
+                dd = constructor_args.get('distribution_dict', {}) or {}
+                if 'latent_dim' in dd:
+                    constructor_args['latent_dim'] = dd['latent_dim']
             model = cls(**constructor_args)
             
         else:
@@ -996,7 +1057,7 @@ class VAE(nn.Module):
             # === Validation Phase ===
             val_loss_dict = None
             if valloader is not None and ((epoch + 1) % validation_freq == 0):
-                val_loss_dict = self.validate(valloader, num_samples=validation_num_samples, device=device, month_key=month_key)
+                val_loss_dict = self.validate(valloader, num_samples=validation_num_samples, device=device)
                 
                 # Log validation metrics
                 writer.add_scalar('Val/Epoch/loss', val_loss_dict["loss"], epoch)
@@ -1114,6 +1175,7 @@ class CVAE(VAE):
         latent_dim: int = 32,
         distribution_dict: dict = None,
         prior_type: str = None,
+        hierarchy_config: HierarchicalConfig = None,
         **kwargs,
     ):
         if distribution_dict is None:
@@ -1125,7 +1187,7 @@ class CVAE(VAE):
         self.condition_dim = conditioner.get_condition_dim()
         self.latent_dim = int(latent_dim)
 
-        super().__init__(input_dim=input_dim, distribution_dict=distribution_dict, prior_type=prior_type, **kwargs)
+        super().__init__(input_dim=input_dim, distribution_dict=distribution_dict, prior_type=prior_type, hierarchy_config=hierarchy_config, **kwargs)
 
         # Now override encoder and decoder with conditioned versions
         # Encoder takes [x, c] as input
@@ -1138,7 +1200,7 @@ class CVAE(VAE):
 
         # Decoder takes [z, c] as input
         self.decoder = get_decoder_model(
-            latent_dim=latent_dim + self.condition_dim,
+            latent_dim=self.decoder_input_dim + self.condition_dim,
             output_dim=input_dim,
             type=kwargs.get("decoder_type", "dictionary"),
             **kwargs,
@@ -1177,11 +1239,20 @@ class CVAE(VAE):
         # Sample latent variables using reparameterization trick - sample z: [S, B, latent_dim]
         z = self.encoder.reparameterize(q_params, num_samples=num_samples)
 
+        hierarchy_results = None
+        if self.hierarchy is not None:
+            S, B, D = z.shape
+            z_flat = z.reshape(S * B, D)
+            hierarchy_results = self.hierarchy(z_flat)
+            z_for_decoder = hierarchy_results["output"].reshape(S, B, -1)
+        else:
+            z_for_decoder = z
+        self._last_hierarchy_results = hierarchy_results
         # expand c to match z: [S, B, C]
         c_expanded = c.unsqueeze(0).expand(num_samples, -1, -1)
 
         # Decode: [S, B, latent_dim + C] -> recon params
-        dec_in = torch.cat([z, c_expanded], dim=-1)
+        dec_in = torch.cat([z_for_decoder, c_expanded], dim=-1)
         S, B, DC = dec_in.shape
         dec_in_flat = dec_in.reshape(S * B, DC)
 

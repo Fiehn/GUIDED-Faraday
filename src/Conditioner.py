@@ -69,7 +69,7 @@ class UserProfiler(LatentDirichletAllocation):
         batch_count = 0
         total_timesteps = 0
 
-        for x, meter_id, timestamps in tqdm(train_loader, desc="Clustering batches"):
+        for x, meter_id, timestamps, _ in tqdm(train_loader, desc="Clustering batches"):
             batch_size, seq_len, num_features = x.shape
             x_daily_patterns = x.cpu().numpy().reshape(batch_size, seq_len * num_features)  # [B, L*F]
 
@@ -92,7 +92,7 @@ class UserProfiler(LatentDirichletAllocation):
         # === Phase 2: Create corpus and fit LDA model ===
         meter_corpus = {} # dict: meter_id -> cluster counts
 
-        for x, meter_id, timestamps in tqdm(train_loader, desc="Creating corpus batches"):
+        for x, meter_id, timestamps, _ in tqdm(train_loader, desc="Creating corpus batches"):
             batch_size, seq_len, num_features = x.shape
             x_batch = x.cpu().numpy().reshape(batch_size, seq_len * num_features)  # [B*T, F]
             meter_id_flat = meter_id.cpu().numpy() 

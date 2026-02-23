@@ -14,10 +14,14 @@ from torch.utils.tensorboard import SummaryWriter
 from src.train_utils import *
 from src.test.run_validation import run_validation
 
+from src.Hierarchical.aggregation import *
+from src.Hierarchical.config import *
+
+
 # Set up device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def run_test(model_type: str = "vae", skip_validation: bool = False):
+def run_test(model_type: str = "vae", skip_validation: bool = False, file_name = "test_data_small.csv"):
     model_type = model_type.lower()
     assert model_type in {"vae", "cvae"}
 
@@ -48,7 +52,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
     ##############################
     # load data
     data_dir = "data/" # "data/"
-    filename = "hourly_measurements_2023_10.csv"
+    filename = file_name
 
     meter_col = "meter_number"
     timestamp_dst_col = "timestamp_dst"
@@ -134,6 +138,22 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
                      prior_type="vampprior", device=device)
         log_dir = "./runs/CVAE_training"
 
+    ##############################
+    # Heirarchy latent space
+    h_config = HierarchicalConfig(
+        levels=[
+            LevelConfig(name="Level 1", input_dim=input_dim, latent_dim=32, strategy="linear", top_down=False, bottom_up=True, loss_weight=1.0),
+            LevelConfig(name="Level 2", input_dim=32, latent_dim=16, strategy="linear", top_down=True, bottom_up=True, loss_weight=0.5),
+            LevelConfig(name="Level 3", input_dim=16, latent_dim=8, strategy="linear", top_down=True, bottom_up=False, loss_weight=0.25),
+        ],
+        aggregation="concat",
+        bidirectional=True,
+        residual_connections=True,
+        kl_annealing=True,
+        kl_warmup_steps=1000,
+        free_bits=0.1,
+    )
+
 
     ##############################
     # Train
@@ -160,6 +180,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False):
         save_epoch_freq=10,
         log_dir=log_dir,
         weighted_loss=15.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
+        heirarchical_config=h_config, # Pass the hierarchical config to enable hierarchical latent space training
     )
 
     print("Training complete. Model saved as ", model_tag)
@@ -327,7 +348,8 @@ if __name__ == "__main__":
     # run_test(model_type="vae", skip_validation=False)  # VAE with validation
     # run_test(model_type="cvae", skip_validation=False)  # CVAE with validation
     # run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
-    online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
+    # online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
+    run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
 
 
 
