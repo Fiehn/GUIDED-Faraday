@@ -3,13 +3,13 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
-from src.encoder_decoder_model import *
-from src.Conditioner import *
-from src.Models import *
-from src.dataloader import *
-from src.normalizer import *
-from tqdm import tqdm
-import matplotlib.pyplot as plt
+from Models.encoder_decoder_model import *
+from Data.Conditioner import *
+from src.Models.CVAE import *
+from src.Models.Online_CVAE import *
+from src.Models.VAE import *
+from Data.dataloader import *
+from Data.normalizer import *
 from torch.utils.tensorboard import SummaryWriter
 from src.train_utils import *
 from src.test.run_validation import run_validation
@@ -120,7 +120,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
     conditioner = Conditioner()
     conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
     conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
-    conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json'))
+    conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json')) # TODO: check that this works and actually adds on the days it says it should
     cond = conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)  # Pass all data (x, meter, timestamps)
     
     print("Condition shape:", cond.shape)
@@ -133,7 +133,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
         model = VAE(input_dim=input_dim, latent_dim=32, device=device)
         log_dir = "./runs/VAE_training"
     else:
-        print("Initializing CVAE model (condition = day-of-week + user-profile)...")
+        print("Initializing CVAE model (condition = day-of-week + user-profile + holiday)...")
         model = CVAE(input_dim=input_dim, latent_dim=32, conditioner=conditioner, 
                      encoder_type="dictionary",decoder_type='dictionary', 
                      prior_type="vampprior", device=device)

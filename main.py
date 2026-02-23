@@ -8,10 +8,10 @@ import yaml
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.config_loader import load_config
-from src.dataloader import SmartMeterDataModule, WindowSpec
-from src.normalizer import Normalizer
+from Data.dataloader import SmartMeterDataModule, WindowSpec
+from Data.normalizer import Normalizer
 from src.Models import VAE, CVAE
-from src.Conditioner import Conditioner, UserProfiler, DayOfWeekConditioner
+from Data.Conditioner import Conditioner, UserProfiler, DayOfWeekConditioner
 import torch
 
 

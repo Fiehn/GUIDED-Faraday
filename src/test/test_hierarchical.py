@@ -606,8 +606,8 @@ class TestHierarchyWithRealData:
     @pytest.fixture(autouse=True)
     def setup_data(self):
         """Load a small slice of real data via the dataloader."""
-        from src.dataloader import SmartMeterDataModule, WindowSpec
-        from src.normalizer import Normalizer
+        from Data.dataloader import SmartMeterDataModule, WindowSpec
+        from Data.normalizer import Normalizer
 
         self.normalizer = Normalizer(method="log1p")
         self.dm = SmartMeterDataModule(

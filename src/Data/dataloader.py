@@ -360,7 +360,7 @@ class SmartMeterDataModule:
 
 # usage
 if __name__ == '__main__':
-    from normalizer import Normalizer
+    from Data.normalizer import Normalizer
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 

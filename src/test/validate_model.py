@@ -24,12 +24,13 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from src.encoder_decoder_model import *
-from src.Conditioner import *
-from src.Models import *
-from src.dataloader import *
-from src.normalizer import *
-from src.priors import *
+from Models.encoder_decoder_model import *
+from Data.Conditioner import *
+from src.Models.VAE import *
+from src.Models.CVAE import *
+from Data.dataloader import *
+from Data.normalizer import *
+from Models.priors import *
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1118,7 +1119,7 @@ class ModelValidator:
             print("\n[18] Testing RevIN...")
 
         try:
-            from src.normalizer import IndexedLogRevIN
+            from Data.normalizer import IndexedLogRevIN
 
             B, L, F, eps = 8, 24, 5, 1e-5
             revin = IndexedLogRevIN(num_features=F, eps=eps, affine=True)
@@ -1193,7 +1194,7 @@ class ModelValidator:
             print("\n[19] Testing Online User Profiler...")
 
         try:
-            from src.Conditioner import OnlineUserProfiler
+            from Data.Conditioner import OnlineUserProfiler
 
             B, L, F, K, T = 16, 24, 2, 10, 5
             op = OnlineUserProfiler(
@@ -1265,8 +1266,8 @@ class ModelValidator:
             print("\n[20] Testing Online CVAE...")
 
         try:
-            from src.Models import OnlineCVAE
-            from src.Conditioner import (Conditioner, DayOfWeekConditioner,
+            from src.Models.Online_CVAE import OnlineCVAE
+            from Data.Conditioner import (Conditioner, DayOfWeekConditioner,
                                          OnlineUserProfiler)
 
             input_dim, latent, B = 24, 8, 16

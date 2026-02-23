@@ -17,10 +17,12 @@ import torch
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, project_root)
 
-from src.dataloader import SmartMeterDataModule, WindowSpec
-from src.normalizer import Normalizer
-from src.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
-from src.Models import VAE, CVAE
+from Data.dataloader import SmartMeterDataModule, WindowSpec
+from Data.normalizer import Normalizer
+from Data.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
+from src.Models.CVAE import CVAE
+from src.Models.VAE import VAE
+
 from src.test.validate_model import validate_before_training
 
 

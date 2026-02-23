@@ -3,11 +3,13 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
-from src.encoder_decoder_model import *
-from src.Conditioner import *
-from src.Models import *
-from src.dataloader import *
-from src.normalizer import *
+from Models.encoder_decoder_model import *
+from Data.Conditioner import *
+from src.Models.CVAE import *
+from src.Models.Online_CVAE import *
+from src.Models.VAE import *
+from Data.dataloader import *
+from Data.normalizer import *
 import matplotlib.pyplot as plt
 import yaml
 
@@ -234,7 +236,7 @@ def _load_model_legacy(model_path, data_config, output_dir, device, num_reconstr
         print(f"  - Prior type: {prior_type}")
         
         # Recreate conditioner (must match training!)
-        from src.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
+        from Data.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
         conditioner = Conditioner()
         conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
         conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=False))
