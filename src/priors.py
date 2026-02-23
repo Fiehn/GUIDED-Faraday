@@ -251,6 +251,11 @@ class VampPrior(BasePrior):
 
         # Mixture: log (1/K) sum_k exp(log_prob_k) = logsumexp - log(K)
         return torch.logsumexp(log_probs, dim=1) - np.log(K)
+    
+    def forward(self, batch_size):
+        """Return mean parameters expanded to batch_size for compatibility."""
+        params = self.get_params()
+        return {k: v.expand(batch_size, -1) for k, v in params.items()}
 
 def get_prior(prior_type, latent_dim, device="cpu", **kwargs):
     """ Function to get priors based on type string 

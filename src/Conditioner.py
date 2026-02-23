@@ -557,11 +557,12 @@ class MonthOfYearConditioner():
         return moy_onehot
 
 class HolidayConditioner():
+    # https://helligdage-dk.dk/helligdage-2024/
     def __init__(self, holiday_path='data/holidays/denmark_holidays.json'):
         self.condition_dim = 1
         with open(holiday_path, 'r') as f:
             holidays = json.load(f)
-        self.holiday_dates = set(pd.to_datetime(holidays['date']).date)
+        self.holiday_dates = set(pd.to_datetime(holidays['dates']).date)
     def get_conditions(self,x, meter_id, timestamps):
         if isinstance(timestamps, torch.Tensor):
             device = timestamps.device

@@ -120,6 +120,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
     conditioner = Conditioner()
     conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
     conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
+    conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json'))
     cond = conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)  # Pass all data (x, meter, timestamps)
     
     print("Condition shape:", cond.shape)

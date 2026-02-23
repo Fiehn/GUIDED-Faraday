@@ -26,40 +26,6 @@ from src.Hierarchical.core import HierarchicalLatentModule
 # Conditional VAE with conditioning on user profiles
 # and a parameterized covariance matrix (PDCC)
 
-# TODO:
-# - Implement autocast with GradScaler for mixed precision training (Much faster training on GPUs)
-# - Make sure everything works with CPU and GPU seamlessly
-# - Optimize data loading and preprocessing pipeline
-# - Add more conditions (helligdag, sommer ferie, måned, )
-# - Hyperparameter tuning utilities (for optimizers, architectures, etc.)
-# - Make sure the model works with variable length sequences (padding/masking)
-# - IMPORTANT: Streaming algorithm for user profiles (online LDA) and normalization (running mean/std) and for the training (online/streaming VAE training)
-# - Test different loss functions and double check the current implementation against the literature
-# - Make sure loading and saving is robust
-# - Config file for all parameters and settings (e.g., YAML or JSON) and make sure it works with the current code structure
-# - Visualize RevIN normalization effects and user profile clusters
-# - Add more visualization and analysis tools for the learned latent space and reconstructions
-
-# - Adamx optimizer (https://arxiv.org/abs/2203.13751)
-# - 
-
-# TODO: Ideas
-# - Add a discriminator network and adversarial training to improve reconstruction quality (VAE-GAN style) (might not work)
-# - Make NNBlock transformers
-# - Latent Diffusion model instead of VAE
-# - Diffusion priors for sampling ? 
-#       Someone who has done it: (https://arxiv.org/abs/2106.15671) is still beaten by Normalizing flows
-#           Not how we would do it, we would train a seperate diffusion model on the latent space of the VAE
-#           Using that model we could limit the influence of the prior and let the diffusion model learn a more complex distribution in the latent space, which should improve sampling quality and diversity
-#           Thus allowing us to almost entirely remove kl divergence (not entirely, as we need a bit of structure otherwise it cant learn anything) and let the diffusion model learn the unsupervised structure in the latent space
-#           The question is wether that is a thing we mathematically can do and if it will work in practice
-#       VAMP diffusion (https://arxiv.org/html/2412.01373v1#bib.bib23)
-#       Seems like multiple ways to incorporate diffusion models into the VAE framework (https://xyfjason.top/blog-main/2023/07/29/Diffusion+VAE/)
-#       
-# - Add a flow-based prior (e.g., RealNVP or Glow) to allow for more flexible latent distributions (instead of just Gaussian or dictionary) 
-# - Add a hierarchical VAE structure (e.g., Ladder VAE) to capture more complex dependencies in the data and improve reconstruction quality
-#       This has been shown to be one of the most effective ways to improve VAE performance in general, and could be especially useful for smart meter data which has complex temporal and user-level dependencies
-
 # ==============
 # Cyclical Beta Annealing Scheduler
 # Reference: "Cyclical Annealing Schedule: A Simple Approach to Mitigating KL Vanishing"
