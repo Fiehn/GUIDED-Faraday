@@ -13,6 +13,7 @@ class OnlineCVAE(CVAE):
         distribution_dict: dict = None,
         prior_type: str = None,
         normalizer: Normalizer = None,
+        hierarchy_config: HierarchicalConfig = None,
         **kwargs,
     ):
         super().__init__(input_dim=input_dim, conditioner=conditioner, latent_dim=latent_dim, distribution_dict=distribution_dict, prior_type=prior_type, **kwargs)
@@ -121,14 +122,6 @@ class OnlineCVAE(CVAE):
         optim.step()
         return loss_dict
     
-    @torch.no_grad()
-    def sample(self, conditions: torch.Tensor, num_prior_samples: int = 1, num_x_samples: int = 1, device: str = "cpu", timestamps: torch.Tensor = None, month: int = None):
-        x = super().sample(conditions, num_prior_samples, num_x_samples, device)
-        # Now apply inverse RevIN to the samples
-        x = x.reshape(-1, self.sequence_length, self.num_features)  # [S*num_x_samples*B, L, F]
-        x_denormalized = self.normalizer.inverse_transform(x, month_key=month)
-        return x_denormalized.reshape(num_prior_samples, num_x_samples, -1, self.sequence_length * self.num_features)
-
     @torch.no_grad()
     def validate(self, valloader, num_samples=1, beta=1.0, device="cpu", month_key=None):
         self.eval()

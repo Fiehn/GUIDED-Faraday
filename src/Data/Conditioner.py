@@ -13,6 +13,20 @@ from sklearn.cluster import KMeans, MiniBatchKMeans
 from scipy.spatial.distance import cdist
 import pickle
 from tqdm import tqdm
+
+
+class _CompatUnpickler(pickle.Unpickler):
+    """Unpickler that remaps stale module paths to the current package layout."""
+    _MODULE_MAP = {
+        # old path          : new path
+        'src.Conditioner'   : 'src.Data.Conditioner',
+        'Data.Conditioner'  : 'src.Data.Conditioner',
+        'Conditioner'       : 'src.Data.Conditioner',
+    }
+
+    def find_class(self, module, name):
+        module = self._MODULE_MAP.get(module, module)
+        return super().find_class(module, name)
 import os
 
 class UserProfiler(LatentDirichletAllocation):
@@ -299,20 +313,20 @@ class UserProfiler(LatentDirichletAllocation):
     
     @staticmethod
     def load(path):
-        """Load model with cached profiles."""
+        """Load model with cached profiles (handles stale module paths via _CompatUnpickler)."""
         with open(path, "rb") as f:
-            obj = pickle.load(f)
-            
+            obj = _CompatUnpickler(f).load()
         
         if hasattr(obj, 'verbose') and obj.verbose:
             print(f"Loaded model with {len(obj.user_profiles_cache)} cached profiles")
             print(f"Cluster centers shape: {obj.cluster_centers_.shape}")
         
         return obj
-    def load(self,path):
-        """Load model with cached profiles."""
+
+    def load(self, path):
+        """Instance-level load: update self from pickle (handles stale module paths)."""
         with open(path, "rb") as f:
-            obj = pickle.load(f)
+            obj = _CompatUnpickler(f).load()
             self.__dict__.update(obj.__dict__)
             if hasattr(self, 'verbose') and self.verbose:
                 print(f"Loaded model with {len(self.user_profiles_cache)} cached profiles")

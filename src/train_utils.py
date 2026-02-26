@@ -3,13 +3,13 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
-from Models.encoder_decoder_model import *
-from Data.Conditioner import *
+from src.Models.encoder_decoder_model import *
+from src.Data.Conditioner import *
 from src.Models.CVAE import *
-from src.Models.Online_CVAE import *
 from src.Models.VAE import *
-from Data.dataloader import *
-from Data.normalizer import *
+from src.Models.Online_CVAE import *
+from src.Data.dataloader import *
+from src.Data.normalizer import *
 import matplotlib.pyplot as plt
 import yaml
 
@@ -47,7 +47,10 @@ def load_model_and_visualize(
     
     # Use the new unified loading method
     try:
-        from src.Models import VAE, CVAE
+        # VAE and CVAE classes are already imported at the top of this file
+        # via `from src.Models.VAE import *` and `from src.Models.CVAE import *`.
+        # Do NOT do `from src.Models import VAE, CVAE` here — that would import
+        # the *modules* (VAE.py / CVAE.py), shadowing the class names.
         
         # The load_from_checkpoint method automatically handles both new and legacy formats
         model = VAE.load_from_checkpoint(model_path, device)
@@ -236,7 +239,7 @@ def _load_model_legacy(model_path, data_config, output_dir, device, num_reconstr
         print(f"  - Prior type: {prior_type}")
         
         # Recreate conditioner (must match training!)
-        from Data.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
+        from src.Data.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
         conditioner = Conditioner()
         conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
         conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=False))
@@ -754,7 +757,7 @@ def _visualize_latent_space(model, test_loader, device, output_dir, model_tag):
     labels = []
     
     with torch.no_grad():
-        for x, meter_id, timestamps, month_key in test_loader:
+        for x, meter_id, timestamps, _ in test_loader:
             x = x.to(device)
             x_flat = x.reshape(x.shape[0], -1)
             
@@ -1021,41 +1024,37 @@ def _save_model_summary(
         output_dir: str,
         model_tag: str,
     ) -> str:
-    try:
-        import json
-        if model_kwargs is None:
-            model_kwargs = {}
-            for attr in dir(model):
-                if not attr.startswith('_') and not callable(getattr(model, attr)):
-                    model_kwargs[attr] = getattr(model, attr)
-        hyperparameters = {k: v for k, v in model_kwargs.items() if isinstance(v, (int, float, str, bool))}
+    import json
+    if model_kwargs is None:
+        model_kwargs = {}
+        for attr in dir(model):
+            if not attr.startswith('_') and not callable(getattr(model, attr)):
+                model_kwargs[attr] = getattr(model, attr)
+    hyperparameters = {k: v for k, v in model_kwargs.items() if isinstance(v, (int, float, str, bool))}
 
-        summary = {
-            "model_tag": model_tag,
-            "model_class": model.__class__.__name__,
-            "model_kwargs": model_kwargs,
-            "architecture": {
-                "encoder": model.encoder.__class__.__name__,
-                "decoder": model.decoder.__class__.__name__,
-                "prior": model.prior.__class__.__name__,
-            },
-            "dimensions": {
-                "input_dim": model.input_dim,
-                "latent_dim": model.latent_dim,
-                "condition_dim": model.condition_dim if hasattr(model, 'condition_dim') else None,
-                "total_params": sum(p.numel() for p in model.parameters()),
-                "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
-            },
-            "hyperparameters": hyperparameters,
-        }
-        summary_path = os.path.join(output_dir, f"{model_tag}_model_summary.json")
-        with open(summary_path, 'w') as f:
-            json.dump(summary, f, indent=4)
-        print(f"Saved model summary to {summary_path}")
-        return summary_path
-    except:
-        print("Model Summary Failed")
-        return ""
+    summary = {
+        "model_tag": model_tag,
+        "model_class": model.__class__.__name__,
+        "model_kwargs": model_kwargs,
+        "architecture": {
+            "encoder": model.encoder.__class__.__name__,
+            "decoder": model.decoder.__class__.__name__,
+            "prior": model.prior.__class__.__name__,
+        },
+        "dimensions": {
+            "input_dim": model.input_dim,
+            "latent_dim": model.latent_dim,
+            "condition_dim": model.condition_dim if hasattr(model, 'condition_dim') else None,
+            "total_params": sum(p.numel() for p in model.parameters()),
+            "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        },
+        "hyperparameters": hyperparameters,
+    }
+    summary_path = os.path.join(output_dir, f"{model_tag}_model_summary.json")
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=4)
+    print(f"Saved model summary to {summary_path}")
+    return summary_path
 
 
 if __name__ == "__main__":

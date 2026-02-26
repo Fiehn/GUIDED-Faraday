@@ -212,6 +212,12 @@ class CVAE(VAE):
         else:
             raise ValueError(f"Unexpected prior sample tensor dimensions: {z.shape}")
 
+        if self.hierarchy is not None:
+            S, B, D = z.shape
+            z_flat = z.reshape(S * B, D)
+            hierarchy_results = self.hierarchy(z_flat)
+            z = hierarchy_results["output"].reshape(S, B, -1)
+
         # Expand c to [S, B, C]
         c_expanded = c.unsqueeze(0).expand(num_prior_samples, B, -1)
         

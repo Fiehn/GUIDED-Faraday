@@ -237,10 +237,26 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         conditioner = Conditioner()
         conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
         conditioner.add_condition_item("user_profile", OnlineUserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
+        #conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json')) # TODO: check that this works and actually adds on the days it says it should
+
+        heirarchy = HierarchicalConfig(
+            levels=[
+                LevelConfig(name="Level 1", input_dim=24 * 1, latent_dim=32, strategy="linear", top_down=False, bottom_up=True, loss_weight=1.0),
+                LevelConfig(name="Level 2", input_dim=32, latent_dim=16, strategy="linear", top_down=True, bottom_up=True, loss_weight=0.5),
+                LevelConfig(name="Level 3", input_dim=16, latent_dim=8, strategy="linear", top_down=True, bottom_up=False, loss_weight=0.25),
+            ],
+            aggregation="concat",
+            bidirectional=True,
+            residual_connections=True,
+            kl_annealing=True,
+            kl_warmup_steps=1000,
+            free_bits=0.1,
+        )
+
         model = OnlineCVAE(input_dim=24, latent_dim=32, conditioner=conditioner, 
                      encoder_type="dictionary",decoder_type='dictionary', 
                      prior_type="vampprior", device=device,
-                     normalizer=normalizer)  # input_dim will be updated based on data
+                     normalizer=normalizer, hierarchy_config=heirarchy)  # input_dim will be updated based on data
         log_dir = "./runs/CVAE_online_training"
     
     i = 0
@@ -252,15 +268,28 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         print(f"\nProcessing {data_file}")
         i += 1
 
-        # Free previous iteration's resources before loading new data
-        if last_dm is not None and i > 1:
-            del last_dm
+        # ── Clean up BEFORE loading new data ──────────────────────────
+        import gc
+        if i > 1:
+            # Explicitly clear DataLoaders first (they may hold worker refs)
+            if 'train_loader' in dir():
+                del train_loader
+            if 'val_loader' in dir():
+                del val_loader
             if last_test_loader is not None:
                 del last_test_loader
-            import gc
+                last_test_loader = None
+            # Clear the DataModule's internal datasets explicitly
+            if last_dm is not None:
+                last_dm._train_ds = None
+                last_dm._val_ds   = None
+                last_dm._test_ds  = None
+                del last_dm
+                last_dm = None
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            print(f"  Memory cleared before loading {data_file}")
 
         # Load data for this file
         dm = SmartMeterDataModule(
@@ -312,14 +341,11 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
 
         # Free train/val loaders but keep dm and test_loader for potential visualization
         del train_loader, val_loader
-        last_dm = dm
-        last_test_loader = test_loader
-        last_data_file = data_file
-
-        import gc
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+
+        last_dm          = dm
+        last_test_loader = test_loader
+        last_data_file   = data_file
 
     # Visualize using the last file's test set
     if last_test_loader is not None and last_data_file is not None:
@@ -349,8 +375,8 @@ if __name__ == "__main__":
     # run_test(model_type="vae", skip_validation=False)  # VAE with validation
     # run_test(model_type="cvae", skip_validation=False)  # CVAE with validation
     # run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
-    # online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
-    run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
+     online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
+    #run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
 
 
 

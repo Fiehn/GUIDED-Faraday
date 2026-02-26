@@ -211,28 +211,26 @@ class DictionaryCoder(torch.nn.Module):
     
     def loglikelihood(self, inputs, param_dict,**_):
         """Compute log likelihood under multivariate Gaussian with PDCC covariance."""
-        mu = param_dict["mu"]
-        Sigma = self.create_covariance_matrix(param_dict)
+        mu = param_dict['mu']
+        Sigma = self.create_covariance_matrix(param_dict)  # [B, D, D]
 
-        # Stability?: jitter adds a small value to the diagonal to ensure positive definiteness, but it can also bias the likelihood. The marginal_std_lim should already ensure positive definiteness, so we can try without jitter first and only add it if we encounter issues.
-        # jitter = 1e-6 * torch.eye(Sigma.shape[-1], device=Sigma.device)
-        # Sigma = Sigma + jitter
+        # Symmetrize first
+        Sigma = 0.5 * (Sigma + Sigma.transpose(-1, -2))
+        D = Sigma.shape[-1]
+        # Add jitter and use Cholesky — always PD, more numerically stable (It should have been stable but it seems to be an issue in practice, Maybe the heirarchy is causing some instability? I will need to check this later)
+        jitter = 1e-5 * torch.eye(D, device=Sigma.device, dtype=Sigma.dtype).unsqueeze(0)
+        Sigma_jittered = Sigma + jitter
 
         # Use PyTorch's MultivariateNormal distribution
         try:
-            # Stability? cholesky should be more stable than direct covariance matrix, but it can still fail if Sigma is not positive definite
-            #L = torch.cholesky(Sigma)
-            #dist = torch.distributions.MultivariateNormal(loc=mu, scale_tril=L)
-
-            dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=Sigma)
-            return dist.log_prob(inputs)
-        except Exception as e:
-            # Fallback if covariance is not positive definite (IT SHOULD BE by the papers arguments)
-            print(f"Warning: Covariance matrix issue in loglikelihood: {e}")
-            # Add the marginal std lim to diagonal for stability again
-            Sigma_stable = Sigma + torch.eye(self.output_dim, device=Sigma.device) * (self.marginal_std_lim ** 2)
-            dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=Sigma_stable)
-            return dist.log_prob(inputs)
+            # Using scale_tril with Cholesky decomposition for better numerical stability (should be equivalent to covariance_matrix but more stable)
+            L = torch.linalg.cholesky(Sigma_jittered)
+        except torch.linalg.LinAlgError:
+            # Fallback: larger jitter
+            L = torch.linalg.cholesky(Sigma_jittered + 1e-3 * torch.eye(D, device=Sigma.device).unsqueeze(0))
+        
+        dist = torch.distributions.MultivariateNormal(loc=mu, scale_tril=L)
+        return dist.log_prob(inputs)
     
     def kl_divergence(self, param_dict_q, prior=None, **_):
         """

@@ -1320,8 +1320,7 @@ class ModelValidator:
                 sc = _to_tensor(sc, self.device)
                 samples = ocvae.sample(
                     conditions=sc, num_prior_samples=4, num_x_samples=1,
-                    device=str(self.device),
-                    timestamps=torch.tensor([100, 200], device=self.device),
+                    device=str(self.device)
                 )
                 exp = (4, 1, 2, input_dim)
                 self._add_result(
