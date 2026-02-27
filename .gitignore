@@ -12,3 +12,6 @@ data/
 models/
 runs/
 Output/
+
+!src/Data/
+!src/Data/*.py
