@@ -45,14 +45,18 @@ class SmartMeterCSV:
 
         columns_to_load = [self.meter_col, self.timestamp_dst_col, self.timestamp_utc_col] + self.value_cols
         
-        df = pd.read_csv(
-            path,
-            usecols=columns_to_load,
-            dtype={
-                self.meter_col: 'int32',  # Optimize meter_number dtype
-                **{col: 'float32' for col in self.value_cols}  # Optimize value columns
-            }
-        )
+        with open(path, 'r') as f:
+            df = pd.read_csv(
+                f,
+                usecols=columns_to_load,
+                dtype={
+                    self.meter_col: 'int32',  # Optimize meter_number dtype
+                    **{col: 'float32' for col in self.value_cols}  # Optimize value columns
+                }
+            )
+
+        # Defensive copy to detach from original CSV data
+        # df = df.copy() # Should genuinely not be a problem, but if any file is corrupted we will have to activate again. Will be a big slowdown, so let's hope not.
 
         # Parse timestamps
         df[self.timestamp_dst_col] = pd.to_datetime(df[self.timestamp_dst_col])
