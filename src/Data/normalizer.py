@@ -6,7 +6,10 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 import os
 
-def compute_normalization_stats(sm_files, feature_cols, save_path = "normalization_stats.json"):
+def compute_normalization_stats(sm_files, 
+                                feature_cols, 
+                                save_path = "normalization_stats.json", 
+                                valid_ids_json_path = "data\Timeseries_info\Timeseries_info.json"):
     """Compute the mean and standard deviation for normalization across all Parquet files."""
     if os.path.exists(save_path):
         with open(save_path, 'r') as f:
@@ -25,30 +28,95 @@ def compute_normalization_stats(sm_files, feature_cols, save_path = "normalizati
     
     if not feature_cols:
         raise ValueError("No feature columns specified for normalization stats computation.")
-    
-    # Feature columns in the Parquet files have a suffix like _meterid, so we need to remove that to get the base feature name
-    df = df.rename(columns={
-            col: '_'.join(col.split('_')[:-1])  # keep everything except the last part
-            for col in df.columns
-        })
+
+    # === Filter by Timeseries_info JSON if provided ===
+    print("Loading valid IDs...")
+    with open(valid_ids_json_path, 'r') as f:
+        valid_data = json.load(f)
+        # Convert to a set for O(1) lightning-fast lookups
+        valid_ids = set(valid_data['id_list_of_sms_with_data']) 
+        
+    filtered_sm_files = []
+    for file in sm_files:
+        # Extract the ID from the filename (e.g., "sm_100025.parquet" -> "100025")
+        basename = os.path.basename(file)
+        file_id = basename.replace('sm_', '').replace('.parquet', '')
+        
+        if file_id in valid_ids:
+            filtered_sm_files.append(file)
+            
+    print(f"Filtered files: Kept {len(filtered_sm_files)} out of {len(sm_files)} original files.")
+
 
     total_sum = np.zeros(len(feature_cols))
     total_sq_sum = np.zeros(len(feature_cols))
-    total_count = 0
+    total_count = np.zeros(len(feature_cols))
 
-    for file in tqdm(sm_files, desc="Computing normalization stats"):
-        dataset = pq.ParquetDataset(file)
-        for batch in dataset.iter_batches(columns=feature_cols, batch_size=10000):
-            df =  batch.to_pandas()
-            log_df = np.log1p(df[feature_cols])  # Apply log transformation to the features
-            total_sum += log_df[feature_cols].sum().values
-            total_sq_sum += (log_df[feature_cols] ** 2).sum().values
-            total_count += len(log_df)
+    users_missing_columns = 0
 
-    mean = total_sum / total_count
-    std = np.sqrt((total_sq_sum / total_count) - (mean ** 2))
+    for file in tqdm(filtered_sm_files, desc="Computing stats"):
+        dataset = pq.ParquetFile(file)
+        file_cols = dataset.schema.names
+        
+        cols_to_load = []
+        rename_map = {}
+        found_features = []
+        
+        for base_feat in feature_cols:
+            for actual_col in file_cols:
+                if actual_col.startswith(base_feat):
+                    cols_to_load.append(actual_col)
+                    rename_map[actual_col] = base_feat
+                    found_features.append(base_feat)
+                    break
+        
+        # Track how many users are missing at least one column
+        if len(cols_to_load) != len(feature_cols):
+            users_missing_columns += 1
+            
+        # If the file has literally none of the features, skip it entirely
+        if not cols_to_load:
+            continue
 
-    # Save the computed mean and std to a JSON file for later use
+        for batch in dataset.iter_batches(columns=cols_to_load, batch_size=10000):
+            df = batch.to_pandas()
+            df = df.rename(columns=rename_map)
+
+            # Apply log only to the features we actually found
+            log_df = np.log1p(df[found_features])  
+            
+            # Add to the sums independently based on what exists
+            for i, feat in enumerate(feature_cols):
+                if feat in found_features:
+                    # Drop NaNs just in case there are internal empty rows
+                    valid_data = log_df[feat].dropna()
+                    total_sum[i] += valid_data.sum()
+                    total_sq_sum[i] += (valid_data ** 2).sum()
+                    total_count[i] += len(valid_data)
+
+
+    print(f"\n--- DATA QUALITY REPORT ---")
+    print(f"Total files processed: {len(filtered_sm_files)}")
+    print(f"Users missing one or more columns: {users_missing_columns}")
+    for i, feat in enumerate(feature_cols):
+        print(f"Valid rows found for {feat}: {int(total_count[i])}")
+    print(f"---------------------------\n")
+
+
+    mean = np.zeros(len(feature_cols))
+    std = np.ones(len(feature_cols)) 
+    
+    for i in range(len(feature_cols)):
+        if total_count[i] > 0:
+            mean[i] = total_sum[i] / total_count[i]
+            # max(0, ...) prevents math domain errors from floating point inaccuracies
+            var = max(0, (total_sq_sum[i] / total_count[i]) - (mean[i] ** 2))
+            std[i] = np.sqrt(var)
+            
+            # If standard deviation is exactly 0 (constant value), force to 1 to prevent division by zero during training
+            if std[i] == 0:
+                std[i] = 1.0
+
     with open(save_path, 'w') as f:
         json.dump({'log_mean': mean.tolist(), 'log_std': std.tolist()}, f)
 
@@ -136,6 +204,14 @@ class Normalizer:
         X : array-like (N,F)
         month_key : 1-D int array (N,) of YYYYMM values
                     Only required for method=='online_log1p'"""
+        if X is None:
+            # For log1p_phase, we can compute the stats from the entire dataset using the compute_normalization_stats function
+            if self.method == 'log1p_phase':
+                self.mean, self.std = compute_normalization_stats(sm_files=None, feature_cols=['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3'], save_path='normalization_stats.json')
+                self.fitted = True
+                return
+            else:
+                raise ValueError("X cannot be None for methods other than 'log1p_phase'.")
         Xt = self._to_tensor(X) # (N,F)
 
         if self.method == 'zero_preserved_log':
@@ -178,8 +254,6 @@ class Normalizer:
             self._global_std  = X_log.std(dim=0,  keepdim=True)  # (1, F)
             self._global_std[self._global_std == 0] = 1.0
             self.fitted = True
-        elif self.method == 'log1p_phase':
-            self.mean, self.std = compute_normalization_stats(sm_files=None, feature_cols=['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3'], save_path='normalization_stats.json')
         else:
             raise ValueError(f"Normalization method {self.method} not recognized.")
     

@@ -45,13 +45,15 @@ class StreamingParquetBuffer(IterableDataset):
         self.window_spec = window_spec
         self.normalizer = normalizer
         self.num_workers = num_workers
+
+        self.feature_cols = ['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3']
     
     def _push_to_buffer(self, item):
         self.buffer[self.ptr] = item
         self.ptr = (self.ptr + 1) % self.replay_buffer_capacity
         self.current_size = min(self.current_size + 1, self.replay_buffer_capacity)
 
-    def _sample_from_buffer(self, batch_size):
+    def _sample_from_buffer(self):
         if self.current_size < self.min_buffer_size:
             raise ValueError(f"Buffer size {self.current_size} is less than the minimum required {self.min_buffer_size} for sampling.")
         idx = random.randrange(self.current_size)
@@ -76,20 +78,50 @@ class StreamingParquetBuffer(IterableDataset):
         for file in files_for_this_worker:
             # Open parquet file for streaming (does not load entire file into memory)
             parquet_file = pq.ParquetFile(file)
+            file_cols = parquet_file.schema.names
 
-            # strem the file in tiny batches of 1000 rows at a time
-            for batch in parquet_file.iter_batches(batch_size=1000):
+            # Identify which columns to load based on the feature_cols and the actual columns in the file (which have meter_id suffixes), and create a mapping to rename them to the base feature names
+            cols_to_load = []
+            rename_map = {}
+            for base_feat in self.feature_cols:
+                for actual_col in file_cols:
+                    if actual_col.startswith(base_feat):
+                        cols_to_load.append(actual_col)
+                        rename_map[actual_col] = base_feat
+                        break
+            # Get timestamps we guess as to how its saved
+            time_col_name = None
+            for col in file_cols:
+                if col.lower() in ['timestamp_dst']:
+                    cols_to_load.append(col)
+                    time_col_name = col
+                    break
 
-                # Convert to pandas dataframe for easier processing
+            # If the file has absolutely none of our features, skip it
+            if not cols_to_load:
+                continue
+
+            # Only load the exact matched columns to save RAM
+            for batch in parquet_file.iter_batches(columns=cols_to_load, batch_size=10000):
                 chunk_df = batch.to_pandas()
+                chunk_df = chunk_df.rename(columns=rename_map)
 
-                # Timestep sequencing : sequences = [(tensor_seq_1, conditions_1), (tensor_seq_2, conditions_2), ...]
-                sequences = self._extract_sequences(chunk_df)
+                # ZERO-PADDING: If a user is missing L2, create the column and fill with 0s TODO: possibly add flag as set-vae might know what to do
+                for feat in self.feature_cols:
+                    if feat not in chunk_df.columns:
+                        chunk_df[feat] = 0.0
+
+                # Extract meter_id from the original file path (safest method)
+                meter_id = int(os.path.basename(file).replace('sm_', '').replace('.parquet', ''))
+
+                sequences = self._extract_sequences(chunk_df, meter_id, time_col_name)
 
                 for seq, cond in sequences:
                     # Apply normalization if normalizer is provided
                     if self.normalizer is not None:
+                        # seq shape is [24, 3], broadcasting with [3,]
                         seq = self.normalizer.transform(seq)
+                        seq = seq.T
 
                     # Push the (seq, cond) pair into the replay buffer
                     self._push_to_buffer((seq, cond))
@@ -97,36 +129,33 @@ class StreamingParquetBuffer(IterableDataset):
                     # Yield only when the buffer is adequately mixed
                     if self.current_size >= self.min_buffer_size:
                         # The yield pauses the loop right here until PyTorch needs more data
-                        yield self._sample_from_buffer(batch_size=1)
+                        yield self._sample_from_buffer()
     
-    def _extract_sequences(self, df):
+    def _extract_sequences(self, df, meter_id, time_col_name):
         sequences = []
-        # The desired columns are 'active_power_p14_l1_?meter_id?' and 'active_power_p14_l2_?meter_id?' and 'active_power_p14_l3_?meter_id?'
-        # Along with the index extracted out as a separate column 'timestamp' and 'meter_id' as the condition
 
-        # Extract meter_id from the original column names and add it as a separate column
-        df['meter_id'] = int(df.columns[0].split('_')[-1])  # assuming all columns have the same meter_id
-        # rename active_power_p14_l{n}_<meter_id> -> active_power_p14_l{n} (drop the trailing meter_id suffix)
-        df = df.rename(columns={
-            col: '_'.join(col.split('_')[:4])  # keep active_power_p14_l{n}
-            for col in df.columns if col.startswith('active_power_p14')
-        })
-        columns = [col for col in df.columns if col.startswith('active_power_p14_l')]
+        if time_col_name and time_col_name in df.columns:
+            # If PyArrow loaded it as a normal column
+            time_data = df[time_col_name]
+        else:
+            # If PyArrow automatically restored it as the Pandas Index
+            time_data = df.index
+        df['timestamp'] = pd.to_datetime(time_data).astype(np.int64) // 10**9
+        df = df.reset_index(drop=True)
 
-        df['timestamp'] = df.index.astype(np.int64) // 10**9  # convert to unix timestamp in seconds
-        
-        df = df.reset_index(drop=True)  # reset index to have a clean range index
+        # Force exact order of features
+        values = df[self.feature_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0).astype(np.float32).values 
 
-        # The meter_ids are constant so we dont need to group by them, we can just create windows across the entire dataframe and use the meter_id column as condition
-        values = df[columns].apply(pd.to_numeric, errors='coerce').astype(np.float32).values  # shape: [n_rows, 3]
         for start in range(0, len(values) - self.window_spec.input_len + 1, self.window_spec.stride):
             end = start + self.window_spec.input_len
-            # window shape: [3, seq_len]
-            window = torch.tensor(values[start:end], dtype=torch.float32).T
-            # Conditions stacked as [2, seq_len]: condition[0] = meter_id, condition[1] = timestamps
-            meter_ids = torch.full((end - start,), df['meter_id'].iloc[0], dtype=torch.long)
+            
+            # Shape is [seq_len, 3] -> (24, 3). We will transpose to [3, seq_len] in the end to be consistent with the rest of the code and how the model expects it
+            window = torch.tensor(values[start:end], dtype=torch.float32)
+            
+            meter_ids = torch.full((self.window_spec.input_len,), meter_id, dtype=torch.long)
             timestamps = torch.tensor(df['timestamp'].values[start:end], dtype=torch.long)
             condition = torch.stack([meter_ids, timestamps], dim=0)  # [2, seq_len]
+            
             sequences.append((window, condition))
         
         return sequences
@@ -194,6 +223,8 @@ class SMPhaseData:
 
 
 if __name__ == "__main__":
+    normalizer = Normalizer(method='log1p_phase')
+    normalizer.fit(X = None)  # This will compute and save the normalization stats to 'normalization_stats.json'
     # Example usage
     data_module = SMPhaseData(
         data_dir='F:\Data\processed_data\second_batch\individual_sm_datasets\cleaned_profiles',
@@ -201,7 +232,8 @@ if __name__ == "__main__":
         batch_size=32,
         replay_buffer_capacity=10000,
         seed=4,
-        num_workers=4
+        num_workers=4,
+        normalizer=normalizer
     )
     data_module.setup()
     for batch in data_module.train_loader:
