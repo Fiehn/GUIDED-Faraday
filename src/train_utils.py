@@ -17,13 +17,15 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def load_model_and_visualize(
         model_path: str,
+        config_path: str = None,
         data_config: dict = None,
         output_dir: str = "Output/Plots",
         device: str = "auto",
         num_reconstructions: int = 3,
         num_synthetic_samples: int = 5,
         num_samples_per_original: int = 3,
-    normalizer_method: str = "log1p",
+        normalizer_method: str = "log1p",
+        return_components: bool = False,
     ):
     """
     Loads a trained model from disk and generates reconstruction and synthetic data visualizations.
