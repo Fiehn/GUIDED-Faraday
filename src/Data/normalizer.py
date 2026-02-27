@@ -3,7 +3,58 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-from collections import defaultdict
+import json
+import pyarrow.parquet as pq
+from tqdm import tqdm
+import os
+
+def compute_normalization_stats(sm_files, feature_cols, save_path = "normalization_stats.json"):
+    """Compute the mean and standard deviation for normalization across all Parquet files."""
+    if os.path.exists(save_path):
+        with open(save_path, 'r') as f:
+            stats = json.load(f)
+            mean = np.array(stats['log_mean'])
+            std = np.array(stats['log_std'])
+            return mean, std
+        
+    if sm_files is None:
+        # Find all Parquet files in the default data directory
+        data_dir = 'F:\Data\processed_data\second_batch\individual_sm_datasets\cleaned_profiles'
+        sm_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.parquet')]
+    
+    if not sm_files:
+        raise ValueError("No Parquet files found for normalization stats computation.")
+    
+    if not feature_cols:
+        raise ValueError("No feature columns specified for normalization stats computation.")
+    
+    # Feature columns in the Parquet files have a suffix like _meterid, so we need to remove that to get the base feature name
+    df = df.rename(columns={
+            col: '_'.join(col.split('_')[:-1])  # keep everything except the last part
+            for col in df.columns
+        })
+
+    total_sum = np.zeros(len(feature_cols))
+    total_sq_sum = np.zeros(len(feature_cols))
+    total_count = 0
+
+    for file in tqdm(sm_files, desc="Computing normalization stats"):
+        dataset = pq.ParquetDataset(file)
+        for batch in dataset.iter_batches(columns=feature_cols, batch_size=10000):
+            df =  batch.to_pandas()
+            log_df = np.log1p(df[feature_cols])  # Apply log transformation to the features
+            total_sum += log_df[feature_cols].sum().values
+            total_sq_sum += (log_df[feature_cols] ** 2).sum().values
+            total_count += len(log_df)
+
+    mean = total_sum / total_count
+    std = np.sqrt((total_sq_sum / total_count) - (mean ** 2))
+
+    # Save the computed mean and std to a JSON file for later use
+    with open(save_path, 'w') as f:
+        json.dump({'log_mean': mean.tolist(), 'log_std': std.tolist()}, f)
+
+    return mean, std
 
 # === Normalizer class that will use the entire data ===
 class Normalizer:
