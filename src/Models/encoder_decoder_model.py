@@ -1,83 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Normal, kl_divergence
-from src.priors import *
-
-# === Multivariate Student T distribtion, not in PyTorch by default, so we implement it here ===
-import math
-from torch.distributions import Distribution, constraints
-from torch.distributions.utils import _standard_normal, lazy_property
-
-class MultivariateStudentT(Distribution):
-    # Constraints: df > 0, scale_tril is lower triangular with positive diagonal
-    arg_constraints = {'df': constraints.positive, 'loc': constraints.real_vector, 'scale_tril': constraints.lower_cholesky}
-    support = constraints.real_vector
-    has_rsample = True
-
-    def __init__(self,df,loc,covariance_matrix=None,scale_tril=None,validate_args=None):
-        # Handle covariance input (similar to MultivariateNormal)
-        if scale_tril is None:
-            if covariance_matrix is not None:
-                # Cholesky decomposition to get scale_tril
-                scale_tril = torch.linalg.cholesky(covariance_matrix)
-            else:
-                raise ValueError("Either covariance_matrix or scale_tril must be specified")
-        self.df = df
-        self.loc = loc
-        self.scale_tril = scale_tril
-        self._event_shape = self.loc.size()[-1:]
-        self._batch_shape = self.loc.size()[:-1]
-
-        super().__init__(batch_shape=self._batch_shape, event_shape=self._event_shape, validate_args=validate_args)
-
-    @lazy_property
-    def precision_matrix(self):
-        # inverse of covariance matrix (cholesky)
-        identity = torch.eye(self.scale_tril.size(-1), device=self.scale_tril.device)
-        return torch.cholesky_solve(identity, self.scale_tril)
-    
-    def log_prob(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
-        
-        # Dimensions
-        d = self.loc.size(-1)
-        df = self.df
-
-        # Mahalanobis distance squared: (x-mu)^T Sigma^-1 (x-mu)
-        diff = value - self.loc
-        M = torch.linalg.solve_triangular(self.scale_tril, diff.unsqueeze(-1), upper=False).squeeze(-1)  # Solve L y = diff
-        mahalanobis = M.pow(2).sum(-1)
-
-        # Log probability for multivariate Student's t-distribution
-        log_gamma_term = torch.lgamma((df + d) * 0.5) - torch.lgamma(df * 0.5)
-        log_det_term = -0.5 * d * math.log(math.pi * df) - torch.log(self.scale_tril.diagonal(dim1=-2, dim2=-1)).sum(-1)
-        log_poly_term = -0.5 * (df + d) * torch.log1p(mahalanobis / df)
-
-        return log_gamma_term + log_det_term + log_poly_term
-    
-    def rsample(self, sample_shape = torch.Size()):
-        # Reparameterization trick for sampling from multivariate Student's t-distribution
-        # x = mu + (scale * z) / sqrt(u / df) where z ~ N(0, I) and u ~ Chi2(df)
-        shape = self._extended_shape(sample_shape)
-
-        # Sample z from standard normal
-        eps = _standard_normal(shape, dtype=self.loc.dtype, device=self.loc.device)
-
-        # Sample u from chi-squared distribution (Chi2(df) is equivalent to Gamma(df/2, 0.5))
-        u = torch.distributions.Gamma(self.df / 2, 0.5).rsample(shape[:-1])
-
-        # Construct affine transformation
-        z_transformed = (self.scale_tril @ eps.unsqueeze(-1)).squeeze(-1)
-
-        # Scale by sqrt((df - 2) / df) for correct variance and divide by sqrt(u/df) for the t-distribution scaling
-        scale_factor = torch.sqrt(u / self.df).unsqueeze(-1)
-
-        return self.loc + z_transformed / scale_factor
-
-
-
+from Models.priors import *
+from src.Models.model_utils import MultivariateStudentT
 
 # === Gaussian encoder and decoder Model ===
 class GaussianCoder(torch.nn.Module):
@@ -286,28 +211,26 @@ class DictionaryCoder(torch.nn.Module):
     
     def loglikelihood(self, inputs, param_dict,**_):
         """Compute log likelihood under multivariate Gaussian with PDCC covariance."""
-        mu = param_dict["mu"]
-        Sigma = self.create_covariance_matrix(param_dict)
+        mu = param_dict['mu']
+        Sigma = self.create_covariance_matrix(param_dict)  # [B, D, D]
 
-        # Stability?: jitter adds a small value to the diagonal to ensure positive definiteness, but it can also bias the likelihood. The marginal_std_lim should already ensure positive definiteness, so we can try without jitter first and only add it if we encounter issues.
-        # jitter = 1e-6 * torch.eye(Sigma.shape[-1], device=Sigma.device)
-        # Sigma = Sigma + jitter
+        # Symmetrize first
+        Sigma = 0.5 * (Sigma + Sigma.transpose(-1, -2))
+        D = Sigma.shape[-1]
+        # Add jitter and use Cholesky — always PD, more numerically stable (It should have been stable but it seems to be an issue in practice, Maybe the heirarchy is causing some instability? I will need to check this later)
+        jitter = 1e-5 * torch.eye(D, device=Sigma.device, dtype=Sigma.dtype).unsqueeze(0)
+        Sigma_jittered = Sigma + jitter
 
         # Use PyTorch's MultivariateNormal distribution
         try:
-            # Stability? cholesky should be more stable than direct covariance matrix, but it can still fail if Sigma is not positive definite
-            #L = torch.cholesky(Sigma)
-            #dist = torch.distributions.MultivariateNormal(loc=mu, scale_tril=L)
-
-            dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=Sigma)
-            return dist.log_prob(inputs)
-        except Exception as e:
-            # Fallback if covariance is not positive definite (IT SHOULD BE by the papers arguments)
-            print(f"Warning: Covariance matrix issue in loglikelihood: {e}")
-            # Add the marginal std lim to diagonal for stability again
-            Sigma_stable = Sigma + torch.eye(self.output_dim, device=Sigma.device) * (self.marginal_std_lim ** 2)
-            dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=Sigma_stable)
-            return dist.log_prob(inputs)
+            # Using scale_tril with Cholesky decomposition for better numerical stability (should be equivalent to covariance_matrix but more stable)
+            L = torch.linalg.cholesky(Sigma_jittered)
+        except torch.linalg.LinAlgError:
+            # Fallback: larger jitter
+            L = torch.linalg.cholesky(Sigma_jittered + 1e-3 * torch.eye(D, device=Sigma.device).unsqueeze(0))
+        
+        dist = torch.distributions.MultivariateNormal(loc=mu, scale_tril=L)
+        return dist.log_prob(inputs)
     
     def kl_divergence(self, param_dict_q, prior=None, **_):
         """

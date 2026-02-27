@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 import numpy as np
@@ -5,7 +6,7 @@ import numpy as np
 # =============
 # Prior Dsitribution Classes
 # =============
-class BasePrior(nn.Module):
+class BasePrior(nn.Module, ABC):
     """ Base class for prior distributions. 
     Parameters:
     - latent_dim: Dimension of the latent space
@@ -16,21 +17,25 @@ class BasePrior(nn.Module):
         self.latent_dim = latent_dim
         self.device = device
     
+    @abstractmethod
     def get_params(self):
         """Return dict of prior parameters."""
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     def sample(self,batch_size, num_samples=1):
         """Sample from the prior distribution."""
-        raise NotImplementedError
+        ...
     
+    @abstractmethod
     def log_prob(self, z):
         """Compute log probability of z under the prior."""
-        raise NotImplementedError
+        ...
     
+    @abstractmethod
     def forward(self, batch_size):
         """returns params expanded to batch_size."""
-        raise NotImplementedError
+        ...
 
 class StandardGaussianPrior(BasePrior):
     """ Standard Normal Prior N(0, I) - non-learnable """
@@ -246,6 +251,11 @@ class VampPrior(BasePrior):
 
         # Mixture: log (1/K) sum_k exp(log_prob_k) = logsumexp - log(K)
         return torch.logsumexp(log_probs, dim=1) - np.log(K)
+    
+    def forward(self, batch_size):
+        """Return mean parameters expanded to batch_size for compatibility."""
+        params = self.get_params()
+        return {k: v.expand(batch_size, -1) for k, v in params.items()}
 
 def get_prior(prior_type, latent_dim, device="cpu", **kwargs):
     """ Function to get priors based on type string 

@@ -1,8 +1,5 @@
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Normal, kl_divergence
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 import json
@@ -12,145 +9,22 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir) 
-from src.encoder_decoder_model import *
-from src.Conditioner import *
-from src.priors import *
-from src.normalizer import *
+from Models.encoder_decoder_model import *
+from Data.Conditioner import *
+from Models.priors import *
+from Data.normalizer import *
+
+from src.Hierarchical.config import HierarchicalConfig
+from src.Hierarchical.core import HierarchicalLatentModule
+
+from src.Models.model_utils import CyclicalBetaScheduler, EarlyStopping
+
+
 
 # https://arxiv.org/pdf/2411.03936
 # GuideVAE model implementation
 # Conditional VAE with conditioning on user profiles
 # and a parameterized covariance matrix (PDCC)
-
-# TODO:
-# - Implement autocast with GradScaler for mixed precision training (Much faster training on GPUs)
-# - Make sure everything works with CPU and GPU seamlessly
-# - Optimize data loading and preprocessing pipeline
-# - Add more conditions
-# - Hyperparameter tuning utilities (for optimizers, architectures, etc.)
-# - Make sure the model works with variable length sequences (padding/masking)
-# - IMPORTANT: Streaming algorithm for user profiles (online LDA) and normalization (running mean/std) and for the training (online/streaming VAE training)
-# - Test different loss functions and double check the current implementation against the literature
-# - Make sure loading and saving is robust
-# - Config file for all parameters and settings (e.g., YAML or JSON) and make sure it works with the current code structure
-# - Visualize RevIN normalization effects and user profile clusters
-# - Add more visualization and analysis tools for the learned latent space and reconstructions
-
-# TODO: Ideas
-# - Add a discriminator network and adversarial training to improve reconstruction quality (VAE-GAN style) (might not work)
-# - Make NNBlock transformers
-# - Latent Diffusion model instead of VAE
-# - Diffusion priors for sampling ? 
-
-# ==============
-# Cyclical Beta Annealing Scheduler
-# Reference: "Cyclical Annealing Schedule: A Simple Approach to Mitigating KL Vanishing"
-# (Fu et al., 2019) https://arxiv.org/abs/1903.10145
-# ==============
-class CyclicalBetaScheduler:
-    """Cyclical annealing schedule for the KL weight (beta) in VAE training.
-
-    Each cycle consists of a linear warmup from 0 to *beta_max* followed by a
-    constant phase at *beta_max*.  The proportion of each cycle spent warming
-    up is controlled by *ratio* (default 0.5 = half warmup, half constant).
-
-    Parameters
-    ----------
-    total_steps : int
-        Total number of training steps (epochs * batches_per_epoch).
-    n_cycles : int
-        Number of full annealing cycles over training (default 4).
-    ratio : float
-        Fraction of each cycle devoted to the linear warmup (0-1, default 0.5).
-    beta_max : float
-        Maximum beta value reached at the top of each cycle (default 1.0).
-    """
-
-    def __init__(self, total_steps: int, n_cycles: int = 4, ratio: float = 0.5, beta_max: float = 1.0):
-        assert total_steps > 0, "total_steps must be > 0"
-        assert n_cycles >= 1, "n_cycles must be >= 1"
-        assert 0.0 < ratio <= 1.0, "ratio must be in (0, 1]"
-        self.total_steps = total_steps
-        self.n_cycles = n_cycles
-        self.ratio = ratio
-        self.beta_max = beta_max
-        self._step = 0
-
-    def step(self) -> float:
-        """Advance one step and return the current beta value."""
-        beta = self._get_beta(self._step)
-        self._step += 1
-        return beta
-
-    def _get_beta(self, step: int) -> float:
-        """Compute beta for a given global step."""
-        # How far through training are we (0..1)
-        tau = step / self.total_steps
-        # Which cycle are we in, and where inside that cycle (0..1)
-        cycle_progress = (tau * self.n_cycles) % 1.0
-        if cycle_progress < self.ratio:
-            # Linear warmup phase
-            return self.beta_max * (cycle_progress / self.ratio)
-        else:
-            # Constant phase
-            return self.beta_max
-
-    def state_dict(self):
-        return {"step": self._step, "total_steps": self.total_steps,
-                "n_cycles": self.n_cycles, "ratio": self.ratio, "beta_max": self.beta_max}
-
-    @classmethod
-    def from_state_dict(cls, d):
-        obj = cls(d["total_steps"], d["n_cycles"], d["ratio"], d["beta_max"])
-        obj._step = d["step"]
-        return obj
-
-    def __repr__(self):
-        return (f"CyclicalBetaScheduler(total_steps={self.total_steps}, n_cycles={self.n_cycles}, "
-                f"ratio={self.ratio}, beta_max={self.beta_max}, current_step={self._step})")
-
-
-class EarlyStopping:
-    def __init__(self, patience=10, min_delta=0.001, mode='min'):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-        self.best_epoch = 0
-        self.mode = mode
-
-    def __call__(self, train_metric, val_metric, epoch=None):
-        score = -val_metric if self.mode == 'min' else val_metric
-
-        if train_metric is not None and val_metric is not None:
-            if abs(train_metric - val_metric) < self.min_delta * 10:
-                # Overfitting detected - Stop training
-                self.early_stop = True
-                return False
-
-        if self.best_score is None:
-            # First time call
-            self.best_score = score
-            if epoch is not None:
-                self.best_epoch = epoch
-            return True
-        elif score < self.best_score + self.min_delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-            return False                
-        else:
-            self.best_score = score
-            self.counter = 0
-            if epoch is not None:
-                self.best_epoch = epoch
-            return True
-    def reset(self):
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-        self.best_epoch = 0
 
 # ==============
 # Define a base VAE class that CVAE will inherit from
@@ -165,6 +39,7 @@ class VAE(nn.Module):
                  decoder_type = "dictionary",
                  prior_type = None,
                  device="cpu",
+                 hierarchy_config: HierarchicalConfig = None,
                  **_):
         super(VAE, self).__init__()
 
@@ -190,9 +65,20 @@ class VAE(nn.Module):
         latent_dim = distribution_dict.get("latent_dim", 32)
         self.latent_dim = latent_dim
 
-        # 1. Create encoder and decoder
+        # 1. Create encoder and decoder and the latent module for the hierarchy if specified
         self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim, type=encoder_type)
-        self.decoder = get_decoder_model(latent_dim=latent_dim, output_dim=input_dim, type=decoder_type)
+
+        # Hierarchical latent module (optional) - can be used to add multiple levels of latent variables with different strategies and connections between them
+        self.hierarchy = None
+        self.decoder_input_dim = latent_dim # By default, the decoder takes the latent variable as input, but if we have a hierarchy, it will take the output of the hierarchy instead
+        if hierarchy_config is not None:
+            self.hierarchy = HierarchicalLatentModule(
+                config=hierarchy_config,
+                encoder_latent_dim=latent_dim,
+            )
+            self.decoder_input_dim = self.hierarchy.output_dim
+            
+        self.decoder = get_decoder_model(latent_dim=self.decoder_input_dim, output_dim=input_dim, type=decoder_type)
 
         # 2. Create prior after encoder (VampPrior needs a reference to the encoder)
         if prior_type is None:
@@ -201,7 +87,7 @@ class VAE(nn.Module):
         
         self.prior = get_prior(
             prior_type=prior_type,
-            latent_dim=latent_dim,
+            latent_dim=self.decoder_input_dim,
             device=self.device,
             dictionary_size=distribution_dict.get("dictionary_size", 100),
             input_shape=input_dim,
@@ -217,8 +103,23 @@ class VAE(nn.Module):
         posterior_params_dict = self.encoder(inputs)
         # Sample latent variables using reparameterization trick 
         z = self.encoder.reparameterize(posterior_params_dict, num_samples=num_samples)
+        
+        # If we have a hierarchy, pass z through it
+        hierarchy_results = None
+        if self.hierarchy is not None:
+            # z shape: [S, B, latent_dim]
+            S,B,D = z.shape
+            z_flat = z.reshape(S * B, D)  # Flatten for hierarchy: [S*B, latent_dim]
+            hierarchy_results = self.hierarchy(z_flat)  # Pass through hierarchy
+            z_for_decoder = hierarchy_results["z"].reshape(S, B, -1)  # Reshape back to [S, B, output_dim]
+        else:
+            z_for_decoder = z
+        
         # Decode latent samples to get reconstruction parameters
-        recon_params_dict = self.decoder(z)
+        recon_params_dict = self.decoder(z_for_decoder)
+
+        self._last_hierarchy_results = hierarchy_results  # Store for later use in loss calculation or analysis
+
         return recon_params_dict, posterior_params_dict
     
     @torch.no_grad()
@@ -296,6 +197,10 @@ class VAE(nn.Module):
 
         loss = -(recon_loglikelihood - beta * kl_div)
 
+        if self._last_hierarchy_results is not None:
+            hierarchy_loss = self._last_hierarchy_results["loss"]
+            loss = loss + hierarchy_loss
+
         # TODO: MMD (mean maximum discrepancy) has been shown to be useful for smart meter data by one of the papers
         return {"loss": loss, "recon_loglikelihood": recon_loglikelihood, "kl_divergence": kl_div}
 
@@ -305,7 +210,9 @@ class VAE(nn.Module):
 
         if isinstance(x, tuple) or isinstance(x, list):
             # Unpack if dataloader returns (x, meter_id, timestamps)
-            if len(x) == 3:
+            if len(x) == 4:
+                x_data, meter_id, timestamps, month_key = x
+            elif len(x) == 3:
                 x_data, meter_id, timestamps = x
             elif len(x) == 2:
                 x_data, meter_id = x
@@ -433,7 +340,7 @@ class VAE(nn.Module):
             constructor_args['distribution_dict'] = distribution_dict
 
             # === CVAE-Specific Information ===
-            if isinstance(self, CVAE):
+            if self.__class__.__name__ == "CVAE":
                 model_info = self._serialize_cvae_info(model_info)
 
             # === Prior Serialization ===
@@ -472,7 +379,7 @@ class VAE(nn.Module):
             print(f"✓ Model saved successfully: {model_path}")
             print(f"  - Model class: {model_info['model_class']}")
             print(f"  - Parameters: {self.num_parameters:,}")
-            if isinstance(self, CVAE):
+            if self.__class__.__name__ == "CVAE":
                 print(f"  - Condition dim: {self.condition_dim}")
                 
         except Exception as e:
@@ -489,13 +396,19 @@ class VAE(nn.Module):
 
     def _extract_constructor_args(self):
         """Safely extract and validate constructor arguments."""
-        return {
+        args =  {
             'input_dim': self.input_dim,
             'encoder_type': getattr(self, 'encoder_type', 'dictionary'),
             'decoder_type': getattr(self, 'decoder_type', 'dictionary'), 
             'prior_type': getattr(self, 'prior_type', self._infer_prior_type()),
             'device': str(self.device),
         }
+        if self.hierarchy is not None:
+            args['hierarchy_config'] = self.hierarchy.config.to_dict()
+        else:
+            args['hierarchy_config'] = None
+        return args
+        
 
     def _infer_prior_type(self):
         """Safely infer prior type from class name."""
@@ -667,6 +580,13 @@ class VAE(nn.Module):
         if 'model_info' in checkpoint:
             print(f"Loading model using new format: {checkpoint['model_info']['model_class']}")
             
+            # Hierarchy config handling
+            hier_raw = checkpoint.get('constructor_args', {}).get('hierarchy_config', None)
+            if hier_raw is not None and isinstance(hier_raw, dict) and self.hierarchy is None:
+                hier_cfg = HierarchicalConfig.from_dict(hier_raw)
+                self.hierarchy = HierarchicalLatentModule(config=hier_cfg, encoder_latent_dim=self.latent_dim)
+                self.decoder_input_dim = self.hierarchy.output_dim
+            
             # Load prior
             prior_state = checkpoint['prior_state']
             import importlib
@@ -686,11 +606,11 @@ class VAE(nn.Module):
                 print(f"Error loading prior {prior_state['prior_type']}: {e}")
 
             # Load CVAE conditioner if present
-            if isinstance(self, CVAE) and 'conditioner_state' in checkpoint['model_info']:
+            if self.__class__.__name__ == "CVAE" and 'conditioner_state' in checkpoint['model_info']:
                 conditioner_state = checkpoint['model_info']['conditioner_state']
                 print(f"Reconstructing conditioner with tags: {conditioner_state['condition_tags']}")
                 
-                from src.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
+                from Data.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
                 self.conditioner = Conditioner()
                 
                 for tag, item_state in conditioner_state['condition_items'].items():
@@ -745,16 +665,23 @@ class VAE(nn.Module):
         
         model_info = checkpoint['model_info']
         constructor_args = checkpoint['constructor_args']
+        model_class_name = model_info['model_class']
+
+        hier_raw = constructor_args.get('hierarchy_config', None)
+        if hier_raw is not None and isinstance(hier_raw, dict):
+            constructor_args['hierarchy_config'] = HierarchicalConfig.from_dict(hier_raw)
+        else:
+            constructor_args['hierarchy_config'] = None
         
         print(f"Creating {model_info['model_class']} from checkpoint...")
         
         # Handle CVAE reconstruction
-        if model_info['model_class'] == 'CVAE':
+        if model_info['model_class'] in ("CVAE", "HierarchicalCVAE"):
             # Reconstruct conditioner first
             conditioner_state = model_info['conditioner_state']
             
             import importlib
-            from src.Conditioner import Conditioner
+            from Data.Conditioner import Conditioner
             conditioner = Conditioner()
             
             print(f"Reconstructing conditioner with {len(conditioner_state['condition_items'])} items...")
@@ -775,6 +702,12 @@ class VAE(nn.Module):
             
             # Create CVAE instance
             constructor_args['conditioner'] = conditioner
+            # CVAE expects latent_dim as a top-level kwarg, but it's also stored
+            # inside distribution_dict.  Extract it so the constructor sees it.
+            if 'latent_dim' not in constructor_args:
+                dd = constructor_args.get('distribution_dict', {}) or {}
+                if 'latent_dim' in dd:
+                    constructor_args['latent_dim'] = dd['latent_dim']
             model = cls(**constructor_args)
             
         else:
@@ -788,7 +721,7 @@ class VAE(nn.Module):
             init_args = prior_state.get('init_args', {})
             
             import importlib
-            from src.priors import VampPrior
+            from Models.priors import VampPrior
             
             # Create VampPrior with encoder reference 
             model.prior = VampPrior(
@@ -949,7 +882,6 @@ class VAE(nn.Module):
                     gradient_clip=gradient_clip, 
                     gradient_clip_kwargs=gradient_clip_kwargs,
                     weighted_loss=weighted_loss,
-                    month_key=month_key,
                 )
                 
                 # Accumulate epoch losses
@@ -981,7 +913,7 @@ class VAE(nn.Module):
             # === Validation Phase ===
             val_loss_dict = None
             if valloader is not None and ((epoch + 1) % validation_freq == 0):
-                val_loss_dict = self.validate(valloader, num_samples=validation_num_samples, device=device, month_key=month_key)
+                val_loss_dict = self.validate(valloader, num_samples=validation_num_samples, device=device)
                 
                 # Log validation metrics
                 writer.add_scalar('Val/Epoch/loss', val_loss_dict["loss"], epoch)
@@ -1087,397 +1019,4 @@ class VAE(nn.Module):
         return self.decoder.get_SigmaMapper()
 
 
-# ==============
-# Define the Conditional VAE (CVAE) class
-# ==============
-class CVAE(VAE):
-    def __init__(
-        self,
-        input_dim: int,
-        *,
-        conditioner: Conditioner,
-        latent_dim: int = 32,
-        distribution_dict: dict = None,
-        prior_type: str = None,
-        **kwargs,
-    ):
-        if distribution_dict is None:
-            distribution_dict = {}
-        distribution_dict = dict(distribution_dict)
-        distribution_dict["latent_dim"] = latent_dim
 
-        self.conditioner = conditioner
-        self.condition_dim = conditioner.get_condition_dim()
-        self.latent_dim = int(latent_dim)
-
-        super().__init__(input_dim=input_dim, distribution_dict=distribution_dict, prior_type=prior_type, **kwargs)
-
-        # Now override encoder and decoder with conditioned versions
-        # Encoder takes [x, c] as input
-        self.encoder = get_encoder_model(
-            input_dim=input_dim + self.condition_dim,
-            latent_dim=latent_dim,
-            type=kwargs.get("encoder_type", "dictionary"),
-            **kwargs,
-        )
-
-        # Decoder takes [z, c] as input
-        self.decoder = get_decoder_model(
-            latent_dim=latent_dim + self.condition_dim,
-            output_dim=input_dim,
-            type=kwargs.get("decoder_type", "dictionary"),
-            **kwargs,
-        )
-
-        # If VampPrior, re-point it to the new (conditioned) encoder and resize pseudo-inputs
-        if isinstance(self.prior, VampPrior):
-            self.prior.set_encoder(self.encoder, input_shape=input_dim + self.condition_dim)
-
-        # Recalculate num_parameters after overriding encoder/decoder
-        self.num_parameters = self.encoder._num_parameters() + self.decoder._num_parameters()
-
-    def _prep_inputs(self, x: torch.Tensor) -> torch.Tensor:
-        """ Flatten [B, L, F] to [B, D] if needed """
-        if x.dim() == 3:
-            return x.reshape(x.shape[0], -1)
-        return x
-
-    def forward(self, x: torch.Tensor, c: torch.Tensor, num_samples: int = 1):
-        """
-        Forward pass with pre-computed conditions.
-        
-        Args:
-            x: Input tensor [B, D] (already flattened)
-            c: Condition tensor [B, C] (already computed)
-            num_samples: Number of latent samples
-        
-        Returns:
-            recon_params: dict with [S, B, D] tensors
-            q_params: dict with [B, latent_dim] tensors
-        """
-        # Encode: [B, D+C] -> posterior params
-        enc_in = torch.cat([x, c], dim=-1)
-        q_params = self.encoder(enc_in) # dict of [B, latent_dim] params
-
-        # Sample latent variables using reparameterization trick - sample z: [S, B, latent_dim]
-        z = self.encoder.reparameterize(q_params, num_samples=num_samples)
-
-        # expand c to match z: [S, B, C]
-        c_expanded = c.unsqueeze(0).expand(num_samples, -1, -1)
-
-        # Decode: [S, B, latent_dim + C] -> recon params
-        dec_in = torch.cat([z, c_expanded], dim=-1)
-        S, B, DC = dec_in.shape
-        dec_in_flat = dec_in.reshape(S * B, DC)
-
-        # Decode latent samples to get reconstruction parameters
-        recon_params = self.decoder(dec_in_flat)   # dict of [S*B, D]
-        
-        # reshape recon params back to [S, B, D]
-        for k in recon_params:
-            recon_params[k] = recon_params[k].reshape(S, B, -1)
-
-        return recon_params, q_params 
-
-    def loss(self, x: torch.Tensor, recon_params, posterior_params, beta=1.0, weighted_loss=0.0,**_):
-        """Compute ELBO loss."""
-        # recon_params: dict of [S, B, D] -> use first sample for training
-        if recon_params["mu"].dim() == 3:
-            recon_params_squeezed = {k: v[0] for k, v in recon_params.items()}
-        else:
-            recon_params_squeezed = recon_params
-
-        return super().loss(x, recon_params_squeezed, posterior_params, beta=beta, weighted_loss=weighted_loss)
-
-    def train_core(self, batch, optim, beta=1.0,weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
-        self.train()
-        x, meter_id, timestamps = batch
-
-        # Prep inputs: [B, L, F] -> [B, D] if needed
-        x = self._prep_inputs(x)
-
-        # Compute conditions
-        c = self.conditioner.get_conditions(x, meter_id, timestamps)
-        c = self.move_to_device(c, device=x.device)
-
-        # Forward pass
-        recon_params, q_params = self.forward(x, c, num_samples=1)
-
-        # Backward pass
-        optim.zero_grad(set_to_none=True)
-        loss_dict = self.loss(x, recon_params, q_params, beta=beta, weighted_loss=weighted_loss)
-        loss_dict["loss"].backward()
-
-        if gradient_clip is not None:
-            torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_kwargs.get("max_norm", 1.0))
-
-        optim.step()
-        return loss_dict
-
-    @torch.no_grad()
-    def validate(self, valloader, num_samples: int = 1, beta: float = 1.0, device: str = "cpu"):
-        self.eval()
-        agg = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
-        num_batches = 0
-
-        for x, meter_id, timestamps in valloader:
-            # Keep original 3D shape for conditioning
-            x_3d = x.to(device)
-            
-            # Flatten for model
-            x_flat = self._prep_inputs(x_3d)  # [B, D]
-
-            # Get conditions - PASS 3D tensor
-            c = self.conditioner.get_conditions(x_3d, meter_id=meter_id, timestamps=timestamps)
-            c = self.move_to_device(c, device=device)
-
-            # Forward pass
-            recon_params, q_params = self.forward(x_flat, c, num_samples=1)
-            loss_dict = self.loss(x_flat, recon_params, q_params, beta=beta)
-
-            for k in agg:
-                agg[k] += float(loss_dict[k])
-            num_batches += 1
-
-        for k in agg:
-            agg[k] /= max(num_batches, 1)
-        return agg
-
-    @torch.no_grad()
-    def sample(self, conditions: torch.Tensor, num_prior_samples: int = 1, num_x_samples: int = 1, device: str = "cpu",):
-        self.eval()
-
-        c = self.move_to_device(conditions, device=device)
-        B = c.size(0)
-
-        # Sample z from prior: handle different prior return shapes
-        z = self.prior.sample(batch_size=B, num_samples=num_prior_samples)
-        
-        # Dictionary priors sample in dictionary space (dim=dictionary_size).
-        # Map to latent space via the encoder's SigmaMapper so the decoder
-        # receives the correct dimensionality (latent_dim).
-        if hasattr(self.prior, 'dictionary_size') and z.shape[-1] != self.latent_dim:
-            U = self.encoder.get_SigmaMapper()          # [latent_dim, dictionary_size]
-            if U is not None:
-                z = torch.einsum('sbd,do->sbo', z, U.T) # [S, B, latent_dim]
-                # Add prior mean (zeros for standard, learned for learnable)
-                prior_params = self.prior.get_params()
-                z = z + prior_params['mu'].to(z.device)
-        
-        # Ensure z has the correct shape [S, B, latent_dim]
-        if z.dim() == 3:
-            if z.shape[0] == B and z.shape[1] == num_prior_samples:
-                # Shape is [B, S, latent_dim] - transpose to [S, B, latent_dim]
-                z = z.transpose(0, 1)
-            elif z.shape[0] == num_prior_samples and z.shape[1] == B:
-                # Shape is already [S, B, latent_dim]
-                pass
-            else:
-                # Unexpected shape - try to reshape
-                print(f"Warning: Unexpected prior sample shape {z.shape}, attempting to reshape...")
-                z = z.view(num_prior_samples, B, -1)
-        elif z.dim() == 2:
-            # Shape is [B, latent_dim] - add sample dimension
-            z = z.unsqueeze(0).expand(num_prior_samples, B, -1)
-        else:
-            raise ValueError(f"Unexpected prior sample tensor dimensions: {z.shape}")
-
-        # Expand c to [S, B, C]
-        c_expanded = c.unsqueeze(0).expand(num_prior_samples, B, -1)
-        
-        # Verify shapes before concatenation
-        if z.shape[:2] != c_expanded.shape[:2]:
-            raise ValueError(f"Shape mismatch: z.shape={z.shape}, c_expanded.shape={c_expanded.shape}")
-
-        # decode 
-        dec_in = torch.cat([z, c_expanded], dim=-1)  # [S, B, latent_dim + C]
-        S, B, DC = dec_in.shape
-        dec_in_flat = dec_in.reshape(S * B, DC)
-
-        recon_params = self.decoder(dec_in_flat)  # dict [S*B, D]
-        for k in recon_params:
-            recon_params[k] = recon_params[k].reshape(S, B, -1)
-
-        # sample x from decoder for each prior sample
-        xs_all = []
-        for s in range(S):
-            params_s = {k: v[s] for k, v in recon_params.items()}         # [B, D]
-            xs = self.decoder.sample(params_s, num_samples=num_x_samples) # [num_x_samples, B, D]
-            xs_all.append(xs)
-
-        return torch.stack(xs_all, dim=0)  # [S, num_x_samples, B, D]
-    
-    @torch.no_grad()
-    def reconstruct(self, x: torch.Tensor, meter_ids: torch.Tensor, timestamps: torch.Tensor, num_samples: int = 1):
-        self.eval()
-        x = self._prep_inputs(x)
-        c = self.conditioner.get_conditions(x, meter_id=meter_ids, timestamps=timestamps)
-        c = self.move_to_device(c, device=x.device)
-        return self.forward(x, c, num_samples=num_samples)
-    
-
-# ==============
-# Online CVAE class for streaming data - inherits from CVAE but adds online updating capabilities
-# ==============
-class OnlineCVAE(CVAE):
-    def __init__(
-        self,
-        input_dim: int,
-        *,
-        conditioner: Conditioner,
-        latent_dim: int = 32,
-        distribution_dict: dict = None,
-        prior_type: str = None,
-        normalizer: IndexedLogRevIN = None,
-        **kwargs,
-    ):
-        super().__init__(input_dim=input_dim, conditioner=conditioner, latent_dim=latent_dim, distribution_dict=distribution_dict, prior_type=prior_type, **kwargs)
-        
-        # For smart meter data: L=24 hours, F=1 feature
-        # input_dim = L * F = 24
-        self.sequence_length = 24
-        self.num_features = max(1, input_dim // self.sequence_length)
-        
-        if normalizer is not None:
-            self.revin_normalizer = normalizer
-        else:
-            self.revin_normalizer = IndexedLogRevIN(
-                num_features=self.num_features,  # Should be 1, not 24
-                affine=True,
-                device=str(next(self.parameters()).device)
-            )
-        
-        # Convert conditioners to online versions
-        self._convert_to_online_conditioners()
-    
-    def _convert_to_online_conditioners(self):
-        """Convert regular UserProfiler conditioners to online versions."""
-        from src.Conditioner import OnlineUserProfiler, UserProfiler
-        
-        for tag, item in self.conditioner.condition_items.items():
-            if isinstance(item, UserProfiler) and not isinstance(item, OnlineUserProfiler):
-                # Convert to online version
-                online_profiler = OnlineUserProfiler(
-                    n_topics=item.n_topics,
-                    num_clusters=item.num_clusters,
-                    decay=0.95,  # Set reasonable default
-                    update_frequency=3,  # Update every 10 batches
-                    random_state=item.random_state,
-                    path=item.path,
-                    verbose=item.verbose
-                )
-                
-                # Transfer any existing state
-                if hasattr(item, 'cluster_centers_') and item.cluster_centers_ is not None:
-                    online_profiler.cluster_centers_ = item.cluster_centers_
-                    online_profiler.kmeans_initialized = True
-                if hasattr(item, 'gamma_cache'):
-                    online_profiler.gamma_cache = item.gamma_cache.copy()
-                if hasattr(item, 'user_profiles_cache'):
-                    online_profiler.user_profiles_cache = item.user_profiles_cache.copy()
-                if hasattr(item, 'is_fitted'):
-                    online_profiler.is_fitted = item.is_fitted
-                
-                # Replace in conditioner
-                self.conditioner.condition_items[tag] = online_profiler
-    
-    def train_core(self, batch, optim, beta=1.0, weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None,month_key=None, **_):
-        self.train()
-
-        # 1. Unpack batch
-        x, meter_id, timestamps = batch
-        
-        # 2. Handle input shapes: convert to 3D for RevIN if needed
-        if x.dim() == 2:
-            # Assume input is [B, L*F] and reshape to [B, L, F] 
-            B = x.shape[0]
-            x_3d = x.reshape(B, self.sequence_length, self.num_features)
-        elif x.dim() == 3:
-            x_3d = x
-            B, L, F = x_3d.shape
-            # Update dimensions if they don't match initialization
-            if F != self.num_features:
-                self.num_features = F
-        else:
-            raise ValueError(f"Unexpected input dimension: {x.dim()}")
-
-        # 3. Apply RevIN normalization 
-        x_normalized = self.revin_normalizer(x_3d, mode='norm', month_key=month_key)
-        
-        # 4. Flatten normalized input for the model
-        if x_normalized.dim() == 3:
-            B, L, F = x_normalized.shape  
-            x_flat = x_normalized.reshape(B, L * F)
-        else:
-            x_flat = x_normalized
-            
-        # 5. Compute conditions using ORIGINAL (unnormalized) input
-        # This is important because user profilers expect original energy patterns
-        if x.dim() == 2:
-            x_for_conditions = x.reshape(B, self.sequence_length, self.num_features)
-        else:
-            x_for_conditions = x
-            
-        c = self.conditioner.get_conditions(x_for_conditions, meter_id=meter_id, timestamps=timestamps)
-        c = self.move_to_device(c, device=x.device)
-
-        # 6. Forward pass on normalized data
-        recon_params, q_params = self.forward(x_flat, c, num_samples=1)
-
-        # 7. Compute loss on normalized data
-        optim.zero_grad(set_to_none=True)
-        loss_dict = self.loss(x_flat, recon_params, q_params, beta=beta, weighted_loss=weighted_loss)
-        loss_dict["loss"].backward()
-
-        # 8. Gradient clipping
-        if gradient_clip is not None:
-            torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_kwargs.get("max_norm", 1.0))
-
-        # 9. Optimizer step
-        optim.step()
-        return loss_dict
-    
-    @torch.no_grad()
-    def sample(self, conditions: torch.Tensor, num_prior_samples: int = 1, num_x_samples: int = 1, device: str = "cpu", timestamps: torch.Tensor = None, month: int = None):
-        x = super().sample(conditions, num_prior_samples, num_x_samples, device)
-        # Now apply inverse RevIN to the samples
-        x = x.reshape(-1, self.sequence_length, self.num_features)  # [S*num_x_samples*B, L, F]
-        x_denormalized = self.revin_normalizer(x, mode='denorm', timestamp=timestamps, month=month)
-        return x_denormalized.reshape(num_prior_samples, num_x_samples, -1, self.sequence_length * self.num_features)
-
-    @torch.no_grad()
-    def validate(self, valloader, num_samples=1, beta=1.0, device="cpu", month_key=None):
-        self.eval()
-        agg = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
-        num_batches = 0
-
-        for x, meter_id, timestamps in valloader:
-            x = x.to(device)
-            
-            if x.dim() == 2:
-                B = x.shape[0]
-                x_3d = x.reshape(B, self.sequence_length, self.num_features)
-            else:
-                x_3d = x
-
-            x_normalized = self.revin_normalizer(x_3d, mode='norm', month_key=month_key)
-            
-            if x_normalized.dim() == 3:
-                B, L, F = x_normalized.shape
-                x_flat = x_normalized.reshape(B, L * F)
-            else:
-                x_flat = x_normalized
-
-            c = self.conditioner.get_conditions(x_3d, meter_id=meter_id, timestamps=timestamps)
-            c = self.move_to_device(c, device=device)
-
-            recon_params, q_params = self.forward(x_flat, c, num_samples=1)
-            loss_dict = self.loss(x_flat, recon_params, q_params, beta=beta)
-
-            for k in agg:
-                agg[k] += float(loss_dict[k])
-            num_batches += 1
-
-        for k in agg:
-            agg[k] /= max(num_batches, 1)
-        return agg

@@ -1,30 +1,44 @@
 """
 Pre-Training Validation System
+===============================
 Validates model configuration, components, and data pipeline before training.
 Catches common errors early and provides diagnostic reports.
+
+Each ``_test_*`` method is a self-contained validation suite that appends
+``ValidationResult`` objects to ``self.results``.  They can be called
+independently (handy for pytest wrappers) or all-at-once via
+``run_all_tests()`` / ``validate_before_training()``.
 """
+
 import os
 import sys
+import tempfile
+import copy
 import torch
 import numpy as np
 from datetime import datetime
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List
 import traceback
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from src.encoder_decoder_model import *
-from src.Conditioner import *
-from src.Models import *
-from src.dataloader import *
-from src.normalizer import *
-from src.priors import *
+from Models.encoder_decoder_model import *
+from Data.Conditioner import *
+from src.Models.VAE import *
+from src.Models.CVAE import *
+from Data.dataloader import *
+from Data.normalizer import *
+from Models.priors import *
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 class ValidationResult:
-    """Stores result of a validation test."""
+    """Stores result of a single validation check."""
+
     def __init__(self, name: str, passed: bool, message: str = "", details: Dict = None):
         self.name = name
         self.passed = passed
@@ -33,17 +47,57 @@ class ValidationResult:
         self.timestamp = datetime.now()
 
 
+def _get_batch(loader, device="cpu"):
+    """Grab one batch and move tensors to *device*."""
+    x, meter_id, timestamps, month_key = next(iter(loader))
+    return (
+        x.to(device),
+        meter_id.to(device),
+        timestamps.to(device),
+        month_key.to(device) if torch.is_tensor(month_key) else month_key,
+    )
+
+
+def _to_tensor(val, device="cpu"):
+    """Convert numpy/number to torch.Tensor on *device*."""
+    if isinstance(val, np.ndarray):
+        return torch.tensor(val, dtype=torch.float32).to(device)
+    if isinstance(val, torch.Tensor):
+        return val.to(device)
+    return val
+
+
+# ===========================================================================
+# Main validator
+# ===========================================================================
+
 class ModelValidator:
-    """Comprehensive model validation system."""
-    
-    def __init__(self, 
-                 model,
-                 train_loader,
-                 val_loader=None,
-                 test_loader=None,
-                 normalizer=None,
-                 device="cpu",
-                 verbose=True):
+    """Comprehensive model validation system.
+
+    Parameters
+    ----------
+    model : VAE | CVAE | OnlineCVAE
+        The model to validate.
+    train_loader, val_loader, test_loader : DataLoader
+        PyTorch data loaders for train / val / test splits.
+    normalizer : Normalizer | None
+        The normalizer used during data loading (for round-trip tests).
+    device : str | torch.device
+        Device the model lives on.
+    verbose : bool
+        Print progress to stdout.
+    """
+
+    def __init__(
+        self,
+        model,
+        train_loader,
+        val_loader=None,
+        test_loader=None,
+        normalizer=None,
+        device="cpu",
+        verbose=True,
+    ):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -52,10 +106,27 @@ class ModelValidator:
         self.device = device
         self.verbose = verbose
         self.results: List[ValidationResult] = []
-        self.is_cvae = hasattr(model, 'condition_dim') and model.condition_dim > 0
-        
+        self.is_cvae = hasattr(model, "condition_dim") and model.condition_dim > 0
+
+    # ------------------------------------------------------------------
+    # Result bookkeeping
+    # ------------------------------------------------------------------
+
+    def _add_result(self, name: str, passed: bool, message: str = "", details: Dict = None):
+        result = ValidationResult(name, passed, message, details)
+        self.results.append(result)
+        if self.verbose:
+            status = "✓ PASS" if passed else "✗ FAIL"
+            print(f"  {status}: {name}")
+            if message:
+                print(f"         {message}")
+
+    # ------------------------------------------------------------------
+    # run_all_tests
+    # ------------------------------------------------------------------
+
     def run_all_tests(self) -> bool:
-        """Run all validation tests and return overall pass/fail."""
+        """Execute every validation suite and return *True* when all pass."""
         if self.verbose:
             print("=" * 80)
             print("STARTING MODEL VALIDATION")
@@ -63,8 +134,7 @@ class ModelValidator:
             print(f"Model Type: {'CVAE' if self.is_cvae else 'VAE'}")
             print(f"Device: {self.device}")
             print("-" * 80)
-        
-        # Run test suites
+
         self._test_configuration()
         self._test_data_pipeline()
         if self.is_cvae:
@@ -75,1296 +145,1276 @@ class ModelValidator:
         self._test_loss_computation()
         self._test_device_placement()
         self._test_full_training_step()
+        self._test_numerical_stability()
+        self._test_weight_initialization()
+        self._test_multi_step_convergence()
+        self._test_save_load_roundtrip()
+        self._test_validation_loop()
+        self._test_sampling()
+        if getattr(self.model, "hierarchy", None) is not None:
+            self._test_hierarchy()
         self._test_regression_bugs()
         self._test_RevIn()
         self._test_online_user_profiler()
         self._test_online_cvae()
-        
-        # Generate report
-        all_passed = self._generate_report()
-        return all_passed
-    
-    def _add_result(self, name: str, passed: bool, message: str = "", details: Dict = None):
-        """Add a test result."""
-        result = ValidationResult(name, passed, message, details)
-        self.results.append(result)
-        if self.verbose:
-            status = "✓ PASS" if passed else "✗ FAIL"
-            print(f"  {status}: {name}")
-            if message:
-                print(f"         {message}")
-    
+
+        return self._generate_report()
+
+    # ==================================================================
+    # 1. Configuration
+    # ==================================================================
+
     def _test_configuration(self):
-        """Validate model configuration."""
+        """Validate model attributes and hyper-parameter sanity."""
         if self.verbose:
             print("\n[1] Testing Configuration...")
-        
+
         try:
-            # Check model attributes
-            assert hasattr(self.model, 'input_dim'), "Model missing input_dim"
-            assert hasattr(self.model, 'encoder'), "Model missing encoder"
-            assert hasattr(self.model, 'decoder'), "Model missing decoder"
-            assert hasattr(self.model, 'prior'), "Model missing prior"
-            
-            config = {
-                'model_type': 'CVAE' if self.is_cvae else 'VAE',
-                'input_dim': self.model.input_dim,
-                'encoder_type': type(self.model.encoder).__name__,
-                'decoder_type': type(self.model.decoder).__name__,
-                'prior_type': type(self.model.prior).__name__,
-            }
-            
-            if self.is_cvae:
-                config['condition_dim'] = self.model.condition_dim
-                config['conditioner_tags'] = self.model.conditioner.get_condition_tags()
-            
-            if hasattr(self.model.encoder, 'output_dim'):
-                config['latent_dim'] = self.model.encoder.output_dim
-                
-            if hasattr(self.model.encoder, 'dictionary_size'):
-                config['dictionary_size'] = self.model.encoder.dictionary_size
-                # Validate dictionary size > output_dim
-                if self.model.encoder.dictionary_size <= self.model.encoder.output_dim:
-                    self._add_result("Configuration: Dictionary Size",
-                                   False,
-                                   f"dictionary_size ({self.model.encoder.dictionary_size}) must be > output_dim ({self.model.encoder.output_dim})")
+            for attr in ("input_dim", "encoder", "decoder", "prior"):
+                if not hasattr(self.model, attr):
+                    self._add_result("Config: Model Structure", False,
+                                     f"Missing attribute '{attr}'")
                     return
-            
-            self._add_result("Configuration: Model Structure", True, 
-                           f"All required components present", config)
-            
+
+            config = {
+                "model_type": "CVAE" if self.is_cvae else "VAE",
+                "input_dim": self.model.input_dim,
+                "encoder": type(self.model.encoder).__name__,
+                "decoder": type(self.model.decoder).__name__,
+                "prior": type(self.model.prior).__name__,
+            }
+
+            if self.is_cvae:
+                config["condition_dim"] = self.model.condition_dim
+                config["conditioner_tags"] = self.model.conditioner.get_condition_tags()
+
+            if hasattr(self.model.encoder, "output_dim"):
+                config["latent_dim"] = self.model.encoder.output_dim
+
+            if hasattr(self.model.encoder, "dictionary_size"):
+                ds = self.model.encoder.dictionary_size
+                od = self.model.encoder.output_dim
+                config["dictionary_size"] = ds
+                if ds <= od:
+                    self._add_result(
+                        "Config: Dictionary Size", False,
+                        f"dictionary_size ({ds}) must be > output_dim ({od})",
+                    )
+                    return
+
+            self._add_result("Config: Model Structure", True,
+                             "All required components present", config)
+
+            # Encoder / decoder input dim consistency
+            if self.is_cvae:
+                expected_enc_in = self.model.input_dim + self.model.condition_dim
+            else:
+                expected_enc_in = self.model.input_dim
+            actual_enc_in = getattr(self.model.encoder, "input_dim", None)
+            if actual_enc_in is not None and actual_enc_in != expected_enc_in:
+                self._add_result(
+                    "Config: Encoder Input Dim", False,
+                    f"Encoder expects {actual_enc_in}, model provides {expected_enc_in}",
+                )
+            else:
+                self._add_result("Config: Encoder Input Dim", True,
+                                 f"Encoder input dim = {expected_enc_in}")
+
+            # Parameter count
+            n_params = sum(p.numel() for p in self.model.parameters())
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            self._add_result("Config: Parameters", True,
+                             f"Total: {n_params:,} | Trainable: {trainable:,}")
+
         except Exception as e:
-            self._add_result("Configuration: Model Structure", False, str(e))
-    
+            self._add_result("Config: Model Structure", False, str(e))
+
+    # ==================================================================
+    # 2. Data pipeline
+    # ==================================================================
+
     def _test_data_pipeline(self):
-        """Test data loading and preprocessing."""
+        """Validate data shapes, NaN/Inf, and normalizer round-trip."""
         if self.verbose:
             print("\n[2] Testing Data Pipeline...")
-        
+
         try:
-            # Get a batch
-            batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
-            
-            # Test shapes
-            expected_batch_dim = 3  # [B, L, F]
-            if x.dim() != expected_batch_dim:
-                self._add_result("Data Pipeline: Input Shape",
-                               False,
-                               f"Expected {expected_batch_dim}D tensor, got {x.dim()}D: {x.shape}")
+            x, meter_id, timestamps, month_key = _get_batch(self.train_loader, self.device)
+
+            if x.dim() != 3:
+                self._add_result("Data: Input Shape", False,
+                                 f"Expected 3-D [B,L,F], got {x.dim()}-D: {x.shape}")
                 return
-            
+
             B, L, F = x.shape
-            details = {
-                'batch_size': B,
-                'sequence_length': L,
-                'num_features': F,
-                'input_dim': L * F,
-                'meter_id_shape': meter_id.shape,
-                'num_timestamps': len(timestamps),
-            }
-            
-            self._add_result("Data Pipeline: Input Shape", True,
-                           f"Shape: {x.shape} → flattened: ({B}, {L*F})", details)
-            
-            # Test for NaN/Inf
+            self._add_result("Data: Input Shape", True,
+                             f"[{B}, {L}, {F}] -> flat [{B}, {L*F}]")
+
+            # NaN / Inf
             if torch.isnan(x).any():
-                self._add_result("Data Pipeline: NaN Detection", False, "NaN values found in input data")
+                self._add_result("Data: NaN/Inf", False, "NaN values detected")
             elif torch.isinf(x).any():
-                self._add_result("Data Pipeline: Inf Detection", False, "Inf values found in input data")
+                self._add_result("Data: NaN/Inf", False, "Inf values detected")
             else:
-                self._add_result("Data Pipeline: No NaN/Inf", True)
-            
-            # Test normalizer if present
-            if self.normalizer:
+                self._add_result("Data: NaN/Inf", True, "Clean")
+
+            # Normalizer round-trip
+            if self.normalizer is not None:
                 x_denorm = self.normalizer.inverse_transform(x)
                 x_renorm = self.normalizer.transform(x_denorm)
-                
-                # Check roundtrip (should be close)
-                max_error = torch.max(torch.abs(x - x_renorm)).item()
-                if max_error > 1e-4:
-                    self._add_result("Data Pipeline: Normalizer Roundtrip", False,
-                                   f"Max error: {max_error:.6f} (threshold: 1e-4)")
+                max_err = torch.max(torch.abs(x - x_renorm)).item()
+                if max_err > 1e-4:
+                    self._add_result("Data: Normalizer Roundtrip", False,
+                                     f"Max error {max_err:.6f} > 1e-4")
                 else:
-                    self._add_result("Data Pipeline: Normalizer Roundtrip", True,
-                                   f"Max error: {max_error:.6e}")
-                    
-                # Check denormalized values are non-negative (energy data)
+                    self._add_result("Data: Normalizer Roundtrip", True,
+                                     f"Max error: {max_err:.2e}")
+
                 if (x_denorm < 0).any():
-                    self._add_result("Data Pipeline: Denormalized Values", False,
-                                   f"Negative values found: min={x_denorm.min().item():.3f}")
+                    self._add_result("Data: Non-negative Energy", False,
+                                     f"min = {x_denorm.min().item():.4f}")
                 else:
-                    self._add_result("Data Pipeline: Denormalized Values", True,
-                                   f"Range: [{x_denorm.min().item():.3f}, {x_denorm.max().item():.3f}]")
-            
+                    self._add_result("Data: Non-negative Energy", True,
+                                     f"[{x_denorm.min().item():.3f}, {x_denorm.max().item():.3f}]")
+
+            # Check that multiple batches are iterable
+            try:
+                n_batches = sum(1 for _ in self.train_loader)
+                self._add_result("Data: Loader Iteration", True,
+                                 f"{n_batches} batches in train_loader")
+            except Exception as e:
+                self._add_result("Data: Loader Iteration", False, str(e))
+
         except Exception as e:
-            self._add_result("Data Pipeline: Overall", False, f"{type(e).__name__}: {str(e)}")
+            self._add_result("Data: Overall", False, f"{type(e).__name__}: {e}")
             if self.verbose:
                 traceback.print_exc()
-    
+
+    # ==================================================================
+    # 3. Conditioners (CVAE only)
+    # ==================================================================
+
     def _test_conditioners(self):
-        """Test conditioner components (CVAE only)."""
+        """Test condition generation, individual conditioners, random generation."""
         if self.verbose:
             print("\n[3] Testing Conditioners...")
-        
+
         try:
-            batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
-            x = x.to(self.device)
-            meter_id = meter_id.to(self.device)
-            timestamps = timestamps.to(self.device)
-            
-            # Test condition generation
-            conditions = self.model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
-            
+            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
+            B = x.shape[0]
+
+            conditions = self.model.conditioner.get_conditions(
+                x, meter_id=meter_id, timestamps=timestamps)
+            conditions = _to_tensor(conditions, self.device)
+
             if not isinstance(conditions, torch.Tensor):
-                self._add_result("Conditioners: Output Type", False,
-                               f"Expected torch.Tensor, got {type(conditions)}")
+                self._add_result("Cond: Output Type", False, f"Got {type(conditions)}")
                 return
-            
-            expected_shape = (x.shape[0], self.model.condition_dim)
-            if conditions.shape != expected_shape:
-                self._add_result("Conditioners: Output Shape", False,
-                               f"Expected {expected_shape}, got {conditions.shape}")
+
+            expected = (B, self.model.condition_dim)
+            if conditions.shape != expected:
+                self._add_result("Cond: Shape", False,
+                                 f"Expected {expected}, got {conditions.shape}")
             else:
-                self._add_result("Conditioners: Output Shape", True,
-                               f"Shape: {conditions.shape}")
-            
-            # Test each conditioner individually
+                self._add_result("Cond: Shape", True, f"{conditions.shape}")
+
+            # Individual conditioners
             for tag in self.model.conditioner.get_condition_tags():
                 try:
-                    conditioner_item = self.model.conditioner.condition_items[tag]
-                    cond = conditioner_item.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
-                    
-                    if isinstance(cond, np.ndarray):
-                        cond = torch.tensor(cond)
-                    
-                    self._add_result(f"Conditioners: {tag}", True,
-                                   f"Shape: {cond.shape}, Dim: {cond.shape[1]}")
-                    
-                    # Special checks for UserProfiler
-                    if tag == "user_profile" and hasattr(conditioner_item, 'user_profiles_cache'):
-                        num_cached = len(conditioner_item.user_profiles_cache)
-                        self._add_result(f"Conditioners: {tag} Cache", True,
-                                       f"{num_cached} profiles cached")
-                        
+                    item = self.model.conditioner.condition_items[tag]
+                    cond = item.get_conditions(
+                        x, meter_id=meter_id, timestamps=timestamps)
+                    cond = _to_tensor(cond, self.device)
+                    self._add_result(f"Cond: {tag}", True, f"Shape {cond.shape}")
+                    if tag == "user_profile" and hasattr(item, "user_profiles_cache"):
+                        self._add_result(f"Cond: {tag} Cache", True,
+                                         f"{len(item.user_profiles_cache)} profiles")
                 except Exception as e:
-                    self._add_result(f"Conditioners: {tag}", False, str(e))
-            
-            # Test random condition generation
+                    self._add_result(f"Cond: {tag}", False, str(e))
+
+            # Random conditions
             try:
-                random_conds = self.model.conditioner.get_random_conditions(batch_size=16)
-                if random_conds.shape != (16, self.model.condition_dim):
-                    self._add_result("Conditioners: Random Generation", False,
-                                   f"Expected (16, {self.model.condition_dim}), got {random_conds.shape}")
+                rc = self.model.conditioner.get_random_conditions(batch_size=16)
+                if rc.shape != (16, self.model.condition_dim):
+                    self._add_result("Cond: Random", False, f"Shape {rc.shape}")
                 else:
-                    self._add_result("Conditioners: Random Generation", True,
-                                   f"Shape: {random_conds.shape}")
+                    self._add_result("Cond: Random", True, f"Shape {rc.shape}")
             except Exception as e:
-                self._add_result("Conditioners: Random Generation", False, str(e))
-                
+                self._add_result("Cond: Random", False, str(e))
+
         except Exception as e:
-            self._add_result("Conditioners: Overall", False, f"{type(e).__name__}: {str(e)}")
+            self._add_result("Cond: Overall", False, f"{type(e).__name__}: {e}")
             if self.verbose:
                 traceback.print_exc()
-    
+
+    # ==================================================================
+    # 4. Encoder / Decoder
+    # ==================================================================
+
     def _test_encoder_decoder(self):
-        """Test encoder and decoder forward passes."""
+        """Test encoder/decoder forward, shapes, sigma positivity, reparam."""
         if self.verbose:
             print("\n[4] Testing Encoder/Decoder...")
-        
+
         try:
-            batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
-            x = x.to(self.device)
+            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
             B, L, F = x.shape
             x_flat = x.reshape(B, -1)
-            
-            # Test encoder
+
+            # Encoder
             if self.is_cvae:
-                c = self.model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
-                c = torch.tensor(c, dtype=torch.float32).to(self.device) if isinstance(c, np.ndarray) else c.to(self.device)
-                encoder_input = torch.cat([x_flat, c], dim=-1)
+                c = self.model.conditioner.get_conditions(
+                    x, meter_id=meter_id, timestamps=timestamps)
+                c = _to_tensor(c, self.device)
+                enc_in = torch.cat([x_flat, c], dim=-1)
             else:
-                encoder_input = x_flat
-            
-            posterior_params = self.model.encoder(encoder_input)
-            
-            # Check posterior parameters
-            if 'mu' not in posterior_params or 'sigma' not in posterior_params:
-                self._add_result("Encoder: Output Parameters", False,
-                               "Missing 'mu' or 'sigma' in output")
-                return
-            
-            mu = posterior_params['mu']
-            sigma = posterior_params['sigma']
-            
-            expected_mu_shape = (B, self.model.encoder.output_dim)
-            if mu.shape != expected_mu_shape:
+                enc_in = x_flat
+
+            q = self.model.encoder(enc_in)
+            for key in ("mu", "sigma"):
+                if key not in q:
+                    self._add_result(f"Encoder: Missing '{key}'", False,
+                                     f"Keys: {list(q.keys())}")
+                    return
+
+            mu, sigma = q["mu"], q["sigma"]
+            exp_shape = (B, self.model.encoder.output_dim)
+            if mu.shape != exp_shape:
                 self._add_result("Encoder: Mu Shape", False,
-                               f"Expected {expected_mu_shape}, got {mu.shape}")
+                                 f"Expected {exp_shape}, got {mu.shape}")
             else:
-                self._add_result("Encoder: Mu Shape", True, f"Shape: {mu.shape}")
-            
-            # Check sigma is positive
+                self._add_result("Encoder: Mu Shape", True, f"{mu.shape}")
+
             if (sigma <= 0).any():
-                self._add_result("Encoder: Sigma Positive", False,
-                               f"Non-positive sigma values found: min={sigma.min().item():.6f}")
+                self._add_result("Encoder: Sigma > 0", False,
+                                 f"min = {sigma.min().item():.6f}")
             else:
-                self._add_result("Encoder: Sigma Positive", True,
-                               f"Range: [{sigma.min().item():.4f}, {sigma.max().item():.4f}]")
-            
-            # Test reparameterization
-            try:
-                z = self.model.encoder.reparameterize(posterior_params, num_samples=3)
-                expected_z_shape = (3, B, self.model.encoder.output_dim)
-                if z.shape != expected_z_shape:
-                    self._add_result("Encoder: Reparameterization Shape", False,
-                                   f"Expected {expected_z_shape}, got {z.shape}")
-                else:
-                    self._add_result("Encoder: Reparameterization Shape", True,
-                                   f"Shape: {z.shape}")
-            except Exception as e:
-                self._add_result("Encoder: Reparameterization", False, str(e))
-            
-            # Test decoder
-            z_single = z[0]  # [B, latent_dim]
+                self._add_result("Encoder: Sigma > 0", True,
+                                 f"[{sigma.min().item():.4f}, {sigma.max().item():.4f}]")
+
+            # Reparameterization
+            z = self.model.encoder.reparameterize(q, num_samples=3)
+            exp_z = (3, B, self.model.encoder.output_dim)
+            if z.shape != exp_z:
+                self._add_result("Encoder: Reparam Shape", False,
+                                 f"Expected {exp_z}, got {z.shape}")
+            else:
+                self._add_result("Encoder: Reparam Shape", True, f"{z.shape}")
+
+            # Decoder
+            z_single = z[0]
             if self.is_cvae:
-                decoder_input = torch.cat([z_single, c], dim=-1)
+                dec_in = torch.cat([z_single, c], dim=-1)
             else:
-                decoder_input = z_single
-            
-            recon_params = self.model.decoder(decoder_input)
-            
-            recon_mu = recon_params['mu']
-            recon_sigma = recon_params['sigma']
-            
-            expected_recon_shape = (B, self.model.input_dim)
-            if recon_mu.shape != expected_recon_shape:
+                dec_in = z_single
+            rp = self.model.decoder(dec_in)
+
+            if rp["mu"].shape != (B, self.model.input_dim):
                 self._add_result("Decoder: Output Shape", False,
-                               f"Expected {expected_recon_shape}, got {recon_mu.shape}")
+                                 f"Expected ({B}, {self.model.input_dim}), got {rp['mu'].shape}")
             else:
-                self._add_result("Decoder: Output Shape", True,
-                               f"Shape: {recon_mu.shape}")
-            
-            # Test Dictionary-specific components
-            if hasattr(self.model.encoder, 'get_SigmaMapper'):
-                sigma_mapper = self.model.encoder.get_SigmaMapper()
-                if sigma_mapper is not None:
-                    expected_mapper_shape = (self.model.encoder.output_dim, 
-                                           self.model.encoder.dictionary_size)
-                    if sigma_mapper.shape != expected_mapper_shape:
-                        self._add_result("Encoder: SigmaMapper Shape", False,
-                                       f"Expected {expected_mapper_shape}, got {sigma_mapper.shape}")
+                self._add_result("Decoder: Output Shape", True, f"{rp['mu'].shape}")
+
+            # Dictionary-specific: SigmaMapper normalization
+            if hasattr(self.model.encoder, "get_SigmaMapper"):
+                sm = self.model.encoder.get_SigmaMapper()
+                if sm is not None:
+                    norms = torch.norm(sm, dim=0)
+                    if not torch.allclose(norms, torch.ones_like(norms), atol=1e-5):
+                        self._add_result("Encoder: SigmaMapper Norms", False,
+                                         f"Sample norms: {norms[:5].tolist()}")
                     else:
-                        # Check normalization (columns should have unit norm)
-                        col_norms = torch.norm(sigma_mapper, dim=0)
-                        if not torch.allclose(col_norms, torch.ones_like(col_norms), atol=1e-5):
-                            self._add_result("Encoder: SigmaMapper Normalization", False,
-                                           f"Columns not unit norm: {col_norms[:5].tolist()}")
-                        else:
-                            self._add_result("Encoder: SigmaMapper Normalization", True,
-                                           "All columns have unit norm")
-                            
+                        self._add_result("Encoder: SigmaMapper Norms", True,
+                                         "Unit-norm columns")
+
         except Exception as e:
-            self._add_result("Encoder/Decoder: Overall", False, f"{type(e).__name__}: {str(e)}")
+            self._add_result("Encoder/Decoder: Overall", False,
+                             f"{type(e).__name__}: {e}")
             if self.verbose:
                 traceback.print_exc()
-    
+
+    # ==================================================================
+    # 5. Prior
+    # ==================================================================
+
     def _test_prior(self):
-        """Test prior distribution."""
+        """Test prior sampling, log-prob, and parameter expansion."""
         if self.verbose:
             print("\n[5] Testing Prior...")
-        
+
         try:
             prior = self.model.prior
-            batch_size = 16
-            
-            # Test sampling
-            samples = prior.sample(batch_size=batch_size, num_samples=5)
-            
-            if hasattr(self.model.encoder, 'dictionary_size'):
-                # Dictionary prior
-                expected_shape = (5, batch_size, self.model.encoder.dictionary_size)
-            else:
-                # Gaussian prior
-                expected_shape = (batch_size, 5, self.model.encoder.output_dim)
-            
-            # Note: Different priors may have different sample shape conventions
-            self._add_result("Prior: Sampling", True,
-                           f"Sample shape: {samples.shape}")
-            
-            # Test log_prob
+            bs = 16
+
+            samples = prior.sample(batch_size=bs, num_samples=5)
+            self._add_result("Prior: Sampling", True, f"Shape: {samples.shape}")
+
+            test_z = torch.randn(bs, self.model.encoder.output_dim, device=self.device)
             try:
-                if hasattr(self.model.encoder, 'dictionary_size'):
-                    # For dictionary, create output space sample
-                    test_z = torch.randn(batch_size, self.model.encoder.output_dim).to(self.device)
+                lp = prior.log_prob(test_z)
+                if torch.isnan(lp).any() or torch.isinf(lp).any():
+                    self._add_result("Prior: Log-prob", False, "NaN/Inf in log_prob")
                 else:
-                    test_z = torch.randn(batch_size, self.model.encoder.output_dim).to(self.device)
-                
-                log_p = prior.log_prob(test_z)
-                
-                if torch.isnan(log_p).any() or torch.isinf(log_p).any():
-                    self._add_result("Prior: Log Prob", False, "NaN or Inf in log_prob")
-                else:
-                    self._add_result("Prior: Log Prob", True,
-                                   f"Mean: {log_p.mean().item():.3f}, Range: [{log_p.min().item():.3f}, {log_p.max().item():.3f}]")
+                    self._add_result("Prior: Log-prob", True,
+                                     f"mean={lp.mean().item():.3f}")
             except Exception as e:
-                self._add_result("Prior: Log Prob", False, str(e))
-            
-            # Test parameter expansion
+                self._add_result("Prior: Log-prob", False, str(e))
+
             try:
-                params = prior.forward(batch_size)
-                self._add_result("Prior: Parameter Expansion", True,
-                               f"Mu: {params['mu'].shape}, Sigma: {params['sigma'].shape}")
+                params = prior.forward(bs)
+                self._add_result("Prior: Forward", True,
+                                 f"mu {params['mu'].shape}, sigma {params['sigma'].shape}")
             except Exception as e:
-                self._add_result("Prior: Parameter Expansion", False, str(e))
-                
+                self._add_result("Prior: Forward", False, str(e))
+
         except Exception as e:
-            self._add_result("Prior: Overall", False, f"{type(e).__name__}: {str(e)}")
+            self._add_result("Prior: Overall", False, f"{type(e).__name__}: {e}")
             if self.verbose:
                 traceback.print_exc()
-    
+
+    # ==================================================================
+    # 6. Full forward + backward
+    # ==================================================================
+
     def _test_model_forward_backward(self):
-        """Test full model forward and backward pass."""
+        """Full model forward/backward: shapes, gradient existence, NaN."""
         if self.verbose:
             print("\n[6] Testing Model Forward/Backward...")
-        
+
         try:
             self.model.train()
-            batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
-            x = x.to(self.device)
-            meter_id = meter_id.to(self.device)
-            timestamps = timestamps.to(self.device)
-            
+            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
             B, L, F = x.shape
             x_flat = x.reshape(B, -1)
-            
-            # Forward pass
+
             if self.is_cvae:
-                c = self.model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
-                c = torch.tensor(c, dtype=torch.float32).to(self.device) if isinstance(c, np.ndarray) else c.to(self.device)
-                recon_params, posterior_params = self.model.forward(x_flat, c, num_samples=1)
+                c = self.model.conditioner.get_conditions(
+                    x, meter_id=meter_id, timestamps=timestamps)
+                c = _to_tensor(c, self.device)
+                recon, q = self.model.forward(x_flat, c, num_samples=1)
             else:
-                recon_params, posterior_params = self.model.forward(x_flat, num_samples=1)
-            
-            # Check output shapes
-            if recon_params['mu'].shape != (1, B, self.model.input_dim):
-                self._add_result("Model Forward: Reconstruction Shape", False,
-                               f"Expected (1, {B}, {self.model.input_dim}), got {recon_params['mu'].shape}")
+                recon, q = self.model.forward(x_flat, num_samples=1)
+
+            exp = (1, B, self.model.input_dim)
+            if recon["mu"].shape != exp:
+                self._add_result("Forward: Recon Shape", False,
+                                 f"Expected {exp}, got {recon['mu'].shape}")
             else:
-                self._add_result("Model Forward: Reconstruction Shape", True,
-                               f"Shape: {recon_params['mu'].shape}")
-            
-            # Test backward pass
-            try:
-                # Compute a simple loss
-                recon_mu = recon_params['mu'].squeeze(0)  # [B, input_dim]
-                loss = torch.nn.functional.mse_loss(recon_mu, x_flat)
-                
-                # Backward
-                loss.backward()
-                
-                # Check gradients exist and are not NaN
-                # Note: Some params may not have gradients if not in computation graph
-                grad_issues = []
-                params_with_grad = 0
-                for name, param in self.model.named_parameters():
-                    if param.requires_grad:
-                        if param.grad is not None:
-                            params_with_grad += 1
-                            if torch.isnan(param.grad).any():
-                                grad_issues.append(f"{name}: NaN")
-                            elif torch.isinf(param.grad).any():
-                                grad_issues.append(f"{name}: Inf")
-                
-                if grad_issues:
-                    self._add_result("Model Backward: Gradients", False,
-                                   f"Issues: {grad_issues[:3]}")
-                elif params_with_grad == 0:
-                    self._add_result("Model Backward: Gradients", False,
-                                   "No gradients computed")
-                else:
-                    self._add_result("Model Backward: Gradients", True,
-                                   f"All gradients valid ({params_with_grad} params)")
-                
-                # Zero gradients for cleanup
-                self.model.zero_grad()
-                
-            except Exception as e:
-                self._add_result("Model Backward: Overall", False, str(e))
-                
+                self._add_result("Forward: Recon Shape", True,
+                                 f"{recon['mu'].shape}")
+
+            # Backward via MSE
+            loss = torch.nn.functional.mse_loss(recon["mu"].squeeze(0), x_flat)
+            loss.backward()
+
+            grad_issues, n_grad = [], 0
+            for name, p in self.model.named_parameters():
+                if p.requires_grad and p.grad is not None:
+                    n_grad += 1
+                    if torch.isnan(p.grad).any():
+                        grad_issues.append(f"{name}: NaN")
+                    elif torch.isinf(p.grad).any():
+                        grad_issues.append(f"{name}: Inf")
+
+            if grad_issues:
+                self._add_result("Backward: Gradients", False,
+                                 f"Issues: {grad_issues[:5]}")
+            elif n_grad == 0:
+                self._add_result("Backward: Gradients", False,
+                                 "No gradients computed")
+            else:
+                self._add_result("Backward: Gradients", True,
+                                 f"{n_grad} params with grad")
+
+            self.model.zero_grad()
+
         except Exception as e:
-            self._add_result("Model Forward/Backward: Overall", False, f"{type(e).__name__}: {str(e)}")
+            self._add_result("Forward/Backward: Overall", False,
+                             f"{type(e).__name__}: {e}")
             if self.verbose:
                 traceback.print_exc()
-    
+
+    # ==================================================================
+    # 7. Loss computation (ELBO)
+    # ==================================================================
+
     def _test_loss_computation(self):
-        """Test loss components."""
+        """Verify loss keys, finiteness, KL >= 0, ELBO formula."""
         if self.verbose:
             print("\n[7] Testing Loss Computation...")
-        
+
         try:
             self.model.eval()
-            batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
-            x = x.to(self.device)
-            meter_id = meter_id.to(self.device)
-            timestamps = timestamps.to(self.device)
-            
-            B, L, F = x.shape
-            x_flat = x.reshape(B, -1)
-            
+            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
+            x_flat = x.reshape(x.shape[0], -1)
+
             with torch.no_grad():
                 if self.is_cvae:
-                    c = self.model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
-                    c = torch.tensor(c, dtype=torch.float32).to(self.device) if isinstance(c, np.ndarray) else c.to(self.device)
-                    recon_params, posterior_params = self.model.forward(x_flat, c, num_samples=1)
-                    loss_dict = self.model.loss(x_flat, recon_params, posterior_params, beta=1.0)
+                    c = self.model.conditioner.get_conditions(
+                        x, meter_id=meter_id, timestamps=timestamps)
+                    c = _to_tensor(c, self.device)
+                    rp, qp = self.model.forward(x_flat, c, num_samples=1)
+                    ld = self.model.loss(x_flat, rp, qp, beta=1.0)
                 else:
-                    recon_params, posterior_params = self.model.forward(x_flat, num_samples=1)
-                    loss_dict = self.model.loss(x_flat, recon_params, posterior_params, beta=1.0)
-                
-                # Check loss components (keys may vary: recon/reconstruction, kl/kl_divergence)
-                if 'loss' not in loss_dict:
-                    self._add_result("Loss: Components", False, "Missing 'loss' key")
-                    return
-                
-                # Get reconstruction loss (check multiple possible keys)
-                recon_loss = None
-                for key in ['recon_loss', 'recon', 'reconstruction_loss', 'reconstruction', 'recon_loglikelihood']:
-                    if key in loss_dict:
-                        recon_loss = loss_dict[key].item()
-                        break
-                
-                # Get KL loss (check multiple possible keys)
-                kl_loss = None
-                for key in ['kl_loss', 'kl', 'kl_divergence']:
-                    if key in loss_dict:
-                        kl_loss = loss_dict[key].item()
-                        break
-                
-                total_loss = loss_dict['loss'].item()
-                
-                if recon_loss is None or kl_loss is None:
-                    self._add_result("Loss: Components", False,
-                                   f"Available keys: {list(loss_dict.keys())}")
-                    return
-                
-                # Check values are finite
-                if not np.isfinite(total_loss):
-                    self._add_result("Loss: Total Loss Finite", False,
-                                   f"Total loss is {total_loss}")
-                else:
-                    self._add_result("Loss: Total Loss Finite", True,
-                                   f"Value: {total_loss:.4f}")
-                
-                if not np.isfinite(recon_loss):
-                    self._add_result("Loss: Reconstruction Loss Finite", False,
-                                   f"Recon loss is {recon_loss}")
-                else:
-                    self._add_result("Loss: Reconstruction Loss Finite", True,
-                                   f"Value: {recon_loss:.4f}")
-                
-                # KL should be non-negative
-                if kl_loss < -1e-5:  # Small tolerance for numerical errors
-                    self._add_result("Loss: KL Non-negative", False,
-                                   f"KL divergence is negative: {kl_loss:.6f}")
-                else:
-                    self._add_result("Loss: KL Non-negative", True,
-                                   f"Value: {kl_loss:.4f}")
-                
-                # Check ELBO formula: loss = -(recon_loglikelihood - beta*kl_loss)
-                # Note: recon_loglikelihood is positive (log likelihood), kl is positive
-                # Total loss should be negative of ELBO
-                expected_loss = -(recon_loss - 1.0 * kl_loss)
-                if abs(total_loss - expected_loss) > 1e-3:
-                    self._add_result("Loss: ELBO Formula", False,
-                                   f"Expected {expected_loss:.4f}, got {total_loss:.4f}")
-                else:
-                    self._add_result("Loss: ELBO Formula", True,
-                                   f"-(recon_loglik - β*KL) = {total_loss:.4f}")
-                    
+                    rp, qp = self.model.forward(x_flat, num_samples=1)
+                    ld = self.model.loss(x_flat, rp, qp, beta=1.0)
+
+            if "loss" not in ld:
+                self._add_result("Loss: Keys", False,
+                                 f"Missing 'loss'. Keys: {list(ld.keys())}")
+                return
+
+            _recon_keys = ("recon_loglikelihood", "recon_loss", "recon")
+            _kl_keys = ("kl_divergence", "kl_loss", "kl")
+            recon_val = next((ld[k].item() for k in _recon_keys if k in ld), None)
+            kl_val = next((ld[k].item() for k in _kl_keys if k in ld), None)
+            total = ld["loss"].item()
+
+            if recon_val is None or kl_val is None:
+                self._add_result("Loss: Components", False,
+                                 f"Keys: {list(ld.keys())}")
+                return
+
+            if not np.isfinite(total):
+                self._add_result("Loss: Finite", False, f"total = {total}")
+            else:
+                self._add_result("Loss: Finite", True, f"total = {total:.4f}")
+
+            if kl_val < -1e-5:
+                self._add_result("Loss: KL >= 0", False, f"KL = {kl_val:.6f}")
+            else:
+                self._add_result("Loss: KL >= 0", True, f"KL = {kl_val:.4f}")
+
+            expected = -(recon_val - 1.0 * kl_val)
+            if abs(total - expected) > 1e-3:
+                self._add_result("Loss: ELBO Formula", False,
+                                 f"Expected {expected:.4f}, got {total:.4f}")
+            else:
+                self._add_result("Loss: ELBO Formula", True,
+                                 f"-(recon - beta*KL) = {total:.4f}")
+
+            # Beta sensitivity
+            with torch.no_grad():
+                ld0 = self.model.loss(x_flat, rp, qp, beta=0.0)
+            if abs(ld0["loss"].item() - total) < 1e-8 and kl_val > 1e-4:
+                self._add_result("Loss: Beta Sensitivity", False,
+                                 "Loss unchanged between beta=0 and beta=1")
+            else:
+                self._add_result("Loss: Beta Sensitivity", True,
+                                 f"beta=0 -> {ld0['loss'].item():.4f}, beta=1 -> {total:.4f}")
+
         except Exception as e:
-            self._add_result("Loss: Overall", False, f"{type(e).__name__}: {str(e)}")
+            self._add_result("Loss: Overall", False, f"{type(e).__name__}: {e}")
             if self.verbose:
                 traceback.print_exc()
-    
+
+    # ==================================================================
+    # 8. Device placement
+    # ==================================================================
+
     def _test_device_placement(self):
-        """Test that all components are on correct device."""
+        """Ensure model, prior, and data all live on the expected device."""
         if self.verbose:
             print("\n[8] Testing Device Placement...")
-        
+
         try:
-            # Check model device
-            model_device = next(self.model.parameters()).device
-            # Compare device types (cuda:0 == cuda)
-            model_device_type = str(model_device).split(':')[0]
-            expected_device_type = str(self.device).split(':')[0]
-            if model_device_type != expected_device_type:
+            model_dev = str(next(self.model.parameters()).device).split(":")[0]
+            expected_dev = str(self.device).split(":")[0]
+
+            if model_dev != expected_dev:
                 self._add_result("Device: Model", False,
-                               f"Model on {model_device_type}, expected {expected_device_type}")
+                                 f"On {model_dev}, expected {expected_dev}")
             else:
-                self._add_result("Device: Model", True, f"Device: {model_device}")
-            
-            # Check prior device
-            if hasattr(self.model.prior, 'mu'):
-                prior_device = self.model.prior.mu.device
-                if str(prior_device) != str(model_device):
+                self._add_result("Device: Model", True, f"{model_dev}")
+
+            if hasattr(self.model.prior, "mu"):
+                prior_dev = str(self.model.prior.mu.device).split(":")[0]
+                if prior_dev != model_dev:
                     self._add_result("Device: Prior", False,
-                                   f"Prior on {prior_device}, model on {model_device}")
+                                     f"Prior on {prior_dev}, model on {model_dev}")
                 else:
-                    self._add_result("Device: Prior", True, f"Device: {prior_device}")
-            
-            # Test forward pass with data on device
-            batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
-            x = x.to(self.device)
-            
+                    self._add_result("Device: Prior", True, f"{prior_dev}")
+
+            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
             if self.is_cvae:
-                meter_id = meter_id.to(self.device)
-                timestamps = timestamps.to(self.device)
-                c = self.model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
-                c = torch.tensor(c, dtype=torch.float32).to(self.device) if isinstance(c, np.ndarray) else c.to(self.device)
-                
-                # Check condition device
+                c = self.model.conditioner.get_conditions(
+                    x, meter_id=meter_id, timestamps=timestamps)
+                c = _to_tensor(c, self.device)
                 if c.device != x.device:
                     self._add_result("Device: Conditions", False,
-                                   f"Conditions on {c.device}, data on {x.device}")
+                                     f"Cond on {c.device}, data on {x.device}")
                 else:
-                    self._add_result("Device: Conditions", True, f"Device: {c.device}")
-            
-            self._add_result("Device: Overall Consistency", True, "All components on same device")
-            
+                    self._add_result("Device: Conditions", True, f"{c.device}")
+
+            self._add_result("Device: Consistency", True, "All on same device")
+
         except Exception as e:
-            self._add_result("Device: Overall", False, f"{type(e).__name__}: {str(e)}")
+            self._add_result("Device: Overall", False, f"{type(e).__name__}: {e}")
             if self.verbose:
                 traceback.print_exc()
-    
+
+    # ==================================================================
+    # 9. Full training step (train_core)
+    # ==================================================================
+
     def _test_full_training_step(self):
-        """Test a complete training iteration to catch dimension mismatches."""
+        """Run one ``train_core`` call and check loss / gradients."""
         if self.verbose:
             print("\n[9] Testing Full Training Step...")
-        
+
         try:
-            # Set model to training mode
             self.model.train()
-            
-            # Get a batch
-            batch = next(iter(self.train_loader))
-            x, meter_id, timestamps = batch
-            x = x.to(self.device)
-            meter_id = meter_id.to(self.device)
-            timestamps = timestamps.to(self.device)
-            
+            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
             B, L, F = x.shape
             x_flat = x.reshape(B, -1)
-            
-            # Create optimizer (won't actually update, just need it for the training step)
             optim = torch.optim.Adam(self.model.parameters(), lr=1e-3)
-            
-            # Test the actual train_core method (this is what runs during training)
-            try:
-                if self.is_cvae:
-                    # CVAE expects (x, meter_id, timestamps) tuple
-                    loss_dict = self.model.train_core((x, meter_id, timestamps), optim, beta=1.0)
+
+            if self.is_cvae:
+                ld = self.model.train_core(
+                    (x, meter_id, timestamps), optim, beta=1.0)
+            else:
+                ld = self.model.train_core(x, optim, beta=1.0)
+
+            if "loss" not in ld:
+                self._add_result("TrainStep: Loss Key", False, "Missing 'loss'")
+                return
+
+            loss_v = ld["loss"].item()
+            if not np.isfinite(loss_v):
+                self._add_result("TrainStep: Loss Finite", False,
+                                 f"loss = {loss_v}")
+            else:
+                self._add_result("TrainStep: Forward/Backward", True,
+                                 f"loss = {loss_v:.4f}")
+
+            has_grad = any(p.grad is not None for p in self.model.parameters())
+            self._add_result("TrainStep: Gradients", has_grad,
+                             "Computed" if has_grad else "None computed")
+
+            # Dimension consistency
+            if self.is_cvae:
+                c = self.model.conditioner.get_conditions(
+                    x, meter_id=meter_id, timestamps=timestamps)
+                c = _to_tensor(c, self.device)
+                expected = self.model.input_dim + self.model.condition_dim
+                actual = x_flat.shape[1] + c.shape[1]
+                if expected != actual:
+                    self._add_result("TrainStep: Dim Consistency", False,
+                                     f"Encoder expects {expected}, got {actual}")
                 else:
-                    # VAE expects just x
-                    loss_dict = self.model.train_core(x, optim, beta=1.0)
-                
-                # Check that loss_dict has expected keys
-                if 'loss' not in loss_dict:
-                    self._add_result("Full Training Step: Loss Dict", False,
-                                   "Missing 'loss' key in train_core output")
-                    return
-                
-                loss = loss_dict['loss'].item()
-                
-                if not np.isfinite(loss):
-                    self._add_result("Full Training Step: Loss Value", False,
-                                   f"Loss is not finite: {loss}")
-                else:
-                    self._add_result("Full Training Step: Forward/Backward", True,
-                                   f"Complete training step successful, loss={loss:.4f}")
-                
-                # Check that gradients were computed
-                has_grad = False
-                for param in self.model.parameters():
-                    if param.grad is not None:
-                        has_grad = True
-                        break
-                
-                if not has_grad:
-                    self._add_result("Full Training Step: Gradients", False,
-                                   "No gradients computed during train_core")
-                else:
-                    self._add_result("Full Training Step: Gradients", True,
-                                   "Gradients computed successfully")
-                
-                # Test dimension consistency through the pipeline
-                details = {
-                    'input_shape': f"{x.shape}",
-                    'flattened_shape': f"{x_flat.shape}",
-                    'batch_size': B,
-                    'loss': f"{loss:.4f}"
-                }
-                
-                if self.is_cvae:
-                    c = self.model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
-                    c = torch.tensor(c, dtype=torch.float32).to(self.device) if isinstance(c, np.ndarray) else c.to(self.device)
-                    details['condition_shape'] = f"{c.shape}"
-                    details['encoder_input_dim'] = f"{x_flat.shape[1] + c.shape[1]}"
-                    
-                    # Verify dimensions match what encoder expects
-                    expected_encoder_input = self.model.input_dim + self.model.condition_dim
-                    actual_encoder_input = x_flat.shape[1] + c.shape[1]
-                    
-                    if expected_encoder_input != actual_encoder_input:
-                        self._add_result("Full Training Step: Dimension Consistency", False,
-                                       f"Encoder expects {expected_encoder_input}, got {actual_encoder_input}",
-                                       details)
-                    else:
-                        self._add_result("Full Training Step: Dimension Consistency", True,
-                                       f"All dimensions consistent", details)
-                else:
-                    details['encoder_input_dim'] = f"{x_flat.shape[1]}"
-                    self._add_result("Full Training Step: Dimension Consistency", True,
-                                   f"All dimensions consistent", details)
-                
-            except RuntimeError as e:
-                error_msg = str(e)
-                if "mat1 and mat2 shapes cannot be multiplied" in error_msg:
-                    # Extract dimension info from error
-                    self._add_result("Full Training Step: Dimension Mismatch", False,
-                                   f"Matrix multiplication error: {error_msg}")
-                elif "size mismatch" in error_msg or "shape" in error_msg:
-                    self._add_result("Full Training Step: Shape Error", False,
-                                   f"Shape mismatch: {error_msg}")
-                else:
-                    self._add_result("Full Training Step: Runtime Error", False,
-                                   f"RuntimeError: {error_msg}")
-                if self.verbose:
-                    traceback.print_exc()
-            
-            # Clean up
+                    self._add_result("TrainStep: Dim Consistency", True,
+                                     f"Encoder input = {expected}")
+            else:
+                self._add_result("TrainStep: Dim Consistency", True,
+                                 f"Encoder input = {x_flat.shape[1]}")
+
             self.model.zero_grad()
             self.model.eval()
-            
-        except Exception as e:
-            self._add_result("Full Training Step: Overall", False, 
-                           f"{type(e).__name__}: {str(e)}")
+
+        except RuntimeError as e:
+            msg = str(e)
+            if "mat1 and mat2" in msg or "size mismatch" in msg:
+                self._add_result("TrainStep: Shape Error", False, msg)
+            else:
+                self._add_result("TrainStep: Runtime Error", False, msg)
             if self.verbose:
                 traceback.print_exc()
-    
-    def _test_regression_bugs(self):
-        """Test for known bugs that have been fixed."""
+        except Exception as e:
+            self._add_result("TrainStep: Overall", False,
+                             f"{type(e).__name__}: {e}")
+            if self.verbose:
+                traceback.print_exc()
+
+    # ==================================================================
+    # 10. Numerical stability
+    # ==================================================================
+
+    def _test_numerical_stability(self):
+        """Feed extreme inputs (zeros, large, small) and check for NaN/Inf."""
         if self.verbose:
-            print("\n[10] Testing Regression Prevention...")
-        
-        # Bug 1: 2D vs 3D input handling in UserProfiler
+            print("\n[10] Testing Numerical Stability...")
+
+        try:
+            self.model.eval()
+            B = 4
+            D = self.model.input_dim
+
+            cases = {
+                "zeros": torch.zeros(B, D, device=self.device),
+                "ones": torch.ones(B, D, device=self.device),
+                "large": torch.ones(B, D, device=self.device) * 100.0,
+                "small_pos": torch.ones(B, D, device=self.device) * 1e-6,
+            }
+
+            for tag, x_test in cases.items():
+                try:
+                    with torch.no_grad():
+                        if self.is_cvae:
+                            c = self.model.conditioner.get_random_conditions(
+                                batch_size=B)
+                            c = _to_tensor(c, self.device)
+                            rp, qp = self.model.forward(x_test, c, num_samples=1)
+                        else:
+                            rp, qp = self.model.forward(x_test, num_samples=1)
+
+                    has_nan = any(torch.isnan(v).any() for v in rp.values())
+                    has_inf = any(torch.isinf(v).any() for v in rp.values())
+                    if has_nan or has_inf:
+                        self._add_result(f"Stability: {tag}", False,
+                                         "NaN/Inf in output")
+                    else:
+                        self._add_result(f"Stability: {tag}", True, "Clean")
+                except Exception as e:
+                    self._add_result(f"Stability: {tag}", False, str(e))
+
+        except Exception as e:
+            self._add_result("Stability: Overall", False,
+                             f"{type(e).__name__}: {e}")
+
+    # ==================================================================
+    # 11. Weight initialization
+    # ==================================================================
+
+    def _test_weight_initialization(self):
+        """Check for dead layers (all-zero) and exploding weights."""
+        if self.verbose:
+            print("\n[11] Testing Weight Initialization...")
+
+        try:
+            dead, exploding = [], []
+            for name, p in self.model.named_parameters():
+                if p.numel() == 0:
+                    continue
+                if p.abs().max().item() == 0.0:
+                    dead.append(name)
+                if p.abs().max().item() > 1e6:
+                    exploding.append((name, p.abs().max().item()))
+
+            if dead:
+                self._add_result("Weights: Dead Layers", False,
+                                 f"{len(dead)} all-zero: {dead[:3]}")
+            else:
+                self._add_result("Weights: Dead Layers", True, "None detected")
+
+            if exploding:
+                self._add_result("Weights: Exploding", False,
+                                 f"{len(exploding)} > 1e6: {exploding[:3]}")
+            else:
+                self._add_result("Weights: Exploding", True, "All within bounds")
+
+            # Check encoder/decoder independence
+            enc_p = list(self.model.encoder.parameters())
+            dec_p = list(self.model.decoder.parameters())
+            if len(enc_p) > 0 and len(dec_p) > 0:
+                e0 = enc_p[0].data.flatten()[:10]
+                d0 = dec_p[0].data.flatten()[:10]
+                if e0.shape == d0.shape and torch.allclose(e0, d0):
+                    self._add_result("Weights: Enc/Dec Independence", False,
+                                     "First tensors appear identical")
+                else:
+                    self._add_result("Weights: Enc/Dec Independence", True,
+                                     "Distinct weights")
+
+        except Exception as e:
+            self._add_result("Weights: Overall", False,
+                             f"{type(e).__name__}: {e}")
+
+    # ==================================================================
+    # 12. Multi-step convergence
+    # ==================================================================
+
+    def _test_multi_step_convergence(self):
+        """Run a few optimization steps; loss should trend downward."""
+        if self.verbose:
+            print("\n[12] Testing Multi-Step Convergence...")
+
+        try:
+            model_copy = copy.deepcopy(self.model)
+            model_copy.train()
+            opt = torch.optim.Adam(model_copy.parameters(), lr=1e-3)
+
+            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
+
+            losses = []
+            n_steps = 5
+            for _ in range(n_steps):
+                if self.is_cvae:
+                    ld = model_copy.train_core(
+                        (x, meter_id, timestamps), opt, beta=1.0)
+                else:
+                    ld = model_copy.train_core(x, opt, beta=1.0)
+                losses.append(ld["loss"].item())
+
+            if not all(np.isfinite(l) for l in losses):
+                self._add_result("Convergence: Finite", False,
+                                 f"Losses: {losses}")
+                return
+
+            improved = losses[-1] < losses[0]
+            suffix = " (improved)" if improved else " (may be okay for 1 batch)"
+            self._add_result(
+                "Convergence: Loss Decreased", improved,
+                f"Step 1: {losses[0]:.4f} -> Step {n_steps}: {losses[-1]:.4f}" + suffix,
+            )
+
+            self._add_result("Convergence: Stable", True,
+                             f"All {n_steps} losses finite: "
+                             f"{[f'{l:.2f}' for l in losses]}")
+
+            del model_copy
+
+        except Exception as e:
+            self._add_result("Convergence: Overall", False,
+                             f"{type(e).__name__}: {e}")
+            if self.verbose:
+                traceback.print_exc()
+
+    # ==================================================================
+    # 13. Save / Load round-trip
+    # ==================================================================
+
+    def _test_save_load_roundtrip(self):
+        """Save model to temp dir, reload, and compare parameters."""
+        if self.verbose:
+            print("\n[13] Testing Save/Load Round-trip...")
+
+        try:
+            self.model.eval()
+            original_sd = {k: v.clone() for k, v in self.model.state_dict().items()}
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.model.save_model(
+                    save_path=tmpdir, model_name="val_test", device="cpu")
+
+                pt_path = os.path.join(tmpdir, "val_test.pt")
+                if not os.path.exists(pt_path):
+                    self._add_result("Save/Load: File Created", False,
+                                     "Checkpoint not found")
+                    return
+                self._add_result("Save/Load: File Created", True,
+                                 f"{os.path.getsize(pt_path) / 1024:.1f} KB")
+
+                loaded = type(self.model).load_from_checkpoint(
+                    pt_path, device="cpu")
+                loaded_sd = loaded.state_dict()
+
+                mismatched = []
+                for k in original_sd:
+                    if k not in loaded_sd:
+                        mismatched.append(f"missing: {k}")
+                    elif not torch.allclose(
+                        original_sd[k].float(), loaded_sd[k].float(), atol=1e-5
+                    ):
+                        mismatched.append(f"differs: {k}")
+
+                if mismatched:
+                    self._add_result("Save/Load: Params Match", False,
+                                     f"{len(mismatched)} issues: {mismatched[:5]}")
+                else:
+                    self._add_result("Save/Load: Params Match", True,
+                                     f"All {len(original_sd)} params match")
+
+            # Restore device
+            self.model.to(self.device)
+            if hasattr(self.model, "prior"):
+                self.model.prior.to(self.device)
+
+        except Exception as e:
+            self._add_result("Save/Load: Overall", False,
+                             f"{type(e).__name__}: {e}")
+            if self.verbose:
+                traceback.print_exc()
+            try:
+                self.model.to(self.device)
+            except Exception:
+                pass
+
+    # ==================================================================
+    # 14. Validation loop
+    # ==================================================================
+
+    def _test_validation_loop(self):
+        """Run model.validate() on val_loader and check finiteness."""
+        if self.verbose:
+            print("\n[14] Testing Validation Loop...")
+
+        if self.val_loader is None:
+            self._add_result("ValLoop: Skipped", True, "No val_loader")
+            return
+
+        try:
+            self.model.eval()
+            if self.is_cvae:
+                agg = self.model.validate(
+                    self.val_loader, num_samples=1, beta=1.0,
+                    device=str(self.device))
+            else:
+                agg = self.model.validate(
+                    self.val_loader, num_samples=1, beta=1.0,
+                    device=str(self.device))
+
+            for k, v in agg.items():
+                if not np.isfinite(v):
+                    self._add_result(f"ValLoop: {k}", False, f"Non-finite: {v}")
+                else:
+                    self._add_result(f"ValLoop: {k}", True, f"{v:.4f}")
+
+        except Exception as e:
+            self._add_result("ValLoop: Overall", False,
+                             f"{type(e).__name__}: {e}")
+            if self.verbose:
+                traceback.print_exc()
+
+    # ==================================================================
+    # 15. Sampling
+    # ==================================================================
+
+    def _test_sampling(self):
+        """Sample from prior and check shapes, NaN, diversity."""
+        if self.verbose:
+            print("\n[15] Testing Sampling...")
+
+        try:
+            self.model.eval()
+
+            if self.is_cvae:
+                rc = self.model.conditioner.get_random_conditions(batch_size=4)
+                rc = _to_tensor(rc, self.device)
+                samples = self.model.sample(
+                    conditions=rc, num_prior_samples=3, num_x_samples=1,
+                    device=str(self.device),
+                )
+                if samples.dim() != 4:
+                    self._add_result("Sampling: Shape", False,
+                                     f"Expected 4-D, got {samples.shape}")
+                else:
+                    self._add_result("Sampling: Shape", True,
+                                     f"{samples.shape}")
+            else:
+                result = self.model.sample(num_samples_prior=3,
+                                           num_samples_posterior=1)
+                samples = result["samples"]
+                self._add_result("Sampling: Shape", True, f"{samples.shape}")
+
+            if torch.isnan(samples).any() or torch.isinf(samples).any():
+                self._add_result("Sampling: Clean", False, "NaN/Inf in samples")
+            else:
+                self._add_result("Sampling: Clean", True, "No NaN/Inf")
+
+            flat = samples.reshape(-1, samples.shape[-1])
+            var = flat.var(dim=0).mean().item()
+            if var < 1e-8:
+                self._add_result("Sampling: Diversity", False,
+                                 f"Near-zero var ({var:.2e}) - mode collapse?")
+            else:
+                self._add_result("Sampling: Diversity", True,
+                                 f"Mean var = {var:.4f}")
+
+        except Exception as e:
+            self._add_result("Sampling: Overall", False,
+                             f"{type(e).__name__}: {e}")
+            if self.verbose:
+                traceback.print_exc()
+
+    # ==================================================================
+    # 16. Hierarchical module
+    # ==================================================================
+
+    def _test_hierarchy(self):
+        """Validate the optional HierarchicalLatentModule."""
+        if self.verbose:
+            print("\n[16] Testing Hierarchy...")
+
+        try:
+            h = self.model.hierarchy
+            if h is None:
+                self._add_result("Hierarchy: Present", True, "None - skipped")
+                return
+
+            self._add_result("Hierarchy: Present", True,
+                             f"{len(h.levels)} levels, "
+                             f"agg={type(h.aggregation).__name__}")
+
+            z = torch.randn(8, h.config.levels[0].input_dim, device=self.device)
+            out = h(z)
+
+            for key in ("z", "loss", "level_outputs"):
+                if key not in out:
+                    self._add_result(f"Hierarchy: Key '{key}'", False, "Missing")
+                else:
+                    self._add_result(f"Hierarchy: Key '{key}'", True, "Present")
+
+            if out["z"].shape != (8, h.output_dim):
+                self._add_result("Hierarchy: Output Shape", False,
+                                 f"Got {out['z'].shape}, expected (8, {h.output_dim})")
+            else:
+                self._add_result("Hierarchy: Output Shape", True,
+                                 f"{out['z'].shape}")
+
+            z_g = torch.randn(4, h.config.levels[0].input_dim,
+                              device=self.device, requires_grad=True)
+            out_g = h(z_g)
+            out_g["z"].sum().backward()
+            if z_g.grad is None or z_g.grad.abs().max() == 0:
+                self._add_result("Hierarchy: Gradient Flow", False,
+                                 "No gradients")
+            else:
+                self._add_result("Hierarchy: Gradient Flow", True, "OK")
+
+        except Exception as e:
+            self._add_result("Hierarchy: Overall", False,
+                             f"{type(e).__name__}: {e}")
+            if self.verbose:
+                traceback.print_exc()
+
+    # ==================================================================
+    # 17. Regression bugs
+    # ==================================================================
+
+    def _test_regression_bugs(self):
+        """Known-bug regression tests."""
+        if self.verbose:
+            print("\n[17] Testing Regression Bugs...")
+
         if self.is_cvae and "user_profile" in self.model.conditioner.get_condition_tags():
             try:
-                batch = next(iter(self.train_loader))
-                x, meter_id, timestamps = batch
-                x_3d = x  # [B, L, F]
-                x_2d = x.reshape(x.shape[0], -1)  # [B, D]
-                
-                user_profiler = self.model.conditioner.condition_items["user_profile"]
-                
-                # Test 3D input
-                try:
-                    cond_3d = user_profiler.get_conditions(x_3d, meter_id=meter_id, timestamps=timestamps)
-                    self._add_result("Regression: UserProfiler 3D Input", True,
-                                   f"Shape: {cond_3d.shape if isinstance(cond_3d, torch.Tensor) else np.array(cond_3d).shape}")
-                except Exception as e:
-                    self._add_result("Regression: UserProfiler 3D Input", False, str(e))
-                
-                # Test 2D input
-                try:
-                    cond_2d = user_profiler.get_conditions(x_2d, meter_id=meter_id, timestamps=timestamps)
-                    self._add_result("Regression: UserProfiler 2D Input", True,
-                                   f"Shape: {cond_2d.shape if isinstance(cond_2d, torch.Tensor) else np.array(cond_2d).shape}")
-                except Exception as e:
-                    self._add_result("Regression: UserProfiler 2D Input", False, str(e))
-                    
+                x, meter_id, timestamps, _ = _get_batch(
+                    self.train_loader, self.device)
+                up = self.model.conditioner.condition_items["user_profile"]
+                x_2d = x.reshape(x.shape[0], -1)
+
+                for tag, inp in [("3D", x), ("2D", x_2d)]:
+                    try:
+                        c = up.get_conditions(
+                            inp, meter_id=meter_id, timestamps=timestamps)
+                        c = _to_tensor(c, self.device)
+                        self._add_result(
+                            f"Regression: UserProfiler {tag}", True,
+                            f"Shape {c.shape}")
+                    except Exception as e:
+                        self._add_result(
+                            f"Regression: UserProfiler {tag}", False, str(e))
             except Exception as e:
-                self._add_result("Regression: UserProfiler Input Shapes", False, str(e))
-        
-        # Bug 2: Numpy vs Tensor type mixing in condition concatenation
+                self._add_result("Regression: UserProfiler", False, str(e))
+
         if self.is_cvae:
             try:
-                random_conds = self.model.conditioner.get_random_conditions(batch_size=8)
-                if not isinstance(random_conds, torch.Tensor):
-                    self._add_result("Regression: Random Conditions Type", False,
-                                   f"Expected torch.Tensor, got {type(random_conds)}")
+                rc = self.model.conditioner.get_random_conditions(batch_size=8)
+                if not isinstance(rc, torch.Tensor):
+                    self._add_result("Regression: Random Cond Type", False,
+                                     f"Got {type(rc)}")
                 else:
-                    self._add_result("Regression: Random Conditions Type", True,
-                                   "Returns torch.Tensor")
+                    self._add_result("Regression: Random Cond Type", True,
+                                     "torch.Tensor")
             except Exception as e:
-                self._add_result("Regression: Random Conditions", False, str(e))
-    
+                self._add_result("Regression: Random Cond", False, str(e))
+
+    # ==================================================================
+    # 18. RevIN (IndexedLogRevIN)
+    # ==================================================================
+
     def _test_RevIn(self):
-        """Test reversible instance normalization (RevIN)."""
+        """Reversible instance normalization -- synthetic test."""
         if self.verbose:
-            print("\n[11] Testing RevIN...")
-        
+            print("\n[18] Testing RevIN...")
+
         try:
-            from src.normalizer import IndexedLogRevIN
-            
-            # Test parameters
-            batch_size = 8
-            num_features = 5
-            sequence_length = 24
-            eps = 1e-5
-            
-            # Create RevIN instance
-            revin = IndexedLogRevIN(num_features=num_features, eps=eps, affine=True)
-            
-            # Create test data - [B, L, F] format (batch, sequence_length, num_features)
-            torch.manual_seed(42)  # For reproducible tests
-            x_original = torch.randn(batch_size, sequence_length, num_features) * 2.0 + 5.0
-            x_original = torch.abs(x_original)  # Ensure positive values for log1p
-            
-            # Create timestamps (different dates for different samples)
-            base_time = 1640995200  # Jan 1, 2022 00:00:00 UTC
-            timestamps = torch.tensor([base_time + i * 24 * 3600 for i in range(batch_size)])  # Different days
-            
-            # Test 1: Basic normalization
-            x_norm = revin(x_original.clone(), mode='norm', timestamp=timestamps)
-            
-            if x_norm.shape != x_original.shape:
-                self._add_result("RevIN: Normalization Shape", False,
-                               f"Expected {x_original.shape}, got {x_norm.shape}")
-                return
-            else:
-                self._add_result("RevIN: Normalization Shape", True,
-                               f"Shape preserved: {x_norm.shape}")
-            
-            # Test 2: Check that normalized data has reasonable statistical properties
-            # After normalization, data should be log1p transformed and normalized
-            # Stats over time dimension (dim=1) for each sample should be ~N(0,1) before affine
-            norm_mean = torch.mean(x_norm, dim=1)  # [B, F] - mean over time
-            norm_std = torch.std(x_norm, dim=1)    # [B, F] - std over time
-            
-            # The normalized data should have some variance (not all zeros)
-            if torch.allclose(norm_std, torch.zeros_like(norm_std), atol=1e-6):
-                self._add_result("RevIN: Normalized Variance", False,
-                               "Normalized data has zero variance")
-            else:
-                self._add_result("RevIN: Normalized Variance", True,
-                               f"Normalized std range: [{norm_std.min().item():.4f}, {norm_std.max().item():.4f}]")
-            
-            # Test 3: Test denormalization without timestamps (should use cached stats)
-            x_denorm = revin(x_norm.clone(), mode='denorm')
-            
-            if x_denorm.shape != x_original.shape:
-                self._add_result("RevIN: Denormalization Shape", False,
-                               f"Expected {x_original.shape}, got {x_denorm.shape}")
-            else:
-                self._add_result("RevIN: Denormalization Shape", True,
-                               f"Shape preserved: {x_denorm.shape}")
-            
-            # Test 4: Round-trip test (normalize then denormalize)
-            max_error = torch.max(torch.abs(x_original - x_denorm)).item()
-            relative_error = max_error / (torch.max(torch.abs(x_original)).item() + 1e-8)
-            
-            if relative_error > 1e-3:  # Allow some numerical error
-                self._add_result("RevIN: Round-trip Accuracy", False,
-                               f"High reconstruction error: {relative_error:.6f}")
-            else:
-                self._add_result("RevIN: Round-trip Accuracy", True,
-                               f"Max relative error: {relative_error:.6f}")
-            
-            # Test 5: Test monthly stats update via update_monthly_stats
-            from torch.utils.data import TensorDataset, DataLoader
-            test_dataset = TensorDataset(x_original, timestamps, timestamps)  # (x, meter_id, timestamps)
-            test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
-            revin.update_monthly_stats(test_dataloader, month_key=202201)
-            
-            if 202201 in revin.monthly_stats:
-                stats = revin.monthly_stats[202201]
-                self._add_result("RevIN: Monthly Stats Update", True,
-                               f"Stored stats for month 202201, count={stats['count']}")
-            else:
-                self._add_result("RevIN: Monthly Stats Update", False,
-                               "update_monthly_stats did not store stats")
-            
-            # Test 6: Test denormalization with specific timestamp
-            test_timestamp = timestamps[0]
-            x_test = torch.randn(1, sequence_length, num_features)
-            try:
-                x_denorm_specific = revin(x_test, mode='denorm', timestamp=test_timestamp)
-                self._add_result("RevIN: Timestamp-specific Denorm", True,
-                               f"Successfully denormalized with timestamp")
-            except Exception as e:
-                self._add_result("RevIN: Timestamp-specific Denorm", False, str(e))
-            
-            # Test 7: Test with month parameter
-            try:
-                month_val = 1  # January
-                x_denorm_month = revin(x_test, mode='denorm', timestamp=test_timestamp, month=month_val)
-                self._add_result("RevIN: Month-based Denorm", True,
-                               f"Successfully denormalized with month parameter")
-            except Exception as e:
-                self._add_result("RevIN: Month-based Denorm", False, str(e))
-            
-            # Test 8: Test affine parameters (if affine=True)
-            if revin.affine:
-                if not hasattr(revin, 'weight') or not hasattr(revin, 'bias'):
-                    self._add_result("RevIN: Affine Parameters", False,
-                                   "Missing weight or bias parameters")
-                elif revin.weight.shape != torch.Size([num_features]) or revin.bias.shape != torch.Size([num_features]):
-                    self._add_result("RevIN: Affine Parameters", False,
-                                   f"Incorrect parameter shapes: weight {revin.weight.shape}, bias {revin.bias.shape}")
-                else:
-                    self._add_result("RevIN: Affine Parameters", True,
-                                   f"Correct affine parameter shapes")
-            
-            # Test 9: Test update_monthly_stats with second month
-            batch2_x = torch.abs(torch.randn(batch_size, sequence_length, num_features)) + 2.0
-            batch2_ts = timestamps + 31 * 24 * 3600  # ~1 month later
-            test_dataset2 = TensorDataset(batch2_x, batch2_ts, batch2_ts)
-            test_dataloader2 = DataLoader(test_dataset2, batch_size=batch_size)
-            revin.update_monthly_stats(test_dataloader2, month_key=202202)
-            
-            if len(revin.monthly_stats) == 2:
-                self._add_result("RevIN: Multiple Months", True,
-                               f"Tracking {len(revin.monthly_stats)} months: {list(revin.monthly_stats.keys())}")
-            else:
-                self._add_result("RevIN: Multiple Months", False,
-                               f"Expected 2 months, got {len(revin.monthly_stats)}")
-            
-            # Test 10: Edge case - empty timestamp (should work without indexing)
-            try:
-                x_no_timestamp = revin(x_original.clone(), mode='norm', timestamp=None)
-                self._add_result("RevIN: No Timestamp", True,
-                               "Normalization works without timestamp")
-            except Exception as e:
-                self._add_result("RevIN: No Timestamp", False, str(e))
-            
-            # Test 11: Edge case - constant window (all same value)
-            x_constant = torch.ones(2, sequence_length, num_features) * 3.0
-            try:
-                x_const_norm = revin(x_constant.clone(), mode='norm')
-                if torch.isnan(x_const_norm).any() or torch.isinf(x_const_norm).any():
-                    self._add_result("RevIN: Constant Window", False,
-                                   "NaN or Inf in output for constant input")
-                else:
-                    self._add_result("RevIN: Constant Window", True,
-                                   "Handled constant window without NaN/Inf")
-            except Exception as e:
-                self._add_result("RevIN: Constant Window", False, str(e))
-            
-            # Test 12: Edge case - zero window
-            x_zero = torch.zeros(2, sequence_length, num_features)
-            try:
-                x_zero_norm = revin(x_zero.clone(), mode='norm')
-                if torch.isnan(x_zero_norm).any() or torch.isinf(x_zero_norm).any():
-                    self._add_result("RevIN: Zero Window", False,
-                                   "NaN or Inf in output for zero input")
-                else:
-                    self._add_result("RevIN: Zero Window", True,
-                                   "Handled zero window without NaN/Inf")
-            except Exception as e:
-                self._add_result("RevIN: Zero Window", False, str(e))
-                
-        except ImportError:
-            self._add_result("RevIN: Import", False, "Could not import IndexedLogRevIN")
-        except Exception as e:
-            self._add_result("RevIN: Overall", False, f"{type(e).__name__}: {str(e)}")
-            if self.verbose:
-                traceback.print_exc()
-    
-    def _test_online_user_profiler(self):
-        """Test online user profiler functionality."""
-        if self.verbose:
-            print("\n[12] Testing Online User Profiler...")
-        
-        try:
-            from src.Conditioner import OnlineUserProfiler
-            
-            # Test parameters
-            batch_size = 16
-            sequence_length = 24
-            num_features = 2
-            n_topics = 5
-            num_clusters = 10
-            
-            # Create OnlineUserProfiler instance
-            online_profiler = OnlineUserProfiler(
-                n_topics=n_topics,
-                num_clusters=num_clusters,
-                decay=0.8,
-                random_state=42,
-                verbose=False
-            )
-            
-            # Test 1: Basic initialization
-            if not hasattr(online_profiler, 'kmeans'):
-                self._add_result("Online Profiler: Initialization", False, "Missing kmeans attribute")
-                return
-            else:
-                self._add_result("Online Profiler: Initialization", True,
-                               f"Initialized with {n_topics} topics, {num_clusters} clusters")
-            
-            # Create test data batches
+            from Data.normalizer import IndexedLogRevIN
+
+            B, L, F, eps = 8, 24, 5, 1e-5
+            revin = IndexedLogRevIN(num_features=F, eps=eps, affine=True)
+
             torch.manual_seed(42)
-            batch1_x = torch.abs(torch.randn(batch_size, sequence_length, num_features)) + 1.0
-            batch1_ids = torch.randint(0, 10, (batch_size,))
-            
-            batch2_x = torch.abs(torch.randn(batch_size, sequence_length, num_features)) + 1.0  
-            batch2_ids = torch.randint(5, 15, (batch_size,))  # Some overlap, some new users
-            
-            # Test 2: First batch processing
-            try:
-                profiles1 = online_profiler.update_and_get_profile(batch1_x, batch1_ids)
-                
-                expected_shape = (batch_size, n_topics)
-                if profiles1.shape != expected_shape:
-                    self._add_result("Online Profiler: First Batch Shape", False,
-                                   f"Expected {expected_shape}, got {profiles1.shape}")
-                else:
-                    self._add_result("Online Profiler: First Batch Shape", True,
-                                   f"Shape: {profiles1.shape}")
-                
-                # Check that profiles are valid probability distributions
-                profile_sums = torch.sum(profiles1, dim=1)
-                if not torch.allclose(profile_sums, torch.ones(batch_size), atol=1e-4):
-                    self._add_result("Online Profiler: Profile Normalization", False,
-                                   f"Profiles don't sum to 1: {profile_sums[:5]}")
-                else:
-                    self._add_result("Online Profiler: Profile Normalization", True,
-                                   "All profiles properly normalized")
-                    
-            except Exception as e:
-                self._add_result("Online Profiler: First Batch", False, str(e))
+            x = torch.abs(torch.randn(B, L, F) * 2.0 + 5.0)
+            ts = torch.tensor([1640995200 + i * 86400 for i in range(B)])
+
+            xn = revin(x.clone(), mode="norm", timestamp=ts)
+            if xn.shape != x.shape:
+                self._add_result("RevIN: Norm Shape", False, f"{xn.shape}")
                 return
-            
-            # Test 3: KMeans was updated
-            if not online_profiler.kmeans_initialized:
-                self._add_result("Online Profiler: KMeans Update", False,
-                               "KMeans not marked as initialized after first batch")
+            self._add_result("RevIN: Norm Shape", True, f"{xn.shape}")
+
+            std = torch.std(xn, dim=1)
+            if torch.allclose(std, torch.zeros_like(std), atol=1e-6):
+                self._add_result("RevIN: Variance", False, "Zero after norm")
             else:
-                cluster_centers_shape = online_profiler.cluster_centers_.shape
-                expected_centers_shape = (num_clusters, sequence_length * num_features)
-                if cluster_centers_shape != expected_centers_shape:
-                    self._add_result("Online Profiler: KMeans Centers", False,
-                                   f"Expected {expected_centers_shape}, got {cluster_centers_shape}")
-                else:
-                    self._add_result("Online Profiler: KMeans Centers", True,
-                                   f"Cluster centers shape: {cluster_centers_shape}")
-            
-            # Test 4: Second batch processing (incremental learning)
-            try:
-                profiles2 = online_profiler.update_and_get_profile(batch2_x, batch2_ids)
-                
-                if profiles2.shape != expected_shape:
-                    self._add_result("Online Profiler: Second Batch Shape", False,
-                                   f"Expected {expected_shape}, got {profiles2.shape}")
-                else:
-                    self._add_result("Online Profiler: Second Batch Shape", True,
-                                   "Incremental update successful")
-                
-                # Check that the model has learned from both batches
-                # The cluster centers should be different after the second batch
-                if torch.allclose(torch.tensor(online_profiler.cluster_centers_), 
-                                torch.zeros_like(torch.tensor(online_profiler.cluster_centers_))):
-                    self._add_result("Online Profiler: Incremental Learning", False,
-                                   "Cluster centers appear to be zeros")
-                else:
-                    self._add_result("Online Profiler: Incremental Learning", True,
-                                   "Model successfully updated with second batch")
-                    
-            except Exception as e:
-                self._add_result("Online Profiler: Second Batch", False, str(e))
-            
-            # Test 5: Handling empty/invalid data
-            try:
-                empty_x = torch.full((batch_size, sequence_length, num_features), float('nan'))
-                empty_ids = torch.randint(0, 5, (batch_size,))
-                
-                profiles_empty = online_profiler.update_and_get_profile(empty_x, empty_ids)
-                self._add_result("Online Profiler: Empty Data Handling", True,
-                               "Successfully handled batch with NaN values")
-            except Exception as e:
-                self._add_result("Online Profiler: Empty Data Handling", False, str(e))
-            
-            # Test 6: Interface compatibility with base UserProfiler
-            try:
-                # Test that it has the expected methods
-                if not hasattr(online_profiler, 'get_conditions'):
-                    self._add_result("Online Profiler: Interface Compatibility", False,
-                                   "Missing get_conditions method")
-                elif not hasattr(online_profiler, 'get_random_conditions'):
-                    self._add_result("Online Profiler: Interface Compatibility", False,
-                                   "Missing get_random_conditions method")
-                else:
-                    # Test get_random_conditions
-                    random_conds = online_profiler.get_random_conditions(8)
-                    if random_conds.shape != (8, n_topics):
-                        self._add_result("Online Profiler: Interface Compatibility", False,
-                                       f"get_random_conditions returned wrong shape: {random_conds.shape}")
-                    else:
-                        self._add_result("Online Profiler: Interface Compatibility", True,
-                                       "Interface compatible with base UserProfiler")
-            except Exception as e:
-                self._add_result("Online Profiler: Interface Compatibility", False, str(e))
-            
-            # Test 7: Check for proper decay/forgetting mechanism
-            if hasattr(online_profiler, 'decay') and online_profiler.decay != 1.0:
-                self._add_result("Online Profiler: Decay Parameter", True,
-                               f"Decay parameter set to {online_profiler.decay}")
+                self._add_result("RevIN: Variance", True,
+                                 f"std [{std.min().item():.4f}, {std.max().item():.4f}]")
+
+            xd = revin(xn.clone(), mode="denorm")
+            rel_err = (x - xd).abs().max().item() / (x.abs().max().item() + 1e-8)
+            if rel_err > 1e-3:
+                self._add_result("RevIN: Round-trip", False,
+                                 f"rel err = {rel_err:.6f}")
             else:
-                self._add_result("Online Profiler: Decay Parameter", False,
-                               "No decay/forgetting mechanism implemented")
-                
+                self._add_result("RevIN: Round-trip", True,
+                                 f"rel err = {rel_err:.6f}")
+
+            from torch.utils.data import TensorDataset, DataLoader as DL
+            dl = DL(TensorDataset(x, ts, ts), batch_size=B)
+            revin.update_monthly_stats(dl, month_key=202201)
+            if 202201 in revin.monthly_stats:
+                self._add_result("RevIN: Monthly Stats", True, "Stored")
+            else:
+                self._add_result("RevIN: Monthly Stats", False, "Not stored")
+
+            for tag, xt in [("constant", torch.ones(2, L, F) * 3.0),
+                             ("zeros", torch.zeros(2, L, F))]:
+                try:
+                    out = revin(xt.clone(), mode="norm")
+                    ok = not (torch.isnan(out).any() or torch.isinf(out).any())
+                    self._add_result(f"RevIN: {tag}", ok,
+                                     "Clean" if ok else "NaN/Inf")
+                except Exception as e:
+                    self._add_result(f"RevIN: {tag}", False, str(e))
+
+            if revin.affine:
+                ok = (hasattr(revin, "weight") and hasattr(revin, "bias")
+                      and revin.weight.shape == torch.Size([F])
+                      and revin.bias.shape == torch.Size([F]))
+                self._add_result("RevIN: Affine Params", ok,
+                                 "Correct shapes" if ok else "Bad shapes")
+
         except ImportError:
-            self._add_result("Online Profiler: Import", False, "Could not import OnlineUserProfiler")
+            self._add_result("RevIN: Import", False,
+                             "Could not import IndexedLogRevIN")
         except Exception as e:
-            self._add_result("Online Profiler: Overall", False, f"{type(e).__name__}: {str(e)}")
+            self._add_result("RevIN: Overall", False,
+                             f"{type(e).__name__}: {e}")
             if self.verbose:
                 traceback.print_exc()
-    
-    def _test_online_cvae(self):
-        """Test OnlineCVAE functionality and online learning capabilities."""
+
+    # ==================================================================
+    # 19. Online User Profiler
+    # ==================================================================
+
+    def _test_online_user_profiler(self):
+        """OnlineUserProfiler -- synthetic incremental-update test."""
         if self.verbose:
-            print("\n[13] Testing Online CVAE...")
-        
+            print("\n[19] Testing Online User Profiler...")
+
         try:
-            from src.Models import OnlineCVAE
-            from src.Conditioner import Conditioner, DayOfWeekConditioner, OnlineUserProfiler
-            from src.normalizer import IndexedLogRevIN
-            
-            # Test parameters
-            input_dim = 24  # 24-hour sequences
-            latent_dim = 8
-            batch_size = 16
-            
-            # Create online conditioner with OnlineUserProfiler
-            online_conditioner = Conditioner()
-            online_conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
-            online_conditioner.add_condition_item("user_profile", OnlineUserProfiler(
-                n_topics=5, 
-                num_clusters=10,
-                decay=0.9,
-                update_frequency=5,
-                random_state=42,
-                verbose=False
-            ))
-            
-            # Test 1: OnlineCVAE initialization
-            try:
-                online_cvae = OnlineCVAE(
-                    input_dim=input_dim,
-                    conditioner=online_conditioner,
-                    latent_dim=latent_dim,
-                    prior_type="standard_dictionary",
-                    device=self.device
-                )
-                online_cvae.to(self.device)
-                
-                if not hasattr(online_cvae, 'revin_normalizer'):
-                    self._add_result("Online CVAE: Initialization", False, "Missing RevIN normalizer")
-                    return
-                else:
-                    self._add_result("Online CVAE: Initialization", True,
-                                f"Successfully initialized with RevIN normalizer")
-                    
-            except Exception as e:
-                self._add_result("Online CVAE: Initialization", False, str(e))
+            from Data.Conditioner import OnlineUserProfiler
+
+            B, L, F, K, T = 16, 24, 2, 10, 5
+            op = OnlineUserProfiler(
+                n_topics=T, num_clusters=K, decay=0.8,
+                random_state=42, verbose=False)
+
+            if not hasattr(op, "kmeans"):
+                self._add_result("OnlineProf: Init", False, "Missing kmeans")
                 return
-            
-            # Create test data in correct format for OnlineCVAE
-            # OnlineCVAE expects 3D input [batch, seq_len, features]
-            test_data = torch.abs(torch.randn(batch_size, 24, 1, device=self.device)) + 1.0  # Positive values for energy
-            test_meter_ids = torch.randint(1, 11, (batch_size,), device=self.device)
-            test_timestamps = torch.randint(0, 365*24, (batch_size,), device=self.device)
-            
-            # Test 2: First batch training using train_core
-            try:
-                online_cvae.train()
-                optimizer = torch.optim.Adam(online_cvae.parameters(), lr=1e-3)
-                
-                # Create batch tuple in the format expected by train_core
-                batch = (test_data, test_meter_ids, test_timestamps)
-                
-                loss_dict = online_cvae.train_core(batch, optimizer, beta=1.0)
-                
-                # Check for the correct loss keys (based on VAE loss method)
-                expected_keys = ['loss', 'recon_loglikelihood', 'kl_divergence']
-                for key in expected_keys:
-                    if key not in loss_dict:
-                        self._add_result("Online CVAE: First Batch Training", False, 
-                                    f"Missing key '{key}' in train_core result")
-                        return
-                
-                # Check that losses are reasonable
-                total_loss = loss_dict['loss'].item()
-                if torch.isnan(torch.tensor(total_loss)) or torch.isinf(torch.tensor(total_loss)):
-                    self._add_result("Online CVAE: First Batch Training", False,
-                                f"Invalid loss: {total_loss}")
-                    return
-                    
-                self._add_result("Online CVAE: First Batch Training", True,
-                            f"First batch training successful, loss: {total_loss:.4f}")
-                    
-            except Exception as e:
-                self._add_result("Online CVAE: First Batch Training", False, str(e))
-                return
-            
-            # Test 3: Sampling
-            try:
-                online_cvae.eval()
-                
-                # Create conditions for sampling
-                sample_batch = 2
-                sample_conditions = online_cvae.conditioner.get_random_conditions(sample_batch)
-                if isinstance(sample_conditions, torch.Tensor):
-                    sample_conditions = sample_conditions.to(self.device)
-                else:
-                    sample_conditions = torch.tensor(sample_conditions, dtype=torch.float32).to(self.device)
-                
-                samples = online_cvae.sample(
-                    conditions=sample_conditions,
-                    num_prior_samples=4, 
-                    num_x_samples=1, 
-                    device=str(self.device),
-                    timestamps=torch.tensor([100, 200], device=self.device)
-                )
-                
-                # samples shape should be [S, num_x_samples, B, D] = [4, 1, 2, 24]
-                expected_sample_shape = (4, 1, sample_batch, input_dim)
-                if samples.shape == expected_sample_shape:
-                    self._add_result("Online CVAE: Sampling", True,
-                                f"Sampling successful, shape: {samples.shape}")
-                else:
-                    self._add_result("Online CVAE: Sampling", False,
-                                f"Sample shape {samples.shape} != expected {expected_sample_shape}")
-                    
-            except Exception as e:
-                self._add_result("Online CVAE: Sampling", False, str(e))
-            
-            # Test 4: Check RevIN normalization updates
-            normalizer_stats = len(online_cvae.revin_normalizer.monthly_stats)
-            # Monthly stats are updated via update_monthly_stats(), not per-batch,
-            # so it's expected to be 0 after individual training steps
-            self._add_result("Online CVAE: RevIN Updates", True,
-                        f"RevIN tracking {normalizer_stats} months (updated via update_monthly_stats)")
-            
-            # Test 5: Second batch (incremental learning)
-            try:
-                # Create a second batch with some overlap and new data
-                batch2_data = torch.abs(torch.randn(batch_size, 24, 1, device=self.device)) + 1.0
-                batch2_ids = torch.randint(5, 15, (batch_size,), device=self.device)  # Some overlap, some new
-                batch2_timestamps = test_timestamps + 24*3600  # Next day
-                
-                batch2 = (batch2_data, batch2_ids, batch2_timestamps)
-                loss2_dict = online_cvae.train_core(batch2, optimizer, beta=1.0)
-                
-                second_loss = loss2_dict['loss'].item()
-                self._add_result("Online CVAE: Second Batch Training", True,
-                            f"Second batch successful, loss: {second_loss:.4f}")
-                
-                # Test update_monthly_stats explicitly
-                from torch.utils.data import TensorDataset, DataLoader
-                combined_data = torch.cat([test_data, batch2_data], dim=0)
-                combined_ids = torch.cat([test_meter_ids, batch2_ids], dim=0)
-                combined_ts = torch.cat([test_timestamps, batch2_timestamps], dim=0)
-                test_dataset = TensorDataset(combined_data, combined_ids, combined_ts)
-                test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
-                
-                online_cvae.revin_normalizer.update_monthly_stats(test_dataloader, month_key=202301)
-                
-                if 202301 in online_cvae.revin_normalizer.monthly_stats:
-                    stats = online_cvae.revin_normalizer.monthly_stats[202301]
-                    self._add_result("Online CVAE: Incremental Learning", True,
-                                f"Monthly stats updated: mean={stats['mean']}, count={stats['count']}")
-                else:
-                    self._add_result("Online CVAE: Incremental Learning", False,
-                                "update_monthly_stats did not store stats")
-                    
-            except Exception as e:
-                self._add_result("Online CVAE: Second Batch Training", False, str(e))
-            
-            # Test 6: Interface compatibility
-            try:
-                # Test that it still works like regular CVAE for reconstruction
-                online_cvae.eval()
-                test_x = test_data[:4]  # [4, 24, 1]
-                test_ids = test_meter_ids[:4]
-                test_ts = test_timestamps[:4]
-                
-                with torch.no_grad():
-                    recon_params, posterior_params = online_cvae.reconstruct(
-                        test_x, test_ids, test_ts, num_samples=1
-                    )
-                    expected_recon_shape = (1, 4, 24)  # [samples, batch, input_dim]
-                    actual_shape = recon_params['mu'].shape
-                    
-                    if actual_shape == expected_recon_shape:
-                        self._add_result("Online CVAE: Interface Compatibility", True,
-                                    f"Compatible interface, recon shape: {actual_shape}")
-                    else:
-                        self._add_result("Online CVAE: Interface Compatibility", False,
-                                    f"Shape mismatch: got {actual_shape}, expected {expected_recon_shape}")
-                        
-            except Exception as e:
-                self._add_result("Online CVAE: Interface Compatibility", False, str(e))
-                
-            # Test 7: Memory efficiency
-            user_profiler = online_cvae.conditioner.condition_items.get("user_profile")
-            if hasattr(user_profiler, 'user_profiles_cache'):
-                num_cached = len(user_profiler.user_profiles_cache)
-                num_months = len(online_cvae.revin_normalizer.monthly_stats)
-                self._add_result("Online CVAE: Memory Efficiency", True,
-                            f"Cached users: {num_cached}, tracked months: {num_months}")
+            self._add_result("OnlineProf: Init", True,
+                             f"topics={T}, clusters={K}")
+
+            torch.manual_seed(42)
+            x1 = torch.abs(torch.randn(B, L, F)) + 1.0
+            ids1 = torch.randint(0, 10, (B,))
+            p1 = op.update_and_get_profile(x1, ids1)
+
+            if p1.shape != (B, T):
+                self._add_result("OnlineProf: Batch1", False,
+                                 f"Shape {p1.shape}")
             else:
-                self._add_result("Online CVAE: Memory Efficiency", False,
-                            "User profiler not caching profiles")
-                
+                self._add_result("OnlineProf: Batch1", True,
+                                 f"Shape {p1.shape}")
+                sums = torch.sum(p1, dim=1)
+                ok = torch.allclose(sums, torch.ones(B), atol=1e-4)
+                self._add_result("OnlineProf: Normalized", ok,
+                                 "Sum ~ 1" if ok else f"Sums: {sums[:5]}")
+
+            if not op.kmeans_initialized:
+                self._add_result("OnlineProf: KMeans", False, "Not init")
+            else:
+                self._add_result("OnlineProf: KMeans", True,
+                                 f"Centers {op.cluster_centers_.shape}")
+
+            x2 = torch.abs(torch.randn(B, L, F)) + 1.0
+            ids2 = torch.randint(5, 15, (B,))
+            p2 = op.update_and_get_profile(x2, ids2)
+            self._add_result("OnlineProf: Incremental",
+                             p2.shape == (B, T), f"Shape {p2.shape}")
+
+            try:
+                rc = op.get_random_conditions(8)
+                self._add_result("OnlineProf: Interface",
+                                 rc.shape == (8, T), f"Shape {rc.shape}")
+            except Exception as e:
+                self._add_result("OnlineProf: Interface", False, str(e))
+
+            if hasattr(op, "decay") and op.decay != 1.0:
+                self._add_result("OnlineProf: Decay", True,
+                                 f"decay = {op.decay}")
+            else:
+                self._add_result("OnlineProf: Decay", False, "No decay")
+
         except ImportError:
-            self._add_result("Online CVAE: Import", False, "Could not import OnlineCVAE")
+            self._add_result("OnlineProf: Import", False, "Could not import")
         except Exception as e:
-            self._add_result("Online CVAE: Overall", False, f"{type(e).__name__}: {str(e)}")
+            self._add_result("OnlineProf: Overall", False,
+                             f"{type(e).__name__}: {e}")
             if self.verbose:
                 traceback.print_exc()
-    
+
+    # ==================================================================
+    # 20. Online CVAE
+    # ==================================================================
+
+    def _test_online_cvae(self):
+        """OnlineCVAE lifecycle: init, train, sample, reconstruct."""
+        if self.verbose:
+            print("\n[20] Testing Online CVAE...")
+
+        try:
+            from src.Models.Online_CVAE import OnlineCVAE
+            from Data.Conditioner import (Conditioner, DayOfWeekConditioner,
+                                         OnlineUserProfiler)
+
+            input_dim, latent, B = 24, 8, 16
+
+            cond = Conditioner()
+            cond.add_condition_item("day_of_week", DayOfWeekConditioner())
+            cond.add_condition_item("user_profile", OnlineUserProfiler(
+                n_topics=5, num_clusters=10, decay=0.9,
+                update_frequency=5, random_state=42, verbose=False,
+            ))
+
+            norm = Normalizer("online_log1p")
+            try:
+                ocvae = OnlineCVAE(
+                    input_dim=input_dim, conditioner=cond,
+                    latent_dim=latent, prior_type="standard_dictionary",
+                    device=self.device, normalizer=norm,
+                )
+                ocvae.to(self.device)
+                self._add_result("OnlineCVAE: Init", True, "OK")
+            except Exception as e:
+                self._add_result("OnlineCVAE: Init", False, str(e))
+                return
+
+            td = torch.abs(torch.randn(B, 24, 1, device=self.device)) + 1.0
+            ids = torch.randint(1, 11, (B,), device=self.device)
+            ts = torch.randint(0, 365 * 24, (B,), device=self.device)
+            norm.fit(td)
+
+            # Train
+            try:
+                ocvae.train()
+                opt = torch.optim.Adam(ocvae.parameters(), lr=1e-3)
+                ld1 = ocvae.train_core((td, ids, ts), opt, beta=1.0)
+                loss1 = ld1["loss"].item()
+                if not np.isfinite(loss1):
+                    self._add_result("OnlineCVAE: Train", False,
+                                     f"loss = {loss1}")
+                    return
+                self._add_result("OnlineCVAE: Train", True,
+                                 f"loss = {loss1:.4f}")
+            except Exception as e:
+                self._add_result("OnlineCVAE: Train", False, str(e))
+                return
+
+            # Sample
+            try:
+                ocvae.eval()
+                sc = ocvae.conditioner.get_random_conditions(2)
+                sc = _to_tensor(sc, self.device)
+                samples = ocvae.sample(
+                    conditions=sc, num_prior_samples=4, num_x_samples=1,
+                    device=str(self.device)
+                )
+                exp = (4, 1, 2, input_dim)
+                self._add_result(
+                    "OnlineCVAE: Sample",
+                    samples.shape == exp,
+                    f"Shape {samples.shape}"
+                    + ("" if samples.shape == exp else f" != {exp}"))
+            except Exception as e:
+                self._add_result("OnlineCVAE: Sample", False, str(e))
+
+            # Second batch
+            try:
+                ocvae.train()
+                td2 = torch.abs(
+                    torch.randn(B, 24, 1, device=self.device)) + 1.0
+                ids2 = torch.randint(5, 15, (B,), device=self.device)
+                ld2 = ocvae.train_core((td2, ids2, ts + 86400), opt, beta=1.0)
+                self._add_result("OnlineCVAE: Incremental", True,
+                                 f"loss = {ld2['loss'].item():.4f}")
+            except Exception as e:
+                self._add_result("OnlineCVAE: Incremental", False, str(e))
+
+            # Reconstruct
+            try:
+                ocvae.eval()
+                with torch.no_grad():
+                    rp, qp = ocvae.reconstruct(
+                        td[:4], ids[:4], ts[:4], num_samples=1)
+                exp_r = (1, 4, input_dim)
+                self._add_result("OnlineCVAE: Reconstruct",
+                                 rp["mu"].shape == exp_r,
+                                 f"Shape {rp['mu'].shape}")
+            except Exception as e:
+                self._add_result("OnlineCVAE: Reconstruct", False, str(e))
+
+            # Memory
+            up = ocvae.conditioner.condition_items.get("user_profile")
+            if hasattr(up, "user_profiles_cache"):
+                self._add_result(
+                    "OnlineCVAE: Memory", True,
+                    f"Cached: {len(up.user_profiles_cache)} users, "
+                    f"{len(ocvae.normalizer.monthly_stats)} months")
+            else:
+                self._add_result("OnlineCVAE: Memory", False,
+                                 "No profile cache")
+
+        except ImportError:
+            self._add_result("OnlineCVAE: Import", False,
+                             "Could not import OnlineCVAE")
+        except Exception as e:
+            self._add_result("OnlineCVAE: Overall", False,
+                             f"{type(e).__name__}: {e}")
+            if self.verbose:
+                traceback.print_exc()
+
+    # ==================================================================
+    # Report
+    # ==================================================================
+
     def _generate_report(self) -> bool:
-        """Generate and print validation report."""
         if self.verbose:
             print("\n" + "=" * 80)
             print("VALIDATION REPORT")
             print("=" * 80)
-        
+
         passed = [r for r in self.results if r.passed]
         failed = [r for r in self.results if not r.passed]
-        
-        pass_rate = len(passed) / len(self.results) * 100 if self.results else 0
-        
+        rate = len(passed) / len(self.results) * 100 if self.results else 0
+
         if self.verbose:
-            print(f"\nResults: {len(passed)}/{len(self.results)} tests passed ({pass_rate:.1f}%)")
-            
+            print(f"\nResults: {len(passed)}/{len(self.results)} "
+                  f"passed ({rate:.1f}%)")
             if failed:
                 print(f"\n{'!' * 80}")
                 print(f"FAILED TESTS ({len(failed)}):")
-                print('!' * 80)
+                print("!" * 80)
                 for r in failed:
-                    print(f"\n✗ {r.name}")
-                    print(f"  Message: {r.message}")
+                    print(f"\n  x {r.name}")
+                    print(f"    {r.message}")
                     if r.details:
-                        print(f"  Details: {r.details}")
-            
+                        print(f"    {r.details}")
             print("\n" + "=" * 80)
-            if len(failed) == 0:
-                print("✓ ALL TESTS PASSED - Model is ready for training!")
+            if not failed:
+                print("ALL TESTS PASSED")
             else:
-                print(f"✗ {len(failed)} TEST(S) FAILED - Please fix issues before training")
+                print(f"{len(failed)} FAILED")
             print("=" * 80 + "\n")
-        
-        return len(failed) == 0
-    
 
+        return len(failed) == 0
+
+
+# ===========================================================================
+# Convenience entry points
+# ===========================================================================
 
 def validate_before_training(
     model,
@@ -1375,13 +1425,8 @@ def validate_before_training(
     device="cpu",
     verbose=True,
 ) -> bool:
-    """
-    Convenience function to run validation.
-    
-    Returns:
-        bool: True if all tests passed, False otherwise
-    """
-    validator = ModelValidator(
+    """Run the full validation suite.  Returns True when everything passes."""
+    v = ModelValidator(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -1390,30 +1435,18 @@ def validate_before_training(
         device=device,
         verbose=verbose,
     )
-    return validator.run_all_tests()
+    return v.run_all_tests()
 
 
 def create_test_dataset_if_missing():
-    """
-    Check if test dataset exists, if not, prompt to create it.
-    
-    Returns:
-        bool: True if test dataset exists or was created
-    """
     test_file = "data/test_data_small.csv"
     if os.path.exists(test_file):
         return True
-    
-    print("\n" + "="*80)
-    print("OPTIONAL: Create small test dataset for faster validation")
-    print("="*80)
-    print(f"Test dataset not found: {test_file}")
-    print("\nCreate it with:")
-    print("  python src/create_test_data.py")
-    print("\nThis will create a 10 meters × 2 days subset for ~instant validation.")
-    print("="*80 + "\n")
+    print(f"\nTest dataset not found: {test_file}")
+    print("Create it with:  python src/test/create_test_data.py\n")
     return False
 
 
 if __name__ == "__main__":
-    print("Run this module via train.py with validation enabled")
+    print("Run this module via train.py with validation enabled,")
+    print("or via pytest:  uv run pytest src/test/test_validation.py -v")

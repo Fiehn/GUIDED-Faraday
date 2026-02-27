@@ -3,11 +3,13 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
-from src.encoder_decoder_model import *
-from src.Conditioner import *
-from src.Models import *
-from src.dataloader import *
-from src.normalizer import *
+from src.Models.encoder_decoder_model import *
+from src.Data.Conditioner import *
+from src.Models.CVAE import *
+from src.Models.VAE import *
+from src.Models.Online_CVAE import *
+from src.Data.dataloader import *
+from src.Data.normalizer import *
 import matplotlib.pyplot as plt
 import yaml
 
@@ -47,7 +49,10 @@ def load_model_and_visualize(
     
     # Use the new unified loading method
     try:
-        from src.Models import VAE, CVAE
+        # VAE and CVAE classes are already imported at the top of this file
+        # via `from src.Models.VAE import *` and `from src.Models.CVAE import *`.
+        # Do NOT do `from src.Models import VAE, CVAE` here — that would import
+        # the *modules* (VAE.py / CVAE.py), shadowing the class names.
         
         # The load_from_checkpoint method automatically handles both new and legacy formats
         model = VAE.load_from_checkpoint(model_path, device)
@@ -236,7 +241,7 @@ def _load_model_legacy(model_path, data_config, output_dir, device, num_reconstr
         print(f"  - Prior type: {prior_type}")
         
         # Recreate conditioner (must match training!)
-        from src.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
+        from src.Data.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
         conditioner = Conditioner()
         conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
         conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=False))
@@ -526,7 +531,7 @@ def _visualize_reconstructions(
         is_cvae: bool,
     ) -> str:
     with torch.no_grad():
-        x, meter_id, timestamps = next(iter(test_loader))
+        x, meter_id, timestamps, _ = next(iter(test_loader))
         x = x.to(device)
         timestamps = timestamps.to(device)
         x_original = x  # This is normalized
@@ -754,7 +759,7 @@ def _visualize_latent_space(model, test_loader, device, output_dir, model_tag):
     labels = []
     
     with torch.no_grad():
-        for x, meter_id, timestamps in test_loader:
+        for x, meter_id, timestamps, _ in test_loader:
             x = x.to(device)
             x_flat = x.reshape(x.shape[0], -1)
             
@@ -835,7 +840,7 @@ def _visualize_synthetic_recreations(model, test_loader, normalizer, device, out
     
     with torch.no_grad():
         # Get a batch from test loader
-        x, meter_id, timestamps = next(iter(test_loader))
+        x, meter_id, timestamps, _ = next(iter(test_loader))
         x = x.to(device)
         timestamps = timestamps.to(device)
         

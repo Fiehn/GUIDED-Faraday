@@ -13,9 +13,9 @@ sys.path.append(parent_dir)
 
 
 def create_test_dataset(
-    input_file: str = "data/hourly_measurements_2023_10.csv",
+    input_file: str = "data/hourly_measurements_2023_12.csv",
     output_file: str = "data/test_data_small.csv",
-    num_meters: int = 10,
+    num_meters: int = 40,
     num_days: int = 2,
 ):
     """
@@ -27,7 +27,7 @@ def create_test_dataset(
         num_meters: Number of meters to include
         num_days: Number of days to include per meter
     """
-    print(f"Creating test dataset: {num_meters} meters × {num_days} days")
+    print(f"Creating test dataset: {num_meters} meters * {num_days} days")
     print(f"Reading from: {input_file}")
     
     # Read full data
@@ -90,11 +90,11 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Create small test dataset for validation")
-    parser.add_argument("--input", type=str, default="data/hourly_measurements_2023_10.csv",
+    parser.add_argument("--input", type=str, default="data/hourly_measurements_2023_12.csv",
                        help="Input CSV file")
     parser.add_argument("--output", type=str, default="data/test_data_small.csv",
                        help="Output CSV file")
-    parser.add_argument("--meters", type=int, default=10,
+    parser.add_argument("--meters", type=int, default=40,
                        help="Number of meters to include")
     parser.add_argument("--days", type=int, default=2,
                        help="Number of days per meter")

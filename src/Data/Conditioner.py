@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import json
 
 # =============
 # LDA conditions and user profiles
@@ -12,6 +13,20 @@ from sklearn.cluster import KMeans, MiniBatchKMeans
 from scipy.spatial.distance import cdist
 import pickle
 from tqdm import tqdm
+
+
+class _CompatUnpickler(pickle.Unpickler):
+    """Unpickler that remaps stale module paths to the current package layout."""
+    _MODULE_MAP = {
+        # old path          : new path
+        'src.Conditioner'   : 'src.Data.Conditioner',
+        'Data.Conditioner'  : 'src.Data.Conditioner',
+        'Conditioner'       : 'src.Data.Conditioner',
+    }
+
+    def find_class(self, module, name):
+        module = self._MODULE_MAP.get(module, module)
+        return super().find_class(module, name)
 import os
 
 class UserProfiler(LatentDirichletAllocation):
@@ -68,7 +83,7 @@ class UserProfiler(LatentDirichletAllocation):
         batch_count = 0
         total_timesteps = 0
 
-        for x, meter_id, timestamps in tqdm(train_loader, desc="Clustering batches"):
+        for x, meter_id, timestamps, _ in tqdm(train_loader, desc="Clustering batches"):
             batch_size, seq_len, num_features = x.shape
             x_daily_patterns = x.cpu().numpy().reshape(batch_size, seq_len * num_features)  # [B, L*F]
 
@@ -91,7 +106,7 @@ class UserProfiler(LatentDirichletAllocation):
         # === Phase 2: Create corpus and fit LDA model ===
         meter_corpus = {} # dict: meter_id -> cluster counts
 
-        for x, meter_id, timestamps in tqdm(train_loader, desc="Creating corpus batches"):
+        for x, meter_id, timestamps, _ in tqdm(train_loader, desc="Creating corpus batches"):
             batch_size, seq_len, num_features = x.shape
             x_batch = x.cpu().numpy().reshape(batch_size, seq_len * num_features)  # [B*T, F]
             meter_id_flat = meter_id.cpu().numpy() 
@@ -298,20 +313,20 @@ class UserProfiler(LatentDirichletAllocation):
     
     @staticmethod
     def load(path):
-        """Load model with cached profiles."""
+        """Load model with cached profiles (handles stale module paths via _CompatUnpickler)."""
         with open(path, "rb") as f:
-            obj = pickle.load(f)
-            
+            obj = _CompatUnpickler(f).load()
         
         if hasattr(obj, 'verbose') and obj.verbose:
             print(f"Loaded model with {len(obj.user_profiles_cache)} cached profiles")
             print(f"Cluster centers shape: {obj.cluster_centers_.shape}")
         
         return obj
-    def load(self,path):
-        """Load model with cached profiles."""
+
+    def load(self, path):
+        """Instance-level load: update self from pickle (handles stale module paths)."""
         with open(path, "rb") as f:
-            obj = pickle.load(f)
+            obj = _CompatUnpickler(f).load()
             self.__dict__.update(obj.__dict__)
             if hasattr(self, 'verbose') and self.verbose:
                 print(f"Loaded model with {len(self.user_profiles_cache)} cached profiles")
@@ -529,6 +544,80 @@ class DayOfWeekConditioner():
         dow_onehot = F.one_hot(random_days, num_classes=7).float()
         return dow_onehot
 
+class MonthOfYearConditioner():
+    def __init__(self):
+        self.condition_dim = 12
+
+    def get_conditions(self,x, meter_id, timestamps):
+        if isinstance(timestamps, torch.Tensor):
+            device = timestamps.device
+            # Convert Unix timestamps to months (0-11)
+            months = ((timestamps / 86400 / 30 + 1) % 12).long()  # Approximate month calculation
+        else:
+            months = []
+            for ts in timestamps:
+                if isinstance(ts, (int, float)):
+                    ts = pd.Timestamp(ts, unit='s')
+                months.append(ts.month - 1)  # pandas month is 1-12, we want 0-11
+            months = torch.tensor(months, dtype=torch.long)
+            device = 'cpu'
+        
+        moy_onehot = F.one_hot(months, num_classes=12).float().to(device)
+        return moy_onehot
+    
+    def get_random_conditions(self, batch_size):
+        random_months = torch.randint(0,12,(batch_size,))
+        moy_onehot = F.one_hot(random_months, num_classes=12).float()
+        return moy_onehot
+
+class HolidayConditioner():
+    # https://helligdage-dk.dk/helligdage-2024/
+    def __init__(self, holiday_path='data/holidays/denmark_holidays.json'):
+        self.condition_dim = 1
+        with open(holiday_path, 'r') as f:
+            holidays = json.load(f)
+        self.holiday_dates = set(pd.to_datetime(holidays['dates']).date)
+    def get_conditions(self,x, meter_id, timestamps):
+        if isinstance(timestamps, torch.Tensor):
+            device = timestamps.device
+            dates = pd.to_datetime(timestamps.cpu().numpy(), unit='s').date
+            is_holiday = torch.tensor([1.0 if d in self.holiday_dates else 0.0 for d in dates], device=device).unsqueeze(1)
+        else:
+            is_holiday = []
+            for ts in timestamps:
+                if isinstance(ts, (int, float)):
+                    ts = pd.Timestamp(ts, unit='s')
+                is_holiday.append(1.0 if ts.date() in self.holiday_dates else 0.0)
+            is_holiday = torch.tensor(is_holiday, dtype=torch.float32).unsqueeze(1)
+        return is_holiday
+    
+    def get_random_conditions(self, batch_size):
+        random_holiday = torch.randint(0,2,(batch_size,1)).float()
+        return random_holiday
+
+class SchoolHolidayConditioner():
+    def __init__(self):
+        self.condition_dim = 1
+        # Define school holiday periods (example for Denmark)
+        # Weeks 7, 27-32, 43
+        
+    def get_conditions(self,x, meter_id, timestamps):
+        if isinstance(timestamps, torch.Tensor):
+            device = timestamps.device
+            dates = pd.to_datetime(timestamps.cpu().numpy(), unit='s')
+            is_school_holiday = torch.tensor([1.0 if (d.weekofyear in [7,27,28,29,30,31,32,43]) else 0.0 for d in dates], device=device).unsqueeze(1)
+        else:
+            is_school_holiday = []
+            for ts in timestamps:
+                if isinstance(ts, (int, float)):
+                    ts = pd.Timestamp(ts, unit='s')
+                is_school_holiday.append(1.0 if (ts.weekofyear in [7,27,28,29,30,31,32,43]) else 0.0)
+            is_school_holiday = torch.tensor(is_school_holiday, dtype=torch.float32).unsqueeze(1)
+        return is_school_holiday
+    
+    def get_random_conditions(self, batch_size):
+        random_school_holiday = torch.randint(0,2,(batch_size,1)).float()
+        return random_school_holiday
 
 # =============
 # Conditioner Module - Holds an object that creates and determines type of conditioning to be used in Models
