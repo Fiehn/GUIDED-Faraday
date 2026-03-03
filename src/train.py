@@ -347,6 +347,38 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         last_test_loader = test_loader
         last_data_file   = data_file
 
+    # Evaluation framework On last test set (from the last file) after all training is done
+    from src.eval_framework import EvalFramework
+    from src.eval_framework import (
+        ReconstructionMSE, ReconstructionMSE, ReconstructionRMSE, ReconstructionLogLikelihood, FlexibilityDistance,
+        MaximumMeanDiscrepancy, ACFDistribution, VisualEvaluation, ClassicalStatistics, TSTR
+    )
+    # Create evaluator
+    evaluator = EvalFramework(model, last_test_loader, normalizer, device='cpu')
+    
+    # Register reconstruction metrics
+    evaluator.register_metrics([
+        ReconstructionMSE(),
+        ReconstructionRMSE(),
+        ReconstructionLogLikelihood(),
+        FlexibilityDistance(tau='auto', normalize=True),
+    ])
+    
+    # Register synthetic metrics
+    evaluator.register_metrics([
+        MaximumMeanDiscrepancy(),
+        ACFDistribution(),
+        ClassicalStatistics(),
+        #TSTR(model, last_test_loader),
+        VisualEvaluation()
+    ])
+    
+    # Run all metrics (will print reconstruction section, then synthetic section)
+    results = evaluator.evaluate()
+    
+    # Save results
+    evaluator.save_results('Output/eval_results.json')
+
     # Visualize using the last file's test set
     if last_test_loader is not None and last_data_file is not None:
         model.to('cpu')
@@ -375,7 +407,7 @@ if __name__ == "__main__":
     # run_test(model_type="vae", skip_validation=False)  # VAE with validation
     # run_test(model_type="cvae", skip_validation=False)  # CVAE with validation
     # run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
-     online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
+    online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
     #run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
 
 

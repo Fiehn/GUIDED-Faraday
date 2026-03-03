@@ -169,18 +169,48 @@ def load_model_and_visualize(
     )
     viz_path.update(synth_recreation_path)
     
-    summary_path = _save_model_summary(
-        model=model,
-        model_kwargs=checkpoint.get('model_kwargs', {}),
-        output_dir=output_dir,
-        model_tag=model_tag,
-    )
-    viz_path['model_summary'] = summary_path
+    evalutation_path = _run_evaluation_framework(model, test_loader, normalizer, device, output_dir, model_tag)
+    viz_path.update(evalutation_path)
 
     print("All visualizations saved.")
     print(viz_path)
     return viz_path
 
+def _run_evaluation_framework(model, test_loader, normalizer, device, output_dir, model_tag):
+    # Evaluation framework On last test set (from the last file) after all training is done
+    from src.eval_framework import EvalFramework
+    from src.eval_framework import (
+        ReconstructionMSE, ReconstructionMSE, ReconstructionRMSE, ReconstructionLogLikelihood, FlexibilityDistance,
+        MaximumMeanDiscrepancy, ACFDistribution, VisualEvaluation, ClassicalStatistics #, TSTR
+    )
+
+    # Create evaluator
+    evaluator = EvalFramework(model, test_loader, normalizer, device='cpu')
+    
+    # Register reconstruction metrics
+    evaluator.register_metrics([
+        ReconstructionMSE(),
+        ReconstructionRMSE(),
+        ReconstructionLogLikelihood(),
+        FlexibilityDistance(tau='auto', normalize=True),
+    ])
+    
+    # Register synthetic metrics
+    evaluator.register_metrics([
+        MaximumMeanDiscrepancy(max_samples=2000),
+        ACFDistribution(),
+        ClassicalStatistics(),
+        #TSTR(model, test_loader),
+        VisualEvaluation()
+    ])
+    
+    # Run all metrics (will print reconstruction section, then synthetic section)
+    results = evaluator.evaluate()
+    
+    path = os.path.join(output_dir, f"{model_tag}_evaluation_results.yaml")
+    # Save results
+    evaluator.save_results(path)
+    return {"evaluation_results:": path}
 
 def _load_model_legacy(model_path, data_config, output_dir, device, num_reconstructions, num_synthetic_samples, num_samples_per_original):
     """
@@ -408,14 +438,9 @@ def _load_model_legacy(model_path, data_config, output_dir, device, num_reconstr
         model_tag=model_tag,
     )
     viz_path.update(synth_recreation_path)
-    
-    summary_path = _save_model_summary(
-        model=model,
-        model_kwargs=model_kwargs,
-        output_dir=output_dir,
-        model_tag=model_tag,
-    )
-    viz_path['model_summary'] = summary_path
+
+    evalutation_path = _run_evaluation_framework(model, test_loader, normalizer, device, output_dir, model_tag)
+    viz_path.update(evalutation_path)
 
     print("Legacy model loaded and visualizations saved.")
     print(viz_path)
@@ -507,13 +532,6 @@ def visualize_trained_model(
     )
     viz_path.update(user_profile_path)
 
-    summary_path = _save_model_summary(
-        model=model,
-        model_kwargs={},
-        output_dir=output_dir,
-        model_tag=model_tag,
-    )
-    viz_path['model_summary'] = summary_path
     print("All visualizations saved.")
     print(viz_path)
     return viz_path

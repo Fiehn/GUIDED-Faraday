@@ -91,6 +91,8 @@ class EvalFramework:
         normalizer=None,
         conditioner=None, 
         device: str = 'cpu',
+        window_size: int = 24,
+        n_synthetic_samples: int = 1000
     ):
         """Initialize evaluation framework.
         
@@ -106,12 +108,145 @@ class EvalFramework:
         self.normalizer = normalizer
         self.conditioner = conditioner
         self.device = device
+
+        self.window_size = window_size
+        self.n_synthetic_samples = n_synthetic_samples
         
         # Metrics storage 
         self.reconstruction_metrics: Dict[str, ReconstructionMetric] = {}
         self.synthetic_metrics: Dict[str, SyntheticMetric] = {}
         self.results: Dict[str, float] = {}
-        
+
+        self._real_data: np.ndarray = None  # Cache real data for synthetic metrics that need it
+        self._reconstructed_data: np.ndarray = None  # Cache reconstructed data for metrics that need it
+        self._syntheric_data: np.ndarray = None  # Cache synthetic data for metrics that need it
+
+    def _is_cvae(self) -> bool:
+        """Check if model is a CVAE based on presence of conditioner on the model."""
+        return hasattr(self.model, 'conditioner') and self.model.conditioner is not None
+    
+    def _prepare_data(self) -> None:
+        """Extract real data, reconstructed data, and synthetic data for metrics that need it."""
+        print("Preparing data for evaluation metrics...")
+        real_batches = []
+        recon_batches = []
+        condition_batches = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for batch in self.dataloader:
+                if isinstance(batch, (list, tuple)):
+                    x = batch[0].to(self.device)
+                    meter_id = batch[1] if len(batch) > 1 else None
+                    timestamps = batch[2].to(self.device) if len(batch) > 2 else None
+                else:
+                    x = batch.to(self.device)
+                    meter_id = None
+                    timestamps = None
+
+                x_flat = x.reshape(x.shape[0], -1) if x.dim() == 3 else x
+                real_batches.append(x_flat.cpu().numpy())
+
+                recon = self._reconstruct(x, meter_id=meter_id, timestamps=timestamps)
+                recon_batches.append(recon.cpu().numpy())
+
+                if self._is_cvae():
+                    # Use the model's own conditioner, not self.conditioner
+                    c = self.model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
+                    c = self.model.move_to_device(c, device=self.device)
+                    condition_batches.append(c.cpu())
+
+        self._real_data = np.concatenate(real_batches, axis=0)
+        self._reconstructed_data = np.concatenate(recon_batches, axis=0)
+
+        if self._is_cvae() and condition_batches:
+            all_conditions = torch.cat(condition_batches, dim=0)
+            n = self.n_synthetic_samples
+            if len(all_conditions) >= n:
+                idx = torch.randperm(len(all_conditions))[:n]
+                self._synthetic_conditions = all_conditions[idx]
+            else:
+                repeats = (n // len(all_conditions)) + 1
+                self._synthetic_conditions = all_conditions.repeat(repeats, 1)[:n]
+        else:
+            self._synthetic_conditions = None
+
+        self._synthetic_data = self._generate_synthetic(self.n_synthetic_samples)
+
+        print(f"  Real: {self._real_data.shape} | "
+              f"Reconstructed: {self._reconstructed_data.shape} | "
+              f"Synthetic: {self._synthetic_data.shape}")
+
+    
+    def _reconstruct(self, x: torch.Tensor, meter_id=None, timestamps=None) -> torch.Tensor:
+        """Reconstruct via encoder-decoder, using real conditions for CVAE."""
+        with torch.no_grad():
+            x_flat = x.reshape(x.shape[0], -1) if x.dim() == 3 else x
+
+            if self._is_cvae():
+                # Use the model's own conditioner with real meter_id and timestamps
+                c = self.model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
+                c = self.model.move_to_device(c, device=self.device)
+                recon_params, _ = self.model.forward(x_flat, c, num_samples=1)
+            else:
+                recon_params, _ = self.model.forward(x_flat, num_samples=1)
+
+            if isinstance(recon_params, dict):
+                mu = recon_params.get('mu')
+                if mu is not None:
+                    recon = mu[0] if mu.dim() == 3 else mu
+                else:
+                    for key in ['recon', 'x_recon', 'reconstruction', 'x']:
+                        if key in recon_params:
+                            v = recon_params[key]
+                            recon = v[0] if v.dim() == 3 else v
+                            break
+                    else:
+                        raise ValueError(f"Cannot find reconstruction in decoder output. Keys: {list(recon_params.keys())}")
+            else:
+                recon = recon_params[0] if recon_params.dim() == 3 else recon_params
+
+        return recon  # [B, D]
+    
+    def _generate_synthetic(self, n_samples: int) -> np.ndarray:
+        """Sample from prior using real conditions to match the real data distribution."""
+        with torch.no_grad():
+            if self._is_cvae():
+                # Use real conditions collected during _prepare_data
+                c = self._synthetic_conditions.to(self.device)  # [n_samples, C]
+
+                samples = self.model.sample(
+                    conditions=c,
+                    num_prior_samples=1,
+                    num_x_samples=1,
+                    device=self.device,
+                )
+                # [1, 1, B, D] -> [B, D]
+                synthetic_flat = samples[0, 0]
+
+            else:
+                result = self.model.sample(
+                    num_samples_prior=n_samples,
+                    num_samples_posterior=1,
+                )
+                synthetic_flat = result["samples"][:, 0, 0, :]  # [n_samples, D]
+
+        return synthetic_flat.cpu().numpy()
+
+    def _inject_data_into_metrics(self) -> None:
+        """Inject prepared data into metrics that need it."""
+        for metric in self.reconstruction_metrics.values():
+            metric.real_data = self._real_data
+            metric.reconstructed_data = self._reconstructed_data
+            metric.model = self.model
+            metric.device = self.device
+
+        for metric in self.synthetic_metrics.values():
+            metric.real_data = self._real_data
+            metric.synthetic_data = self._synthetic_data
+            metric.model = self.model
+            metric.device = self.device
+
     def register_metric(self, metric: EvaluationMetric) -> None:
         """Register an evaluation metric.
         
@@ -145,6 +280,10 @@ class EvalFramework:
         print("EVALUATION FRAMEWORK")
         print("="*70 + "\n")
         
+        # Prepare data for metrics that need it (reconstructions, synthetic samples)
+        self._prepare_data()
+        self._inject_data_into_metrics()
+
         self.results = {}
         
         # Run reconstruction metrics
@@ -276,10 +415,8 @@ class EvalFramework:
 class ReconstructionMSE(ReconstructionMetric):
     """Mean squared error on reconstruction."""
     
-    def __init__(self, model, dataloader, device='cpu'):
-        self.model = model
-        self.dataloader = dataloader
-        self.device = device
+    real_data: np.ndarray = None
+    reconstructed_data: np.ndarray = None
     
     @property
     def name(self) -> str:
@@ -287,17 +424,16 @@ class ReconstructionMSE(ReconstructionMetric):
     
     def compute(self) -> float:
         """Compute reconstruction MSE on test data."""
-        # TODO: Implement reconstruction MSE computation
-        return 0.0
+        diff = self.real_data - self.reconstructed_data
+        mse = np.mean(diff ** 2)
+        return float(mse)
 
 # TODO: implement this 
 class ReconstructionRMSE(ReconstructionMetric):
     """Mean absolute error on reconstruction."""
     
-    def __init__(self, model, dataloader, device='cpu'):
-        self.model = model
-        self.dataloader = dataloader
-        self.device = device
+    real_data: np.ndarray = None
+    reconstructed_data: np.ndarray = None
     
     @property
     def name(self) -> str:
@@ -305,18 +441,17 @@ class ReconstructionRMSE(ReconstructionMetric):
     
     def compute(self) -> float:
         """Compute reconstruction RMSE on test data."""
-        # TODO: Implement reconstruction RMSE computation
-        return 0.0
+        diff = self.real_data - self.reconstructed_data
+        rmse = np.sqrt(np.mean(diff ** 2))
+        return float(rmse)
 
 
 # TODO: implement this 
 class ReconstructionLogLikelihood(ReconstructionMetric):
     """Log-likelihood of reconstruction."""
-    
-    def __init__(self, model, dataloader, device='cpu'):
-        self.model = model
-        self.dataloader = dataloader
-        self.device = device
+
+    real_data: np.ndarray = None
+    reconstructed_data: np.ndarray = None
     
     @property
     def name(self) -> str:
@@ -325,6 +460,7 @@ class ReconstructionLogLikelihood(ReconstructionMetric):
     def compute(self) -> float:
         """Compute reconstruction log-likelihood."""
         # TODO: Implement reconstruction log-likelihood
+        # TODO: needs the prior and likelihood from the model, and may require sampling or approximation
         return 0.0
     
 
@@ -337,18 +473,15 @@ class FlexibilityDistance(ReconstructionMetric):
     the minimum reshaping cost.
     """
     
-    def __init__(self, model, real_data, device='cpu', tau='auto', normalize=True):
+    real_data: np.ndarray = None
+    reconstructed_data: np.ndarray = None
+
+    def __init__(self, tau='auto', normalize=True):
         """
         Args:
-            model: Trained VAE/CVAE model
-            real_data: Real data array [N, D] (flattened windows) to reconstruct
-            device: Device to run on ('cpu' or 'cuda')
             tau: Temporal scaling factor. Use 'auto' to set tau = data_range / D.
             normalize: If True, divide per-sample cost by D (per-hour average).
         """
-        self.model = model
-        self.real_data = real_data
-        self.device = device
         self.tau = tau
         self.normalize = normalize
     
@@ -360,7 +493,6 @@ class FlexibilityDistance(ReconstructionMetric):
         """Compute flexibility distance metric.
         
         Process:
-        1. Pass real data through encoder-decoder (reconstruct)
         2. For each window, build cost matrix and solve linear assignment
         3. Return average FD across windows (optionally normalized per hour)
         
@@ -368,63 +500,8 @@ class FlexibilityDistance(ReconstructionMetric):
             Flexibility Distance (lower is better, 0 = perfect reconstruction)
         """
         
-        # Convert to tensor
-        real_tensor = torch.FloatTensor(self.real_data).to(self.device)
-        
-        # Flatten if needed (handle 3D [batch, length, features] -> [batch, length*features])
-        if real_tensor.dim() == 3:
-            batch_size, length, features = real_tensor.shape
-            real_flat = real_tensor.reshape(batch_size, -1)  # [batch, length*features]
-        else:
-            real_flat = real_tensor
-        
-        # Reconstruct data through encoder-decoder
-        self.model.eval()
-        with torch.no_grad():
-            # For CVAE: need to create dummy conditions to match training
-            if hasattr(self.model, 'condition_dim') and self.model.condition_dim > 0:
-                # CVAE: need conditions
-                batch_size = real_flat.shape[0]
-                c = torch.zeros(batch_size, self.model.condition_dim).to(self.device)
-                enc_input = torch.cat([real_flat, c], dim=-1)
-            else:
-                # VAE: no conditions needed
-                enc_input = real_flat
-            
-            # Encode
-            q_params = self.model.encoder(enc_input)
-            z = self.model.encoder.reparameterize(q_params, num_samples=1).squeeze(0)  # [batch, latent_dim]
-            
-            # Decode
-            if hasattr(self.model, 'condition_dim') and self.model.condition_dim > 0:
-                # CVAE: need to concat conditions to latent
-                dec_input = torch.cat([z, c], dim=-1)
-            else:
-                # VAE: just use latent
-                dec_input = z
-            
-            # Get reconstruction parameters
-            recon_params = self.model.decoder(dec_input)
-            
-            # Extract mu (mean) from reconstruction parameters
-            if isinstance(recon_params, dict):
-                if 'mu' in recon_params:
-                    reconstructed = recon_params['mu']
-                else:
-                    # Try other keys
-                    for key in ['recon', 'x_recon', 'reconstruction', 'x']:
-                        if key in recon_params:
-                            reconstructed = recon_params[key]
-                            break
-                    else:
-                        raise ValueError(f"Could not find reconstruction key in decoder output. Keys: {list(recon_params.keys())}")
-            else:
-                # Decoder output is already the reconstruction
-                reconstructed = recon_params
-        
-        # Convert to numpy
-        real_np = real_flat.cpu().numpy()
-        recon_np = reconstructed.cpu().numpy()
+        real_np = self.real_data
+        recon_np = self.reconstructed_data
         
         # Ensure shapes match
         if real_np.shape != recon_np.shape:
@@ -479,18 +556,19 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
     Uses RBF (Gaussian) kernel with automatic bandwidth selection via median heuristic.
     """
     
-    def __init__(self, real_data, synthetic_data, sigma=None, seed=42):
+    real_data: np.ndarray = None
+    synthetic_data: np.ndarray = None
+
+    def __init__(self, sigma=None, seed=42, max_samples=2000):
         """
         Args:
-            real_data: numpy array [N, D] where D = window_size * n_features
-            synthetic_data: numpy array [M, D] where D = window_size * n_features
             sigma: RBF kernel bandwidth. If None, uses median heuristic.
             seed: Random seed for reproducibility
+            max_samples: Maximum number of samples to use for median heuristic (for efficiency)
         """
-        self.real_data = real_data
-        self.synthetic_data = synthetic_data
         self.sigma = sigma
         self.seed = seed
+        self.max_samples = max_samples
     
     @property
     def name(self) -> str:
@@ -572,17 +650,28 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
         Returns:
             MMD value (lower is better, 0 = identical distributions)
         """
+        rng = np.random.default_rng(self.seed)
+
+        real = self.real_data
+        synthetic = self.synthetic_data
+
+        # Subsample to avoid OOM (O(n^2) kernel matrix)
+        if len(real) > self.max_samples:
+            idx = rng.choice(len(real), size=self.max_samples, replace=False)
+            real = real[idx]
+        if len(synthetic) > self.max_samples:
+            idx = rng.choice(len(synthetic), size=self.max_samples, replace=False)
+            synthetic = synthetic[idx]
+
         # Use provided sigma or auto-estimate
         sigma = self.sigma
         if sigma is None:
-            combined = np.vstack([self.real_data, self.synthetic_data])
+            combined = np.vstack([real, synthetic])
             sigma = self._median_heuristic_sigma(combined)
         
         # Compute MMD^2, return MMD 
-        mmd2 = self._mmd_rbf_unbiased(self.real_data, self.synthetic_data, sigma=sigma)
-        mmd = np.sqrt(np.maximum(mmd2, 0.0))  # Ensure non-negative before sqrt
-        
-        return float(mmd)
+        mmd2 = self._mmd_rbf_unbiased(real, synthetic, sigma=sigma)
+        return float(np.sqrt(np.maximum(mmd2, 0.0)))
 
 
 class ACFDistribution(SyntheticMetric):
@@ -595,8 +684,11 @@ class ACFDistribution(SyntheticMetric):
     the distributions using Kolmogorov-Smirnov (KS) test. The final metric is the
     average KS statistic across all lags.
     """
+
+    real_data: np.ndarray = None
+    synthetic_data: np.ndarray = None
     
-    def __init__(self, real_data, synthetic_data, window_size=24, max_lag=10):
+    def __init__(self, window_size=24, max_lag=10):
         """
         Args:
             real_data: numpy array [N, D] where D = window_size * n_features
@@ -604,8 +696,6 @@ class ACFDistribution(SyntheticMetric):
             window_size: Length of each time series window (e.g., 24 hours)
             max_lag: Maximum lag to compute ACF for (default: 10)
         """
-        self.real_data = real_data
-        self.synthetic_data = synthetic_data
         self.window_size = window_size
         self.max_lag = max_lag
     
@@ -691,15 +781,16 @@ class ACFDistribution(SyntheticMetric):
 class VisualEvaluation(SyntheticMetric):
     """Visual evaluation of synthetic data"""
     
-    def __init__(self, real_data, synthetic_data, output_dir='src/Output/Plots'):
+    real_data: np.ndarray = None
+    synthetic_data: np.ndarray = None   
+
+    def __init__(self, output_dir='src/Output/Plots'):
         """
         Args:
             real_data: numpy array of real data [N, D]
             synthetic_data: numpy array of synthetic data [M, D]
             output_dir: Directory to save plots
         """
-        self.real_data = real_data
-        self.synthetic_data = synthetic_data
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
     
@@ -710,8 +801,8 @@ class VisualEvaluation(SyntheticMetric):
 
     def pca(self) -> None:
         """Generate PCA plots for real vs synthetic data."""
-        real_data = self.real_data[:50] if len(self.real_data) > 50 else self.real_data
-        synthetic_data = self.synthetic_data[:50] if len(self.synthetic_data) > 50 else self.synthetic_data
+        real_data = self.real_data[:500] if len(self.real_data) > 500 else self.real_data
+        synthetic_data = self.synthetic_data[:500] if len(self.synthetic_data) > 500 else self.synthetic_data
         
         # Verify same number of features
         if real_data.shape[1] != synthetic_data.shape[1]:
@@ -752,8 +843,8 @@ class VisualEvaluation(SyntheticMetric):
     def tsne(self) -> None:
         """Generate t-SNE plots for real vs synthetic data."""
         # Use smaller subset for t-SNE
-        real_data = self.real_data[:25] if len(self.real_data) > 25 else self.real_data
-        synthetic_data = self.synthetic_data[:25] if len(self.synthetic_data) > 25 else self.synthetic_data
+        real_data = self.real_data[:500] if len(self.real_data) > 500 else self.real_data
+        synthetic_data = self.synthetic_data[:500] if len(self.synthetic_data) > 500 else self.synthetic_data
         
         # Verify same number of features
         if real_data.shape[1] != synthetic_data.shape[1]:
@@ -806,17 +897,15 @@ class ClassicalStatistics(SyntheticMetric):
     Computes and compares basic statistical properties including mean, variance,
     min/max, quantiles, and standard deviation across time for both datasets.
     """
+    real_data: np.ndarray = None
+    synthetic_data: np.ndarray = None
     
-    def __init__(self, real_data, synthetic_data, window_size=24, n_features=1):
+    def __init__(self, window_size=24, n_features=1):
         """
         Args:
-            real_data: numpy array [N, D] where D = window_size * n_features
-            synthetic_data: numpy array [M, D] where D = window_size * n_features
             window_size: Length of time series window (default: 24 hours)
             n_features: Number of features (default: 1 for consumption only)
         """
-        self.real_data = real_data
-        self.synthetic_data = synthetic_data
         self.window_size = window_size
         self.n_features = n_features
     
@@ -879,10 +968,23 @@ class ClassicalStatistics(SyntheticMetric):
         real_stats = self._compute_stats(self.real_data)
         synthetic_stats = self._compute_stats(self.synthetic_data)
         
-        return {
-            'real': real_stats,
-            'synthetic': synthetic_stats
-        }
+        print(f"  Computed classical statistics for real and synthetic data.")
+        print(f"  Overall Mean - Real: {real_stats['overall_mean']:.4f}, Synthetic: {synthetic_stats['overall_mean']:.4f}")
+        print(f"  Overall Std - Real: {real_stats['overall_std']:.4f}, Synthetic: {synthetic_stats['overall_std']:.4f}")
+        print(f"  Overall Min - Real: {real_stats['overall_min']:.4f}, Synthetic: {synthetic_stats['overall_min']:.4f}")
+        print(f"  Overall Max - Real: {real_stats['overall_max']:.4f}, Synthetic: {synthetic_stats['overall_max']:.4f}")
+        print(f"  Quantiles (25%, 50%, 75%) - Real: {real_stats['quantiles']}, Synthetic: {synthetic_stats['quantiles']}")
+
+        # Scalar summary: mean absolute difference of mean profiles
+        mean_profile_diff = float(np.mean(np.abs(
+            real_stats['mean_profile'] - synthetic_stats['mean_profile']
+        )))
+        std_profile_diff = float(np.mean(np.abs(
+            real_stats['std_profile'] - synthetic_stats['std_profile']
+        )))
+        overall_mean_diff = float(abs(real_stats['overall_mean'] - synthetic_stats['overall_mean']))
+
+        return mean_profile_diff
     
     def print_comparison(self):
         """Print formatted comparison of statistics."""
@@ -1112,16 +1214,16 @@ if __name__ == "__main__":
     
     # Register reconstruction metrics
     evaluator.register_metrics([
-        ReconstructionMSE(model, dataloader),
-        ReconstructionMAE(model, dataloader),
-        KLDivergence(model, dataloader),
+        ReconstructionMSE(),
+        ReconstructionMAE(),
+        KLDivergence(),
     ])
     
     # Register synthetic metrics
     evaluator.register_metrics([
-        DistributionMatch(model, dataloader),
-        TemporalConsistency(model, dataloader),
-        PrivacyMetric(model, dataloader),
+        DistributionMatch(),
+        TemporalConsistency(),
+        PrivacyMetric(),
     ])
     
     # Run all metrics (will print reconstruction section, then synthetic section)
