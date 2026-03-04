@@ -23,21 +23,9 @@ import pandas as pd
 from Data.normalizer import Normalizer
 from Data.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
 
-# Import ALL visualization functions from train_utils
-from train_utils import (
-    load_model_and_visualize,
-    visualize_trained_model,
-    _visualize_reconstructions,
-    _visualize_synthetic_samples,
-    _visualize_sigma_mapper,
-    _visualize_latent_space,
-    _visualize_synthetic_recreations,
-    _visualize_user_dictionary,
-    _save_model_summary,
-    _visualize_training_curves,
-    _visualize_prior_vs_posterior,
-    _visualize_user_clustering_quality,
-)
+from Visualization.Visualizer import Visualizer
+from Visualization.Writer import Writer
+from Visualization.PlotStyling import PlotStyle
 
 # Create output directory
 output_dir = "Output/Plots/quick_demo"
@@ -480,19 +468,11 @@ mock_dataloader_cvae = MockDataLoader(batch_size=B, num_batches=2, input_dim=24,
 
 print("Input: mock_cvae (with real Conditioner), mock_dataloader_cvae, normalizer")
 try:
-    result = visualize_trained_model(
-        model=mock_cvae,
-        test_loader=mock_dataloader_cvae,
-        normalizer=normalizer,
-        device=device,
-        output_dir=output_dir,
-        num_reconstructions=2,
-        num_synthetic_samples=3,
-        num_samples_per_original=2,
-    )
-    print(f"Generated {len(result)} visualizations")
-    for key, path in result.items():
-        print(f"  - {key}: {path}")
+    
+    visualizer = Visualizer(plot_style=PlotStyle(), log_dir=os.path.join(output_dir, "Output/test_11_visualize_trained_model"), model=mock_cvae, writer=Writer(log_dir=os.path.join(output_dir, "Output/test_11_visualize_trained_model")), device=device, normalizer=normalizer)
+    visualizer.visualize(test_loader=mock_dataloader_cvae, num_originals=3
+                        , num_synthetic_per=30)
+    
 except Exception as e:
     print(f"FAILED: {e}")
     import traceback

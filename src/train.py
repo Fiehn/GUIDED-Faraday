@@ -17,6 +17,9 @@ from src.test.run_validation import run_validation
 from src.Hierarchical.aggregation import *
 from src.Hierarchical.config import *
 
+from src.Visualization.Visualizer import Visualizer
+from src.Visualization.Writer import Writer
+
 
 # Set up device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -131,13 +134,13 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
     if model_type == "vae":
         print("Initializing VAE model...")
         model = VAE(input_dim=input_dim, latent_dim=32, device=device)
-        log_dir = "./runs/VAE_training"
+        log_dir = "./models/" 
     else:
         print("Initializing CVAE model (condition = day-of-week + user-profile + holiday)...")
         model = CVAE(input_dim=input_dim, latent_dim=32, conditioner=conditioner, 
                      encoder_type="dictionary",decoder_type='dictionary', 
                      prior_type="vampprior", device=device)
-        log_dir = "./runs/CVAE_training"
+        log_dir = "./models/"
 
     ##############################
     # Heirarchy latent space
@@ -159,7 +162,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
     ##############################
     # Train
     # Use the .fit() method with all its features
-    model_tag = model.fit(
+    model_tag, writer = model.fit(
         trainloader=train_loader,
         valloader=val_loader,
         lr=1e-3,
@@ -180,16 +183,14 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
         early_stopping_kwargs={"patience": 3, "min_delta": 0.001},
         save_epoch_freq=10,
         log_dir=log_dir,
-        weighted_loss=15.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
+        weighted_loss=14.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
         heirarchical_config=h_config, # Pass the hierarchical config to enable hierarchical latent space training
     )
 
     print("Training complete. Model saved as ", model_tag)
 
     ##############################
-    # Reopen TensorBoard writer for logging visualizations #TODO: figure out this tensorboard stuff it is a mess
     log_dir_tagged = os.path.join(log_dir, model_tag)
-    writer = SummaryWriter(log_dir=log_dir_tagged)
 
     # Move model
     model.to(device)
@@ -197,11 +198,14 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
     model.eval()
 
     # Visualize reconstructions on test set
-    visualize_trained_model(model=model, test_loader=test_loader, normalizer=normalizer, device=device,output_dir="Output/Plots", model_tag=model_tag)
+    visualizer = Visualizer(model = model, writer = writer,
+                            plot_style = PlotStyle(), 
+                            log_dir = log_dir_tagged,
+                            device = device, 
+                            normalizer = normalizer,)
 
-    writer.close()
-    print("\nDone.")
-    print(f"TensorBoard: tensorboard --logdir={log_dir}/{model_tag}")
+    visualizer.visualize(test_loader)
+
 
 def online_train(model_type: str = "vae", skip_validation: bool = False):
     if not skip_validation:
@@ -377,7 +381,7 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
     results = evaluator.evaluate()
     
     # Save results
-    evaluator.save_results('Output/eval_results.json')
+    evaluator.save_results(os.path.join(log_dir, 'eval_results.json'))
 
     # Visualize using the last file's test set
     if last_test_loader is not None and last_data_file is not None:
@@ -407,8 +411,8 @@ if __name__ == "__main__":
     # run_test(model_type="vae", skip_validation=False)  # VAE with validation
     # run_test(model_type="cvae", skip_validation=False)  # CVAE with validation
     # run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
-    online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
-    #run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
+    #online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
+    run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
 
 
 
