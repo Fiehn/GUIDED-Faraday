@@ -888,9 +888,6 @@ class VisualEvaluation(SyntheticMetric):
             return 0.0  # Failure
 
 
-
-
-
 class ClassicalStatistics(SyntheticMetric):
     """Classical statistics comparison between real and synthetic data.
     
@@ -1048,15 +1045,14 @@ class TSTR(SyntheticMetric):
     
     Predicts next timestep given previous timesteps.
     """
+
+    real_data: np.ndarray = None
+    synthetic_data: np.ndarray = None
     
-    def __init__(self, real_train, real_test, synthetic_train, 
-                 task='next_step', window_size=24, n_features=1, 
+    def __init__(self, task='next_step', window_size=24, n_features=1, 
                  predictor_type='linear', epochs=50, random_state=42):
         """
         Args:
-            real_train: Real training data [N, D] where D = window_size * n_features
-            real_test: Real test data [M, D]
-            synthetic_train: Synthetic training data [K, D]
             task: Prediction task - 'next_step' (predict hour 24 from hours 0-23)
             window_size: Length of time series window (default: 24)
             n_features: Number of features (default: 1 for consumption)
@@ -1064,9 +1060,6 @@ class TSTR(SyntheticMetric):
             epochs: Training epochs for predictor
             random_state: Random seed
         """
-        self.real_train = real_train
-        self.real_test = real_test
-        self.synthetic_train = synthetic_train
         self.task = task
         self.window_size = window_size
         self.n_features = n_features
@@ -1093,8 +1086,17 @@ class TSTR(SyntheticMetric):
         Returns:
             X: [N, input_features], y: [N, 1]
         """
-        # Reshape to [N, window_size, n_features] and extract consumption
-        data_reshaped = data.reshape(-1, self.window_size, 2)
+        # Reshape to [N, window_size, n_features] and extract consumption (feature 0)
+        if data.ndim != 2:
+            raise ValueError(f"Expected 2D array [N, D], got shape {data.shape}")
+
+        if data.shape[1] % self.window_size != 0:
+            raise ValueError(
+                f"Data feature dimension ({data.shape[1]}) must be divisible by window_size ({self.window_size})"
+            )
+
+        inferred_n_features = data.shape[1] // self.window_size
+        data_reshaped = data.reshape(-1, self.window_size, inferred_n_features)
         data_consumption = data_reshaped[:, :, 0]  # [N, window_size]
         
         # TODO: maybe predict several days ahead based on several previous days instead of just hours 
@@ -1162,10 +1164,34 @@ class TSTR(SyntheticMetric):
         Returns:
             Ratio of TSTR performance to TRTR performance (closer to 1.0 is better)
         """
+        if self.real_data is None or self.synthetic_data is None:
+            raise ValueError("TSTR requires injected real_data and synthetic_data before compute().")
+
+        real_data = np.asarray(self.real_data)
+        synthetic_data = np.asarray(self.synthetic_data)
+
+        if len(real_data) < 2:
+            raise ValueError("Need at least 2 real samples for an 80/20 train/test split.")
+
+        # Split real data: 80% train, 20% test
+        split_idx = int(0.8 * len(real_data))
+        split_idx = max(1, min(split_idx, len(real_data) - 1))
+        real_train = real_data[:split_idx]
+        real_test = real_data[split_idx:]
+
+        # Cap synthetic data to real training size (if synthetic is larger)
+        if len(synthetic_data) > len(real_train):
+            synthetic_train = synthetic_data[:len(real_train)]
+        else:
+            synthetic_train = synthetic_data
+
+        if len(synthetic_train) == 0:
+            raise ValueError("Synthetic data is empty after capping.")
+
         # Prepare data
-        X_real_train, y_real_train = self._prepare_prediction_data(self.real_train)
-        X_real_test, y_real_test = self._prepare_prediction_data(self.real_test)
-        X_synth_train, y_synth_train = self._prepare_prediction_data(self.synthetic_train)
+        X_real_train, y_real_train = self._prepare_prediction_data(real_train)
+        X_real_test, y_real_test = self._prepare_prediction_data(real_test)
+        X_synth_train, y_synth_train = self._prepare_prediction_data(synthetic_train)
         
         input_dim = X_real_train.shape[1]
         

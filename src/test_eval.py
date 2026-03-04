@@ -1,7 +1,8 @@
 import torch
 from eval_framework import FlexibilityDistance # for reconstruction evaluation
 from eval_framework import VisualEvaluation, ACFDistribution, ClassicalStatistics, TSTR, MaximumMeanDiscrepancy # for distributional evaluation
-from Models import VAE, CVAE
+from src.Models.VAE import VAE
+from src.Models.CVAE import CVAE
 import glob
 import os
 import sys
@@ -9,7 +10,7 @@ import numpy as np
 import pandas as pd
 from config_loader import load_config
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'test'))
-from create_test_data import create_test_dataset
+from src.test.create_test_data import create_test_dataset
 
 print("="*70)
 print("EVALUATION FRAMEWORK")
@@ -112,7 +113,7 @@ input_dim = window_size * len(feature_cols)
 
 # Create model
 if model_type.upper() == 'CVAE':
-    from Conditioner import Conditioner
+    from src.Data.Conditioner import Conditioner
     conditioner = Conditioner(config=config)
     model = CVAE(input_dim=input_dim, latent_dim=latent_dim, encoder_type=encoder_type, 
                  decoder_type=decoder_type, prior_type=prior_type, conditioner=conditioner)
@@ -142,58 +143,55 @@ real_data_subset = real_data[:100]
 print(f"Using {len(real_data_subset)} real samples")
 
 
-# Run reconstruction evaluation
-print("\n" + "="*70)
-print("RECONSTRUCTION EVALUATION METRICS")
-print("="*70)
+# # Run reconstruction evaluation
+# print("\n" + "="*70)
+# print("RECONSTRUCTION EVALUATION METRICS")
+# print("="*70)
 
-fd_metric = FlexibilityDistance(model, real_data_subset, device='cpu')
-fd_score = fd_metric.compute()
-print(f"Flexibility Distance: {fd_score:.4f}") # (lower is better, 0 = perfect reconstruction)
+# fd_metric = FlexibilityDistance(model, real_data_subset, device='cpu')
+# fd_score = fd_metric.compute()
+# print(f"Flexibility Distance: {fd_score:.4f}") # (lower is better, 0 = perfect reconstruction)
  
 
 
-# Run distributional evaluation
-print("\n" + "="*70)
-print("DISTRIBUTIONAL EVALUATION METRICS")
-print("="*70)
+# # Run distributional evaluation
+# print("\n" + "="*70)
+# print("DISTRIBUTIONAL EVALUATION METRICS")
+# print("="*70)
 
-# Visual evaluation
-print("\nVisual Evaluation:")
-visual_eval = VisualEvaluation(real_data_subset, synthetic_data, output_dir='Output/Plots')
-visual_eval.pca()
-visual_eval.tsne()
-print("PCA and t-SNE plots saved to Output/Plots")
+# # Visual evaluation
+# print("\nVisual Evaluation:")
+# visual_eval = VisualEvaluation(real_data_subset, synthetic_data, output_dir='Output/Plots')
+# visual_eval.pca()
+# visual_eval.tsne()
+# print("PCA and t-SNE plots saved to Output/Plots")
 
-# ACF Distribution metric
-acf_metric = ACFDistribution(real_data_subset, synthetic_data, window_size=window_size, max_lag=10)
-acf_score = acf_metric.compute()
-print("\nACF Distribution Match:")
-print(f"  Average Kolmogorov-Smirnov (KS) test statistic across lags: {acf_score:.4f}") # (lower is better: 0 = perfect match, 1 = completely different)
+# # ACF Distribution metric
+# acf_metric = ACFDistribution(real_data_subset, synthetic_data, window_size=window_size, max_lag=10)
+# acf_score = acf_metric.compute()
+# print("\nACF Distribution Match:")
+# print(f"  Average Kolmogorov-Smirnov (KS) test statistic across lags: {acf_score:.4f}") # (lower is better: 0 = perfect match, 1 = completely different)
 
-# Maximum Mean Discrepancy
-print("\nMaximum Mean Discrepancy (MMD):")
-mmd_metric = MaximumMeanDiscrepancy(real_data_subset, synthetic_data)
-mmd_score = mmd_metric.compute()
-print(f"  MMD score: {mmd_score:.6f}") # (lower is better, 0 = identical distributions)
+# # Maximum Mean Discrepancy
+# print("\nMaximum Mean Discrepancy (MMD):")
+# mmd_metric = MaximumMeanDiscrepancy(real_data_subset, synthetic_data)
+# mmd_score = mmd_metric.compute()
+# print(f"  MMD score: {mmd_score:.6f}") # (lower is better, 0 = identical distributions)
 
-# Classicl statistics match
-print("\nClassical Statistics Match:")
-stats_metric = ClassicalStatistics(real_data, synthetic_data, window_size=24, n_features=2)
-stats_metric.print_comparison()
+# # Classicl statistics match
+# print("\nClassical Statistics Match:")
+# stats_metric = ClassicalStatistics(real_data, synthetic_data, window_size=24, n_features=2)
+# stats_metric.print_comparison()
 
 # TSTR evaluation (Train on Synthetic, Test on Real)
-split_idx = int(0.8 * len(real_data)) # split real data into train/test
-real_train = real_data[:split_idx]
-real_test = real_data[split_idx:]
 tstr_metric = TSTR(
-    real_train=real_train,
-    real_test=real_test,
-    synthetic_train=synthetic_data,
     task='next_step',
-    window_size=24,
+    window_size=window_size,
     n_features=1,
     predictor_type='mlp',  # mlp (multilayer perceptron) / linear
     epochs=50
 )
+tstr_metric.real_data = real_data
+tstr_metric.synthetic_data = synthetic_data
 ratio = tstr_metric.compute()
+print(f"\nTSTR Ratio: {ratio:.6f}")
