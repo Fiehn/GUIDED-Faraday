@@ -20,6 +20,12 @@ from src.Hierarchical.config import *
 from src.Visualization.Visualizer import Visualizer
 from src.Visualization.Writer import Writer
 
+from src.eval_framework import EvalFramework
+from src.eval_framework import (
+    ReconstructionMSE, ReconstructionMSE, ReconstructionRMSE, ReconstructionLogLikelihood, FlexibilityDistance,
+    MaximumMeanDiscrepancy, ACFDistribution, VisualEvaluation, ClassicalStatistics, TSTR
+)
+
 
 # Set up device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -206,6 +212,32 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
 
     visualizer.visualize(test_loader)
 
+    # Create evaluator
+    evaluator = EvalFramework(model, test_loader, normalizer, device='cpu')
+    
+    # Register reconstruction metrics
+    evaluator.register_metrics([
+        ReconstructionMSE(),
+        ReconstructionRMSE(),
+        ReconstructionLogLikelihood(),
+        FlexibilityDistance(tau='auto', normalize=True),
+    ])
+    
+    # Register synthetic metrics
+    evaluator.register_metrics([
+        MaximumMeanDiscrepancy(),
+        ACFDistribution(),
+        ClassicalStatistics(),
+        TSTR(),
+        VisualEvaluation(output_dir=os.path.join(log_dir_tagged, "eval_plots"))
+    ])
+    
+    # Run all metrics (will print reconstruction section, then synthetic section)
+    results = evaluator.evaluate()
+    
+    # Save results
+    evaluator.save_results(os.path.join(log_dir_tagged, 'eval_results.json'))
+
 
 def online_train(model_type: str = "vae", skip_validation: bool = False):
     if not skip_validation:
@@ -213,7 +245,7 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         validation_passed = run_validation(
             model_type=model_type,
             use_test_data=True,  # use small test data for fast validation
-            verbose=True
+            verbose=False
         )
         
         if not validation_passed:
@@ -235,7 +267,7 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
     if model_type == "vae":
         print("Initializing VAE model...")
         model = VAE(input_dim=24 * 1, latent_dim=32, device=device)  # input_dim will be updated based on data
-        log_dir = "./runs/VAE_online_training"
+        log_dir = "./models/"
     else:
         print("Initializing CVAE model (condition = day-of-week + user-profile)...")
         conditioner = Conditioner()
@@ -261,12 +293,14 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
                      encoder_type="dictionary",decoder_type='dictionary', 
                      prior_type="vampprior", device=device,
                      normalizer=normalizer, hierarchy_config=heirarchy)  # input_dim will be updated based on data
-        log_dir = "./runs/CVAE_online_training"
+        log_dir = "./models/"
     
     i = 0
     last_dm = None
     last_test_loader = None
     last_data_file = None
+
+    model_tag = None
 
     for data_file in data_files:
         print(f"\nProcessing {data_file}")
@@ -319,7 +353,7 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         test_loader = dm.test_dataloader()
         
         # Train on this data
-        model.fit(
+        model_tag, writer = model.fit(
             trainloader=train_loader,
             valloader=val_loader,
             lr=1e-3,
@@ -339,7 +373,8 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
             early_stopping=True,
             early_stopping_kwargs={"patience": 3, "min_delta": 0.001},
             save_epoch_freq=10,
-            log_dir=os.path.join(log_dir, data_file.replace(".csv", "")),
+            log_dir=log_dir,
+            model_name= model_tag if model_tag is not None else f"online_{model_type}",
         )
         print(f"Finished training on {data_file} advancing to next file...\n")
 
@@ -351,12 +386,16 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         last_test_loader = test_loader
         last_data_file   = data_file
 
+    log_dir = os.path.join(log_dir, model_tag)
+    
+    visualizer = Visualizer(model = model, writer = writer,
+                            plot_style = PlotStyle(), 
+                            log_dir = log_dir,
+                            device = device, 
+                            normalizer = normalizer,)
+    visualizer.visualize(test_loader)
+
     # Evaluation framework On last test set (from the last file) after all training is done
-    from src.eval_framework import EvalFramework
-    from src.eval_framework import (
-        ReconstructionMSE, ReconstructionMSE, ReconstructionRMSE, ReconstructionLogLikelihood, FlexibilityDistance,
-        MaximumMeanDiscrepancy, ACFDistribution, VisualEvaluation, ClassicalStatistics, TSTR
-    )
     # Create evaluator
     evaluator = EvalFramework(model, last_test_loader, normalizer, device='cpu')
     
@@ -373,7 +412,7 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         MaximumMeanDiscrepancy(),
         ACFDistribution(),
         ClassicalStatistics(),
-        #TSTR(model, last_test_loader),
+        TSTR(),
         VisualEvaluation()
     ])
     
@@ -382,21 +421,6 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
     
     # Save results
     evaluator.save_results(os.path.join(log_dir, 'eval_results.json'))
-
-    # Visualize using the last file's test set
-    if last_test_loader is not None and last_data_file is not None:
-        model.to('cpu')
-        model.eval()
-        visualize_trained_model(
-            model=model,
-            test_loader=last_test_loader,
-            normalizer=normalizer,
-            device='cpu',
-            output_dir="Output/Plots",
-            model_tag="online_" + last_data_file.replace(".csv", ""),
-        )
-    else:
-        print("No data files found — skipping visualization.")
 
     # Final cleanup
     if last_dm is not None:
