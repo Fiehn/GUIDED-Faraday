@@ -226,21 +226,50 @@ def load_model_and_visualize(
     )
     viz_path.update(synth_recreation_path)
     
-    summary_path = _save_model_summary(
-        model=model,
-        model_kwargs=checkpoint.get('model_kwargs', {}),
-        output_dir=output_dir,
-        model_tag=model_tag,
-    )
-    viz_path['model_summary'] = summary_path
+    evalutation_path = _run_evaluation_framework(model, test_loader, normalizer, device, output_dir, model_tag)
+    viz_path.update(evalutation_path)
 
     print("All visualizations saved.")
     print(viz_path)
     return viz_path
 
+def _run_evaluation_framework(model, test_loader, normalizer, device, output_dir, model_tag):
+    # Evaluation framework On last test set (from the last file) after all training is done
+    from src.eval_framework import EvalFramework
+    from src.eval_framework import (
+        ReconstructionMSE, ReconstructionMSE, ReconstructionRMSE, ReconstructionLogLikelihood, FlexibilityDistance,
+        MaximumMeanDiscrepancy, ACFDistribution, VisualEvaluation, ClassicalStatistics #, TSTR
+    )
 
-def _load_model_legacy(model_path, data_config, output_dir, device, num_reconstructions, 
-                       num_synthetic_samples, num_samples_per_original):
+    # Create evaluator
+    evaluator = EvalFramework(model, test_loader, normalizer, device='cpu')
+    
+    # Register reconstruction metrics
+    evaluator.register_metrics([
+        ReconstructionMSE(),
+        ReconstructionRMSE(),
+        ReconstructionLogLikelihood(),
+        FlexibilityDistance(tau='auto', normalize=True),
+    ])
+    
+    # Register synthetic metrics
+    evaluator.register_metrics([
+        MaximumMeanDiscrepancy(max_samples=2000),
+        ACFDistribution(),
+        ClassicalStatistics(),
+        #TSTR(model, test_loader),
+        VisualEvaluation()
+    ])
+    
+    # Run all metrics (will print reconstruction section, then synthetic section)
+    results = evaluator.evaluate()
+    
+    path = os.path.join(output_dir, f"{model_tag}_evaluation_results.yaml")
+    # Save results
+    evaluator.save_results(path)
+    return {"evaluation_results:": path}
+
+def _load_model_legacy(model_path, data_config, output_dir, device, num_reconstructions, num_synthetic_samples, num_samples_per_original):
     """
     Legacy model loading for old checkpoint format.
     Uses parameter inference from state_dict (fragile but needed for backward compatibility).
@@ -466,16 +495,101 @@ def _load_model_legacy(model_path, data_config, output_dir, device, num_reconstr
         model_tag=model_tag,
     )
     viz_path.update(synth_recreation_path)
+
+    evalutation_path = _run_evaluation_framework(model, test_loader, normalizer, device, output_dir, model_tag)
+    viz_path.update(evalutation_path)
+
+    print("Legacy model loaded and visualizations saved.")
+    print(viz_path)
+    return viz_path
+
+def visualize_trained_model(
+        model,
+        test_loader,
+        normalizer,
+        device,
+        output_dir: str,
+        model_tag: str,
+        num_reconstructions: int = 4,
+        num_synthetic_samples: int = 15,
+        num_samples_per_original: int = 15,
+    ) -> dict:
+    """
+    Generates reconstruction and synthetic data visualizations for a trained model.
+    model: Trained model instance.
+    test_loader: DataLoader for the test dataset.
+    normalizer: Normalizer instance used for data normalization.
+    device: Device to run the model on.
+    output_dir: Directory to save the output plots.
+    model_tag: Tag/name for the model (used in filenames).
+    num_reconstructions: Number of reconstruction samples per original data point.
+    num_synthetic_samples: Number of synthetic samples to generate.
+    num_samples_per_original: Number of reconstruction samples per original data point.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    is_cvae = hasattr(model, 'condition_dim') and model.condition_dim > 0
+    viz_path = {}
     
-    summary_path = _save_model_summary(
+    recon_path = _visualize_reconstructions(
         model=model,
-        model_kwargs=model_kwargs,
+        test_loader=test_loader,
+        normalizer=normalizer,
+        device=device,
+        num_samples=num_reconstructions,
+        num_recon_per=num_samples_per_original,
+        output_dir=output_dir,
+        model_tag=model_tag,
+        is_cvae=is_cvae,
+    )
+    viz_path['reconstructions'] = recon_path
+    synth_path = _visualize_synthetic_samples(
+        model=model,
+        normalizer=normalizer,
+        device=device,
+        num_samples=num_synthetic_samples,
+        output_dir=output_dir,
+        model_tag=model_tag,
+        is_cvae=is_cvae,
+    )
+    viz_path['synthetic_samples'] = synth_path
+    if hasattr(model, 'get_SigmaMapper'):
+        sigma_mapper_path = _visualize_sigma_mapper(
+            model=model,
+            test_loader=test_loader,
+            device=device,
+            output_dir=output_dir,
+            model_tag=model_tag,
+        )
+        viz_path.update(sigma_mapper_path)
+    latent_space_path = _visualize_latent_space(
+        model=model,
+        test_loader=test_loader,
+        device=device,
         output_dir=output_dir,
         model_tag=model_tag,
     )
-    viz_path['model_summary'] = summary_path
+    viz_path.update(latent_space_path)
+    synth_recreation_path = _visualize_synthetic_recreations(
+        model=model,
+        test_loader=test_loader,
+        normalizer=normalizer,
+        device=device,
+        output_dir=output_dir,
+        model_tag=model_tag,
+    )
+    viz_path.update(synth_recreation_path)
+    
+    
+    user_profile_path = _visualize_user_dictionary(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        output_dir=output_dir,
+        model_tag=model_tag,
+    )
+    viz_path.update(user_profile_path)
 
-    print("Legacy model loaded and visualizations saved.")
+    print("All visualizations saved.")
     print(viz_path)
     return viz_path
 

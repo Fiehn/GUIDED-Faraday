@@ -594,31 +594,72 @@ class HolidayConditioner():
     def get_random_conditions(self, batch_size):
         random_holiday = torch.randint(0,2,(batch_size,1)).float()
         return random_holiday
-
-class SchoolHolidayConditioner():
-    def __init__(self):
+    
+class HeatpumpConditioner():
+    def __init__(self, topology_path = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
         self.condition_dim = 1
-        # Define school holiday periods (example for Denmark)
-        # Weeks 7, 27-32, 43
+        self.topology_df = pd.read_csv(topology_path)
+    
+    def get_conditions(self, x, meter_id, timestamps):
+        if isinstance(meter_id, torch.Tensor):
+            meter_id = meter_id.cpu().numpy()
         
-    def get_conditions(self,x, meter_id, timestamps):
-        if isinstance(timestamps, torch.Tensor):
-            device = timestamps.device
-            dates = pd.to_datetime(timestamps.cpu().numpy(), unit='s')
-            is_school_holiday = torch.tensor([1.0 if (d.weekofyear in [7,27,28,29,30,31,32,43]) else 0.0 for d in dates], device=device).unsqueeze(1)
-        else:
-            is_school_holiday = []
-            for ts in timestamps:
-                if isinstance(ts, (int, float)):
-                    ts = pd.Timestamp(ts, unit='s')
-                is_school_holiday.append(1.0 if (ts.weekofyear in [7,27,28,29,30,31,32,43]) else 0.0)
-            is_school_holiday = torch.tensor(is_school_holiday, dtype=torch.float32).unsqueeze(1)
-        return is_school_holiday
+        heatpump_status = []
+        for m_id in meter_id:
+            row = self.topology_df[self.topology_df['meter_number'] == m_id]
+            if not row.empty:
+                val = row['has_heat_pump'].iloc[0]
+                if str(val) == "True":
+                    heatpump_status.append(1.0)
+                else:
+                    heatpump_status.append(0.0)
+            else:
+                heatpump_status.append(0.0)
+
+        return torch.tensor(heatpump_status, dtype=torch.float32).unsqueeze(1)
     
     def get_random_conditions(self, batch_size):
-        random_school_holiday = torch.randint(0,2,(batch_size,1)).float()
-        return random_school_holiday
+        random_status = torch.randint(0,2,(batch_size,1)).float()
+        return random_status
+    
+class SolarPanelConditioner():
+    def __init__(self, topology_path = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
+        self.condition_dim = 1
+        self.topology_df = pd.read_csv(topology_path)
+    
+    def get_conditions(self, x, meter_id, timestamps):
+        if isinstance(meter_id, torch.Tensor):
+            meter_id = meter_id.cpu().numpy()
+        
+        solar_status = []
+        for m_id in meter_id:
+            row = self.topology_df[self.topology_df['meter_number'] == m_id]
+            if not row.empty:
+                val = row['has_solar_panel'].iloc[0]
+                if str(val) == "True":
+                    solar_status.append(1.0)
+                else:
+                    solar_status.append(0.0)
+            else:
+                solar_status.append(0.0)
 
+        return torch.tensor(solar_status, dtype=torch.float32).unsqueeze(1)
+    
+    def get_random_conditions(self, batch_size):
+        random_status = torch.randint(0,2,(batch_size,1)).float()
+        return random_status
+    
+class ElectricVehicleConditioner():
+    # TODO: WAIT FOR EV data to arrive
+    def __init__(self, topology_path = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
+        self.condition_dim = 0
+
+    def get_conditions(self, x, meter_id, timestamps):
+        return None
+    
+    def get_random_conditions(self, batch_size):
+        return None
+    
 # =============
 # Conditioner Module - Holds an object that creates and determines type of conditioning to be used in Models
 # ============
