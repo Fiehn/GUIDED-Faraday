@@ -112,7 +112,7 @@ class Visualizer:
         
         self.model.eval()
         with torch.no_grad():
-            x, meter_id, timestamps, _ = next(iter(test_loader))
+            x, meter_id, timestamps = next(iter(test_loader))
             x = x.to(self.device)
             timestamps = timestamps.to(self.device)
             x_original = x  # This is normalized
@@ -301,7 +301,7 @@ class Visualizer:
 
         self.model.eval()
         with torch.no_grad():
-            for x, meter_id, timestamps, _ in test_loader:
+            for x, meter_id, timestamps in test_loader:
                 x = x.to(self.device)
                 x_flat = x.reshape(x.shape[0], -1)
                 if self._is_cvae():
@@ -383,7 +383,7 @@ class Visualizer:
         self.model.eval()
         with torch.no_grad():
             # Get a batch from test loader
-            x, meter_id, timestamps, _ = next(iter(test_loader))
+            x, meter_id, timestamps = next(iter(test_loader))
             x = x.to(self.device)
             timestamps = timestamps.to(self.device)
             

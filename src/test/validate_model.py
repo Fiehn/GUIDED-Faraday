@@ -49,12 +49,11 @@ class ValidationResult:
 
 def _get_batch(loader, device="cpu"):
     """Grab one batch and move tensors to *device*."""
-    x, meter_id, timestamps, month_key = next(iter(loader))
+    x, meter_id, timestamps = next(iter(loader))
     return (
         x.to(device),
         meter_id.to(device),
         timestamps.to(device),
-        month_key.to(device) if torch.is_tensor(month_key) else month_key,
     )
 
 
@@ -239,7 +238,7 @@ class ModelValidator:
             print("\n[2] Testing Data Pipeline...")
 
         try:
-            x, meter_id, timestamps, month_key = _get_batch(self.train_loader, self.device)
+            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
 
             if x.dim() != 3:
                 self._add_result("Data: Input Shape", False,
@@ -300,7 +299,7 @@ class ModelValidator:
             print("\n[3] Testing Conditioners...")
 
         try:
-            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
+            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
             B = x.shape[0]
 
             conditions = self.model.conditioner.get_conditions(
@@ -357,7 +356,7 @@ class ModelValidator:
             print("\n[4] Testing Encoder/Decoder...")
 
         try:
-            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
+            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
             B, L, F = x.shape
             x_flat = x.reshape(B, -1)
 
@@ -483,7 +482,7 @@ class ModelValidator:
 
         try:
             self.model.train()
-            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
+            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
             B, L, F = x.shape
             x_flat = x.reshape(B, -1)
 
@@ -545,7 +544,7 @@ class ModelValidator:
 
         try:
             self.model.eval()
-            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
+            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
             x_flat = x.reshape(x.shape[0], -1)
 
             with torch.no_grad():
@@ -635,7 +634,7 @@ class ModelValidator:
                 else:
                     self._add_result("Device: Prior", True, f"{prior_dev}")
 
-            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
+            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
             if self.is_cvae:
                 c = self.model.conditioner.get_conditions(
                     x, meter_id=meter_id, timestamps=timestamps)
@@ -664,7 +663,7 @@ class ModelValidator:
 
         try:
             self.model.train()
-            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
+            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
             B, L, F = x.shape
             x_flat = x.reshape(B, -1)
             optim = torch.optim.Adam(self.model.parameters(), lr=1e-3)
@@ -833,7 +832,7 @@ class ModelValidator:
             model_copy.train()
             opt = torch.optim.Adam(model_copy.parameters(), lr=1e-3)
 
-            x, meter_id, timestamps, _ = _get_batch(self.train_loader, self.device)
+            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
 
             losses = []
             n_steps = 5
@@ -1078,7 +1077,7 @@ class ModelValidator:
 
         if self.is_cvae and "user_profile" in self.model.conditioner.get_condition_tags():
             try:
-                x, meter_id, timestamps, _ = _get_batch(
+                x, meter_id, timestamps = _get_batch(
                     self.train_loader, self.device)
                 up = self.model.conditioner.condition_items["user_profile"]
                 x_2d = x.reshape(x.shape[0], -1)
@@ -1279,7 +1278,7 @@ class ModelValidator:
                 update_frequency=5, random_state=42, verbose=False,
             ))
 
-            norm = Normalizer("online_log1p")
+            norm = Normalizer("log1p")
             try:
                 ocvae = OnlineCVAE(
                     input_dim=input_dim, conditioner=cond,
@@ -1361,8 +1360,7 @@ class ModelValidator:
             if hasattr(up, "user_profiles_cache"):
                 self._add_result(
                     "OnlineCVAE: Memory", True,
-                    f"Cached: {len(up.user_profiles_cache)} users, "
-                    f"{len(ocvae.normalizer.monthly_stats)} months")
+                    f"Cached: {len(up.user_profiles_cache)} users, ")
             else:
                 self._add_result("OnlineCVAE: Memory", False,
                                  "No profile cache")
