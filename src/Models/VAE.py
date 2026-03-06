@@ -211,9 +211,7 @@ class VAE(nn.Module):
 
         if isinstance(x, tuple) or isinstance(x, list):
             # Unpack if dataloader returns (x, meter_id, timestamps)
-            if len(x) == 4:
-                x_data, meter_id, timestamps, month_key = x
-            elif len(x) == 3:
+            if len(x) == 3:
                 x_data, meter_id, timestamps = x
             elif len(x) == 2:
                 x_data, meter_id = x
@@ -778,7 +776,6 @@ class VAE(nn.Module):
             model_name = None, # Optionally specify model name for saving
             save_dir = './models/',
             weighted_loss = 0.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
-            month_key=None, # Used in RevIN normalization
             **_):
 
         # === Generate a model tag ===

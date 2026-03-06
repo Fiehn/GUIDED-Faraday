@@ -105,7 +105,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
 
     ##############################
     # get one batch
-    x, meter_id, timestamps, _ = next(iter(train_loader))  # Now also get timestamps
+    x, meter_id, timestamps = next(iter(train_loader))  # Now also get timestamps
     print("x shape:", x.shape)
     print("meter_id shape:", meter_id.shape, "example:", meter_id[:5])
     print("timestamps shape:", len(timestamps))
@@ -239,7 +239,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
     evaluator.save_results(os.path.join(log_dir_tagged, 'eval_results.json'))
 
 
-def online_train(model_type: str = "vae", skip_validation: bool = False):
+def online_train(model_type: str = "cvae", skip_validation: bool = False):
     if not skip_validation:
         print("\nStarting model validation before online training...\n") 
         validation_passed = run_validation(
@@ -262,7 +262,20 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
     # remove data files that are already trained on (check runs folder for existing models)
     # TODO: Check runs and find and remove already trained files in the list.
 
-    normalizer = Normalizer('online_log1p')
+    normalizer = Normalizer('log1p')
+    # Fit normalizer once across ALL available files before the training loop
+    # (reads Parquet caches, result is persisted; subsequent runs are instant)
+    from Data.dataloader import fit_normalizer_on_files
+    fit_normalizer_on_files(
+        normalizer,
+        data_dir="data/",
+        filenames=data_files,
+        feature_cols=("hourly_energy_consumption",),
+        meter_col="meter_number",
+        timestamp_dst_col="timestamp_dst",
+        train_frac=0.8,
+        seed=42,
+    )
     # Create the model and normalizer and conditioner once
     if model_type == "vae":
         print("Initializing VAE model...")
@@ -336,7 +349,6 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
             filename=data_file,
             meter_col="meter_number",
             timestamp_dst_col="timestamp_dst",
-            timestamp_utc_col="timestamp_utc",
             feature_cols=("hourly_energy_consumption",),
             window=WindowSpec(input_len=24, stride=24),
             batch_size=512,

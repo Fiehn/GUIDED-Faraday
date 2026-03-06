@@ -555,7 +555,7 @@ def _visualize_reconstructions(
         is_cvae: bool,
     ) -> str:
     with torch.no_grad():
-        x, meter_id, timestamps, _ = next(iter(test_loader))
+        x, meter_id, timestamps = next(iter(test_loader))
         x = x.to(device)
         timestamps = timestamps.to(device)
         x_original = x  # This is normalized
@@ -775,7 +775,7 @@ def _visualize_latent_space(model, test_loader, device, output_dir, model_tag):
     labels = []
     
     with torch.no_grad():
-        for x, meter_id, timestamps, _ in test_loader:
+        for x, meter_id, timestamps in test_loader:
             x = x.to(device)
             x_flat = x.reshape(x.shape[0], -1)
             
@@ -857,7 +857,7 @@ def _visualize_synthetic_recreations(model, test_loader, normalizer, device, out
     
     with torch.no_grad():
         # Get a batch from test loader
-        x, meter_id, timestamps, _ = next(iter(test_loader))
+        x, meter_id, timestamps = next(iter(test_loader))
         x = x.to(device)
         timestamps = timestamps.to(device)
         
@@ -1165,7 +1165,7 @@ def _visualize_prior_vs_posterior(
     # Collect posterior samples (encode real data)
     posterior_samples = []
     with torch.no_grad():
-        for x, meter_id, timestamps, _ in test_loader:
+        for x, meter_id, timestamps in test_loader:
             if len(posterior_samples) >= num_samples:
                 break
             

@@ -631,7 +631,7 @@ class TestHierarchyWithRealData:
         self.train_loader = self.dm.train_dataloader()
 
     def _get_batch_flat(self):
-        x, meter_id, timestamps, month_key = next(iter(self.train_loader))
+        x, meter_id, timestamps = next(iter(self.train_loader))
         return x.reshape(x.shape[0], -1), meter_id, timestamps
 
     def test_vae_with_hierarchy_forward(self):
