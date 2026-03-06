@@ -22,7 +22,9 @@ import traceback
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
+root_dir = os.path.dirname(parent_dir)
 sys.path.append(parent_dir)
+sys.path.append(root_dir)
 
 from Models.encoder_decoder_model import *
 from Data.Conditioner import *
@@ -260,8 +262,8 @@ class ModelValidator:
 
             # Normalizer round-trip
             if self.normalizer is not None:
-                x_denorm = self.normalizer.inverse_transform(x)
-                x_renorm = self.normalizer.transform(x_denorm)
+                x_denorm = self.normalizer.inverse_transform(x).to(x.dtype)
+                x_renorm = self.normalizer.transform(x_denorm).to(x.dtype).to(x.device)
                 max_err = torch.max(torch.abs(x - x_renorm)).item()
                 if max_err > 1e-4:
                     self._add_result("Data: Normalizer Roundtrip", False,
@@ -903,7 +905,7 @@ class ModelValidator:
                     if k not in loaded_sd:
                         mismatched.append(f"missing: {k}")
                     elif not torch.allclose(
-                        original_sd[k].float(), loaded_sd[k].float(), atol=1e-5
+                        original_sd[k].float().cpu(), loaded_sd[k].float(), atol=1e-5
                     ):
                         mismatched.append(f"differs: {k}")
 

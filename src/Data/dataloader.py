@@ -1,4 +1,5 @@
 from __future__ import annotations
+import gc
 import os
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple, List, Dict
@@ -281,6 +282,11 @@ class SmartMeterDataModule:
         self._train_ds  = self._make_dataset(self.train_ids)
         self._val_ds    = self._make_dataset(self.val_ids)
         self._test_ds   = self._make_dataset(self.test_ids)
+
+        # Free the raw DataFrame now that all splits are converted to tensors.
+        # This halves peak memory when the DataModule stays alive during training.
+        self.loader.df = None
+        gc.collect()
 
     def _fit_normalizer(self):
         """ Fit normalizer on training data only """

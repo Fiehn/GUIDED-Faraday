@@ -70,8 +70,8 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
 
     window = WindowSpec(input_len=24, stride=24)  # full day windows
 
-    batch_size = 512 # 256 # tried smaller batch size for CVAE
-    num_workers = 0
+    batch_size = 1048 # 256 # tried smaller batch size for CVAE
+    num_workers = 8
     shuffle_train = False
     seed = 42
     train_frac = 0.8
@@ -129,7 +129,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
     conditioner = Conditioner()
     conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
     conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
-    conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json')) # TODO: check that this works and actually adds on the days it says it should
+    #conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json')) # TODO: check that this works and actually adds on the days it says it should
     cond = conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)  # Pass all data (x, meter, timestamps)
     
     print("Condition shape:", cond.shape)
@@ -163,7 +163,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
         kl_warmup_steps=1000,
         free_bits=0.1,
     )
-
+    h_config = None # Set to None to disable hierarchical latent space for now (can be added back in later once the training loop is working well)
 
     ##############################
     # Train
@@ -181,7 +181,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
         beta_annealing=True,  # cyclical annealing to avoid posterior collapse
         beta_annealing_kwargs={"n_cycles": 4, "ratio": 0.5},
         num_samples=1,
-        epochs=20,
+        epochs=10,
         validation_freq=1,
         validation_num_samples=1,
         device=device,
@@ -275,19 +275,20 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
         conditioner.add_condition_item("user_profile", OnlineUserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
         #conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json')) # TODO: check that this works and actually adds on the days it says it should
 
-        heirarchy = HierarchicalConfig(
-            levels=[
-                LevelConfig(name="Level 1", input_dim=24 * 1, latent_dim=32, strategy="linear", top_down=False, bottom_up=True, loss_weight=1.0),
-                LevelConfig(name="Level 2", input_dim=32, latent_dim=16, strategy="linear", top_down=True, bottom_up=True, loss_weight=0.5),
-                LevelConfig(name="Level 3", input_dim=16, latent_dim=8, strategy="linear", top_down=True, bottom_up=False, loss_weight=0.25),
-            ],
-            aggregation="concat",
-            bidirectional=True,
-            residual_connections=True,
-            kl_annealing=True,
-            kl_warmup_steps=1000,
-            free_bits=0.1,
-        )
+        # heirarchy = HierarchicalConfig(
+        #     levels=[
+        #         LevelConfig(name="Level 1", input_dim=24 * 1, latent_dim=32, strategy="linear", top_down=False, bottom_up=True, loss_weight=1.0),
+        #         LevelConfig(name="Level 2", input_dim=32, latent_dim=16, strategy="linear", top_down=True, bottom_up=True, loss_weight=0.5),
+        #         LevelConfig(name="Level 3", input_dim=16, latent_dim=8, strategy="linear", top_down=True, bottom_up=False, loss_weight=0.25),
+        #     ],
+        #     aggregation="concat",
+        #     bidirectional=True,
+        #     residual_connections=True,
+        #     kl_annealing=True,
+        #     kl_warmup_steps=1000,
+        #     free_bits=0.1,
+        # )
+        heirarchy = None # Set to None to disable hierarchical latent space for now (can be added back in later once the online training loop is working well)
 
         model = OnlineCVAE(input_dim=24, latent_dim=32, conditioner=conditioner, 
                      encoder_type="dictionary",decoder_type='dictionary', 
@@ -430,13 +431,15 @@ def online_train(model_type: str = "vae", skip_validation: bool = False):
 
 # now we can run either VAE or CVAE test
 if __name__ == "__main__":
+    import gc
     # choose: "vae" or "cvae"
     # run_test(model_type="vae")
     # run_test(model_type="vae", skip_validation=False)  # VAE with validation
-    # run_test(model_type="cvae", skip_validation=False)  # CVAE with validation
-    # run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
-    #online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
-    run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
+    run_test(model_type="cvae", skip_validation=True, file_name='hourly_measurements_2023_11.csv')  # CVAE with validation
+    #run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
+    gc.collect()  # Release run_test's DataModule/DataLoader memory before loading the next file
+    online_train(model_type="cvae", skip_validation=True)  # Online training with CVAE and validation
+    #run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
 
 
 
