@@ -813,6 +813,7 @@ class VAE(nn.Module):
             model_name = None, # Optionally specify model name for saving
             save_dir = './models/',
             normalizer = None,
+            compile_model = False, # Whether to use torch.compile for faster training (PyTorch 2.0+)
             weighted_loss = 0.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
             **_):
 
@@ -893,11 +894,20 @@ class VAE(nn.Module):
             )
             print(f"Cyclical beta annealing enabled: {beta_scheduler}")
 
+        # === Optional Model Compilation ===
+        if compile_model and hasattr(torch, 'compile'):
+            self.encoder = torch.compile(self.encoder, mode='reduce-overhead')
+            self.decoder = torch.compile(self.decoder, mode='reduce-overhead')
+            self.hierarchy = torch.compile(self.hierarchy, mode='reduce-overhead') if self.hierarchy is not None else None
+            print("Model compiled with torch.compile for faster training.")
+
+
         # === Training Loop ===
         self.train()
         global_step = 0
         best_val_loss = float('inf')
         best_epoch = 0
+
         for epoch in range(epochs):
             epoch_train_loss = 0.0
             epoch_train_recon = 0.0
@@ -911,14 +921,16 @@ class VAE(nn.Module):
                 current_beta = beta_scheduler.step() if beta_annealing else beta
 
                 batch = self.move_to_device(batch, device)
-                loss_dict = self.train_core(
-                    batch, 
-                    optim, 
-                    beta=current_beta, 
-                    gradient_clip=gradient_clip, 
-                    gradient_clip_kwargs=gradient_clip_kwargs,
-                    weighted_loss=weighted_loss,
-                )
+
+                with torch.amp.autocast(device_type=str(device).split(':')[0], enabled=(str(device) != 'cpu')):
+                    loss_dict = self.train_core(
+                        batch, 
+                        optim, 
+                        beta=current_beta, 
+                        gradient_clip=gradient_clip, 
+                        gradient_clip_kwargs=gradient_clip_kwargs,
+                        weighted_loss=weighted_loss,
+                    )
                 
                 # Accumulate epoch losses
                 epoch_train_loss += loss_dict["loss"].item()

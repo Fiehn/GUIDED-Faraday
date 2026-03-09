@@ -445,14 +445,12 @@ def online_train(model_type: str = "cvae", skip_validation: bool = False):
 
 # now we can run either VAE or CVAE test
 if __name__ == "__main__":
-    import gc
     # choose: "vae" or "cvae"
     # run_test(model_type="vae")
-    # run_test(model_type="vae", skip_validation=False)  # VAE with validation
-    run_test(model_type="cvae", skip_validation=True, file_name='hourly_measurements_2023_11.csv')  # CVAE with validation
-    #run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
-    gc.collect()  # Release run_test's DataModule/DataLoader memory before loading the next file
-    online_train(model_type="cvae", skip_validation=True)  # Online training with CVAE and validation
+    #run_test(model_type="vae", skip_validation=False)  # VAE with validation
+    #run_test(model_type="cvae", skip_validation=True, file_name='hourly_measurements_2023_11.csv')  # CVAE with validation
+    run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
+    #online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
     #run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
 
 
