@@ -22,12 +22,53 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 from scipy import stats
 
+from train_utils import PlotStyle
+
 try:
     from tabulate import tabulate
 except ImportError:
     # Fallback if tabulate not installed
     def tabulate(data, headers="keys", **kwargs):
         return str(data)
+
+
+def _to_json_serializable(obj: Any) -> Any:
+    """Recursively convert numpy/torch-like objects into JSON-serializable values."""
+    if isinstance(obj, dict):
+        return {k: _to_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_json_serializable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
+
+
+def _save_standalone_metric_result(metric_key: str, payload: Dict[str, Any],
+                                   output_file: str = 'src/Output/eval_results.json') -> None:
+    """Save/update standalone metric results in the shared per-condition JSON file."""
+    try:
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
+        existing = {}
+        if os.path.exists(output_file):
+            try:
+                with open(output_file, 'r') as f:
+                    existing = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+
+        if not isinstance(existing, dict):
+            existing = {}
+
+        existing.setdefault('standalone_metrics', {})
+        existing['standalone_metrics'][metric_key] = _to_json_serializable(payload)
+
+        with open(output_file, 'w') as f:
+            json.dump(existing, f, indent=2)
+    except Exception as e:
+        print(f"Warning: failed to save standalone metric '{metric_key}' to {output_file}: {e}")
 
 
 class EvaluationMetric(ABC):
@@ -176,7 +217,6 @@ class EvalFramework:
         print(f"  Real: {self._real_data.shape} | "
               f"Reconstructed: {self._reconstructed_data.shape} | "
               f"Synthetic: {self._synthetic_data.shape}")
-
     
     def _reconstruct(self, x: torch.Tensor, meter_id=None, timestamps=None) -> torch.Tensor:
         """Reconstruct via encoder-decoder, using real conditions for CVAE."""
@@ -240,12 +280,14 @@ class EvalFramework:
             metric.reconstructed_data = self._reconstructed_data
             metric.model = self.model
             metric.device = self.device
+            metric.normalizer = self.normalizer
 
         for metric in self.synthetic_metrics.values():
             metric.real_data = self._real_data
             metric.synthetic_data = self._synthetic_data
             metric.model = self.model
             metric.device = self.device
+            metric.normalizer = self.normalizer
 
     def register_metric(self, metric: EvaluationMetric) -> None:
         """Register an evaluation metric.
@@ -411,7 +453,6 @@ class EvalFramework:
 # Reconstruction Evaluation Metrics 
 # ============================================================================
 
-# TODO: implement this 
 class ReconstructionMSE(ReconstructionMetric):
     """Mean squared error on reconstruction."""
     
@@ -424,11 +465,40 @@ class ReconstructionMSE(ReconstructionMetric):
     
     def compute(self) -> float:
         """Compute reconstruction MSE on test data."""
-        diff = self.real_data - self.reconstructed_data
-        mse = np.mean(diff ** 2)
-        return float(mse)
+        if self.real_data is None or self.reconstructed_data is None:
+            raise ValueError("ReconstructionMSE requires injected real_data and reconstructed_data before compute().")
 
-# TODO: implement this 
+        real = np.asarray(self.real_data)
+        recon = np.asarray(self.reconstructed_data)
+
+        if real.ndim != 2 or recon.ndim != 2:
+            raise ValueError(f"Expected 2D arrays [N, D], got real={real.shape}, reconstructed={recon.shape}")
+
+        # Align shapes safely if they differ
+        if real.shape != recon.shape:
+            min_samples = min(real.shape[0], recon.shape[0])
+            min_features = min(real.shape[1], recon.shape[1])
+            if min_samples == 0 or min_features == 0:
+                raise ValueError(f"Invalid shapes for MSE: real={real.shape}, reconstructed={recon.shape}")
+            real = real[:min_samples, :min_features]
+            recon = recon[:min_samples, :min_features]
+
+        diff = real - recon
+        mse = float(np.mean(diff ** 2))
+
+        _save_standalone_metric_result(
+            metric_key='ReconstructionMSE',
+            payload={
+                'value': mse,
+                'n_samples': int(real.shape[0]),
+                'n_features': int(real.shape[1]),
+                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+            }
+        )
+
+        return mse
+
+
 class ReconstructionRMSE(ReconstructionMetric):
     """Mean absolute error on reconstruction."""
     
@@ -441,12 +511,40 @@ class ReconstructionRMSE(ReconstructionMetric):
     
     def compute(self) -> float:
         """Compute reconstruction RMSE on test data."""
-        diff = self.real_data - self.reconstructed_data
-        rmse = np.sqrt(np.mean(diff ** 2))
-        return float(rmse)
+        if self.real_data is None or self.reconstructed_data is None:
+            raise ValueError("ReconstructionRMSE requires injected real_data and reconstructed_data before compute().")
+
+        real = np.asarray(self.real_data)
+        recon = np.asarray(self.reconstructed_data)
+
+        if real.ndim != 2 or recon.ndim != 2:
+            raise ValueError(f"Expected 2D arrays [N, D], got real={real.shape}, reconstructed={recon.shape}")
+
+        # Align shapes safely if they differ
+        if real.shape != recon.shape:
+            min_samples = min(real.shape[0], recon.shape[0])
+            min_features = min(real.shape[1], recon.shape[1])
+            if min_samples == 0 or min_features == 0:
+                raise ValueError(f"Invalid shapes for RMSE: real={real.shape}, reconstructed={recon.shape}")
+            real = real[:min_samples, :min_features]
+            recon = recon[:min_samples, :min_features]
+
+        diff = real - recon
+        rmse = float(np.sqrt(np.mean(diff ** 2)))
+
+        _save_standalone_metric_result(
+            metric_key='ReconstructionRMSE',
+            payload={
+                'value': rmse,
+                'n_samples': int(real.shape[0]),
+                'n_features': int(real.shape[1]),
+                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+            }
+        )
+
+        return rmse
 
 
-# TODO: implement this 
 class ReconstructionLogLikelihood(ReconstructionMetric):
     """Log-likelihood of reconstruction."""
 
@@ -458,10 +556,60 @@ class ReconstructionLogLikelihood(ReconstructionMetric):
         return "Reconstruction Log-Likelihood"
     
     def compute(self) -> float:
-        """Compute reconstruction log-likelihood."""
-        # TODO: Implement reconstruction log-likelihood
-        # TODO: needs the prior and likelihood from the model, and may require sampling or approximation
-        return 0.0
+        """Compute reconstruction log-likelihood.
+
+        Uses a simple isotropic Gaussian likelihood approximation:
+        x | x_hat ~ N(x_hat, sigma^2 I), where sigma^2 is estimated from residuals.
+        Returns mean log-likelihood per element (higher is better).
+        """
+        if self.real_data is None or self.reconstructed_data is None:
+            raise ValueError(
+                "ReconstructionLogLikelihood requires injected real_data and reconstructed_data before compute()."
+            )
+
+        real = np.asarray(self.real_data)
+        recon = np.asarray(self.reconstructed_data)
+
+        if real.ndim != 2 or recon.ndim != 2:
+            raise ValueError(f"Expected 2D arrays [N, D], got real={real.shape}, reconstructed={recon.shape}")
+
+        # Align shapes safely if they differ
+        if real.shape != recon.shape:
+            min_samples = min(real.shape[0], recon.shape[0])
+            min_features = min(real.shape[1], recon.shape[1])
+            if min_samples == 0 or min_features == 0:
+                raise ValueError(
+                    f"Invalid shapes for log-likelihood: real={real.shape}, reconstructed={recon.shape}"
+                )
+            real = real[:min_samples, :min_features]
+            recon = recon[:min_samples, :min_features]
+
+        residual = real - recon
+
+        # Estimate isotropic residual variance and guard against degenerate zero variance
+        eps = 1e-8
+        sigma2 = float(np.var(residual))
+        sigma2 = max(sigma2, eps)
+
+        log_const = -0.5 * np.log(2.0 * np.pi * sigma2)
+        ll_matrix = log_const - (residual ** 2) / (2.0 * sigma2)
+
+        mean_log_likelihood = float(np.mean(ll_matrix))
+        total_log_likelihood = float(np.sum(ll_matrix))
+
+        _save_standalone_metric_result(
+            metric_key='ReconstructionLogLikelihood',
+            payload={
+                'value': mean_log_likelihood,
+                'total_log_likelihood': total_log_likelihood,
+                'sigma2_estimate': sigma2,
+                'n_samples': int(real.shape[0]),
+                'n_features': int(real.shape[1]),
+                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+            }
+        )
+
+        return mean_log_likelihood
     
 
 class FlexibilityDistance(ReconstructionMetric):
@@ -489,6 +637,43 @@ class FlexibilityDistance(ReconstructionMetric):
     def name(self) -> str:
         return "Flexibility Distance"
     
+    @staticmethod
+    def compute_fd_between_series(x: np.ndarray, y: np.ndarray, tau='auto', normalize=True) -> float:
+        """Compute flexibility distance between two time series.
+        
+        Args:
+            x: First time series [T]
+            y: Second time series [T]
+            tau: Temporal scaling factor ('auto' or float)
+            normalize: If True, divide cost by series length
+            
+        Returns:
+            Flexibility distance value
+        """
+        series_len = len(x)
+        indices = np.arange(series_len)
+        
+        # Auto tau based on value range and series length
+        if tau == 'auto' or tau is None:
+            value_range = float(np.max([x.max(), y.max()]) - np.min([x.min(), y.min()]))
+            tau_val = value_range / series_len if series_len > 0 else 0.0
+        else:
+            tau_val = float(tau)
+        
+        # Cost matrix: |X_i - Y_j| + |i - j| * tau
+        amplitude_cost = np.abs(x[:, None] - y[None, :])
+        temporal_cost = np.abs(indices[:, None] - indices[None, :]) * tau_val
+        cost_matrix = amplitude_cost + temporal_cost
+        
+        # Linear sum assignment (minimum cost)
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        total_cost = float(cost_matrix[row_ind, col_ind].sum())
+        
+        if normalize and series_len > 0:
+            total_cost /= series_len
+        
+        return total_cost
+    
     def compute(self) -> float:
         """Compute flexibility distance metric.
         
@@ -499,9 +684,16 @@ class FlexibilityDistance(ReconstructionMetric):
         Returns:
             Flexibility Distance (lower is better, 0 = perfect reconstruction)
         """
-        
-        real_np = self.real_data
-        recon_np = self.reconstructed_data
+        if self.real_data is None or self.reconstructed_data is None:
+            raise ValueError(
+                "FlexibilityDistance requires injected real_data and reconstructed_data before compute()."
+            )
+
+        real_np = np.asarray(self.real_data)
+        recon_np = np.asarray(self.reconstructed_data)
+
+        if real_np.ndim != 2 or recon_np.ndim != 2:
+            raise ValueError(f"Expected 2D arrays [N, D], got real={real_np.shape}, reconstructed={recon_np.shape}")
         
         # Ensure shapes match
         if real_np.shape != recon_np.shape:
@@ -512,33 +704,13 @@ class FlexibilityDistance(ReconstructionMetric):
         
         # Compute FD per sample using assignment-based cost
         num_samples, series_len = real_np.shape
-        indices = np.arange(series_len)
         fd_values = []
         
         for i in range(num_samples):
             x = real_np[i]
             y = recon_np[i]
-            
-            # Auto tau based on value range and series length
-            if self.tau == 'auto' or self.tau is None:
-                value_range = float(np.max([x.max(), y.max()]) - np.min([x.min(), y.min()]))
-                tau = value_range / series_len if series_len > 0 else 0.0
-            else:
-                tau = float(self.tau)
-            
-            # Cost matrix: |X_i - Y_j| + |i - j| * tau
-            amplitude_cost = np.abs(x[:, None] - y[None, :])
-            temporal_cost = np.abs(indices[:, None] - indices[None, :]) * tau
-            cost_matrix = amplitude_cost + temporal_cost
-            
-            # Linear sum assignment (minimum cost)
-            row_ind, col_ind = linear_sum_assignment(cost_matrix)
-            total_cost = float(cost_matrix[row_ind, col_ind].sum())
-            
-            if self.normalize and series_len > 0:
-                total_cost /= series_len
-            
-            fd_values.append(total_cost)
+            fd = self.compute_fd_between_series(x, y, tau=self.tau, normalize=self.normalize)
+            fd_values.append(fd)
         
         return float(np.mean(fd_values))
 
@@ -671,7 +843,23 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
         
         # Compute MMD^2, return MMD 
         mmd2 = self._mmd_rbf_unbiased(real, synthetic, sigma=sigma)
-        return float(np.sqrt(np.maximum(mmd2, 0.0)))
+        mmd_value = float(np.sqrt(np.maximum(mmd2, 0.0)))
+
+        _save_standalone_metric_result(
+            metric_key='MaximumMeanDiscrepancy',
+            payload={
+                'value': mmd_value,
+                'mmd2': float(mmd2),
+                'sigma': float(sigma),
+                'seed': int(self.seed),
+                'max_samples': int(self.max_samples),
+                'n_real_used': int(len(real)),
+                'n_synthetic_used': int(len(synthetic)),
+                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+            }
+        )
+
+        return mmd_value
 
 
 class ACFDistribution(SyntheticMetric):
@@ -773,9 +961,22 @@ class ACFDistribution(SyntheticMetric):
             ks_statistics.append(ks_stat)
         
         # Average KS statistic across all lags
-        avg_ks = np.mean(ks_statistics)
-        
-        return float(avg_ks)
+        avg_ks = float(np.mean(ks_statistics))
+
+        _save_standalone_metric_result(
+            metric_key='ACFDistribution',
+            payload={
+                'value': avg_ks,
+                'window_size': int(self.window_size),
+                'max_lag': int(self.max_lag),
+                'ks_by_lag': [float(v) for v in ks_statistics],
+                'n_real_series': int(len(real_ts)),
+                'n_synthetic_series': int(len(synthetic_ts)),
+                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+            }
+        )
+
+        return avg_ks
 
 
 class VisualEvaluation(SyntheticMetric):
@@ -855,9 +1056,19 @@ class VisualEvaluation(SyntheticMetric):
         # Combine for t-SNE
         combined = np.vstack([real_data, synthetic_data])
         labels = np.hstack([np.zeros(len(real_data)), np.ones(len(synthetic_data))])
+
+        n_samples = combined.shape[0]
+        if n_samples < 3:
+            raise ValueError(f"Need at least 3 samples for t-SNE, got {n_samples}.")
+
+        # Perplexity must be strictly less than n_samples
+        perplexity = min(30, n_samples - 1)
+        # Keep a sensible lower bound for stability when possible
+        if perplexity < 5 and n_samples >= 6:
+            perplexity = 5
         
         # Apply t-SNE
-        tsne = TSNE(n_components=2, learning_rate='auto', random_state=42, perplexity=30)
+        tsne = TSNE(n_components=2, learning_rate='auto', random_state=42, perplexity=perplexity)
         tsne_result = tsne.fit_transform(combined)
         
         # Plot
@@ -919,9 +1130,18 @@ class ClassicalStatistics(SyntheticMetric):
         Returns:
             Dictionary with statistical measures
         """
-        # Use only consumption, so reshape: [N, window_size * 2] -> [N, window_size, 2]
-        data_reshaped = data.reshape(-1, self.window_size, 2)
-        data = data_reshaped[:, :, 0:1] # [N, window_size, 1]
+        data = np.asarray(data)
+        if data.ndim != 2:
+            raise ValueError(f"Expected 2D array [N, D], got shape {data.shape}")
+        if data.shape[1] % self.window_size != 0:
+            raise ValueError(
+                f"Data feature dimension ({data.shape[1]}) must be divisible by window_size ({self.window_size})"
+            )
+
+        # Support both [N, window_size] (consumption only) and [N, window_size * n_features]
+        inferred_n_features = data.shape[1] // self.window_size
+        data_reshaped = data.reshape(-1, self.window_size, inferred_n_features)
+        data = data_reshaped[:, :, 0:1]  # consumption channel, shape [N, window_size, 1]
         
         # Compute mean profile: average value at each timestep across all samples, shape: [window_size, 1]
         mean_profile = np.mean(data, axis=0)
@@ -980,6 +1200,21 @@ class ClassicalStatistics(SyntheticMetric):
             real_stats['std_profile'] - synthetic_stats['std_profile']
         )))
         overall_mean_diff = float(abs(real_stats['overall_mean'] - synthetic_stats['overall_mean']))
+
+        _save_standalone_metric_result(
+            metric_key='ClassicalStatistics',
+            payload={
+                'value': mean_profile_diff,
+                'differences': {
+                    'mean_profile_mae': mean_profile_diff,
+                    'std_profile_mae': std_profile_diff,
+                    'overall_mean_abs_diff': overall_mean_diff,
+                },
+                'real': real_stats,
+                'synthetic': synthetic_stats,
+                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+            }
+        )
 
         return mean_profile_diff
     
@@ -1212,10 +1447,682 @@ class TSTR(SyntheticMetric):
         print(f"  TRTR MSE: {trtr_mse:.6f}")
         print(f"  TSTR MSE: {tstr_mse:.6f}")
         print(f"  TSTR/TRTR Ratio: {tstr_ratio:.6f}")
+
+        _save_standalone_metric_result(
+            metric_key='TSTR',
+            payload={
+                'value': float(tstr_ratio),
+                'trtr_mse': float(trtr_mse),
+                'tstr_mse': float(tstr_mse),
+                'task': self.task,
+                'window_size': int(self.window_size),
+                'predictor_type': self.predictor_type,
+                'epochs': int(self.epochs),
+                'n_real_total': int(len(real_data)),
+                'n_real_train': int(len(real_train)),
+                'n_real_test': int(len(real_test)),
+                'n_synthetic_train': int(len(synthetic_train)),
+                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+            }
+        )
         
         return tstr_ratio
 
 
+class AggregatedProfiles(SyntheticMetric):
+    """Aggregate samples from real and synthetic data and compute Flexibility Distance between aggregated profiles."""
+    
+    real_data: np.ndarray = None
+    synthetic_data: np.ndarray = None
+    normalizer = None
+    
+    def __init__(self, n_samples=100, window_size=24, tau='auto', normalize=True, output_dir='src/Output/Plots'):
+        self.n_samples = n_samples
+        self.window_size = window_size
+        self.tau = tau
+        self.normalize = normalize
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+    
+    @property
+    def name(self) -> str:
+        return "Aggregated Profiles (Flexibility Distance)"
+    
+    def compute(self) -> float:
+        """Aggregate real and synthetic data, then compute Flexibility Distance."""
+        real_data = np.asarray(self.real_data)
+        synthetic_data = np.asarray(self.synthetic_data)
+        
+        # Denormalize synthetic data if normalizer is available
+        if self.normalizer is not None and hasattr(self.normalizer, 'inverse_transform'):
+            synthetic_data = self.normalizer.inverse_transform(synthetic_data).detach().cpu().numpy()
+
+        # Extract consumption only (feature 0)
+        real_n_features = real_data.shape[1] // self.window_size
+        synth_n_features = synthetic_data.shape[1] // self.window_size
+        
+        real_data = real_data.reshape(-1, self.window_size, real_n_features)[:, :, 0]
+        synthetic_data = synthetic_data.reshape(-1, self.window_size, synth_n_features)[:, :, 0]
+        
+        # Use the same number of samples for fair comparison
+        n_agg = min(self.n_samples, len(real_data), len(synthetic_data))
+        real_samples = real_data[:n_agg]
+        synth_samples = synthetic_data[:n_agg]
+        
+        print(f"  Aggregating {n_agg} samples (real: {len(real_data)} available, synth: {len(synthetic_data)} available)")
+        
+        # Aggregate by summing
+        real_aggregated = np.sum(real_samples, axis=0)
+        synth_aggregated = np.sum(synth_samples, axis=0)
+        
+        # Plot aggregated profiles
+        self._plot_aggregated_profiles(real_aggregated, synth_aggregated)
+        
+        # Compute Flexibility Distance
+        fd_score = FlexibilityDistance.compute_fd_between_series(
+            real_aggregated, synth_aggregated, tau=self.tau, normalize=self.normalize
+        )
+
+        _save_standalone_metric_result(
+            metric_key='AggregatedProfiles',
+            payload={
+                'value': float(fd_score),
+                'n_samples_requested': int(self.n_samples),
+                'n_samples_used': int(n_agg),
+                'window_size': int(self.window_size),
+                'tau': self.tau,
+                'normalize': bool(self.normalize),
+                'real_aggregated': real_aggregated,
+                'synthetic_aggregated': synth_aggregated,
+                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+            }
+        )
+        
+        return fd_score
+    
+    def _plot_aggregated_profiles(self, real_aggregated, synth_aggregated):
+        """Plot aggregated real and synthetic profiles."""
+        fig, ax = plt.subplots(figsize=(14, 6))
+        timesteps = np.arange(len(real_aggregated))
+        ax.plot(timesteps, real_aggregated, label='Real Aggregated', 
+                color='blue', linewidth=2, alpha=0.8)
+        ax.plot(timesteps, synth_aggregated, label='Synthetic Aggregated', 
+                color='red', linewidth=2, alpha=0.8, linestyle='--')
+        ax.set_xlabel('Hour', fontsize=12)
+        ax.set_ylabel('Aggregated Consumption [kWh]', fontsize=12)
+        ax.set_title(f'Aggregated Consumption Profiles (n={self.n_samples} samples)', fontsize=14)
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, 'aggregated_profiles_comparison.png'), dpi=150)
+        plt.close()
+        
+
+class PerConditionEval(SyntheticMetric):
+    """Compute per-condition evaluation for MMD, ACFDistribution, TSTR, ClassicalStatistics, and AggregatedProfiles.
+
+    Includes:
+    - MMD per day-of-week and month (using full 24-hour windows)
+    - ACFDistribution per day-of-week and month (using full 24-hour windows)
+    - ClassicalStatistics per day-of-week and month
+    - TSTR per day-of-week and month (train/test on real, train on synthetic, test on real holdout)
+    - AggregatedProfiles per day-of-week and month (aggregate samples within each group and compare profiles)
+
+    Can be tested using test_eval.py
+    """
+
+    real_data: np.ndarray = None
+    synthetic_data: np.ndarray = None
+    timestamps: np.ndarray = None
+
+    def __init__(self, window_size=24, max_lag=10, min_samples_per_group=2, output_dir='src/Output', 
+                 verbose=False, predictor_type='linear', tstr_epochs=50):
+        self.window_size = window_size
+        self.max_lag = max_lag
+        self.min_samples_per_group = min_samples_per_group
+        self.output_dir = output_dir
+        self.verbose = verbose
+        self.predictor_type = predictor_type
+        self.tstr_epochs = tstr_epochs
+        os.makedirs(output_dir, exist_ok=True)
+
+        self.results_by_condition = {
+            'mmd': {
+                'day_of_week': {},
+                'month_of_year': {},
+            },
+            'acf': {
+                'day_of_week': {},
+                'month_of_year': {},
+            },
+            'classical_statistics': {
+                'day_of_week': {},
+                'month_of_year': {},
+            },
+            'aggregated_profiles': {
+                'day_of_week': {},
+                'month_of_year': {},
+            },
+            'tstr': {
+                'day_of_week': {},
+                'month_of_year': {},
+            }
+        }
+
+        self.mmd_calculator = MaximumMeanDiscrepancy(sigma=None, seed=42, max_samples=2000)
+        self.acf_calculator = ACFDistribution(window_size=window_size, max_lag=max_lag)
+        self.classical_statistics_calculator = ClassicalStatistics(window_size=window_size, n_features=1)
+        self.tstr_calculator = TSTR(
+            task='next_step',
+            window_size=window_size,
+            n_features=1,
+            predictor_type=predictor_type,
+            epochs=tstr_epochs,
+            random_state=42
+        )
+        self.aggregated_profiles_calculator = AggregatedProfiles(
+            n_samples=100,
+            window_size=window_size,
+            tau='auto',
+            normalize=True,
+            output_dir=os.path.join(output_dir, 'Plots')
+        )
+
+    @property
+    def name(self) -> str:
+        return "Per-Condition Evaluation"
+
+    def _print_input_debug(self, real_data: np.ndarray, synthetic_data: np.ndarray, timestamps: np.ndarray) -> None:
+        """Print information about input formats."""
+        print("\n" + "=" * 70)
+        print("PER-CONDITION DATA INPUT")
+        print("=" * 70)
+        print(f"real_data:      shape={real_data.shape}, dtype={real_data.dtype}")
+        print(f"synthetic_data: shape={synthetic_data.shape}, dtype={synthetic_data.dtype}")
+        print(f"timestamps:     shape={timestamps.shape}, dtype={timestamps.dtype}")
+
+        if len(real_data) > 0:
+            print(f"real_data[0] (first window, len={len(real_data[0])}):")
+            print(np.array2string(real_data[0], precision=4, separator=", "))
+
+        if len(synthetic_data) > 0:
+            print(f"synthetic_data[0] (first window, len={len(synthetic_data[0])}):")
+            print(np.array2string(synthetic_data[0], precision=4, separator=", "))
+
+        if len(timestamps) > 0:
+            dt0 = datetime.utcfromtimestamp(int(timestamps[0]))
+            print(f"timestamps[0]: {int(timestamps[0])} -> {dt0.strftime('%Y-%m-%d %A %H:%M:%S')} UTC")
+
+    def _compute_subset_acf(self, real_subset: np.ndarray, synthetic_subset: np.ndarray):
+        """Compute ACF score for one subset; return None if too few samples."""
+        if len(real_subset) < self.min_samples_per_group or len(synthetic_subset) < self.min_samples_per_group:
+            return None
+        self.acf_calculator.real_data = real_subset
+        self.acf_calculator.synthetic_data = synthetic_subset
+        return float(self.acf_calculator.compute())
+
+    def _compute_subset_tstr(self, real_subset: np.ndarray, synthetic_subset: np.ndarray,
+                             group_label: str = None) -> float:
+        """Compute TSTR ratio for one subset using the TSTR metric; return None if too few samples."""
+        if len(real_subset) < 4 or len(synthetic_subset) < 2:
+            if self.verbose and group_label is not None:
+                print(f"\n  [TSTR] {group_label} -> insufficient samples (real={len(real_subset)}, synthetic={len(synthetic_subset)})")
+            return None
+
+        try:
+            if self.verbose and group_label is not None:
+                print(f"\n  [TSTR] {group_label} (real={len(real_subset)}, synthetic={len(synthetic_subset)})")
+            self.tstr_calculator.real_data = real_subset
+            self.tstr_calculator.synthetic_data = synthetic_subset
+            tstr_ratio = self.tstr_calculator.compute()
+            return float(tstr_ratio)
+        except Exception as e:
+            if self.verbose:
+                label_suffix = f" for {group_label}" if group_label is not None else ""
+                print(f"Warning: TSTR computation failed{label_suffix}: {e}")
+            return None
+
+    def _compute_subset_aggregated_profiles(self, real_subset: np.ndarray, synthetic_subset: np.ndarray):
+        """Compute AggregatedProfiles score for one subset; return None if too few samples."""
+        if len(real_subset) < self.min_samples_per_group or len(synthetic_subset) < self.min_samples_per_group:
+            return None
+
+        try:
+            self.aggregated_profiles_calculator.real_data = real_subset
+            self.aggregated_profiles_calculator.synthetic_data = synthetic_subset
+            return float(self.aggregated_profiles_calculator.compute())
+        except Exception as e:
+            if self.verbose:
+                print(f"Warning: AggregatedProfiles computation failed: {e}")
+            return None
+
+    def _compute_classical_stats_for_data(self, data: np.ndarray) -> Dict[str, Any]:
+        """Compute classical stats for [N, window_size] consumption windows."""
+        data = np.asarray(data)
+        if data.ndim != 2 or data.shape[1] != self.window_size:
+            raise ValueError(
+                f"Expected [N, {self.window_size}] array for classical stats, got {data.shape}"
+            )
+
+        mean_profile = np.mean(data, axis=0)
+        std_profile = np.std(data, axis=0)
+
+        return {
+            'mean_profile': mean_profile.tolist(),
+            'std_profile': std_profile.tolist(),
+            'overall_mean': float(np.mean(data)),
+            'overall_std': float(np.std(data)),
+            'overall_min': float(np.min(data)),
+            'overall_max': float(np.max(data)),
+            'quantiles': {
+                '25%': float(np.percentile(data, 25)),
+                '50%': float(np.percentile(data, 50)),
+                '75%': float(np.percentile(data, 75)),
+            }
+        }
+
+    def _compute_subset_classical_stats(self, real_subset: np.ndarray, synthetic_subset: np.ndarray):
+        """Compute full classical stats for one subset; return None if too few samples."""
+        if len(real_subset) < self.min_samples_per_group or len(synthetic_subset) < self.min_samples_per_group:
+            return None
+
+        try:
+            real_stats = self._compute_classical_stats_for_data(real_subset)
+            synthetic_stats = self._compute_classical_stats_for_data(synthetic_subset)
+            real_mean_profile = np.array(real_stats['mean_profile'])
+            synth_mean_profile = np.array(synthetic_stats['mean_profile'])
+            real_std_profile = np.array(real_stats['std_profile'])
+            synth_std_profile = np.array(synthetic_stats['std_profile'])
+
+            return {
+                'n_profiles': int(min(len(real_subset), len(synthetic_subset))),
+                'real': real_stats,
+                'synthetic': synthetic_stats,
+                'differences': {
+                    'overall_mean_abs_diff': float(abs(real_stats['overall_mean'] - synthetic_stats['overall_mean'])),
+                    'overall_std_abs_diff': float(abs(real_stats['overall_std'] - synthetic_stats['overall_std'])),
+                    'mean_profile_mae': float(np.mean(np.abs(real_mean_profile - synth_mean_profile))),
+                    'std_profile_mae': float(np.mean(np.abs(real_std_profile - synth_std_profile))),
+                }
+            }
+        except Exception as e:
+            if self.verbose:
+                print(f"Warning: ClassicalStatistics computation failed: {e}")
+            return None
+
+    def _plot_aggregated_profiles_bars(
+        self,
+        real_data: np.ndarray,
+        synthetic_data: np.ndarray,
+        days_of_week: np.ndarray,
+        months_of_year: np.ndarray,
+    ) -> Dict[str, str]:
+        """Create bar charts of aggregated real vs synthetic consumption by day and month."""
+        plots_dir = os.path.join(self.output_dir, 'Plots')
+        os.makedirs(plots_dir, exist_ok=True)
+        
+        # Plot style
+        plot_style = PlotStyle(figsize=(14, 6))
+        color_real = plot_style.palette_colors[0]
+        color_synthetic = plot_style.palette_colors[4]
+        day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June',
+                       'July', 'August', 'September', 'October', 'November', 'December']
+
+        # Sum total consumption (all windows + all 24 hours) per day-of-week
+        day_labels = []
+        day_real_totals = []
+        day_synth_totals = []
+        day_counts = []
+        for day in range(7):
+            mask = days_of_week == day
+            if np.sum(mask) > 0:
+                day_labels.append(day_names[day])
+                day_real_totals.append(float(np.sum(real_data[mask])))
+                day_synth_totals.append(float(np.sum(synthetic_data[mask])))
+                day_counts.append(int(np.sum(mask)))
+
+        day_plot_path = os.path.join(plots_dir, 'aggregated_profiles_bar_day_of_week.png')
+        if day_labels:
+            x = np.arange(len(day_labels))
+            width = 0.38
+            fig, ax = plt.subplots(figsize=plot_style.figsize)
+            ax.bar(x - width / 2, day_real_totals, width, label='Real', 
+                   color=color_real, alpha=0.9, linewidth=1.2)
+            ax.bar(x + width / 2, day_synth_totals, width, label='Synthetic', 
+                   color=color_synthetic, alpha=0.9, linewidth=1.2)
+            ax.set_title(f'Aggregated Consumption by Day of Week ({sum(day_counts)} profiles)', fontsize=14, fontweight='bold')
+            ax.set_xlabel('Day of Week', fontsize=12)
+            ax.set_ylabel('Aggregated Consumption (sum)', fontsize=12)
+            ax.set_xticks(x)
+            ax.set_xticklabels(day_labels, rotation=20, ha='right')
+            ax.legend(fontsize=11)
+            ax.grid(axis='y', alpha=0.3, linestyle='--')
+            plt.tight_layout()
+            plt.savefig(day_plot_path, dpi=150, bbox_inches='tight')
+            plt.close()
+
+        # Sum total consumption (all windows + all 24 hours) per month
+        month_labels = []
+        month_real_totals = []
+        month_synth_totals = []
+        month_counts = []
+        for month in range(1, 13):
+            mask = months_of_year == month
+            if np.sum(mask) > 0:
+                month_labels.append(month_names[month])
+                month_real_totals.append(float(np.sum(real_data[mask])))
+                month_synth_totals.append(float(np.sum(synthetic_data[mask])))
+                month_counts.append(int(np.sum(mask)))
+
+        month_plot_path = os.path.join(plots_dir, 'aggregated_profiles_bar_month_of_year.png')
+        if month_labels:
+            x = np.arange(len(month_labels))
+            width = 0.38
+            fig, ax = plt.subplots(figsize=plot_style.figsize)
+            ax.bar(x - width / 2, month_real_totals, width, label='Real', 
+                   color=color_real, alpha=0.9, linewidth=1.2)
+            ax.bar(x + width / 2, month_synth_totals, width, label='Synthetic', 
+                   color=color_synthetic, alpha=0.9, linewidth=1.2)
+            ax.set_title(f'Aggregated Consumption by Month of Year ({sum(month_counts)} profiles)', fontsize=14, fontweight='bold')
+            ax.set_xlabel('Month of Year', fontsize=12)
+            ax.set_ylabel('Aggregated Consumption (sum)', fontsize=12)
+            ax.set_xticks(x)
+            ax.set_xticklabels(month_labels, rotation=20, ha='right')
+            ax.legend(fontsize=11)
+            ax.grid(axis='y', alpha=0.3, linestyle='--')
+            plt.tight_layout()
+            plt.savefig(month_plot_path, dpi=150, bbox_inches='tight')
+            plt.close()
+
+        return {
+            'day_of_week': day_plot_path,
+            'month_of_year': month_plot_path,
+        }
+
+    def compute(self) -> float:
+        """Run per-condition MMD, ACFDistribution, and TSTR and save results."""
+        if self.real_data is None or self.synthetic_data is None:
+            raise ValueError("PerConditionEval requires injected real_data and synthetic_data.")
+        if self.timestamps is None:
+            raise ValueError("PerConditionEval requires injected timestamps.")
+
+        real_data = np.asarray(self.real_data)
+        synthetic_data = np.asarray(self.synthetic_data)
+        timestamps = np.asarray(self.timestamps)
+
+        if len(real_data) != len(synthetic_data):
+            raise ValueError(f"Real ({len(real_data)}) and synthetic ({len(synthetic_data)}) data must have same length")
+        if len(real_data) != len(timestamps):
+            raise ValueError(f"Data length ({len(real_data)}) must match timestamps length ({len(timestamps)})")
+        if real_data.ndim != 2 or synthetic_data.ndim != 2:
+            raise ValueError(f"Expected 2D arrays [N, D], got real={real_data.shape}, synthetic={synthetic_data.shape}")
+        if real_data.shape[1] != self.window_size or synthetic_data.shape[1] != self.window_size:
+            raise ValueError(
+                f"Expected window shape [N, {self.window_size}], got real={real_data.shape}, synthetic={synthetic_data.shape}"
+            )
+        if self.verbose:
+            self._print_input_debug(real_data, synthetic_data, timestamps)
+
+        days_of_week = []
+        months_of_year = []
+        for ts in timestamps:
+            dt = datetime.utcfromtimestamp(ts)
+            days_of_week.append(dt.weekday())
+            months_of_year.append(dt.month)
+        days_of_week = np.array(days_of_week)
+        months_of_year = np.array(months_of_year)
+
+        if self.verbose:
+            unique_days, day_counts = np.unique(days_of_week, return_counts=True)
+            unique_months, month_counts = np.unique(months_of_year, return_counts=True)
+            print("\nCondition counts:")
+            print("  day_of_week:", {int(k): int(v) for k, v in zip(unique_days, day_counts)})
+            print("  month_of_year:", {int(k): int(v) for k, v in zip(unique_months, month_counts)})
+
+        aggregated_profile_plot_paths = self._plot_aggregated_profiles_bars(
+            real_data=real_data,
+            synthetic_data=synthetic_data,
+            days_of_week=days_of_week,
+            months_of_year=months_of_year,
+        )
+
+        # -------------------------
+        # MMD 
+        # -------------------------
+        mmd_per_day = {}
+        for day in range(7):
+            mask = days_of_week == day
+            if np.sum(mask) > 0:
+                if len(real_data[mask]) >= 2 and len(synthetic_data[mask]) >= 2:
+                    self.mmd_calculator.real_data = real_data[mask]
+                    self.mmd_calculator.synthetic_data = synthetic_data[mask]
+                    mmd_per_day[day] = self.mmd_calculator.compute()
+                else:
+                    mmd_per_day[day] = 0.0
+
+        mmd_per_month = {}
+        for month in range(1, 13):
+            mask = months_of_year == month
+            if np.sum(mask) > 0:
+                if len(real_data[mask]) >= 2 and len(synthetic_data[mask]) >= 2:
+                    self.mmd_calculator.real_data = real_data[mask]
+                    self.mmd_calculator.synthetic_data = synthetic_data[mask]
+                    mmd_per_month[month] = self.mmd_calculator.compute()
+                else:
+                    mmd_per_month[month] = 0.0
+
+        # -------------------------
+        # ACF Distribution 
+        # -------------------------
+        acf_per_day = {}
+        for day in range(7):
+            mask = days_of_week == day
+            if np.sum(mask) > 0:
+                acf_per_day[day] = self._compute_subset_acf(real_data[mask], synthetic_data[mask])
+
+        acf_per_month = {}
+        for month in range(1, 13):
+            mask = months_of_year == month
+            if np.sum(mask) > 0:
+                acf_per_month[month] = self._compute_subset_acf(real_data[mask], synthetic_data[mask])
+
+        # -------------------------
+        # Classical Statistics
+        # -------------------------
+        classical_stats_per_day = {}
+        for day in range(7):
+            if np.sum(days_of_week == day) > 0:
+                classical_stats_per_day[day] = self._compute_subset_classical_stats(
+                    real_data[days_of_week == day], synthetic_data[days_of_week == day]
+                )
+
+        classical_stats_per_month = {}
+        for month in range(1, 13):
+            if np.sum(months_of_year == month) > 0:
+                classical_stats_per_month[month] = self._compute_subset_classical_stats(
+                    real_data[months_of_year == month], synthetic_data[months_of_year == month]
+                )
+
+        # -------------------------
+        # Aggregated Profiles (Flexibility Distance)
+        # -------------------------
+        aggregated_profiles_per_day = {}
+        for day in range(7):
+            if np.sum( days_of_week == day) > 0:
+                aggregated_profiles_per_day[day] = self._compute_subset_aggregated_profiles(
+                    real_data[ days_of_week == day], synthetic_data[ days_of_week == day]
+                )
+
+        aggregated_profiles_per_month = {}
+        for month in range(1, 13):
+            if np.sum(months_of_year == month) > 0:
+                aggregated_profiles_per_month[month] = self._compute_subset_aggregated_profiles(
+                    real_data[months_of_year == month], synthetic_data[months_of_year == month]
+                )
+
+        # -------------------------
+        # TSTR (Train on Synthetic, Test on Real)
+        # -------------------------
+        day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June',
+                       'July', 'August', 'September', 'October', 'November', 'December']
+
+        tstr_per_day = {}
+        for day in range(7):
+            if np.sum(days_of_week == day) > 0:
+                tstr_per_day[day] = self._compute_subset_tstr(
+                    real_data[days_of_week == day],
+                    synthetic_data[days_of_week == day],
+                    group_label=f"day_of_week={day_names[day]} (day {day})"
+                )
+
+        tstr_per_month = {}
+        for month in range(1, 13):
+            if np.sum(months_of_year == month) > 0:
+                tstr_per_month[month] = self._compute_subset_tstr(
+                    real_data[months_of_year == month],
+                    synthetic_data[months_of_year == month],
+                    group_label=f"month_of_year={month_names[month]} (month {month})"
+                )
+
+
+        # -------------------------
+        # Save results and print
+        # -------------------------
+        self.results_by_condition['mmd']['day_of_week'] = mmd_per_day
+        self.results_by_condition['mmd']['month_of_year'] = mmd_per_month
+        self.results_by_condition['acf']['day_of_week'] = acf_per_day
+        self.results_by_condition['acf']['month_of_year'] = acf_per_month
+        self.results_by_condition['classical_statistics']['day_of_week'] = classical_stats_per_day
+        self.results_by_condition['classical_statistics']['month_of_year'] = classical_stats_per_month
+        self.results_by_condition['aggregated_profiles']['day_of_week'] = aggregated_profiles_per_day
+        self.results_by_condition['aggregated_profiles']['month_of_year'] = aggregated_profiles_per_month
+        self.results_by_condition['tstr']['day_of_week'] = tstr_per_day
+        self.results_by_condition['tstr']['month_of_year'] = tstr_per_month
+
+        if self.verbose:
+            print("\n" + "="*70)
+            print("MMD PER DAY OF WEEK (24-HOUR WINDOWS)")
+            print("="*70)
+            for day in sorted(mmd_per_day.keys()):
+                print(f"{day_names[day]:10s} (day {day})  ->  MMD = {mmd_per_day[day]:.6f}")
+
+            print("\n" + "="*70)
+            print("MMD PER MONTH OF YEAR (24-HOUR WINDOWS)")
+            print("="*70)
+            for month in sorted(mmd_per_month.keys()):
+                print(f"{month_names[month]:10s} (month {month:2d})  ->  MMD = {mmd_per_month[month]:.6f}")
+
+            print("\n" + "="*70)
+            print("ACF DISTRIBUTION PER DAY OF WEEK (KS, lower is better)")
+            print("="*70)
+            for day in sorted(acf_per_day.keys()):
+                value = acf_per_day[day]
+                value_str = f"{value:.6f}" if value is not None else "insufficient samples"
+                print(f"{day_names[day]:10s} (day {day})  ->  ACF KS = {value_str}")
+
+            print("\n" + "="*70)
+            print("ACF DISTRIBUTION PER MONTH") # (KS, lower is better)
+            print("="*70)
+            for month in sorted(acf_per_month.keys()):
+                value = acf_per_month[month]
+                value_str = f"{value:.6f}" if value is not None else "insufficient samples"
+                print(f"{month_names[month]:10s} (month {month:2d})  ->  ACF KS = {value_str}")
+
+            print("\n" + "="*70)
+            print("CLASSICAL STATISTICS PER DAY OF WEEK")
+            print("="*70)
+            for day in sorted(classical_stats_per_day.keys()):
+                value = classical_stats_per_day[day]
+                if value is None:
+                    print(f"{day_names[day]:10s} (day {day})  ->  insufficient samples")
+                else:
+                    mae = value['differences']['mean_profile_mae']
+                    omd = value['differences']['overall_mean_abs_diff']
+                    print(f"{day_names[day]:10s} (day {day})  ->  mean_profile_mae = {mae:.6f}, overall_mean_abs_diff = {omd:.6f}")
+
+            print("\n" + "="*70)
+            print("CLASSICAL STATISTICS PER MONTH")
+            print("="*70)
+            for month in sorted(classical_stats_per_month.keys()):
+                value = classical_stats_per_month[month]
+                if value is None:
+                    print(f"{month_names[month]:10s} (month {month:2d})  ->  insufficient samples")
+                else:
+                    mae = value['differences']['mean_profile_mae']
+                    omd = value['differences']['overall_mean_abs_diff']
+                    print(f"{month_names[month]:10s} (month {month:2d})  ->  mean_profile_mae = {mae:.6f}, overall_mean_abs_diff = {omd:.6f}")
+
+            print("\n" + "="*70)
+            print("AGGREGATED PROFILES PER DAY OF WEEK") # (FD, lower is better)
+            print("="*70)
+            for day in sorted(aggregated_profiles_per_day.keys()):
+                value = aggregated_profiles_per_day[day]
+                value_str = f"{value:.6f}" if value is not None else "insufficient samples"
+                print(f"{day_names[day]:10s} (day {day})  ->  Aggregated FD = {value_str}")
+
+            print("\n" + "="*70)
+            print("AGGREGATED PROFILES PER MONTH") # (FD, lower is better)
+            print("="*70)
+            for month in sorted(aggregated_profiles_per_month.keys()):
+                value = aggregated_profiles_per_month[month]
+                value_str = f"{value:.6f}" if value is not None else "insufficient samples"
+                print(f"{month_names[month]:10s} (month {month:2d})  ->  Aggregated FD = {value_str}")
+
+            print("\n" + "="*70)
+            print("TSTR PER DAY OF WEEK") # (Ratio, 1.0 = perfect, lower is better)
+            print("="*70)
+            for day in sorted(tstr_per_day.keys()):
+                value = tstr_per_day[day]
+                value_str = f"{value:.6f}" if value is not None else "insufficient samples"
+                print(f"{day_names[day]:10s} (day {day})  ->  TSTR Ratio = {value_str}")
+
+            print("\n" + "="*70)
+            print("TSTR PER MONTH") # (Ratio, 1.0 = perfect, lower is better)
+            print("="*70)
+            for month in sorted(tstr_per_month.keys()):
+                value = tstr_per_month[month]
+                value_str = f"{value:.6f}" if value is not None else "insufficient samples"
+                print(f"{month_names[month]:10s} (month {month:2d})  ->  TSTR Ratio = {value_str}")
+
+        # Save file
+        combined_output_file = os.path.join(self.output_dir, 'eval_results.json')
+        existing_payload = {}
+        if os.path.exists(combined_output_file):
+            try:
+                with open(combined_output_file, 'r') as f:
+                    existing_payload = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                existing_payload = {}
+
+        output_payload = {
+            'mmd': self.results_by_condition['mmd'],
+            'acf': self.results_by_condition['acf'],
+            'classical_statistics': self.results_by_condition['classical_statistics'],
+            'aggregated_profiles': self.results_by_condition['aggregated_profiles'],
+            'tstr': self.results_by_condition['tstr'],
+            'aggregated_profile_plots': aggregated_profile_plot_paths,
+            'window_size': int(self.window_size),
+            'max_lag': int(self.max_lag),
+            'min_samples_per_group': int(self.min_samples_per_group),
+            'predictor_type': self.predictor_type,
+        }
+
+        # Preserve standalone metric entries written by individual metric classes
+        if isinstance(existing_payload, dict) and 'standalone_metrics' in existing_payload:
+            output_payload['standalone_metrics'] = existing_payload['standalone_metrics']
+
+        with open(combined_output_file, 'w') as f:
+            json.dump(_to_json_serializable(output_payload), f, indent=2)
+
+        if self.verbose:
+            print(f"Results saved to: {combined_output_file}")
+            print(f"Aggregated profile bar plots saved to: {aggregated_profile_plot_paths['day_of_week']} and {aggregated_profile_plot_paths['month_of_year']}")
+
+        all_mmd_scores = list(mmd_per_day.values()) + list(mmd_per_month.values())
+        avg_mmd = np.mean(all_mmd_scores) if all_mmd_scores else 0.0
+        return float(avg_mmd)
 
 
 
