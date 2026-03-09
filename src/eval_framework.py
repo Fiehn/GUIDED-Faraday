@@ -1574,9 +1574,13 @@ class PerConditionEval(SyntheticMetric):
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
     timestamps: np.ndarray = None
+    meter_ids: np.ndarray = None
+    feeder_ids: np.ndarray = None
 
     def __init__(self, window_size=24, max_lag=10, min_samples_per_group=2, output_dir='src/Output', 
-                 verbose=False, predictor_type='linear', tstr_epochs=50):
+                 verbose=False, predictor_type='linear', tstr_epochs=50,
+                 feeder_mapping_path='topology/cleaned/Cleaned_SM_Topology_mapping.json',
+                 min_samples_per_feeder=5):
         self.window_size = window_size
         self.max_lag = max_lag
         self.min_samples_per_group = min_samples_per_group
@@ -1584,6 +1588,9 @@ class PerConditionEval(SyntheticMetric):
         self.verbose = verbose
         self.predictor_type = predictor_type
         self.tstr_epochs = tstr_epochs
+        self.feeder_mapping_path = feeder_mapping_path
+        self.min_samples_per_feeder = min_samples_per_feeder
+        self._meter_to_feeder = None
         os.makedirs(output_dir, exist_ok=True)
 
         self.results_by_condition = {
@@ -1602,6 +1609,7 @@ class PerConditionEval(SyntheticMetric):
             'aggregated_profiles': {
                 'day_of_week': {},
                 'month_of_year': {},
+                'feeder': {},
             },
             'tstr': {
                 'day_of_week': {},
@@ -1696,6 +1704,88 @@ class PerConditionEval(SyntheticMetric):
                 print(f"Warning: AggregatedProfiles computation failed: {e}")
             return None
 
+    def _load_meter_to_feeder_mapping(self) -> Dict[str, str]:
+        """Load meter->feeder mapping from Cleaned_SM_Topology_mapping.json."""
+        if self._meter_to_feeder is not None:
+            return self._meter_to_feeder
+
+        mapping_path = self.feeder_mapping_path
+        if not os.path.isabs(mapping_path):
+            mapping_path = os.path.join(os.getcwd(), mapping_path)
+
+        with open(mapping_path, 'r') as f:
+            raw_mapping = json.load(f)
+
+        meter_to_feeder = {}
+        for meter, topo in raw_mapping.items():
+            feeder_id = topo.get('Feeder ID') if isinstance(topo, dict) else None
+            if feeder_id is None:
+                meter_to_feeder[str(meter)] = None
+            else:
+                meter_to_feeder[str(meter)] = f"LvFeeder.{feeder_id}"
+
+        self._meter_to_feeder = meter_to_feeder
+        return meter_to_feeder
+
+    def _resolve_feeder_ids(self, n_expected: int) -> np.ndarray:
+        """Resolve feeder IDs either from injected feeder_ids or from injected meter_ids + mapping file."""
+        if self.feeder_ids is not None:
+            feeder_ids = np.asarray(self.feeder_ids)
+        elif self.meter_ids is not None:
+            meter_ids = np.asarray(self.meter_ids)
+            if len(meter_ids) != n_expected:
+                raise ValueError(f"meter_ids length ({len(meter_ids)}) must match data length ({n_expected})")
+
+            meter_to_feeder = self._load_meter_to_feeder_mapping()
+            feeder_ids = []
+            for meter in meter_ids:
+                if isinstance(meter, np.generic):
+                    meter = meter.item()
+                meter_key = str(meter)
+                feeder_ids.append(meter_to_feeder.get(meter_key, None))
+            feeder_ids = np.array(feeder_ids, dtype=object)
+        else:
+            return None
+
+        if len(feeder_ids) != n_expected:
+            raise ValueError(f"feeder_ids length ({len(feeder_ids)}) must match data length ({n_expected})")
+        return feeder_ids
+
+    def _compute_aggregated_profiles_per_feeder(
+        self,
+        real_data: np.ndarray,
+        synthetic_data: np.ndarray,
+        feeder_ids: np.ndarray,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Compute AggregatedProfiles FD per feeder."""
+        feeder_scores = {}
+        unique_feeders = [f for f in np.unique(feeder_ids) if f is not None and str(f).lower() != 'nan']
+
+        if self.verbose:
+            print(f"  Found {len(unique_feeders)} unique feeders")
+            print(f"  Min samples threshold per feeder: {self.min_samples_per_feeder}")
+
+        for feeder in unique_feeders:
+            n_group = int(np.sum(feeder_ids == feeder))
+            if n_group < self.min_samples_per_feeder:
+                if self.verbose:
+                    print(f"    Skipping {feeder}: only {n_group} samples (need {self.min_samples_per_feeder})")
+                continue
+
+            score = self._compute_subset_aggregated_profiles(real_data[feeder_ids == feeder], 
+                                                             synthetic_data[feeder_ids == feeder])
+            if score is None:
+                if self.verbose:
+                    print(f"    {feeder}: insufficient samples for FD computation")
+                continue
+
+            feeder_scores[str(feeder)] = {
+                'fd': float(score),
+                'n_samples': n_group,
+            }
+
+        return feeder_scores
+
     def _compute_classical_stats_for_data(self, data: np.ndarray) -> Dict[str, Any]:
         """Compute classical stats for [N, window_size] consumption windows."""
         data = np.asarray(data)
@@ -1756,6 +1846,7 @@ class PerConditionEval(SyntheticMetric):
         synthetic_data: np.ndarray,
         days_of_week: np.ndarray,
         months_of_year: np.ndarray,
+        feeder_ids: np.ndarray = None,
     ) -> Dict[str, str]:
         """Create bar charts of aggregated real vs synthetic consumption by day and month."""
         plots_dir = os.path.join(self.output_dir, 'Plots')
@@ -1835,9 +1926,48 @@ class PerConditionEval(SyntheticMetric):
             plt.savefig(month_plot_path, dpi=150, bbox_inches='tight')
             plt.close()
 
+        # Sum total consumption per feeder (if feeder_ids provided)
+        feeder_plot_path = os.path.join(plots_dir, 'aggregated_profiles_bar_feeder.png')
+        if feeder_ids is not None:
+            unique_feeders = [f for f in np.unique(feeder_ids) if f is not None and str(f).lower() != 'nan']
+            
+            if unique_feeders:
+                feeder_labels = []
+                feeder_real_totals = []
+                feeder_synth_totals = []
+                feeder_counts = []
+                for feeder in sorted(unique_feeders):
+                    mask = feeder_ids == feeder
+                    if np.sum(mask) > 0:
+                        feeder_labels.append(str(feeder))
+                        feeder_real_totals.append(float(np.sum(real_data[mask])))
+                        feeder_synth_totals.append(float(np.sum(synthetic_data[mask])))
+                        feeder_counts.append(int(np.sum(mask)))
+                
+                if feeder_labels:
+                    x = np.arange(len(feeder_labels))
+                    width = 0.38
+                    # fig, ax = plt.subplots(figsize=(max(12, len(feeder_labels)), 6))
+                    fig, ax = plt.subplots(figsize=plot_style.figsize)
+                    ax.bar(x - width / 2, feeder_real_totals, width, label='Real', 
+                           color=color_real, alpha=0.9, linewidth=1.2)
+                    ax.bar(x + width / 2, feeder_synth_totals, width, label='Synthetic', 
+                           color=color_synthetic, alpha=0.9, linewidth=1.2)
+                    ax.set_title(f'Aggregated Consumption by Feeder ({sum(feeder_counts)} profiles)', fontsize=14, fontweight='bold')
+                    ax.set_xlabel('Feeder ID', fontsize=12)
+                    ax.set_ylabel('Aggregated Consumption (sum)', fontsize=12)
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(feeder_labels, rotation=45, ha='right', fontsize=10)
+                    ax.legend(fontsize=11)
+                    ax.grid(axis='y', alpha=0.3, linestyle='--')
+                    plt.tight_layout()
+                    plt.savefig(feeder_plot_path, dpi=150, bbox_inches='tight')
+                    plt.close()
+
         return {
             'day_of_week': day_plot_path,
             'month_of_year': month_plot_path,
+            'feeder': feeder_plot_path if feeder_ids is not None else None,
         }
 
     def compute(self) -> float:
@@ -1880,11 +2010,15 @@ class PerConditionEval(SyntheticMetric):
             print("  day_of_week:", {int(k): int(v) for k, v in zip(unique_days, day_counts)})
             print("  month_of_year:", {int(k): int(v) for k, v in zip(unique_months, month_counts)})
 
+        # Resolve feeder IDs if available
+        feeder_ids = self._resolve_feeder_ids(len(real_data))
+
         aggregated_profile_plot_paths = self._plot_aggregated_profiles_bars(
             real_data=real_data,
             synthetic_data=synthetic_data,
             days_of_week=days_of_week,
             months_of_year=months_of_year,
+            feeder_ids=feeder_ids,
         )
 
         # -------------------------
@@ -1961,6 +2095,15 @@ class PerConditionEval(SyntheticMetric):
                     real_data[months_of_year == month], synthetic_data[months_of_year == month]
                 )
 
+        aggregated_profiles_per_feeder = {}
+        feeder_ids = self._resolve_feeder_ids(len(real_data))
+        if feeder_ids is not None:
+            aggregated_profiles_per_feeder = self._compute_aggregated_profiles_per_feeder(
+                real_data=real_data,
+                synthetic_data=synthetic_data,
+                feeder_ids=feeder_ids,
+            )
+
         # -------------------------
         # TSTR (Train on Synthetic, Test on Real)
         # -------------------------
@@ -1998,6 +2141,7 @@ class PerConditionEval(SyntheticMetric):
         self.results_by_condition['classical_statistics']['month_of_year'] = classical_stats_per_month
         self.results_by_condition['aggregated_profiles']['day_of_week'] = aggregated_profiles_per_day
         self.results_by_condition['aggregated_profiles']['month_of_year'] = aggregated_profiles_per_month
+        self.results_by_condition['aggregated_profiles']['feeder'] = aggregated_profiles_per_feeder
         self.results_by_condition['tstr']['day_of_week'] = tstr_per_day
         self.results_by_condition['tstr']['month_of_year'] = tstr_per_month
 
@@ -2071,6 +2215,22 @@ class PerConditionEval(SyntheticMetric):
                 print(f"{month_names[month]:10s} (month {month:2d})  ->  Aggregated FD = {value_str}")
 
             print("\n" + "="*70)
+            print("AGGREGATED PROFILES PER FEEDER")
+            print("="*70)
+            if not aggregated_profiles_per_feeder:
+                print("  No feeders met minimum sample threshold")
+            else:
+                sorted_feeders = sorted(
+                    aggregated_profiles_per_feeder.items(),
+                    key=lambda kv: kv[1]['fd']
+                )
+                for feeder, details in sorted_feeders[:20]:
+                    print(
+                        f"{feeder:20s} -> Aggregated FD = {details['fd']:.6f} "
+                        f"(n={details['n_samples']})"
+                    )
+
+            print("\n" + "="*70)
             print("TSTR PER DAY OF WEEK") # (Ratio, 1.0 = perfect, lower is better)
             print("="*70)
             for day in sorted(tstr_per_day.keys()):
@@ -2103,6 +2263,8 @@ class PerConditionEval(SyntheticMetric):
             'aggregated_profiles': self.results_by_condition['aggregated_profiles'],
             'tstr': self.results_by_condition['tstr'],
             'aggregated_profile_plots': aggregated_profile_plot_paths,
+            'feeder_mapping_path': self.feeder_mapping_path,
+            'min_samples_per_feeder': int(self.min_samples_per_feeder),
             'window_size': int(self.window_size),
             'max_lag': int(self.max_lag),
             'min_samples_per_group': int(self.min_samples_per_group),

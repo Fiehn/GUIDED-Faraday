@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
 from config_loader import load_config
+from src.Data.dataloader import load_meter_to_feeder_mapping, map_meter_ids_to_feeder_ids
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'test'))
 from src.test.create_test_data import create_test_dataset
 
@@ -66,6 +67,7 @@ print(f"Using only consumption feature for evaluation: {consumption_col}")
 print("\nCreating daily windows from test data...")
 real_data = []
 timestamps = []
+window_meter_ids = []
 
 for meter_id in sorted(df["meter_number"].unique()):
     meter_data = df[df["meter_number"] == meter_id].sort_values("timestamp_utc").reset_index(drop=True)
@@ -96,12 +98,21 @@ for meter_id in sorted(df["meter_number"].unique()):
         print(f"    Window {start_idx}-{end_idx}: {dt.strftime('%Y-%m-%d %A %H:%M')}")
         
         timestamps.append(int(start_ts.timestamp()))
+        window_meter_ids.append(int(meter_id))
 
 real_data = np.array(real_data)
 timestamps = np.array(timestamps)
+window_meter_ids = np.array(window_meter_ids)
 
 print(f"\nCreated {len(real_data)} daily windows from {len(df)} hourly records")
 print(f"Real data shape: {real_data.shape}")
+
+# Resolve feeder ids for each 24-hour window using topology utilities from dataloader
+meter_to_feeder = load_meter_to_feeder_mapping('topology/cleaned/Cleaned_SM_Topology_mapping.json')
+window_feeder_ids = map_meter_ids_to_feeder_ids(window_meter_ids, meter_to_feeder)
+
+mapped_count = int(np.sum([f is not None for f in window_feeder_ids]))
+print(f"Feeder mapping: {mapped_count}/{len(window_feeder_ids)} windows mapped")
 
 # Check temporal coverage
 if len(timestamps) > 0:
@@ -250,9 +261,11 @@ per_condition_eval = PerConditionEval(
     output_dir='src/Output/',
     verbose=True,
     predictor_type='linear',
-    tstr_epochs=50
+    tstr_epochs=50,
+    min_samples_per_feeder=2  # Lower threshold for test data with few samples
 )
 per_condition_eval.real_data = real_data
 per_condition_eval.synthetic_data = synthetic_data
 per_condition_eval.timestamps = timestamps
+per_condition_eval.feeder_ids = window_feeder_ids
 per_condition_eval.compute()
