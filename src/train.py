@@ -191,6 +191,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
         log_dir=log_dir,
         weighted_loss=14.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
         heirarchical_config=h_config, # Pass the hierarchical config to enable hierarchical latent space training
+        normalizer=normalizer, 
     )
 
     print("Training complete. Model saved as ", model_tag)
@@ -388,6 +389,7 @@ def online_train(model_type: str = "cvae", skip_validation: bool = False):
             save_epoch_freq=10,
             log_dir=log_dir,
             model_name= model_tag if model_tag is not None else f"online_{model_type}",
+            normalizer=normalizer,
         )
         print(f"Finished training on {data_file} advancing to next file...\n")
 

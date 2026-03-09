@@ -61,7 +61,7 @@ def load_model_and_visualize(
         # the *modules* (VAE.py / CVAE.py), shadowing the class names.
         
         # The load_from_checkpoint method automatically handles both new and legacy formats
-        model = VAE.load_from_checkpoint(model_path, device)
+        model, normalizer = VAE.load_from_checkpoint(model_path, device)
         
         # Get model tag from checkpoint
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)

@@ -16,7 +16,13 @@ class OnlineCVAE(CVAE):
         hierarchy_config: HierarchicalConfig = None,
         **kwargs,
     ):
-        super().__init__(input_dim=input_dim, conditioner=conditioner, latent_dim=latent_dim, distribution_dict=distribution_dict, prior_type=prior_type, **kwargs)
+        super().__init__(input_dim=input_dim, 
+                         conditioner=conditioner, 
+                         latent_dim=latent_dim, 
+                         distribution_dict=distribution_dict, 
+                         prior_type=prior_type, 
+                         hierarchy_config=hierarchy_config, 
+                         **kwargs)
         
         # For smart meter data: L=24 hours, F=1 feature
         # input_dim = L * F = 24

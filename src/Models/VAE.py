@@ -304,7 +304,7 @@ class VAE(nn.Module):
         return batch
 
 
-    def save_model(self, save_path=None, model_name="trained_model", device="cpu"):
+    def save_model(self, save_path=None, model_name="trained_model", device="cpu", normalizer=None):
         """
         Save model with complete reconstruction information and validation.
         Stores all parameters needed to recreate the model from scratch.
@@ -328,7 +328,7 @@ class VAE(nn.Module):
                 'model_class': self.__class__.__name__,
                 'model_module': self.__class__.__module__,
                 'input_dim': self.input_dim,
-                'save_format_version': 2,  # Track format for future compatibility
+                'save_format_version': 3,  # Track format for future compatibility (normalizer added in v3)
             }
 
             # === Constructor Arguments ===
@@ -345,6 +345,20 @@ class VAE(nn.Module):
             # === Prior Serialization ===
             prior_state = self._serialize_prior()
 
+            # === Normalizer Serialization ===
+            normalizer_state = None
+            if normalizer is not None and hasattr(normalizer, 'fitted') and normalizer.fitted:
+                normalizer_state = {
+                    'method': normalizer.method,
+                    'epsilon': normalizer.epsilon,
+                    'zero_id': normalizer.zero_id,
+                    'shift': normalizer.shift,
+                    'non_zero_mean': normalizer.non_zero_mean,
+                    'non_zero_std': normalizer.non_zero_std,
+                    'mean': normalizer.mean,
+                    'std': normalizer.std,
+                }
+
             # === Build Checkpoint ===
             checkpoint = {
                 'model_state_dict': self.state_dict(),
@@ -352,6 +366,7 @@ class VAE(nn.Module):
                 'constructor_args': constructor_args,
                 'prior_state': prior_state,
                 'model_kwargs': self.model_kwargs,
+                'normalizer_state': normalizer_state,
             }
 
             # === Validate Before Saving ===
@@ -646,11 +661,32 @@ class VAE(nn.Module):
             except Exception as e:
                 print(f"Error initializing prior {prior_state['prior_type']} with args {init_args}: {e}")
 
+        normalizer = self._load_normalizer_from_checkpoint(checkpoint=checkpoint, device="cpu")
         # Load model state
         self.load_state_dict(checkpoint['model_state_dict'])
         self.to(device)
         self.prior.to(device)
         print(f"Model loaded from {load_path}")
+        return normalizer
+    
+    @staticmethod
+    def _load_normalizer_from_checkpoint(checkpoint, device="cpu"):
+        """Load normalizer state from checkpoint if available."""
+        normalizer_state = checkpoint.get('normalizer_state', None)
+        if normalizer_state is not None:
+            try:
+                normalizer = Normalizer(method=normalizer_state['method'], epsilon=normalizer_state['epsilon'])
+                normalizer.zero_id = normalizer_state['zero_id']
+                normalizer.shift = normalizer_state['shift']
+                normalizer.non_zero_mean = normalizer_state['non_zero_mean']
+                normalizer.non_zero_std = normalizer_state['non_zero_std']
+                normalizer.mean = normalizer_state['mean']
+                normalizer.std = normalizer_state['std']
+                print(f"✓ Normalizer loaded from checkpoint")
+                return normalizer
+            except Exception as e:
+                print(f"Warning: Could not load normalizer from checkpoint: {e}")
+        return None
 
     @classmethod
     def load_from_checkpoint(cls, load_path, device="cpu"):
@@ -748,8 +784,9 @@ class VAE(nn.Module):
         else:
             # Normal loading for other prior types
             model.load_model(load_path, device)
-            
-        return model
+        
+        normalizer = cls._load_normalizer_from_checkpoint(checkpoint=checkpoint, device=device)
+        return model, normalizer
 
     def fit(self,
             trainloader,
@@ -775,6 +812,7 @@ class VAE(nn.Module):
             log_dir = './models/',
             model_name = None, # Optionally specify model name for saving
             save_dir = './models/',
+            normalizer = None,
             weighted_loss = 0.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
             **_):
 
@@ -924,7 +962,7 @@ class VAE(nn.Module):
                     best_val_loss = val_loss_dict["loss"]
                     best_epoch = epoch
                     best_model_path = os.path.join(log_dir_tagged, f"{model_tag}_best.pt")
-                    self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_best", device=device)
+                    self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_best", device=device, normalizer=normalizer)
                     print(f"    New best model saved (Val Loss: {best_val_loss:.4f})")
 
                 # Print progress
@@ -960,7 +998,7 @@ class VAE(nn.Module):
             # Save Model Checkpoint
             if (epoch + 1) % save_epoch_freq == 0:
                 checkpoint_path = os.path.join(log_dir_tagged, f"{model_tag}_epoch_{epoch+1}.pt")
-                self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_epoch_{epoch+1}", device=device)
+                self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_epoch_{epoch+1}", device=device, normalizer=normalizer)
                 print(f"    Checkpoint saved: epoch_{epoch+1}")
         
         # === Training Complete ===
@@ -973,7 +1011,7 @@ class VAE(nn.Module):
         final_model_path = os.path.join(log_dir_tagged, f"{model_tag}_final.pt")
         self.to("cpu")
         self.prior.to("cpu")
-        self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_final", device="cpu")
+        self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_final", device="cpu", normalizer=normalizer)
 
         # Save training summary
         summary = {
