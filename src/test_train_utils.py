@@ -20,12 +20,12 @@ import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-from Data.normalizer import Normalizer
-from Data.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
+from data.normalizer import Normalizer
+from data.conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
 
-from Visualization.Visualizer import Visualizer
-from Visualization.Writer import Writer
-from Visualization.PlotStyling import PlotStyle
+from visualization.visualizer import Visualizer
+from visualization.writer import Writer
+from visualization.plot_styling import PlotStyle
 
 # Create output directory
 output_dir = "Output/Plots/quick_demo"
