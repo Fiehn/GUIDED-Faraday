@@ -540,7 +540,7 @@ class TestHierarchySaveLoad:
             model.save_model(save_path=tmpdir, model_name="test_hier_full", device="cpu")
             model_path = os.path.join(tmpdir, "test_hier_full.pt")
 
-            loaded = VAE.load_from_checkpoint(model_path, device="cpu")
+            loaded, normalizer = VAE.load_from_checkpoint(model_path, device="cpu")
             assert loaded.hierarchy is not None
             assert loaded.hierarchy.num_levels == 2
             assert loaded.hierarchy.config.residual_connections is True
@@ -560,7 +560,7 @@ class TestHierarchySaveLoad:
             model_path = os.path.join(tmpdir, "test_rt.pt")
 
             from src.Models.VAE import VAE
-            loaded = VAE.load_from_checkpoint(model_path, device="cpu")
+            loaded, normalizer = VAE.load_from_checkpoint(model_path, device="cpu")
             assert loaded.hierarchy is not None
             assert loaded.hierarchy.num_levels == model.hierarchy.num_levels
             assert loaded.hierarchy.config.aggregation == model.hierarchy.config.aggregation
@@ -587,7 +587,7 @@ class TestHierarchySaveLoad:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             model.save_model(save_path=tmpdir, model_name="no_hier", device="cpu")
-            loaded = VAE.load_from_checkpoint(
+            loaded, normalizer = VAE.load_from_checkpoint(
                 os.path.join(tmpdir, "no_hier.pt"), device="cpu"
             )
             assert loaded.hierarchy is None
@@ -737,7 +737,7 @@ class TestHierarchyWithRealData:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             model.save_model(save_path=tmpdir, model_name="hier_real", device="cpu")
-            loaded = VAE.load_from_checkpoint(
+            loaded, normalizer = VAE.load_from_checkpoint(
                 os.path.join(tmpdir, "hier_real.pt"), device="cpu"
             )
             assert loaded.hierarchy is not None

@@ -895,7 +895,7 @@ class ModelValidator:
                 self._add_result("Save/Load: File Created", True,
                                  f"{os.path.getsize(pt_path) / 1024:.1f} KB")
 
-                loaded = type(self.model).load_from_checkpoint(
+                loaded, normalizer = type(self.model).load_from_checkpoint(
                     pt_path, device="cpu")
                 loaded_sd = loaded.state_dict()
 

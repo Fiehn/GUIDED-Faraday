@@ -221,16 +221,13 @@ class DictionaryCoder(torch.nn.Module):
         jitter = 1e-5 * torch.eye(D, device=Sigma.device, dtype=Sigma.dtype).unsqueeze(0)
         Sigma_jittered = Sigma + jitter
 
+        with torch.amp.autocast('cuda', enabled=False): # AMP and Cholesky don't play well together, so we do this part in full precision on GPU (if available)
         # Use PyTorch's MultivariateNormal distribution
-        try:
-            # Using scale_tril with Cholesky decomposition for better numerical stability (should be equivalent to covariance_matrix but more stable)
+        # Using scale_tril with Cholesky decomposition for better numerical stability (should be equivalent to covariance_matrix but more stable)
             L = torch.linalg.cholesky(Sigma_jittered)
-        except torch.linalg.LinAlgError:
-            # Fallback: larger jitter
-            L = torch.linalg.cholesky(Sigma_jittered + 1e-3 * torch.eye(D, device=Sigma.device).unsqueeze(0))
-        
-        dist = torch.distributions.MultivariateNormal(loc=mu, scale_tril=L)
-        return dist.log_prob(inputs)
+            
+            dist = torch.distributions.MultivariateNormal(loc=mu, scale_tril=L)
+            return dist.log_prob(inputs)
     
     def kl_divergence(self, param_dict_q, prior=None, **_):
         """

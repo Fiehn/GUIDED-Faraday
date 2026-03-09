@@ -192,14 +192,9 @@ class VampPrior(BasePrior):
                                 device=self.pseudo_inputs.device) * 0.01
                 )
 
-    def _require_encoder(self):
-        if self.encoder is None:
-            raise RuntimeError("VampPrior needs an encoder reference.")
-
     def get_params(self):
         """Return MEAN parameters across all components to work with existing expand() logic.
         This lets VampPrior work with the existing VAE structure."""
-        self._require_encoder()
         component_params = self.encoder(self.pseudo_inputs)  # [K, ...]
         
         # Return the mean across components - this works with existing expand() logic
@@ -207,7 +202,6 @@ class VampPrior(BasePrior):
 
     def sample(self, batch_size, num_samples=1):
         """Sample by randomly selecting components then using encoder's reparameterize."""
-        self._require_encoder()
         component_params = self.encoder(self.pseudo_inputs)  # [K, ...]
 
         # Randomly pick components for each sample
@@ -226,7 +220,6 @@ class VampPrior(BasePrior):
 
     def log_prob(self, z):
         """Compute log p(z) = log( (1/K) sum_k q(z | u_k) )."""
-        self._require_encoder()
         component_params = self.encoder(self.pseudo_inputs)  # [K, ...]
 
         K = self.num_components
