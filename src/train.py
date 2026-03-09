@@ -3,30 +3,65 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
-from src.encoder_decoder_model import *
-from src.Conditioner import *
-from src.Models import *
-from src.dataloader import *
-from tqdm import tqdm
-import matplotlib.pyplot as plt
+from Models.encoder_decoder_model import *
+from Data.Conditioner import *
+from src.Models.CVAE import *
+from src.Models.Online_CVAE import *
+from src.Models.VAE import *
+from Data.dataloader import *
+from Data.normalizer import *
 from torch.utils.tensorboard import SummaryWriter
+from src.train_utils import *
+from src.test.run_validation import run_validation
+
+from src.Hierarchical.aggregation import *
+from src.Hierarchical.config import *
+
+from src.Visualization.Visualizer import Visualizer
+from src.Visualization.Writer import Writer
+
+from src.eval_framework import EvalFramework
+from src.eval_framework import (
+    ReconstructionMSE, ReconstructionMSE, ReconstructionRMSE, ReconstructionLogLikelihood, FlexibilityDistance,
+    MaximumMeanDiscrepancy, ACFDistribution, VisualEvaluation, ClassicalStatistics, TSTR
+)
+
 
 # Set up device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def run_test(model_type: str = "vae"):
+def run_test(model_type: str = "vae", skip_validation: bool = False, file_name = "test_data_small.csv"):
     model_type = model_type.lower()
     assert model_type in {"vae", "cvae"}
 
     print("Using device: ", device)
 
     # Up the recursion limit for deep models
-    sys.setrecursionlimit(5000) # default seems to bbe 999
+    sys.setrecursionlimit(5000) # default seems to be 999
+
+    ##############################
+    # Validate model before training
+    if not skip_validation:
+        print("\nStarting model validation before training...\n") 
+        validation_passed = run_validation(
+            model_type=model_type,
+            use_test_data=True,  # use small test data for fast validation
+            verbose=True
+        )
+        
+        if not validation_passed:
+            print("\n!! Validation failed! Please fix issues before training.")
+            print("To skip validation, use: run_test(model_type='cvae', skip_validation=True)")
+            return
+        
+        print("\nValidation passed! Proceeding to training...\n")
+    else:
+        print("\n!!  Skipping validation (not recommended)\n")
 
     ##############################
     # load data
-    data_dir = "/Users/clarareginekold/Desktop/dtu/THESIS/Thesis/data/" # "data/"
-    filename = "hourly_measurements_2023_9.csv"
+    data_dir = "data/" # "data/"
+    filename = file_name
 
     meter_col = "meter_number"
     timestamp_dst_col = "timestamp_dst"
@@ -35,12 +70,13 @@ def run_test(model_type: str = "vae"):
 
     window = WindowSpec(input_len=24, stride=24)  # full day windows
 
-    batch_size = 32 # 256 # tried smaller batch size for CVAE
-    num_workers = 0
+    batch_size = 1048 # 256 # tried smaller batch size for CVAE
+    num_workers = 8
     shuffle_train = False
-    seed = 0
+    seed = 42
     train_frac = 0.8
     val_frac = 0.1
+    normalizer = Normalizer(method='log1p')
 
     print("Initializing DataModule...")
     dm = SmartMeterDataModule(
@@ -57,9 +93,10 @@ def run_test(model_type: str = "vae"):
         seed=seed,
         train_frac=train_frac,
         val_frac=val_frac,
-        max_meters=10, # None # tried smaller number for CVAE
+        max_meters=None, # None # tried smaller number for CVAE
+        normalizer=normalizer, # normalizer # try without normalizer
     )
-
+    
     dm.setup()
     print("done setup")
     train_loader = dm.train_dataloader()
@@ -68,10 +105,10 @@ def run_test(model_type: str = "vae"):
 
     ##############################
     # get one batch
-    x, meter_id, dow = next(iter(train_loader))
+    x, meter_id, timestamps = next(iter(train_loader))  # Now also get timestamps
     print("x shape:", x.shape)
     print("meter_id shape:", meter_id.shape, "example:", meter_id[:5])
-    print("dow shape:", dow.shape, "example:", dow[:10])
+    print("timestamps shape:", len(timestamps))
 
     # flatten for vae and cvae
     x_flat = x.reshape(x.shape[0], -1)
@@ -79,22 +116,59 @@ def run_test(model_type: str = "vae"):
 
     num_features = x.shape[2]
     input_dim = 24 * num_features  # flattened window dim
+    print("input_dim:", input_dim)
+
+    if os.path.exists("models/UserProfiles/user_profiler.pkl"):
+        print("UserProfiler model found on disk.")
+    else:
+        print("UserProfiler model not found on disk. Creating..")
+        os.makedirs("models/UserProfiles", exist_ok=True)
+        UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True).fit(train_loader)
+
+    # Test conditioner - pass timestamps instead of x
+    conditioner = Conditioner()
+    conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
+    conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
+    #conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json')) # TODO: check that this works and actually adds on the days it says it should
+    cond = conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)  # Pass all data (x, meter, timestamps)
+    
+    print("Condition shape:", cond.shape)
+
 
     ##############################
     # use chosen model
     if model_type == "vae":
         print("Initializing VAE model...")
-        model = VAE(input_dim=input_dim)
-        log_dir = "./runs/VAE_training"
+        model = VAE(input_dim=input_dim, latent_dim=32, device=device)
+        log_dir = "./models/" 
     else:
-        print("Initializing CVAE model (condition = day-of-week)...")
-        model = CVAE(input_dim=input_dim, condition_dim=7, latent_dim=10)
-        log_dir = "./runs/CVAE_training"
+        print("Initializing CVAE model (condition = day-of-week + user-profile + holiday)...")
+        model = CVAE(input_dim=input_dim, latent_dim=32, conditioner=conditioner, 
+                     encoder_type="dictionary",decoder_type='dictionary', 
+                     prior_type="vampprior", device=device)
+        log_dir = "./models/"
+
+    ##############################
+    # Heirarchy latent space
+    h_config = HierarchicalConfig(
+        levels=[
+            LevelConfig(name="Level 1", input_dim=input_dim, latent_dim=32, strategy="linear", top_down=False, bottom_up=True, loss_weight=1.0),
+            LevelConfig(name="Level 2", input_dim=32, latent_dim=16, strategy="linear", top_down=True, bottom_up=True, loss_weight=0.5),
+            LevelConfig(name="Level 3", input_dim=16, latent_dim=8, strategy="linear", top_down=True, bottom_up=False, loss_weight=0.25),
+        ],
+        aggregation="concat",
+        bidirectional=True,
+        residual_connections=True,
+        kl_annealing=True,
+        kl_warmup_steps=1000,
+        free_bits=0.1,
+    )
+    h_config = None # Set to None to disable hierarchical latent space for now (can be added back in later once the training loop is working well)
 
     ##############################
     # Train
     # Use the .fit() method with all its features
-    model_tag = model.fit(
+    model_tag, writer = model.fit(
         trainloader=train_loader,
         valloader=val_loader,
         lr=1e-3,
@@ -103,131 +177,270 @@ def run_test(model_type: str = "vae"):
         gradient_clip_kwargs={"max_norm": 1.0},
         lr_scheduler=True,
         lr_scheduler_kwargs={"step_size": 10, "gamma": 0.9},
-        beta=1.0,
+        beta=1.0, # beta_max when annealing is on; fixed beta otherwise
+        beta_annealing=True,  # cyclical annealing to avoid posterior collapse
+        beta_annealing_kwargs={"n_cycles": 4, "ratio": 0.5},
         num_samples=1,
-        epochs=2,
+        epochs=10,
         validation_freq=1,
         validation_num_samples=1,
         device=device,
         early_stopping=True,
-        early_stopping_kwargs={"patience": 10, "min_delta": 0.001},
-        save_epoch_freq=5,
+        early_stopping_kwargs={"patience": 3, "min_delta": 0.001},
+        save_epoch_freq=10,
         log_dir=log_dir,
+        weighted_loss=14.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
+        heirarchical_config=h_config, # Pass the hierarchical config to enable hierarchical latent space training
+        normalizer=normalizer, 
+        compile_model=True,  # Set to True to enable torch.compile() for potential speedup (requires PyTorch 2.0+ and compatible hardware
     )
 
     print("Training complete. Model saved as ", model_tag)
 
     ##############################
-    # Reopen TensorBoard writer for logging visualizations
     log_dir_tagged = os.path.join(log_dir, model_tag)
-    writer = SummaryWriter(log_dir=log_dir_tagged)
-
-    # Make sure output folder exists BEFORE saving figs
-    os.makedirs("Output/Plots", exist_ok=True)
 
     # Move model
     model.to(device)
-    model.prior_params = {k: v.to(device) for k, v in model.prior_params.items()}
+    model.prior.to(device)
     model.eval()
 
-    ##############################
-    # Reconstruction
-    print("\nGenerating reconstruction visualizations...")
-    with torch.no_grad():
-        x, meter_id, dow = next(iter(test_loader))
-        x = x.to(device)
-        dow = dow.to(device)
-        x_original = x
-        x_flat = x.reshape(x.shape[0], -1)
+    # Visualize reconstructions on test set
+    visualizer = Visualizer(model = model, writer = writer,
+                            plot_style = PlotStyle(), 
+                            log_dir = log_dir_tagged,
+                            device = device, 
+                            normalizer = normalizer,)
 
-        if model_type == "vae":
-            recon_params, _ = model.forward(x_flat, num_samples=1)
-            recon_mu = recon_params["mu"]
-            if recon_mu.dim() == 3:
-                recon_mu = recon_mu.squeeze(0)  # [B, D]
-        else:
-            recon_params, _ = model.forward(x_flat, dow, num_samples=1)
-            recon_mu = recon_params["mu"][0]  # [B, D] (S=1)
+    visualizer.visualize(test_loader)
 
-        recon_reshaped = recon_mu.reshape(x_original.shape[0], x_original.shape[1], x_original.shape[2])
-
-    # Plot original vs reconstructed
-    num_samples_to_plot = min(3, x_original.shape[0])
-    fig, axes = plt.subplots(num_samples_to_plot, 1, figsize=(14, 4 * num_samples_to_plot))
-    if num_samples_to_plot == 1:
-        axes = [axes]
-
-    for i in range(num_samples_to_plot):
-        axes[i].plot(x_original[i, :, 0].detach().cpu().numpy(), label="Original", marker="o", alpha=0.7, linewidth=2)
-        axes[i].plot(recon_reshaped[i, :, 0].detach().cpu().numpy(), label="Reconstructed", marker="s", alpha=0.7, linewidth=2)
-        axes[i].set_title(f"Sample {i+1} - Energy Consumption")
-        axes[i].set_xlabel("Hour")
-        axes[i].set_ylabel("Energy (kWh)")
-        axes[i].legend()
-        axes[i].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    reconstruction_path = f"Output/Plots/{model_tag}_reconstruction.png"
-    plt.savefig(reconstruction_path, dpi=150, bbox_inches="tight")
-    print(f"Saved reconstruction comparison to {reconstruction_path}")
-    writer.add_figure("Validation/Reconstructions", fig, global_step=0)
-    plt.close(fig)
+    # Create evaluator
+    evaluator = EvalFramework(model, test_loader, normalizer, device='cpu')
+    
+    # Register reconstruction metrics
+    evaluator.register_metrics([
+        ReconstructionMSE(),
+        ReconstructionRMSE(),
+        ReconstructionLogLikelihood(),
+        FlexibilityDistance(tau='auto', normalize=True),
+    ])
+    
+    # Register synthetic metrics
+    evaluator.register_metrics([
+        MaximumMeanDiscrepancy(),
+        ACFDistribution(),
+        ClassicalStatistics(),
+        TSTR(),
+        VisualEvaluation(output_dir=os.path.join(log_dir_tagged, "eval_plots"))
+    ])
+    
+    # Run all metrics (will print reconstruction section, then synthetic section)
+    results = evaluator.evaluate()
+    
+    # Save results
+    evaluator.save_results(os.path.join(log_dir_tagged, 'eval_results.json'))
 
 
-    ##############################
-    # Synthetic sampling
-    print("Generating synthetic samples...")
-    with torch.no_grad():
-        num_synthetic = 5
+def online_train(model_type: str = "cvae", skip_validation: bool = False):
+    if not skip_validation:
+        print("\nStarting model validation before online training...\n") 
+        validation_passed = run_validation(
+            model_type=model_type,
+            use_test_data=True,  # use small test data for fast validation
+            verbose=False
+        )
+        
+        if not validation_passed:
+            print("\n!! Validation failed! Please fix issues before training.")
+            print("To skip validation, use: online_train(model_type='cvae', skip_validation=True)")
+            return
+        
+        print("\nValidation passed! Proceeding to online training...\n")
+    else:
+        print("\n!!  Skipping validation (not recommended)\n")
 
-        if model_type == "vae":
-            latent_dim = model.prior_params["mu"].shape[1]
-            prior_samples = torch.randn(num_synthetic, latent_dim, device=device) * model.prior_params["sigma"] + model.prior_params["mu"]
-            synthetic_params = model.decoder(prior_samples)  # decoder expects [B, latent_dim] (S=1 case)
-            synthetic_mu = synthetic_params["mu"]
-            if synthetic_mu.dim() == 3:
-                synthetic_mu = synthetic_mu.squeeze(0)
-            synthetic_data = synthetic_mu.reshape(num_synthetic, x_original.shape[1], x_original.shape[2])
+    # Load data sequentially based on what is in the folder and train the model in an online fashion
+    data_files = sorted([f for f in os.listdir("data/") if f.endswith(".csv") and not f.startswith("test")])
+    # remove data files that are already trained on (check runs folder for existing models)
+    # TODO: Check runs and find and remove already trained files in the list.
 
-        else: # CVAE
-            B = num_synthetic
+    normalizer = Normalizer('log1p')
+    # Fit normalizer once across ALL available files before the training loop
+    # (reads Parquet caches, result is persisted; subsequent runs are instant)
+    from Data.dataloader import fit_normalizer_on_files
+    fit_normalizer_on_files(
+        normalizer,
+        data_dir="data/",
+        filenames=data_files,
+        feature_cols=("hourly_energy_consumption",),
+        meter_col="meter_number",
+        timestamp_dst_col="timestamp_dst",
+        train_frac=0.8,
+        seed=42,
+    )
+    # Create the model and normalizer and conditioner once
+    if model_type == "vae":
+        print("Initializing VAE model...")
+        model = VAE(input_dim=24 * 1, latent_dim=32, device=device)  # input_dim will be updated based on data
+        log_dir = "./models/"
+    else:
+        print("Initializing CVAE model (condition = day-of-week + user-profile)...")
+        conditioner = Conditioner()
+        conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
+        conditioner.add_condition_item("user_profile", OnlineUserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
+        #conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json')) # TODO: check that this works and actually adds on the days it says it should
 
-            # either: all Monday
-            cond = torch.zeros(B, dtype=torch.long, device=device)
+        # heirarchy = HierarchicalConfig(
+        #     levels=[
+        #         LevelConfig(name="Level 1", input_dim=24 * 1, latent_dim=32, strategy="linear", top_down=False, bottom_up=True, loss_weight=1.0),
+        #         LevelConfig(name="Level 2", input_dim=32, latent_dim=16, strategy="linear", top_down=True, bottom_up=True, loss_weight=0.5),
+        #         LevelConfig(name="Level 3", input_dim=16, latent_dim=8, strategy="linear", top_down=True, bottom_up=False, loss_weight=0.25),
+        #     ],
+        #     aggregation="concat",
+        #     bidirectional=True,
+        #     residual_connections=True,
+        #     kl_annealing=True,
+        #     kl_warmup_steps=1000,
+        #     free_bits=0.1,
+        # )
+        heirarchy = None # Set to None to disable hierarchical latent space for now (can be added back in later once the online training loop is working well)
 
-            # or: random days
-            # cond = torch.randint(0, 7, (B,), device=device)
+        model = OnlineCVAE(input_dim=24, latent_dim=32, conditioner=conditioner, 
+                     encoder_type="dictionary",decoder_type='dictionary', 
+                     prior_type="vampprior", device=device,
+                     normalizer=normalizer, hierarchy_config=heirarchy)  # input_dim will be updated based on data
+        log_dir = "./models/"
+    
+    i = 0
+    last_dm = None
+    last_test_loader = None
+    last_data_file = None
 
-            samples = model.sample(cond, num_prior_samples=1, num_x_samples=1, device=device)
-            synthetic_flat = samples[0, 0]  # [B, D]
-            synthetic_data = synthetic_flat.reshape(B, x_original.shape[1], x_original.shape[2])
+    model_tag = None
 
-    # # Plot synthetic data
-    fig, axes = plt.subplots(num_synthetic, 1, figsize=(14, 4 * num_synthetic))
-    if num_synthetic == 1:
-        axes = [axes]
+    for data_file in data_files:
+        print(f"\nProcessing {data_file}")
+        i += 1
 
-    for i in range(num_synthetic):
-        axes[i].plot(synthetic_data[i, :, 0].detach().cpu().numpy(), marker="o", alpha=0.7, linewidth=2)
-        axes[i].set_title(f"Synthetic Sample {i+1} - Energy Consumption")
-        axes[i].set_xlabel("Hour")
-        axes[i].set_ylabel("Energy (kWh)")
-        axes[i].grid(True, alpha=0.3)
+        # ── Clean up BEFORE loading new data ──────────────────────────
+        import gc
+        if i > 1:
+            # Explicitly clear DataLoaders first (they may hold worker refs)
+            if 'train_loader' in dir():
+                del train_loader
+            if 'val_loader' in dir():
+                del val_loader
+            if last_test_loader is not None:
+                del last_test_loader
+                last_test_loader = None
+            # Clear the DataModule's internal datasets explicitly
+            if last_dm is not None:
+                last_dm._train_ds = None
+                last_dm._val_ds   = None
+                last_dm._test_ds  = None
+                del last_dm
+                last_dm = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"  Memory cleared before loading {data_file}")
 
-    plt.tight_layout()
+        # Load data for this file
+        dm = SmartMeterDataModule(
+            data_dir="data/",
+            filename=data_file,
+            meter_col="meter_number",
+            timestamp_dst_col="timestamp_dst",
+            feature_cols=("hourly_energy_consumption",),
+            window=WindowSpec(input_len=24, stride=24),
+            batch_size=512,
+            num_workers=0,
+            shuffle_train=False,
+            seed=42,
+            train_frac=0.8,
+            val_frac=0.1,
+            max_meters=None,
+            normalizer=normalizer,
+        )
+        dm.setup()
+        train_loader = dm.train_dataloader()
+        val_loader = dm.val_dataloader()
+        test_loader = dm.test_dataloader()
+        
+        # Train on this data
+        model_tag, writer = model.fit(
+            trainloader=train_loader,
+            valloader=val_loader,
+            lr=1e-3,
+            weight_decay=1e-4,
+            gradient_clip=1.0,
+            gradient_clip_kwargs={"max_norm": 1.0},
+            lr_scheduler=True,
+            lr_scheduler_kwargs={"step_size": 10, "gamma": 0.9},
+            beta=1.0,
+            beta_annealing=True,
+            beta_annealing_kwargs={"n_cycles": 4, "ratio": 0.5},
+            num_samples=1,
+            epochs=5,
+            validation_freq=1,
+            validation_num_samples=1,
+            device=device,
+            early_stopping=True,
+            early_stopping_kwargs={"patience": 3, "min_delta": 0.001},
+            save_epoch_freq=10,
+            log_dir=log_dir,
+            model_name= model_tag if model_tag is not None else f"online_{model_type}",
+            normalizer=normalizer,
+        )
+        print(f"Finished training on {data_file} advancing to next file...\n")
 
-    # Save to file
-    synthetic_path = f"Output/Plots/{model_tag}_synthetic.png" 
-    plt.savefig(synthetic_path, dpi=150, bbox_inches="tight")
-    print(f"Saved synthetic samples to {synthetic_path}")
+        # Free train/val loaders but keep dm and test_loader for potential visualization
+        del train_loader, val_loader
+        gc.collect()
 
-    # Add to TensorBoard
-    writer.add_figure("Validation/Synthetic_Samples", fig, global_step=0)
-    plt.close(fig)
+        last_dm          = dm
+        last_test_loader = test_loader
+        last_data_file   = data_file
 
-    writer.close()
-    print("\nDone.")
-    print(f"TensorBoard: tensorboard --logdir={log_dir}/{model_tag}")
+    log_dir = os.path.join(log_dir, model_tag)
+    
+    visualizer = Visualizer(model = model, writer = writer,
+                            plot_style = PlotStyle(), 
+                            log_dir = log_dir,
+                            device = device, 
+                            normalizer = normalizer,)
+    visualizer.visualize(test_loader)
+
+    # Evaluation framework On last test set (from the last file) after all training is done
+    # Create evaluator
+    evaluator = EvalFramework(model, last_test_loader, normalizer, device='cpu')
+    
+    # Register reconstruction metrics
+    evaluator.register_metrics([
+        ReconstructionMSE(),
+        ReconstructionRMSE(),
+        ReconstructionLogLikelihood(),
+        FlexibilityDistance(tau='auto', normalize=True),
+    ])
+    
+    # Register synthetic metrics
+    evaluator.register_metrics([
+        MaximumMeanDiscrepancy(),
+        ACFDistribution(),
+        ClassicalStatistics(),
+        TSTR(),
+        VisualEvaluation()
+    ])
+    
+    # Run all metrics (will print reconstruction section, then synthetic section)
+    results = evaluator.evaluate()
+    
+    # Save results
+    evaluator.save_results(os.path.join(log_dir, 'eval_results.json'))
+
+    # Final cleanup
+    if last_dm is not None:
+        del last_dm, last_test_loader
 
 
 
@@ -235,262 +448,14 @@ def run_test(model_type: str = "vae"):
 if __name__ == "__main__":
     # choose: "vae" or "cvae"
     # run_test(model_type="vae")
-    run_test(model_type="cvae")
+    #run_test(model_type="vae", skip_validation=False)  # VAE with validation
+    #run_test(model_type="cvae", skip_validation=True, file_name='hourly_measurements_2023_11.csv')  # CVAE with validation
+    run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
+    #online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
+    #run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
 
 
 
 
 
 
-
-
-
-
-
-# # old version which was only for VAE 
-
-# # test Vae
-# if __name__ == "__main__":
-#     print("Using device: ", device)
-
-#     # Up the recursion limit for deep models
-#     sys.setrecursionlimit(5000) # default seems to bbe 999
-
-#     # load data
-#     data_dir = "data/"
-#     filename = "hourly_measurements_2023_10.csv"
-
-#     meter_col="meter_number"
-#     timestamp_dst_col="timestamp_dst"
-#     timestamp_utc_col="timestamp_utc"
-#     feature_cols=("hourly_energy_consumption",) # , "hourly_energy_production")
-
-#     window=WindowSpec(input_len=24, stride=24) # full day windows
-
-#     batch_size=32 # 256
-#     num_workers=0
-#     shuffle_train=False
-#     seed=0
-#     train_frac=0.8
-#     val_frac=0.1
-
-#     print("Initializing DataModule...")
-#     dm = SmartMeterDataModule(
-#         data_dir=data_dir,
-#         filename=filename,
-#         meter_col=meter_col,
-#         timestamp_dst_col=timestamp_dst_col,
-#         timestamp_utc_col=timestamp_utc_col,
-#         feature_cols=feature_cols,
-#         window=window,
-#         batch_size=batch_size,
-#         num_workers=num_workers,
-#         shuffle_train=shuffle_train,
-#         seed=seed,
-#         train_frac=train_frac,
-#         val_frac=val_frac,
-#         max_meters=3, # None
-#     )
-
-#     dm.setup()
-#     print("done setup")
-#     train_loader = dm.train_dataloader()
-#     val_loader   = dm.val_dataloader()
-#     test_loader  = dm.test_dataloader()
-
-#     # get one batch
-#     for x, meter_id, dow in train_loader: 
-#         print("x shape:", x.shape)
-#         print("meter_id shape:", meter_id.shape, "example:", meter_id[:5])
-#         print("dow shape:", dow.shape, "example:", dow[:10])
-#         # Flatten for VAE: [batch_size, 24, 1] -> [batch_size, 24]
-#         x_flat = x.reshape(x.shape[0], -1)
-#         print("x_flat shape:", x_flat.shape) # [B, 24]
-#         break
-    
-#     print("Initializing VAE model...")
-#     VAE_model = VAE(input_dim=x_flat.shape[1])
-    
-#     # Use the .fit() method with all its features
-#     model_tag = VAE_model.fit(
-#         trainloader=train_loader,
-#         valloader=val_loader,
-#         lr=1e-3,
-#         weight_decay=1e-4,
-#         gradient_clip=1.0,
-#         gradient_clip_kwargs={"max_norm": 1.0},
-#         lr_scheduler=True,
-#         lr_scheduler_kwargs={"step_size": 10, "gamma": 0.9},
-#         beta=1.0,
-#         num_samples=1,
-#         epochs=2, # 20
-#         validation_freq=1,
-#         validation_num_samples=1,
-#         device=device,
-#         early_stopping=True,
-#         early_stopping_kwargs={"patience": 10, "min_delta": 0.001},
-#         save_epoch_freq=5,
-#         log_dir='./runs/VAE_training',
-#     )
-    
-#     print("Training complete. Model saved as ", model_tag)
-    
-#     # Reopen TensorBoard writer for logging visualizations
-#     log_dir_tagged = os.path.join('./runs/VAE_training', model_tag)
-#     writer = SummaryWriter(log_dir=log_dir_tagged)
-    
-#     # Load the model for visualization
-#     VAE_model.to(device)
-#     VAE_model.prior_params = {key: val.to(device) for key, val in VAE_model.prior_params.items()}
-#     VAE_model.eval()
-    
-#     # ===== RECONSTRUCTION VISUALIZATION =====
-#     print("\nGenerating reconstruction visualizations...")
-#     with torch.no_grad():
-#         for x in tqdm(test_loader, desc="Reconstruction", leave=False):
-#             x = x.to(device)
-#             x_original = x
-#             x_flat = x.reshape(x.shape[0], -1)
-#             recon_params_dict, _ = VAE_model.forward(x_flat, num_samples=1)
-#             recon_mu = recon_params_dict['mu']
-#             if recon_mu.dim() == 3:
-#                 recon_mu = recon_mu.squeeze(0)
-#             recon_reshaped = recon_mu.reshape(x_original.shape[0], x_original.shape[1], x_original.shape[2])
-#             break
-    
-#     # Plot original vs reconstructed
-#     num_samples_to_plot = min(3, x_original.shape[0])
-#     fig, axes = plt.subplots(num_samples_to_plot, 1, figsize=(14, 4*num_samples_to_plot))
-#     if num_samples_to_plot == 1:
-#         axes = [axes]
-    
-#     for i in range(num_samples_to_plot):
-#         axes[i].plot(x_original[i, :, 0].cpu().numpy(), label='Original', marker='o', alpha=0.7, linewidth=2)
-#         axes[i].plot(recon_reshaped[i, :, 0].cpu().numpy(), label='Reconstructed', marker='s', alpha=0.7, linewidth=2)
-#         axes[i].set_title(f'Sample {i+1} - Energy Consumption', fontsize=12, fontweight='bold')
-#         axes[i].set_xlabel('Hour', fontsize=10)
-#         axes[i].set_ylabel('Energy (kWh)', fontsize=10)
-#         axes[i].legend(fontsize=10)
-#         axes[i].grid(True, alpha=0.3)
-    
-#     os.makedirs('Output/Plots', exist_ok=True)
-#     plt.tight_layout()
-#     plt.savefig('Output/Plots/reconstruction_comparison.png', dpi=150)
-#     print("Saved reconstruction comparison to Output/Plots/reconstruction_comparison.png")
-#     plt.close()
-
-#     # Save to file
-#     reconstruction_path = f'Output/Plots/{model_tag}_reconstruction.png'
-#     plt.savefig(reconstruction_path, dpi=150, bbox_inches='tight')
-#     print(f"Saved reconstruction comparison to {reconstruction_path}")
-    
-#     # Add to TensorBoard
-#     writer.add_figure('Validation/Reconstructions', fig, global_step=0)
-#     plt.close()
-    
-#     #use case:
-#     # Create 10k synthetic samples to instantiate a new transformer station
-#     # some users dont have ev's, so we input them and add condition on ev
-
-#     # ===== SYNTHETIC SAMPLES VISUALIZATION =====
-#     print("Generating synthetic samples...")
-#     with torch.no_grad():
-#         num_synthetic = 5
-#         latent_dim = VAE_model.prior_params["mu"].shape[1]
-#         prior_samples = torch.randn(num_synthetic, latent_dim).to(device) * VAE_model.prior_params["sigma"] + VAE_model.prior_params["mu"]
-#         synthetic_params = VAE_model.decoder(prior_samples)
-#         synthetic_mu = synthetic_params['mu']
-#         if synthetic_mu.dim() == 3:
-#             synthetic_mu = synthetic_mu.squeeze(0)
-#         synthetic_data = synthetic_mu.reshape(num_synthetic, x_original.shape[1], x_original.shape[2])
-    
-#     # Plot synthetic data
-#     fig, axes = plt.subplots(num_synthetic, 1, figsize=(14, 4*num_synthetic))
-#     if num_synthetic == 1:
-#         axes = [axes]
-    
-#     for i in range(num_synthetic):
-#         axes[i].plot(synthetic_data[i, :, 0].cpu().numpy(), marker='o', color='green', alpha=0.7, linewidth=2)
-#         axes[i].set_title(f'Synthetic Sample {i+1} - Energy Consumption', fontsize=12, fontweight='bold')
-#         axes[i].set_xlabel('Hour', fontsize=10)
-#         axes[i].set_ylabel('Energy (kWh)', fontsize=10)
-#         axes[i].grid(True, alpha=0.3)
-    
-#     plt.tight_layout()
-    
-#     # Save to file
-#     synthetic_path = f'Output/Plots/{model_tag}_synthetic.png'
-#     plt.savefig(synthetic_path, dpi=150, bbox_inches='tight')
-#     print(f"Saved synthetic samples to {synthetic_path}")
-    
-#     # Add to TensorBoard
-#     writer.add_figure('Validation/Synthetic_Samples', fig, global_step=0)
-#     plt.close()
-
-#     # ===== COMPARISON PLOT =====
-#     print("Generating comparison visualization...")
-#     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    
-#     # Plot 1: Original samples
-#     for i in range(min(3, x_original.shape[0])):
-#         axes[0].plot(x_original[i, :, 0].cpu().numpy(), alpha=0.6, label=f'Sample {i+1}')
-#     axes[0].set_title('Original Samples', fontsize=12, fontweight='bold')
-#     axes[0].set_xlabel('Hour', fontsize=10)
-#     axes[0].set_ylabel('Energy (kWh)', fontsize=10)
-#     axes[0].legend(fontsize=8)
-#     axes[0].grid(True, alpha=0.3)
-    
-#     # Plot 2: Reconstructed samples
-#     for i in range(min(3, recon_reshaped.shape[0])):
-#         axes[1].plot(recon_reshaped[i, :, 0].cpu().numpy(), alpha=0.6, label=f'Sample {i+1}')
-#     axes[1].set_title('Reconstructed Samples', fontsize=12, fontweight='bold')
-#     axes[1].set_xlabel('Hour', fontsize=10)
-#     axes[1].set_ylabel('Energy (kWh)', fontsize=10)
-#     axes[1].legend(fontsize=8)
-#     axes[1].grid(True, alpha=0.3)
-    
-#     # Plot 3: Synthetic samples
-#     for i in range(min(3, synthetic_data.shape[0])):
-#         axes[2].plot(synthetic_data[i, :, 0].cpu().numpy(), alpha=0.6, label=f'Sample {i+1}', color='green')
-#     axes[2].set_title('Synthetic Samples', fontsize=12, fontweight='bold')
-#     axes[2].set_xlabel('Hour', fontsize=10)
-#     axes[2].set_ylabel('Energy (kWh)', fontsize=10)
-#     axes[2].legend(fontsize=8)
-#     axes[2].grid(True, alpha=0.3)
-    
-#     plt.tight_layout()
-
-#     # Save comparison
-#     comparison_path = f'Output/Plots/{model_tag}_comparison.png'
-#     plt.savefig(comparison_path, dpi=150, bbox_inches='tight')
-#     print(f"Saved comparison plot to {comparison_path}")
-    
-#     # Add to TensorBoard
-#     writer.add_figure('Validation/Comparison', fig, global_step=0)
-#     plt.close()
-    
-#     # ===== STATISTICS =====
-#     # Log sample statistics to TensorBoard
-#     writer.add_scalar('Validation/Original_Mean', x_original.mean().item(), 0)
-#     writer.add_scalar('Validation/Original_Std', x_original.std().item(), 0)
-#     writer.add_scalar('Validation/Reconstructed_Mean', recon_reshaped.mean().item(), 0)
-#     writer.add_scalar('Validation/Reconstructed_Std', recon_reshaped.std().item(), 0)
-#     writer.add_scalar('Validation/Synthetic_Mean', synthetic_data.mean().item(), 0)
-#     writer.add_scalar('Validation/Synthetic_Std', synthetic_data.std().item(), 0)
-    
-#     # Reconstruction error
-#     mse = ((x_original - recon_reshaped) ** 2).mean().item()
-#     mae = (x_original - recon_reshaped).abs().mean().item()
-#     writer.add_scalar('Validation/MSE', mse, 0)
-#     writer.add_scalar('Validation/MAE', mae, 0)
-    
-#     print(f"\nValidation Metrics:")
-#     print(f"  Reconstruction MSE: {mse:.4f}")
-#     print(f"  Reconstruction MAE: {mae:.4f}")
-    
-#     # Close writer
-#     writer.close()
-    
-#     print("\nValidation and visualization complete.")
-#     print(f"View TensorBoard logs with: tensorboard --logdir=./runs/VAE_training/{model_tag}")
-    
