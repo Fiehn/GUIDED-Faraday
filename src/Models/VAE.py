@@ -896,10 +896,12 @@ class VAE(nn.Module):
 
         # === Optional Model Compilation ===
         if compile_model and hasattr(torch, 'compile'):
-            self.encoder = torch.compile(self.encoder, mode='reduce-overhead')
-            self.decoder = torch.compile(self.decoder, mode='reduce-overhead')
-            self.hierarchy = torch.compile(self.hierarchy, mode='reduce-overhead') if self.hierarchy is not None else None
-            print("Model compiled with torch.compile for faster training.")
+            compile_mode = 'reduce-overhead' if str(device) != 'cpu' else None
+            self.encoder = torch.compile(self.encoder, mode=compile_mode)
+            self.decoder = torch.compile(self.decoder, mode=compile_mode)
+            if self.hierarchy is not None:
+                self.hierarchy = torch.compile(self.hierarchy, mode=compile_mode)
+            print(f"Model compiled with torch.compile (mode={compile_mode}).")
 
 
         # === Training Loop ===

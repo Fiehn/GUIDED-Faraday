@@ -192,6 +192,7 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
         weighted_loss=14.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
         heirarchical_config=h_config, # Pass the hierarchical config to enable hierarchical latent space training
         normalizer=normalizer, 
+        compile_model=True,  # Set to True to enable torch.compile() for potential speedup (requires PyTorch 2.0+ and compatible hardware
     )
 
     print("Training complete. Model saved as ", model_tag)
