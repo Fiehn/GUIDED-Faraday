@@ -172,19 +172,37 @@ class Normalizer:
         if isinstance(X, np.ndarray):
             return torch.from_numpy(X.astype(np.float32)).to(self.device)
         return X.float().to(self.device)
+    
+    def _mk_to_tensor(self, month_key, n_rows: int) -> torch.Tensor | None:
+        """Convert month_key to a LongTensor of shape (n_rows,) on self.device.
+        Returns None when keys are none."""
+        if month_key is None:
+            return None
+        if isinstance(month_key, torch.Tensor):
+            mk = month_key.long().to(self.device)
+        else:
+            mk = torch.from_numpy(np.asarray(month_key, dtype=np.int64)).to(self.device)
+        if mk.ndim == 0:
+            mk = mk.expand(n_rows)
+        if mk.shape[0] != n_rows:
+            raise ValueError(f"month_key length {mk.shape[0]} != X rows {n_rows}")
+        return mk 
 
-    def fit(self, X) -> 'Normalizer':
-        """Fit the normalizer on a full dataset at once.
-
-        For large datasets spread across multiple files prefer the incremental
-        API (fit_incremental() per chunk, then finalise_fit()) which keeps peak
-        RAM at O(one chunk) and is numerically equivalent.
-
-        Parameters
-        ----------
-        X : array-like (N, F)
-        """
-        Xt = self._to_tensor(X)
+    def fit(self, X, month_key = None):
+        """Fit the normalizer.
+        Parameters:
+        X : array-like (N,F)
+        month_key : 1-D int array (N,) of YYYYMM values
+                    Only required for method=='online_log1p'"""
+        if X is None:
+            # For log1p_phase, we can compute the stats from the entire dataset using the compute_normalization_stats function
+            if self.method == 'log1p_phase':
+                self.mean, self.std = compute_normalization_stats(sm_files=None, feature_cols=['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3'], save_path='normalization_stats.json')
+                self.fitted = True
+                return
+            else:
+                raise ValueError("X cannot be None for methods other than 'log1p_phase'.")
+        Xt = self._to_tensor(X) # (N,F)
 
         if self.method == 'zero_preserved_log':
             nz = Xt[Xt != 0]
@@ -196,96 +214,34 @@ class Normalizer:
             self.std  = Xt.std(dim=0,  keepdim=True)
             self.std[self.std == 0] = 1.0
         elif self.method == 'log1p':
-            Xl = torch.log1p(Xt.clamp(min=0.0))
-            self.mean = Xl.mean(dim=0, keepdim=True)
-            self.std  = Xl.std(dim=0,  keepdim=True)
-            self.std[self.std == 0] = 1.0
-        else:
-            raise ValueError(f"Unknown normalisation method: '{self.method}'")
+            log1p_values = torch.log1p(Xt)
+            self.mean = log1p_values.mean(dim=0, keepdim=True)
+            self.std = log1p_values.std(dim=0, keepdim=True)
+            self.std[self.std == 0] = 1.0 # Avoid division by zero
+            self.fitted = True
+        elif self.method == 'online_log1p':
+            X_log = torch.log1p(Xt.clamp(min=0.0))
+            # Store values on monthly basis
+            if month_key is not None:
+                mk = self._mk_to_tensor(month_key, Xt.shape[0])
+                for m in mk.unique():
+                    m_int = int(m.item())
+                    mask  = mk == m
+                    vals  = X_log[mask]                     # (K, F)
+                    mean_m = vals.mean(dim=0, keepdim=True) # (1, F)
+                    std_m  = vals.std(dim=0,  keepdim=True) # (1, F)
+                    std_m[std_m == 0] = 1.0
+                    self.monthly_stats[m_int] = {
+                        'mean':  mean_m,
+                        'std':   std_m,
+                        'count': int(mask.sum().item()),
+                    }
 
-        self.fitted = True
-        return self
-    
-    # ------------------------------------------------------------------
-    # Incremental (streaming) fit via batch Welford algorithm.
-    # Processes one meter at a time so peak RAM is O(one meter) instead
-    # of O(full training split).  Call fit_incremental() per chunk, then
-    # finalise_fit() once to commit the stats, identically to fit().
-    # ------------------------------------------------------------------
-
-    def _welford_merge(self, n_a: int, mean_a: torch.Tensor, M2_a: torch.Tensor,
-                       chunk: torch.Tensor):
-        """Merge a new data chunk into running Welford accumulators.
-
-        Returns updated (n, mean, M2).
-        """
-        n_b   = chunk.shape[0]
-        mean_b = chunk.mean(dim=0, keepdim=True)
-        M2_b   = ((chunk - mean_b) ** 2).sum(dim=0, keepdim=True)
-
-        n = n_a + n_b
-        if n_a == 0:
-            return n_b, mean_b, M2_b
-
-        delta    = mean_b - mean_a
-        new_mean = mean_a + delta * (n_b / n)
-        new_M2   = M2_a + M2_b + delta ** 2 * (n_a * n_b / n)
-        return n, new_mean, new_M2
-
-    def fit_incremental(self, X_chunk) -> None:
-        """Stream one chunk of data through the Welford online algorithm.
-
-        Parameters
-        ----------
-        X_chunk : array-like (N, F)
-
-        Call finalise_fit() once all chunks have been streamed to commit
-        the stats.  This is numerically equivalent to fit() but keeps
-        peak RAM at O(one chunk) regardless of dataset size.
-        """
-        Xt = self._to_tensor(X_chunk)   # (N, F)
-        F  = Xt.shape[1]
-
-        # Initialise accumulators on first call
-        if not hasattr(self, '_wf_n'):
-            self._wf_n    = 0
-            self._wf_mean = torch.zeros(1, F, device=self.device)
-            self._wf_M2   = torch.zeros(1, F, device=self.device)
-
-        if self.method == 'log1p':
-            Xt = torch.log1p(Xt.clamp(min=0.0))
-        elif self.method == 'zero_preserved_log':
-            nz = Xt[Xt != 0]
-            if nz.numel() > 0:
-                log_nz = torch.log(nz).unsqueeze(1)    # treat as (N, 1)
-                self._wf_n, self._wf_mean, self._wf_M2 = self._welford_merge(
-                    self._wf_n, self._wf_mean, self._wf_M2, log_nz)
-            return  # handled above; no global row-level update needed
-
-        # Global Welford update
-        self._wf_n, self._wf_mean, self._wf_M2 = self._welford_merge(
-            self._wf_n, self._wf_mean, self._wf_M2, Xt)
-
-    def finalise_fit(self) -> None:
-        """Commit Welford accumulators to the normalizer's parameters.
-
-        Must be called after all fit_incremental() calls.
-        Raises ValueError if no data was streamed.
-        """
-        if not hasattr(self, '_wf_n') or self._wf_n == 0:
-            raise ValueError("No data streamed — call fit_incremental() first.")
-
-        def _safe_std(M2: torch.Tensor, n: int) -> torch.Tensor:
-            std = torch.sqrt(M2 / max(n - 1, 1))
-            std[std == 0] = 1.0
-            return std
-
-        if self.method in ('standard', 'log1p'):
-            self.mean  = self._wf_mean
-            self.std   = _safe_std(self._wf_M2, self._wf_n)
-        elif self.method == 'zero_preserved_log':
-            self.non_zero_mean = float(self._wf_mean.squeeze().item())
-            self.non_zero_std  = float(_safe_std(self._wf_M2, self._wf_n).squeeze().item())
+            # global fallback 
+            self._global_mean = X_log.mean(dim=0, keepdim=True)  # (1, F)
+            self._global_std  = X_log.std(dim=0,  keepdim=True)  # (1, F)
+            self._global_std[self._global_std == 0] = 1.0
+            self.fitted = True
         else:
             raise ValueError(f"finalise_fit() not implemented for method '{self.method}'")
 
@@ -370,7 +326,18 @@ class Normalizer:
         elif self.method == 'standard':
             return (Xt - self.mean) / (self.std + self.epsilon)
         elif self.method == 'log1p':
-            return (torch.log1p(Xt.clamp(min=0.0)) - self.mean) / (self.std + self.epsilon)
+            return (torch.log1p(Xt) - self.mean) / (self.std + self.epsilon)
+
+        elif self.method == 'online_log1p':
+            mk    = self._mk_to_tensor(month_key, Xt.shape[0])
+            return self._apply_online_log1p(Xt, mk, inverse=False)
+        
+        elif self.method == 'log1p_phase':
+            # For phase-aware log1p, we can just apply the standard log1p normalization using pre-computed mean/std from the entire dataset
+            if self.mean is None or self.std is None:
+                raise RuntimeError("log1p_phase normalization requires pre-computed mean and std. Call fit() with method='log1p_phase' first.")
+            return (torch.log1p(Xt) - self.mean) / (self.std + self.epsilon)
+        
         else:
             raise ValueError(f"Unknown normalisation method: '{self.method}'")
 
@@ -390,9 +357,18 @@ class Normalizer:
         elif self.method == 'standard':
             return Xt * self.std + self.mean
         elif self.method == 'log1p':
-            return torch.clamp(
-                torch.expm1(Xt * (self.std + self.epsilon) + self.mean), min=0.0
-            )
+            return torch.clamp(torch.expm1(Xt * (self.std + self.epsilon) + self.mean), min=0.0)
+
+        elif self.method == 'online_log1p':
+            mk  = self._mk_to_tensor(month_key, Xt.shape[0])
+            out = self._apply_online_log1p(Xt, mk, inverse=True)
+            return out.clamp(min=0.0)
+
+        elif self.method == 'log1p_phase':
+            if self.mean is None or self.std is None:
+                raise RuntimeError("log1p_phase normalization requires pre-computed mean and std. Call fit() with method='log1p_phase' first.")
+            return torch.clamp(torch.expm1(Xt * (self.std + self.epsilon) + self.mean), min=0.0)
+        
         else:
             raise ValueError(f"Unknown normalisation method: '{self.method}'")
 
