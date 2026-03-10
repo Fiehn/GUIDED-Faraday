@@ -104,19 +104,9 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
     test_loader = dm.test_dataloader()
 
     ##############################
-    # get one batch
-    x, meter_id, timestamps = next(iter(train_loader))  # Now also get timestamps
-    print("x shape:", x.shape)
-    print("meter_id shape:", meter_id.shape, "example:", meter_id[:5])
-    print("timestamps shape:", len(timestamps))
-
-    # flatten for vae and cvae
-    x_flat = x.reshape(x.shape[0], -1)
-    print("x_flat shape:", x_flat.shape)
 
     num_features = x.shape[2]
     input_dim = 24 * num_features  # flattened window dim
-    print("input_dim:", input_dim)
 
     if os.path.exists("models/UserProfiles/user_profiler.pkl"):
         print("UserProfiler model found on disk.")
@@ -130,10 +120,6 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
     conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
     conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
     #conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json')) # TODO: check that this works and actually adds on the days it says it should
-    cond = conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)  # Pass all data (x, meter, timestamps)
-    
-    print("Condition shape:", cond.shape)
-
 
     ##############################
     # use chosen model
@@ -443,14 +429,12 @@ def online_train(model_type: str = "cvae", skip_validation: bool = False):
 
 # now we can run either VAE or CVAE test
 if __name__ == "__main__":
-    import gc
     # choose: "vae" or "cvae"
     # run_test(model_type="vae")
     # run_test(model_type="vae", skip_validation=False)  # VAE with validation
-    run_test(model_type="cvae", skip_validation=True, file_name='hourly_measurements_2023_11.csv')  # CVAE with validation
+    #run_test(model_type="cvae", skip_validation=True, file_name='hourly_measurements_2023_11.csv')  # CVAE with validation
     #run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
-    gc.collect()  # Release run_test's DataModule/DataLoader memory before loading the next file
-    online_train(model_type="cvae", skip_validation=True)  # Online training with CVAE and validation
+    online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
     #run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
 
 

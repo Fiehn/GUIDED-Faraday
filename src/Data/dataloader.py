@@ -85,7 +85,7 @@ class SmartMeterCSV:
             dtype=dtype_map,
             chunksize=200_000,
         ):
-            chunk[self.timestamp_dst_col] = pd.to_datetime(chunk[self.timestamp_dst_col])
+            chunk[self.timestamp_dst_col] = pd.to_datetime(chunk[self.timestamp_dst_col], format='ISO8601')
             for c in self.value_cols:
                 chunk[c] = pd.to_numeric(chunk[c], errors="coerce")
             if self.nan_as_zero:
