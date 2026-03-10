@@ -177,6 +177,8 @@ def run_test(model_type: str = "vae", skip_validation: bool = False, file_name =
         log_dir=log_dir,
         weighted_loss=14.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
         heirarchical_config=h_config, # Pass the hierarchical config to enable hierarchical latent space training
+        normalizer=normalizer, 
+        compile_model=True,  # Set to True to enable torch.compile() for potential speedup (requires PyTorch 2.0+ and compatible hardware
     )
 
     print("Training complete. Model saved as ", model_tag)
@@ -374,6 +376,7 @@ def online_train(model_type: str = "cvae", skip_validation: bool = False):
             save_epoch_freq=10,
             log_dir=log_dir,
             model_name= model_tag if model_tag is not None else f"online_{model_type}",
+            normalizer=normalizer,
         )
         print(f"Finished training on {data_file} advancing to next file...\n")
 
@@ -431,10 +434,10 @@ def online_train(model_type: str = "cvae", skip_validation: bool = False):
 if __name__ == "__main__":
     # choose: "vae" or "cvae"
     # run_test(model_type="vae")
-    # run_test(model_type="vae", skip_validation=False)  # VAE with validation
+    #run_test(model_type="vae", skip_validation=False)  # VAE with validation
     #run_test(model_type="cvae", skip_validation=True, file_name='hourly_measurements_2023_11.csv')  # CVAE with validation
-    #run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
-    online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
+    run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
+    #online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
     #run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
 
 

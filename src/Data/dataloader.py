@@ -1,6 +1,7 @@
 from __future__ import annotations
 import gc
 import os
+import json
 from dataclasses import dataclass
 import sys
 from typing import Optional, Sequence, List
@@ -13,6 +14,45 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 from Data.normalizer import Normalizer
+
+
+def load_meter_to_feeder_mapping(
+    mapping_path: str = 'topology/cleaned/Cleaned_SM_Topology_mapping.json'
+) -> dict[str, Optional[str]]:
+    """Load meter->feeder mapping from topology JSON.
+
+    Returns a dictionary with string meter ids as keys and feeder labels as values
+    (e.g. ``LvFeeder.975670``). Missing feeder info maps to ``None``.
+    """
+    resolved_path = mapping_path
+    if not os.path.isabs(resolved_path):
+        resolved_path = os.path.join(os.getcwd(), resolved_path)
+
+    if not os.path.exists(resolved_path):
+        raise FileNotFoundError(f"Topology mapping not found: {resolved_path}")
+
+    with open(resolved_path, 'r') as f:
+        raw_mapping = json.load(f)
+
+    meter_to_feeder: dict[str, Optional[str]] = {}
+    for meter, topo in raw_mapping.items():
+        feeder_id = topo.get('Feeder ID') if isinstance(topo, dict) else None
+        meter_to_feeder[str(meter)] = f"LvFeeder.{feeder_id}" if feeder_id is not None else None
+
+    return meter_to_feeder
+
+
+def map_meter_ids_to_feeder_ids(
+    meter_ids: Sequence,
+    meter_to_feeder: dict[str, Optional[str]],
+) -> np.ndarray:
+    """Map a sequence of meter ids to feeder ids using a pre-loaded mapping."""
+    feeder_ids = []
+    for meter in meter_ids:
+        if isinstance(meter, np.generic):
+            meter = meter.item()
+        feeder_ids.append(meter_to_feeder.get(str(meter), None))
+    return np.asarray(feeder_ids, dtype=object)
 
 # read and preprocess 
 class SmartMeterCSV:

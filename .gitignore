@@ -8,7 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Other
 data/
 models/
 runs/
 Output/
+topology/

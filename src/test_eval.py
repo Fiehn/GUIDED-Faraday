@@ -1,6 +1,6 @@
 import torch
 from eval_framework import FlexibilityDistance # for reconstruction evaluation
-from eval_framework import VisualEvaluation, ACFDistribution, ClassicalStatistics, TSTR, MaximumMeanDiscrepancy # for distributional evaluation
+from eval_framework import VisualEvaluation, ACFDistribution, ClassicalStatistics, TSTR, MaximumMeanDiscrepancy, AggregatedProfiles, PerConditionEval # for distributional evaluation
 from src.Models.VAE import VAE
 from src.Models.CVAE import CVAE
 import glob
@@ -8,7 +8,9 @@ import os
 import sys
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 from config_loader import load_config
+from src.Data.dataloader import load_meter_to_feeder_mapping, map_meter_ids_to_feeder_ids
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'test'))
 from src.test.create_test_data import create_test_dataset
 
@@ -57,58 +59,77 @@ window_size = config.window_size
 # Get feature columns
 data_config = config.loader.get_section('data')
 feature_cols = data_config['columns']['value_cols']
-print(f"Features: {feature_cols}")
+consumption_col = feature_cols[0]
+print(f"Features in config: {feature_cols}")
+print(f"Using only consumption feature for evaluation: {consumption_col}")
 
-# Create windowed data
-print("\nCreating windows...")
+# Create 24-hour windows (one per day) from the data
+print("\nCreating daily windows from test data...")
+real_data = []
+timestamps = []
+window_meter_ids = []
 
-# Group by meter and create windows
-all_windows = []
-for meter_id in df["meter_number"].unique():
-    meter_data = df[df["meter_number"] == meter_id].sort_values("timestamp_dst")
+for meter_id in sorted(df["meter_number"].unique()):
+    meter_data = df[df["meter_number"] == meter_id].sort_values("timestamp_utc").reset_index(drop=True)
+    # Parse timestamps robustly:
+    # - numeric unix epoch columns are interpreted as seconds
+    # - string datetime columns are parsed directly
+    ts_col = meter_data["timestamp_utc"]
+    if is_numeric_dtype(ts_col):
+        meter_timestamps = pd.to_datetime(ts_col, unit='s', utc=True)
+    else:
+        meter_timestamps = pd.to_datetime(ts_col, utc=True)
     
-    # Extract feature columns
-    print(f"\nMeter {meter_id}:")
-    print(f"  Columns available: {meter_data.columns.tolist()}")
-    print(f"  Looking for feature_cols: {feature_cols}")
+    print(f"  Meter {meter_id}: {len(meter_data)} records, date range {meter_timestamps.iloc[0]} to {meter_timestamps.iloc[-1]}")
     
-    # Check if columns exist
-    missing_cols = [col for col in feature_cols if col not in meter_data.columns]
-    if missing_cols:
-        print(f"  ERROR: Missing columns: {missing_cols}")
-        continue
-    
-    values = meter_data[feature_cols].values  # Shape: [T, n_features]
-    
-    # Fill NaN values with 0
-    values = np.nan_to_num(values, nan=0.0)
-    
-    print(f"  Values shape: {values.shape}")
-    print(f"  NaN count after filling: {np.isnan(values).sum()}")
-    print(f"  Sample values:\n{values[:5]}")
-    
-    # Create sliding windows
-    for i in range(len(values) - window_size + 1):
-        window = values[i:i+window_size]  # Shape: [window_size, n_features]
-        all_windows.append(window.flatten())  # Flatten to [window_size * n_features]
+    # Group into consecutive 24-hour blocks
+    for start_idx in range(0, len(meter_data) - window_size + 1, window_size):
+        end_idx = start_idx + window_size
+        window = meter_data.iloc[start_idx:end_idx]
+        
+        # Extract consumption column and convert to numpy
+        window_values = window[consumption_col].values.astype(float)
+        real_data.append(window_values)
+        
+        # Use the first timestamp of this 24-hour window
+        start_ts = meter_timestamps.iloc[start_idx]
+        from datetime import datetime
+        dt = start_ts.to_pydatetime()
+        print(f"    Window {start_idx}-{end_idx}: {dt.strftime('%Y-%m-%d %A %H:%M')}")
+        
+        timestamps.append(int(start_ts.timestamp()))
+        window_meter_ids.append(int(meter_id))
 
-real_data = np.array(all_windows)
-print(f"Real data: {real_data.shape} (expected: [N, {window_size * len(feature_cols)}])")
+real_data = np.array(real_data)
+timestamps = np.array(timestamps)
+window_meter_ids = np.array(window_meter_ids)
 
-# Check for NaN values and remove them
-nan_mask = np.isnan(real_data).any(axis=1)
-num_nan = nan_mask.sum()
-if num_nan > 0:
-    print(f"Warning: Found {num_nan} windows with NaN values, removing them...")
-    real_data = real_data[~nan_mask]
-    print(f"Real data after NaN removal: {real_data.shape}")
+print(f"\nCreated {len(real_data)} daily windows from {len(df)} hourly records")
+print(f"Real data shape: {real_data.shape}")
 
-if len(real_data) == 0:
-    print("ERROR: All windows contain NaN values!")
-    exit(1)
+# Resolve feeder ids for each 24-hour window using topology utilities from dataloader
+meter_to_feeder = load_meter_to_feeder_mapping('topology/cleaned/Cleaned_SM_Topology_mapping.json')
+window_feeder_ids = map_meter_ids_to_feeder_ids(window_meter_ids, meter_to_feeder)
+
+mapped_count = int(np.sum([f is not None for f in window_feeder_ids]))
+print(f"Feeder mapping: {mapped_count}/{len(window_feeder_ids)} windows mapped")
+
+# Check temporal coverage
+if len(timestamps) > 0:
+    days = set()
+    hours = set()
+    months = set()
+    from datetime import datetime
+    for ts in timestamps:
+        dt = datetime.utcfromtimestamp(ts)
+        days.add(dt.weekday())
+        hours.add(dt.hour)
+        months.add(dt.month)
+    print(f"Temporal coverage: Days={sorted(days)}, Hours={sorted(hours)}, Months={sorted(months)}")
 
 # Create model and generate synthetic data
 print("\nCreating model and generating synthetic data...")
+# Keep model input dim aligned with training/checkpoint feature count
 input_dim = window_size * len(feature_cols)
 
 # Create model
@@ -126,62 +147,79 @@ model.eval()
 print(f"Model loaded: {model.__class__.__name__}")
 
 # Generate synthetic data
-print("Generating 100 synthetic samples...")
+print(f"Generating {len(real_data)} synthetic samples...")
 synthetic_data = []
 with torch.no_grad():
-    for i in range(0, 100, 16):
-        batch_size = min(16, 100 - i)
+    for i in range(0, len(real_data), 16):
+        batch_size = min(16, len(real_data) - i)
         z = torch.randn(batch_size, latent_dim)
         recon = model.decoder(z)['mu']
         synthetic_data.append(recon.cpu().numpy())
 
 synthetic_data = np.vstack(synthetic_data)
-print(f"Synthetic data: {synthetic_data.shape}")
 
-# Take subset of real data
-real_data_subset = real_data[:100]
-print(f"Using {len(real_data_subset)} real samples")
+# Convert synthetic outputs to consumption-only [N, window_size]
+if synthetic_data.shape[1] % window_size != 0:
+    raise ValueError(
+        f"Synthetic data feature dimension ({synthetic_data.shape[1]}) is not divisible by window_size ({window_size})."
+    )
+synthetic_n_features = synthetic_data.shape[1] // window_size
+synthetic_data = synthetic_data.reshape(-1, window_size, synthetic_n_features)[:, :, 0]
+
+# Use all real data
+real_data_subset = real_data
 
 
-# # Run reconstruction evaluation
-# print("\n" + "="*70)
-# print("RECONSTRUCTION EVALUATION METRICS")
-# print("="*70)
+# Run reconstruction evaluation
+print("\n" + "="*70)
+print("RECONSTRUCTION EVALUATION METRICS")
+print("="*70)
 
-# fd_metric = FlexibilityDistance(model, real_data_subset, device='cpu')
-# fd_score = fd_metric.compute()
-# print(f"Flexibility Distance: {fd_score:.4f}") # (lower is better, 0 = perfect reconstruction)
+fd_metric = FlexibilityDistance(tau='auto', normalize=True)
+fd_metric.real_data = real_data_subset
+fd_metric.reconstructed_data = synthetic_data
+fd_score = fd_metric.compute()
+print(f"Flexibility Distance: {fd_score:.4f}") # (lower is better, 0 = perfect reconstruction)
  
 
 
-# # Run distributional evaluation
-# print("\n" + "="*70)
-# print("DISTRIBUTIONAL EVALUATION METRICS")
-# print("="*70)
+# Run distributional evaluation
+print("\n" + "="*70)
+print("DISTRIBUTIONAL EVALUATION METRICS")
+print("="*70)
 
-# # Visual evaluation
-# print("\nVisual Evaluation:")
-# visual_eval = VisualEvaluation(real_data_subset, synthetic_data, output_dir='Output/Plots')
-# visual_eval.pca()
-# visual_eval.tsne()
-# print("PCA and t-SNE plots saved to Output/Plots")
+# Visual evaluation
+print("\nVisual Evaluation:")
+visual_eval = VisualEvaluation(output_dir='Output/Plots')
+visual_eval.real_data = real_data_subset
+visual_eval.synthetic_data = synthetic_data
+visual_eval.pca()
+visual_eval.tsne()
+print("PCA and t-SNE plots saved to Output/Plots")
 
-# # ACF Distribution metric
-# acf_metric = ACFDistribution(real_data_subset, synthetic_data, window_size=window_size, max_lag=10)
-# acf_score = acf_metric.compute()
-# print("\nACF Distribution Match:")
-# print(f"  Average Kolmogorov-Smirnov (KS) test statistic across lags: {acf_score:.4f}") # (lower is better: 0 = perfect match, 1 = completely different)
+# ACF Distribution metric
+acf_metric = ACFDistribution(window_size=window_size, max_lag=10)
+acf_metric.real_data = real_data_subset
+acf_metric.synthetic_data = synthetic_data
+acf_score = acf_metric.compute()
+print("\nACF Distribution Match:")
+print(f"  Average Kolmogorov-Smirnov (KS) test statistic across lags: {acf_score:.4f}") # (lower is better: 0 = perfect match, 1 = completely different)
 
-# # Maximum Mean Discrepancy
-# print("\nMaximum Mean Discrepancy (MMD):")
-# mmd_metric = MaximumMeanDiscrepancy(real_data_subset, synthetic_data)
-# mmd_score = mmd_metric.compute()
-# print(f"  MMD score: {mmd_score:.6f}") # (lower is better, 0 = identical distributions)
+# Maximum Mean Discrepancy
+print("\nMaximum Mean Discrepancy (MMD):")
+mmd_metric = MaximumMeanDiscrepancy(sigma=None, seed=42, max_samples=2000)
+mmd_metric.real_data = real_data_subset
+mmd_metric.synthetic_data = synthetic_data
+mmd_score = mmd_metric.compute()
+print(f"  MMD score: {mmd_score:.6f}") # (lower is better, 0 = identical distributions)
 
-# # Classicl statistics match
-# print("\nClassical Statistics Match:")
-# stats_metric = ClassicalStatistics(real_data, synthetic_data, window_size=24, n_features=2)
-# stats_metric.print_comparison()
+# Classicl statistics match
+print("\nClassical Statistics Match:")
+stats_metric = ClassicalStatistics(window_size=window_size, n_features=1)
+stats_metric.real_data = real_data_subset
+stats_metric.synthetic_data = synthetic_data
+stats_score = stats_metric.compute()
+print(f"  Mean profile MAE: {stats_score:.6f}")
 
 # TSTR evaluation (Train on Synthetic, Test on Real)
 tstr_metric = TSTR(
@@ -195,3 +233,39 @@ tstr_metric.real_data = real_data
 tstr_metric.synthetic_data = synthetic_data
 ratio = tstr_metric.compute()
 print(f"\nTSTR Ratio: {ratio:.6f}")
+
+# Aggregated Profiles evaluation
+print("\n" + "="*70)
+print("AGGREGATED PROFILES EVALUATION")
+print("="*70)
+agg_metric = AggregatedProfiles(
+    n_samples=100,
+    window_size=window_size,
+    tau='auto',
+    normalize=True
+)
+agg_metric.real_data = real_data
+agg_metric.synthetic_data = synthetic_data
+agg_score = agg_metric.compute()
+print(f"\nAggregated Profiles (Flexibility Distance): {agg_score:.6f}") # (lower is better, 0 = perfect match between summed profiles)
+
+
+# Per condition evaluation 
+print("\n" + "="*70)
+print("PER-CONDITION EVALUATION")
+print("="*70)
+per_condition_eval = PerConditionEval(
+    window_size=window_size, 
+    max_lag=10,
+    min_samples_per_group=2,
+    output_dir='src/Output/',
+    verbose=True,
+    predictor_type='linear',
+    tstr_epochs=50,
+    min_samples_per_feeder=2  # Lower threshold for test data with few samples
+)
+per_condition_eval.real_data = real_data
+per_condition_eval.synthetic_data = synthetic_data
+per_condition_eval.timestamps = timestamps
+per_condition_eval.feeder_ids = window_feeder_ids
+per_condition_eval.compute()
