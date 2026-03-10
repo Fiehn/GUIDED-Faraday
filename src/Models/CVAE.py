@@ -177,11 +177,15 @@ class CVAE(VAE):
     def sample(self, conditions: torch.Tensor, num_prior_samples: int = 1, num_x_samples: int = 1, device: str = "cpu",):
         self.eval()
 
+        original_device = next(self.parameters()).device
+        self.to(device)
+
         c = self.move_to_device(conditions, device=device)
         B = c.size(0)
 
         # Sample z from prior: handle different prior return shapes
         z = self.prior.sample(batch_size=B, num_samples=num_prior_samples)
+        z = z.to(device)  # prior.device may differ from the requested device
         
         # Dictionary priors sample in dictionary space (dim=dictionary_size).
         # Map to latent space via the encoder's SigmaMapper so the decoder
@@ -189,7 +193,7 @@ class CVAE(VAE):
         if hasattr(self.prior, 'dictionary_size') and z.shape[-1] != self.latent_dim:
             U = self.encoder.get_SigmaMapper()          # [latent_dim, dictionary_size]
             if U is not None:
-                z = torch.einsum('sbd,do->sbo', z, U.T) # [S, B, latent_dim]
+                z = torch.einsum('sbd,do->sbo', z, U.T.to(z.device)) # [S, B, latent_dim]
                 # Add prior mean (zeros for standard, learned for learnable)
                 prior_params = self.prior.get_params()
                 z = z + prior_params['mu'].to(z.device)
@@ -241,7 +245,9 @@ class CVAE(VAE):
             xs = self.decoder.sample(params_s, num_samples=num_x_samples) # [num_x_samples, B, D]
             xs_all.append(xs)
 
-        return torch.stack(xs_all, dim=0)  # [S, num_x_samples, B, D]
+        return_val = torch.stack(xs_all, dim=0)  # [S, num_x_samples, B, D]
+        self.to(original_device)
+        return return_val
     
     @torch.no_grad()
     def reconstruct(self, x: torch.Tensor, meter_ids: torch.Tensor, timestamps: torch.Tensor, num_samples: int = 1):

@@ -924,15 +924,14 @@ class VAE(nn.Module):
 
                 batch = self.move_to_device(batch, device)
 
-                with torch.amp.autocast(device_type=str(device).split(':')[0], enabled=(str(device) != 'cpu')):
-                    loss_dict = self.train_core(
-                        batch, 
-                        optim, 
-                        beta=current_beta, 
-                        gradient_clip=gradient_clip, 
-                        gradient_clip_kwargs=gradient_clip_kwargs,
-                        weighted_loss=weighted_loss,
-                    )
+                loss_dict = self.train_core(
+                    batch, 
+                    optim, 
+                    beta=current_beta, 
+                    gradient_clip=gradient_clip, 
+                    gradient_clip_kwargs=gradient_clip_kwargs,
+                    weighted_loss=weighted_loss,
+                )
                 
                 # Accumulate epoch losses
                 epoch_train_loss += loss_dict["loss"].item()
@@ -1026,6 +1025,9 @@ class VAE(nn.Module):
         self.to("cpu")
         self.prior.to("cpu")
         self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_final", device="cpu", normalizer=normalizer)
+        # Restore model to the training device so it's ready for inference after fit() returns
+        self.to(device)
+        self.prior.to(device)
 
         # Save training summary
         summary = {

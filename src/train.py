@@ -23,7 +23,7 @@ from src.Visualization.Writer import Writer
 from src.eval_framework import EvalFramework
 from src.eval_framework import (
     ReconstructionMSE, ReconstructionMSE, ReconstructionRMSE, ReconstructionLogLikelihood, FlexibilityDistance,
-    MaximumMeanDiscrepancy, ACFDistribution, VisualEvaluation, ClassicalStatistics, TSTR
+    MaximumMeanDiscrepancy, ACFDistribution, VisualEvaluation, ClassicalStatistics, TSTR, AggregatedProfiles, PerConditionEval
 )
 
 
@@ -275,6 +275,7 @@ def online_train(model_type: str = "cvae", skip_validation: bool = False):
         conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
         conditioner.add_condition_item("user_profile", OnlineUserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
         #conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json')) # TODO: check that this works and actually adds on the days it says it should
+        conditioner.add_condition_item("MonthOfYearConditioner", MonthOfYearConditioner())
 
         # heirarchy = HierarchicalConfig(
         #     levels=[
@@ -293,7 +294,7 @@ def online_train(model_type: str = "cvae", skip_validation: bool = False):
 
         model = OnlineCVAE(input_dim=24, latent_dim=32, conditioner=conditioner, 
                      encoder_type="dictionary",decoder_type='dictionary', 
-                     prior_type="vampprior", device=device,
+                     prior_type="learnable_dictionary", device=device,
                      normalizer=normalizer, hierarchy_config=heirarchy)  # input_dim will be updated based on data
         log_dir = "./models/"
     
@@ -415,7 +416,9 @@ def online_train(model_type: str = "cvae", skip_validation: bool = False):
         ACFDistribution(),
         ClassicalStatistics(),
         TSTR(),
-        VisualEvaluation()
+        VisualEvaluation(),
+        AggregatedProfiles(),
+        PerConditionEval(),
     ])
     
     # Run all metrics (will print reconstruction section, then synthetic section)
@@ -436,8 +439,8 @@ if __name__ == "__main__":
     # run_test(model_type="vae")
     #run_test(model_type="vae", skip_validation=False)  # VAE with validation
     #run_test(model_type="cvae", skip_validation=True, file_name='hourly_measurements_2023_11.csv')  # CVAE with validation
-    run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
-    #online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
+    #run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
+    online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
     #run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
 
 
