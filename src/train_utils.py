@@ -3,16 +3,16 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
-from src.Models.encoder_decoder_model import *
-from src.Data.Conditioner import *
-from src.Models.CVAE import *
-from src.Models.VAE import *
-from src.Models.Online_CVAE import *
-from src.Data.dataloader import *
-from src.Data.normalizer import *
+from src.models.encoder_decoder_model import *
+from src.data.conditioner import *
+from src.models.cvae import *
+from src.models.vae import *
+from src.models.online_cvae import *
+from src.data.dataloader import *
+from src.data.normalizer import *
 import matplotlib.pyplot as plt
 import yaml
-from src.Visualization.PlotStyling import PlotStyle
+from src.visualization.plot_styling import PlotStyle
 
 # Set up device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -8,17 +8,17 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir) 
-from Models.encoder_decoder_model import *
-from Data.Conditioner import *
-from Models.priors import *
-from Data.normalizer import *
+from models.encoder_decoder_model import *
+from data.conditioner import *
+from models.priors import *
+from data.normalizer import *
 
-from Visualization.Writer import Writer
+from visualization.writer import Writer
 
-from src.Hierarchical.config import HierarchicalConfig
-from src.Hierarchical.core import HierarchicalLatentModule
+from src.hierarchical.config import HierarchicalConfig
+from src.hierarchical.core import HierarchicalLatentModule
 
-from src.Models.model_utils import CyclicalBetaScheduler, EarlyStopping
+from src.models.model_utils import CyclicalBetaScheduler, EarlyStopping
 
 
 

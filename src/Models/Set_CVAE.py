@@ -1,4 +1,4 @@
-from src.Models.Online_CVAE import *
+from src.models.online_cvae import *
 
 # ==============
 # SET-CVAE class for training on multiple datasets sequentially

@@ -13,7 +13,7 @@ from torch.utils.data import Dataset, DataLoader, TensorDataset
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
-from Data.normalizer import Normalizer
+from data.normalizer import Normalizer
 
 
 def load_meter_to_feeder_mapping(

@@ -1,4 +1,4 @@
-from src.Models.VAE import *
+from src.models.vae import *
 
 # ==============
 # Define the Conditional VAE (CVAE) class
