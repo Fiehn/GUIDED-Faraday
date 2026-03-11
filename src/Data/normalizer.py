@@ -201,7 +201,7 @@ class Normalizer:
             'std':  self.std.cpu()  if isinstance(self.std,  torch.Tensor) else self.std,
         }
         torch.save(state, path)
-
+ 
     @classmethod
     def load(cls, path: str, device: str | torch.device = 'cpu') -> 'Normalizer':
         """Load a previously saved Normalizer from disk."""

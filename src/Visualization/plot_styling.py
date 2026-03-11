@@ -24,7 +24,7 @@ class PlotStyle:
         self.marker = marker
         self.linestyle = linestyle
         self.linewidth = linewidth
-    
+     
     def get_color(self, index: int) -> str:
         """Get a color from the palette with cycling."""
         return self.palette_colors[index % len(self.palette_colors)]

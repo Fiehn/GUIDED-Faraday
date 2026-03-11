@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from typing import Optional
-
+ 
 from .config import HierarchicalConfig
 from .levels import StrategyRegistry
 from .aggregation import ConcatAggregation, SumAggregation, GatedAggregation, AttentionAggregation, _AGGREGATION_STRATEGIES

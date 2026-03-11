@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from typing import Optional
-
+ 
 class ConcatAggregation(nn.Module):
     """
     Concatenate latent representations from all levels and project to output_dim.

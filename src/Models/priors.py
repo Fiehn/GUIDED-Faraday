@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 import numpy as np
-
+ 
 # =============
 # Prior Dsitribution Classes
 # =============

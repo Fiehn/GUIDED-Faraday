@@ -19,7 +19,7 @@ import tempfile
 import pytest
 import torch
 import torch.nn as nn
-import numpy as np
+import numpy as np 
 
 # ------------------------------------------------------------------
 # Path setup (same pattern as the rest of the repo)

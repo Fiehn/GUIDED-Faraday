@@ -9,8 +9,8 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from Data.Conditioner import Conditioner
-from Visualization.Writer import Writer
+from data.conditioner import Conditioner
+from visualization.writer import Writer
 class GAN(nn.Module):
     """
     A WGAN-GP implementation for time series data.

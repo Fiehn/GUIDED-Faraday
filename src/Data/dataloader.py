@@ -72,7 +72,7 @@ class SmartMeterCSV:
         timestamp_utc_col: Optional[str] = None, # UTC column – loaded but never used; omit to save I/O
         value_cols: Sequence[str],               # names of the value columns (e.g., consumption, production)
         nan_as_zero: bool = True,                # whether to replace NaN with 0
-    ):
+    ): 
         self.data_dir = data_dir
         self.meter_col = meter_col
         self.timestamp_dst_col = timestamp_dst_col

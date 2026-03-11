@@ -26,7 +26,7 @@ from data.conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
 from visualization.visualizer import Visualizer
 from visualization.writer import Writer
 from visualization.plot_styling import PlotStyle
-
+ 
 # Create output directory
 output_dir = "Output/Plots/quick_demo"
 os.makedirs(output_dir, exist_ok=True)

@@ -75,7 +75,7 @@ class CVAE(VAE):
 
         # Sample latent variables using reparameterization trick - sample z: [S, B, latent_dim]
         z = self.encoder.reparameterize(q_params, num_samples=num_samples)
-
+ 
         hierarchy_results = None
         if self.hierarchy is not None:
             S, B, D = z.shape

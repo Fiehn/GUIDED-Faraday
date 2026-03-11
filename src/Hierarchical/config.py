@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field, asdict
 from typing import Optional
-
+ 
 @dataclass
 class LevelConfig:
     """Configuration for a single level in the hierarchical model."""
