@@ -1,5 +1,6 @@
 import os
 import sys
+from xml.parsers.expat import model
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
@@ -10,439 +11,260 @@ from src.models.online_cvae import *
 from src.models.vae import *
 from data.dataloader import *
 from data.normalizer import *
-from torch.utils.tensorboard import SummaryWriter
-from src.train_utils import *
 from src.test.run_validation import run_validation
 
-from src.hierarchical.aggregation import *
-from src.hierarchical.config import *
+from src.models.hierarchical.aggregation import *
+from src.models.hierarchical.config import *
  
 from src.visualization.visualizer import Visualizer
 from src.visualization.writer import Writer
 
-from src.eval_framework import EvalFramework
-from src.eval_framework import (
-    ReconstructionMSE, ReconstructionMSE, ReconstructionRMSE, ReconstructionLogLikelihood, FlexibilityDistance,
-    MaximumMeanDiscrepancy, ACFDistribution, VisualEvaluation, ClassicalStatistics, TSTR, AggregatedProfiles, PerConditionEval
-)
+from evaluation.eval_framework import EvalFramework
 
+from src.visualization.plot_styling import PlotStyle
+import gc
 
-# Set up device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-def run_test(model_type: str = "vae", skip_validation: bool = False, file_name = "test_data_small.csv"):
-    model_type = model_type.lower()
-    assert model_type in {"vae", "cvae"}
-
+def train(config):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device: ", device)
-
     # Up the recursion limit for deep models
     sys.setrecursionlimit(5000) # default seems to be 999
 
-    ##############################
-    # Validate model before training
-    if not skip_validation:
-        print("\nStarting model validation before training...\n") 
+    if not config.skip_validation:
         validation_passed = run_validation(
-            model_type=model_type,
+            model_type=config.model_type,
             use_test_data=True,  # use small test data for fast validation
-            verbose=True
+            verbose=config.verbose
         )
-        
         if not validation_passed:
-            print("\n!! Validation failed! Please fix issues before training.")
-            print("To skip validation, use: run_test(model_type='cvae', skip_validation=True)")
+            print("\nValidation failed! Please fix issues before training.")
+            print("To skip validation, set skip_validation=True in the config (not recommended)")
             return
-        
-        print("\nValidation passed! Proceeding to training...\n")
-    else:
-        print("\n!!  Skipping validation (not recommended)\n")
-
-    ##############################
-    # load data
-    data_dir = "data/" # "data/"
-    filename = file_name
-
-    meter_col = "meter_number"
-    timestamp_dst_col = "timestamp_dst"
-    timestamp_utc_col = "timestamp_utc"
-    feature_cols = ("hourly_energy_consumption",)  # , "hourly_energy_production")
-
-    window = WindowSpec(input_len=24, stride=24)  # full day windows
-
-    batch_size = 1048 # 256 # tried smaller batch size for CVAE
-    num_workers = 8
-    shuffle_train = False
-    seed = 42
-    train_frac = 0.8
-    val_frac = 0.1
-    normalizer = Normalizer(method='log1p')
-
-    print("Initializing DataModule...")
-    dm = SmartMeterDataModule(
-        data_dir=data_dir,
-        filename=filename,
-        meter_col=meter_col,
-        timestamp_dst_col=timestamp_dst_col,
-        timestamp_utc_col=timestamp_utc_col,
-        feature_cols=feature_cols,
-        window=window,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        shuffle_train=shuffle_train,
-        seed=seed,
-        train_frac=train_frac,
-        val_frac=val_frac,
-        max_meters=None, # None # tried smaller number for CVAE
-        normalizer=normalizer, # normalizer # try without normalizer
-    )
+        print("\nValidation passed! Proceeding to training\n")
     
-    dm.setup()
-    print("done setup")
-    train_loader = dm.train_dataloader()
-    val_loader = dm.val_dataloader()
-    test_loader = dm.test_dataloader()
-
-    ##############################
-
-    num_features = x.shape[2]
-    input_dim = 24 * num_features  # flattened window dim
-
-    if os.path.exists("models/UserProfiles/user_profiler.pkl"):
-        print("UserProfiler model found on disk.")
-    else:
-        print("UserProfiler model not found on disk. Creating..")
-        os.makedirs("models/UserProfiles", exist_ok=True)
-        UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True).fit(train_loader)
-
-    # Test conditioner - pass timestamps instead of x
-    conditioner = Conditioner()
-    conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
-    conditioner.add_condition_item("user_profile", UserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
-    #conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json')) # TODO: check that this works and actually adds on the days it says it should
-
-    ##############################
-    # use chosen model
-    if model_type == "vae":
-        print("Initializing VAE model...")
-        model = VAE(input_dim=input_dim, latent_dim=32, device=device)
-        log_dir = "./models/" 
-    else:
-        print("Initializing CVAE model (condition = day-of-week + user-profile + holiday)...")
-        model = CVAE(input_dim=input_dim, latent_dim=32, conditioner=conditioner, 
-                     encoder_type="dictionary",decoder_type='dictionary', 
-                     prior_type="vampprior", device=device)
-        log_dir = "./models/"
-
-    ##############################
-    # Heirarchy latent space
-    h_config = HierarchicalConfig(
-        levels=[
-            LevelConfig(name="Level 1", input_dim=input_dim, latent_dim=32, strategy="linear", top_down=False, bottom_up=True, loss_weight=1.0),
-            LevelConfig(name="Level 2", input_dim=32, latent_dim=16, strategy="linear", top_down=True, bottom_up=True, loss_weight=0.5),
-            LevelConfig(name="Level 3", input_dim=16, latent_dim=8, strategy="linear", top_down=True, bottom_up=False, loss_weight=0.25),
-        ],
-        aggregation="concat",
-        bidirectional=True,
-        residual_connections=True,
-        kl_annealing=True,
-        kl_warmup_steps=1000,
-        free_bits=0.1,
-    )
-    h_config = None # Set to None to disable hierarchical latent space for now (can be added back in later once the training loop is working well)
-
-    ##############################
-    # Train
-    # Use the .fit() method with all its features
-    model_tag, writer = model.fit(
-        trainloader=train_loader,
-        valloader=val_loader,
-        lr=1e-3,
-        weight_decay=1e-4,
-        gradient_clip=1.0,
-        gradient_clip_kwargs={"max_norm": 1.0},
-        lr_scheduler=True,
-        lr_scheduler_kwargs={"step_size": 10, "gamma": 0.9},
-        beta=1.0, # beta_max when annealing is on; fixed beta otherwise
-        beta_annealing=True,  # cyclical annealing to avoid posterior collapse
-        beta_annealing_kwargs={"n_cycles": 4, "ratio": 0.5},
-        num_samples=1,
-        epochs=10,
-        validation_freq=1,
-        validation_num_samples=1,
-        device=device,
-        early_stopping=True,
-        early_stopping_kwargs={"patience": 3, "min_delta": 0.001},
-        save_epoch_freq=10,
-        log_dir=log_dir,
-        weighted_loss=14.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
-        heirarchical_config=h_config, # Pass the hierarchical config to enable hierarchical latent space training
-        normalizer=normalizer, 
-        compile_model=True,  # Set to True to enable torch.compile() for potential speedup (requires PyTorch 2.0+ and compatible hardware
-    )
-
-    print("Training complete. Model saved as ", model_tag)
-
-    ##############################
-    log_dir_tagged = os.path.join(log_dir, model_tag)
-
-    # Move model
-    model.to(device)
-    model.prior.to(device)
-    model.eval()
-
-    # Visualize reconstructions on test set
-    visualizer = Visualizer(model = model, writer = writer,
-                            plot_style = PlotStyle(), 
-                            log_dir = log_dir_tagged,
-                            device = device, 
-                            normalizer = normalizer,)
-
-    visualizer.visualize(test_loader)
-
-    # Create evaluator
-    evaluator = EvalFramework(model, test_loader, normalizer, device='cpu')
-    
-    # Register reconstruction metrics
-    evaluator.register_metrics([
-        ReconstructionMSE(),
-        ReconstructionRMSE(),
-        ReconstructionLogLikelihood(),
-        FlexibilityDistance(tau='auto', normalize=True),
-    ])
-    
-    # Register synthetic metrics
-    evaluator.register_metrics([
-        MaximumMeanDiscrepancy(),
-        ACFDistribution(),
-        ClassicalStatistics(),
-        TSTR(),
-        VisualEvaluation(output_dir=os.path.join(log_dir_tagged, "eval_plots"))
-    ])
-    
-    # Run all metrics (will print reconstruction section, then synthetic section)
-    results = evaluator.evaluate()
-    
-    # Save results
-    evaluator.save_results(os.path.join(log_dir_tagged, 'eval_results.json'))
-
-
-def online_train(model_type: str = "cvae", skip_validation: bool = False):
-    if not skip_validation:
-        print("\nStarting model validation before online training...\n") 
-        validation_passed = run_validation(
-            model_type=model_type,
-            use_test_data=True,  # use small test data for fast validation
-            verbose=False
+    # === Hierarchical latent space setup ===
+    if config.hierarchy.enabled:
+        levels = []
+        for level_type in config.hierarchy.levels:
+            input_dim = config.model.latent_dim if len(levels) == 0 else levels[-1].latent_dim
+            levels.append(LevelConfig(
+                name=f"Level {len(levels)+1}",
+                strategy=level_type,
+                input_dim=input_dim,
+                latent_dim=config.hierarchy.latent_dims[len(levels)],
+                top_down=config.hierarchy.top_down[len(levels)],
+                bottom_up=config.hierarchy.bottom_up[len(levels)],
+                loss_weight=config.hierarchy.loss_weights[len(levels)],
+            ))
+        hierarchy = HierarchicalConfig(
+            levels=levels,
+            aggregation=config.hierarchy.aggregation,
+            bidirectional=config.hierarchy.bidirectional,
+            residual_connections=config.hierarchy.residual_connections,
+            kl_annealing=config.hierarchy.kl_annealing,
+            kl_warmup_steps=config.hierarchy.kl_warmup_steps,
+            free_bits=config.hierarchy.free_bits,
         )
-        
-        if not validation_passed:
-            print("\n!! Validation failed! Please fix issues before training.")
-            print("To skip validation, use: online_train(model_type='cvae', skip_validation=True)")
-            return
-        
-        print("\nValidation passed! Proceeding to online training...\n")
     else:
-        print("\n!!  Skipping validation (not recommended)\n")
+        hierarchy = None
 
+    # === Model Setup ===
+    if config.model.type == "cvae":
+        conditioner = Conditioner()
+        for condition_tag in config.conditioning.tags:
+            if condition_tag == "day_of_week":
+                conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
+            elif condition_tag == "user_profile":
+                if config.conditioning.user_profile.online:
+                    profiler = OnlineUserProfiler(n_topics=config.user_profile.n_topics,
+                        num_clusters=config.user_profile.num_clusters, 
+                        path=config.user_profile.cache_path, 
+                        verbose=config.user_profile.verbose, 
+                        decay=config.conditioning.online_user_profile.decay, 
+                        update_frequency=config.conditioning.online_user_profile.update_frequency)
+                else:
+                    profiler = UserProfiler(n_topics=config.user_profile.n_topics,
+                        num_clusters=config.user_profile.num_clusters, 
+                        path=config.user_profile.cache_path, 
+                        verbose=config.user_profile.verbose)
+                conditioner.add_condition_item("user_profile", profiler)
+                    
+            elif condition_tag == "holiday":
+                conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json'))
+            elif condition_tag == "month_of_year":
+                conditioner.add_condition_item("month_of_year", MonthOfYearConditioner())
+            else:
+                print(f"Warning: Unknown condition tag '{condition_tag}' in config. Skipping this conditioner.")
+        
+        input_dim = config.window.input_len * len(config.columns.value_cols)
+        model = CVAE(input_dim=input_dim, latent_dim=config.model.latent_dim, 
+                     conditioner=conditioner, dictionary_size=config.model.prior.dictionary_size, 
+                     vamp_num_components=config.model.prior.vamp_num_components,
+                     encoder_type=config.model.encoder.type,
+                     decoder_type=config.model.decoder.type,
+                     prior_type=config.model.prior.type,
+                     hierarchy_config=hierarchy,
+                     )
+        print(f"Initialized CVAE with input_dim={input_dim}, latent_dim={config.model.latent_dim}, encoder_type={config.model.encoder.type}, decoder_type={config.model.decoder.type}, prior_type={config.model.prior.type}, conditioner_tags={config.conditioning.tags}")
+    elif config.model.type == "vae":
+        input_dim = config.window.input_len * len(config.columns.value_cols)
+        model = VAE(input_dim=input_dim, latent_dim=config.model.latent_dim,
+                    encoder_type=config.model.encoder.type,
+                    decoder_type=config.model.decoder.type,
+                    prior_type=config.model.prior.type,
+                    dictionary_size=config.model.prior.dictionary_size,
+                    vamp_num_components=config.model.prior.vamp_num_components,
+                    hierarchy_config=hierarchy,
+                    )
+        print(f"Initialized VAE with input_dim={input_dim}, latent_dim={config.model.latent_dim}, encoder_type={config.model.encoder.type}, decoder_type={config.model.decoder.type}, prior_type={config.model.prior.type}")
+    else:
+        raise ValueError(f"Unknown model type '{config.model.type}' specified in config.")
+
+    model_tag = model.get_tag()
+
+    # === Load Data === 
+    window = WindowSpec(input_len=config.window.input_len, stride=config.window.stride)
+    data_dir = config.data_dir
     # Load data sequentially based on what is in the folder and train the model in an online fashion
-    data_files = sorted([f for f in os.listdir("data/") if f.endswith(".csv") and not f.startswith("test")])
-    # remove data files that are already trained on (check runs folder for existing models)
-    # TODO: Check runs and find and remove already trained files in the list.
-
-    normalizer = Normalizer('log1p')
-    # Fit normalizer once across ALL available files before the training loop
-    # (reads Parquet caches, result is persisted; subsequent runs are instant)
-    from Data.dataloader import fit_normalizer_on_files
+    all_data_files = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv") and not f.startswith("test")])
+    
+    data_files = config.data_files if len(config.data_files) > 0 else all_data_files
+    print(f"Data files to be used for training: {data_files}")
+    
+    normalizer = Normalizer(method=config.normalizer.method)
     fit_normalizer_on_files(
         normalizer,
-        data_dir="data/",
+        data_dir=data_dir,
         filenames=data_files,
-        feature_cols=("hourly_energy_consumption",),
-        meter_col="meter_number",
-        timestamp_dst_col="timestamp_dst",
-        train_frac=0.8,
-        seed=42,
+        feature_cols=config.columns.value_cols,
+        meter_col=config.columns.meter_id,
+        timestamp_dst_col=config.columns.timestamp_dst,
+        train_frac=config.splits.train_ratio,
+        seed=config.splits.random_seed,
     )
-    # Create the model and normalizer and conditioner once
-    if model_type == "vae":
-        print("Initializing VAE model...")
-        model = VAE(input_dim=24 * 1, latent_dim=32, device=device)  # input_dim will be updated based on data
-        log_dir = "./models/"
-    else:
-        print("Initializing CVAE model (condition = day-of-week + user-profile)...")
-        conditioner = Conditioner()
-        conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
-        conditioner.add_condition_item("user_profile", OnlineUserProfiler(num_clusters=30, path="models/UserProfiles/user_profiler.pkl", verbose=True))
-        #conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json')) # TODO: check that this works and actually adds on the days it says it should
-        conditioner.add_condition_item("MonthOfYearConditioner", MonthOfYearConditioner())
 
-        # heirarchy = HierarchicalConfig(
-        #     levels=[
-        #         LevelConfig(name="Level 1", input_dim=24 * 1, latent_dim=32, strategy="linear", top_down=False, bottom_up=True, loss_weight=1.0),
-        #         LevelConfig(name="Level 2", input_dim=32, latent_dim=16, strategy="linear", top_down=True, bottom_up=True, loss_weight=0.5),
-        #         LevelConfig(name="Level 3", input_dim=16, latent_dim=8, strategy="linear", top_down=True, bottom_up=False, loss_weight=0.25),
-        #     ],
-        #     aggregation="concat",
-        #     bidirectional=True,
-        #     residual_connections=True,
-        #     kl_annealing=True,
-        #     kl_warmup_steps=1000,
-        #     free_bits=0.1,
-        # )
-        heirarchy = None # Set to None to disable hierarchical latent space for now (can be added back in later once the online training loop is working well)
+    all_test_tensors = []
 
-        model = OnlineCVAE(input_dim=24, latent_dim=32, conditioner=conditioner, 
-                     encoder_type="dictionary",decoder_type='dictionary', 
-                     prior_type="learnable_dictionary", device=device,
-                     normalizer=normalizer, hierarchy_config=heirarchy)  # input_dim will be updated based on data
-        log_dir = "./models/"
-    
+    writer = Writer(log_dir=os.path.join(config.logging.log_dir, model_tag))
     i = 0
-    last_dm = None
-    last_test_loader = None
-    last_data_file = None
-
-    model_tag = None
-
     for data_file in data_files:
-        print(f"\nProcessing {data_file}")
         i += 1
-
-        # ── Clean up BEFORE loading new data ──────────────────────────
-        import gc
+        print(f"\n=== Processing file {i}/{len(data_files)}: {data_file} ===")
+        # === Clean Up Previous Data ===
         if i > 1:
             # Explicitly clear DataLoaders first (they may hold worker refs)
             if 'train_loader' in dir():
                 del train_loader
             if 'val_loader' in dir():
                 del val_loader
-            if last_test_loader is not None:
-                del last_test_loader
-                last_test_loader = None
             # Clear the DataModule's internal datasets explicitly
-            if last_dm is not None:
-                last_dm._train_ds = None
-                last_dm._val_ds   = None
-                last_dm._test_ds  = None
-                del last_dm
-                last_dm = None
+            if dm is not None:
+                dm._train_ds = None
+                dm._val_ds   = None
+                dm._test_ds  = None
+                del dm
+                dm = None
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             print(f"  Memory cleared before loading {data_file}")
 
-        # Load data for this file
+
         dm = SmartMeterDataModule(
-            data_dir="data/",
+            data_dir=data_dir,
             filename=data_file,
-            meter_col="meter_number",
-            timestamp_dst_col="timestamp_dst",
-            feature_cols=("hourly_energy_consumption",),
-            window=WindowSpec(input_len=24, stride=24),
-            batch_size=512,
-            num_workers=0,
-            shuffle_train=False,
-            seed=42,
-            train_frac=0.8,
-            val_frac=0.1,
+            meter_col=config.columns.meter_id,
+            timestamp_dst_col=config.columns.timestamp_dst,
+            timestamp_utc_col=config.columns.timestamp_utc,
+            feature_cols=config.columns.value_cols,
+            window=window,
+            batch_size=config.dataloader.batch_size,
+            num_workers=config.dataloader.num_workers,
+            shuffle_train=config.dataloader.shuffle,
+            seed=config.splits.random_seed,
+            train_frac=config.splits.train_ratio,
+            val_frac=config.splits.val_ratio,
             max_meters=None,
             normalizer=normalizer,
         )
         dm.setup()
+
+        all_test_tensors.append((
+            dm._test_ds.tensors[0].clone(),  # (N, L, F)
+            dm._test_ds.tensors[1].clone(),  # (N,) meter ids
+            dm._test_ds.tensors[2].clone(),  # (N,) timestamps
+        ))
+
         train_loader = dm.train_dataloader()
         val_loader = dm.val_dataloader()
-        test_loader = dm.test_dataloader()
-        
-        # Train on this data
+
+        if i == 1 and model.conditioner.condition_items.get("user_profile").is_fitted == False:
+            print("Fitting user profile conditioner on first training file...")
+            model.conditioner.condition_items["user_profile"].fit(train_loader)
+
         model_tag, writer = model.fit(
-            trainloader=train_loader,
-            valloader=val_loader,
-            lr=1e-3,
-            weight_decay=1e-4,
-            gradient_clip=1.0,
-            gradient_clip_kwargs={"max_norm": 1.0},
-            lr_scheduler=True,
-            lr_scheduler_kwargs={"step_size": 10, "gamma": 0.9},
-            beta=1.0,
-            beta_annealing=True,
-            beta_annealing_kwargs={"n_cycles": 4, "ratio": 0.5},
-            num_samples=1,
-            epochs=5,
-            validation_freq=1,
-            validation_num_samples=1,
-            device=device,
-            early_stopping=True,
-            early_stopping_kwargs={"patience": 3, "min_delta": 0.001},
-            save_epoch_freq=10,
-            log_dir=log_dir,
-            model_name= model_tag if model_tag is not None else f"online_{model_type}",
-            normalizer=normalizer,
+            trainloader = train_loader,
+            valloader = val_loader,
+            lr = config.training.learning_rate,
+            weight_decay = config.training.weight_decay,
+            gradient_clip = config.training.gradient_clip,
+            gradient_clip_kwargs= {"max_norm": config.training.gradient_clip_max_norm},
+            lr_scheduler = config.training.lr_scheduler.enabled,
+            lr_scheduler_kwargs = {"step_size": config.training.lr_scheduler.step_size, "gamma": config.training.lr_scheduler.gamma},
+            beta = config.training.beta,
+            beta_annealing = config.training.beta_annealing.enabled,
+            beta_annealing_kwargs = {"n_cycles": config.training.beta_annealing.n_cycles, "ratio": config.training.beta_annealing.ratio},
+            epochs = config.training.num_epochs,
+            device = device,
+            early_stopping = config.training.early_stopping.enabled,
+            early_stopping_kwargs= {"patience": config.training.early_stopping.patience, "min_delta": config.training.early_stopping.min_delta},
+            save_epoch_freq = config.training.checkpointing.save_freq,
+            writer = writer,
+            log_dir = os.path.join(config.logging.log_dir, model_tag),
+            weighted_loss = config.training.weighted_loss,
+            heirarchical_config = hierarchy,
+            normalizer = normalizer,
+            compile_model = config.training.compile_model,
+            model_name = model_tag,
         )
-        print(f"Finished training on {data_file} advancing to next file...\n")
 
-        # Free train/val loaders but keep dm and test_loader for potential visualization
-        del train_loader, val_loader
-        gc.collect()
-
-        last_dm          = dm
-        last_test_loader = test_loader
-        last_data_file   = data_file
-
-    log_dir = os.path.join(log_dir, model_tag)
+    combined_test_ds = TensorDataset(
+    torch.cat([t[0] for t in all_test_tensors], dim=0),
+    torch.cat([t[1] for t in all_test_tensors], dim=0),
+    torch.cat([t[2] for t in all_test_tensors], dim=0),
+    )
+    combined_test_loader = DataLoader(
+        combined_test_ds,
+        batch_size=config.dataloader.batch_size,
+        shuffle=False,
+        num_workers=config.dataloader.num_workers,
+    )
+    log_path = os.path.join(config.logging.log_dir, model_tag)
+    # === Evaluation ===
+    evaluator = EvalFramework(model, combined_test_loader, normalizer, device='cpu')
+    evaluator.register_all()
+    evaluator.evaluate()
+    evaluator.save_results(os.path.join(log_path, 'eval_results.json'))
     
+    # === Visualization ===
     visualizer = Visualizer(model = model, writer = writer,
-                            plot_style = PlotStyle(), 
-                            log_dir = log_dir,
-                            device = device, 
-                            normalizer = normalizer,)
-    visualizer.visualize(test_loader)
-
-    # Evaluation framework On last test set (from the last file) after all training is done
-    # Create evaluator
-    evaluator = EvalFramework(model, last_test_loader, normalizer, device='cpu')
-    
-    # Register reconstruction metrics
-    evaluator.register_metrics([
-        ReconstructionMSE(),
-        ReconstructionRMSE(),
-        ReconstructionLogLikelihood(),
-        FlexibilityDistance(tau='auto', normalize=True),
-    ])
-    
-    # Register synthetic metrics
-    evaluator.register_metrics([
-        MaximumMeanDiscrepancy(),
-        ACFDistribution(),
-        ClassicalStatistics(),
-        TSTR(),
-        VisualEvaluation(),
-        AggregatedProfiles(),
-        PerConditionEval(),
-    ])
-    
-    # Run all metrics (will print reconstruction section, then synthetic section)
-    results = evaluator.evaluate()
-    
-    # Save results
-    evaluator.save_results(os.path.join(log_dir, 'eval_results.json'))
-
-    # Final cleanup
-    if last_dm is not None:
-        del last_dm, last_test_loader
-
+                            plot_style = PlotStyle(),
+                            log_dir = log_path,
+                            device = device,
+                            normalizer = normalizer)
+    visualizer.visualize(test_loader = combined_test_loader,
+                         num_samples = config.visualize.num_samples,
+                         num_recon_per = config.visualize.num_recon_per,
+                         num_synthetic = config.visualize.num_synthetic,
+                         num_originals = config.visualize.num_originals,
+                         num_synthetic_per = config.visualize.num_synthetic_per
+                         )
 
 
 # now we can run either VAE or CVAE test
 if __name__ == "__main__":
-    # choose: "vae" or "cvae"
-    # run_test(model_type="vae")
-    #run_test(model_type="vae", skip_validation=False)  # VAE with validation
-    #run_test(model_type="cvae", skip_validation=True, file_name='hourly_measurements_2023_11.csv')  # CVAE with validation
-    #run_test(model_type="cvae", skip_validation=True)  # Skip validation (not recommended)
-    online_train(model_type="cvae", skip_validation=False)  # Online training with CVAE and validation
-    #run_test(model_type="cvae", skip_validation=False, file_name="test_data_small.csv")  # CVAE with validation on small test data
-
+    config = None
+    train(config)
 
 
 

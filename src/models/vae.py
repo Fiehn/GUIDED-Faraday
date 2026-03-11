@@ -15,8 +15,8 @@ from data.normalizer import *
 
 from visualization.writer import Writer
  
-from src.hierarchical.config import HierarchicalConfig
-from src.hierarchical.core import HierarchicalLatentModule
+from src.models.hierarchical.config import HierarchicalConfig
+from src.models.hierarchical.core import HierarchicalLatentModule
 
 from src.models.model_utils import CyclicalBetaScheduler, EarlyStopping
 
@@ -34,11 +34,12 @@ from src.models.model_utils import CyclicalBetaScheduler, EarlyStopping
 class VAE(nn.Module):
     def __init__(self,
                  input_dim=24,
-                 distribution_dict = {},
+                 latent_dim=32,
+                 dictionary_size=100,
+                 vamp_num_components=20,
                  encoder_type = "dictionary",
                  decoder_type = "dictionary",
                  prior_type = None,
-                 device="cpu",
                  hierarchy_config: HierarchicalConfig = None,
                  **_):
         super(VAE, self).__init__()
@@ -61,8 +62,6 @@ class VAE(nn.Module):
         self.encoder_type = encoder_type
         self.decoder_type = decoder_type 
         self.prior_type = prior_type
-        
-        latent_dim = distribution_dict.get("latent_dim", 32)
         self.latent_dim = latent_dim
 
         # 1. Create encoder and decoder and the latent module for the hierarchy if specified
@@ -89,10 +88,10 @@ class VAE(nn.Module):
             prior_type=prior_type,
             latent_dim=self.decoder_input_dim,
             device=self.device,
-            dictionary_size=distribution_dict.get("dictionary_size", 100),
+            dictionary_size=dictionary_size,
             input_shape=input_dim,
             encoder=self.encoder,
-            num_components=distribution_dict.get("vamp_num_components", 20),
+            num_components=vamp_num_components,
         )
 
         # Calculate and store the number of parameters
@@ -623,7 +622,7 @@ class VAE(nn.Module):
                 conditioner_state = checkpoint['model_info']['conditioner_state']
                 print(f"Reconstructing conditioner with tags: {conditioner_state['condition_tags']}")
                 
-                from Data.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
+                from data.conditioner import Conditioner
                 self.conditioner = Conditioner()
                 
                 for tag, item_state in conditioner_state['condition_items'].items():
@@ -715,7 +714,7 @@ class VAE(nn.Module):
             conditioner_state = model_info['conditioner_state']
             
             import importlib
-            from Data.Conditioner import Conditioner
+            from data.conditioner import Conditioner
             conditioner = Conditioner()
             
             print(f"Reconstructing conditioner with {len(conditioner_state['condition_items'])} items...")
@@ -755,7 +754,7 @@ class VAE(nn.Module):
             init_args = prior_state.get('init_args', {})
             
             import importlib
-            from Models.priors import VampPrior
+            from models.priors import VampPrior
             
             # Create VampPrior with encoder reference 
             model.prior = VampPrior(
@@ -786,6 +785,10 @@ class VAE(nn.Module):
         
         normalizer = cls._load_normalizer_from_checkpoint(checkpoint=checkpoint, device=device)
         return model, normalizer
+    
+    def get_tag(self):
+        time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{self.__class__.__name__}_{self.decoder.__class__.__name__}_{time_stamp}"
 
     def fit(self,
             trainloader,
@@ -799,7 +802,6 @@ class VAE(nn.Module):
             beta = 1.0,
             beta_annealing = False,  # Enable cyclical beta annealing to avoid posterior collapse
             beta_annealing_kwargs = {"n_cycles": 4, "ratio": 0.5},  # kwargs for CyclicalBetaScheduler
-            num_samples = 1,
             epochs = 1000,
             validation_freq = 1,
             validation_num_samples = 10,
@@ -810,18 +812,16 @@ class VAE(nn.Module):
             writer = None,
             log_dir = './models/',
             model_name = None, # Optionally specify model name for saving
-            save_dir = './models/',
             normalizer = None,
             compile_model = False, # Whether to use torch.compile for faster training (PyTorch 2.0+)
             weighted_loss = 0.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
             **_):
 
         # === Generate a model tag ===
-        time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         if model_name is None:
-            model_tag = f"{self.__class__.__name__}_{self.decoder.__class__.__name__}_{time_stamp}"
+            model_tag = self.get_tag()
         else:
-            model_tag = f"{model_name}_{time_stamp}"
+            model_tag = model_name
         os.makedirs(log_dir, exist_ok=True)
         model_save_path = os.path.join(log_dir, model_tag)
 

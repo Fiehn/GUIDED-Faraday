@@ -12,14 +12,14 @@ data:
   data_dir: "./data"
   
   # CSV filename to load
-  filename: "hourly_measurements_2023_10.csv"
+  data_files: []
   
   # CSV column specifications
   columns:
     meter_id: "meter_number"
     timestamp_dst: "timestamp_dst"
     timestamp_utc: "timestamp_utc"
-    value_cols: ["hourly_energy_consumption", "hourly_energy_production"]  # List of measurement columns
+    value_cols: ["hourly_energy_consumption",]  # List of measurement columns
   
   # Data loading options
   nan_as_zero: true
@@ -28,23 +28,21 @@ data:
   
   # Train/val/test split (by meter ID)
   splits:
-    train_ratio: 0.7
-    val_ratio: 0.15
-    test_ratio: 0.15
+    train_ratio: 0.8
+    val_ratio: 0.10
+    test_ratio: 0.10
     random_seed: 42
   
   # Windowing configuration
   window:
     input_len: 24  # 24-hour windows
     stride: 24     # Non-overlapping windows (one per day)
-    drop_nan_windows: true
   
   # DataLoader settings
   dataloader:
     batch_size: 64
     num_workers: 0
-    pin_memory: false
-    persistent_workers: false
+    shuffle: false
 
 # ============================================================================
 # NORMALIZATION CONFIGURATION
@@ -56,11 +54,6 @@ normalization:
   # Log1p specific parameters
   log1p:
     epsilon: 1.0e-6
-  
-  # For online learning (RevIN in OnlineCVAE)
-  revin:
-    enabled: false
-    affine: true
 
 # ============================================================================
 # MODEL ARCHITECTURE CONFIGURATION
@@ -72,13 +65,9 @@ model:
   # Device for training: "cpu" or "cuda"
   device: "cuda"
   
-  # Input dimension (will be auto-calculated: 24 hours * num_features)
-  # Set to null to auto-detect from data, or specify manually
-  input_dim: null
-  
   # Latent dimension (size of latent vector z)
   latent_dim: 32
-  
+
   # Encoder configuration
   encoder:
     type: "dictionary"  # Options: "dictionary", "mlp", etc.
@@ -106,27 +95,40 @@ model:
 # ============================================================================
 conditioning:
   # Enable/disable conditioning
-  enabled: true
+
+  tags: ["user_profile", "day_of_week", "month_of_year"]  # List of conditioning tags to use
   
   # User profiling (based on LDA)
   user_profile:
-    enabled: true
+    online: true
     n_topics: 10 # number of LDA topics
     num_clusters: 100 # number of KMeans clusters for "words"
     random_state: 42
     cache_path: "./models/UserProfiles/user_profiles.pkl"
     verbose: false
   
-  # Day-of-week conditioning
-  day_of_week:
-    enabled: true
-    # 7-dimensional one-hot encoding
-  
   # Online user profiling (for OnlineCVAE)
   online_user_profile:
-    enabled: false
     decay: 0.95
     update_frequency: 10  # update every N batches
+
+# ============================================================================
+# HIERARCHICAL LATENT SPACE
+# ============================================================================
+hierarchy:
+  enabled: false
+  levels: ["linear", "linear", "linear"] # eg. ["linear", "StochasticLevel", "VQLevel"]
+  latent_dims: [64, 32, 16] # latent dimensions for each level
+  top_down: [false, false, false] # whether to use top-down connections for each level
+  bottom_up: [false, false, false] # whether to use bottom-up connections for each level
+  loss_weights: [1.0, 1.0, 1.0] # weights for KL loss at each level
+  
+  aggregation: "concat"
+  bidirectional: false
+  residual_connections: false
+  kl_annealing: true
+  kl_warmup_steps: 1000
+  free_bits: 0.1
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -170,12 +172,6 @@ training:
     patience: 15 # stop if no improvement for N validations
     min_delta: 0.001 # minimum improvement threshold
   
-  # Validation
-  validation:
-    enabled: true
-    validation_freq: 1 # validate every N epochs
-    num_mc_samples: 10 # number of MC samples for validation
-  
   # Model checkpointing
   checkpointing:
     save_freq: 10 # save checkpoint every N epochs
@@ -184,45 +180,35 @@ training:
     save_final_model: true
   
   # Number of latent samples for training
-  num_samples: 1
+  weighted_loss: 10.0
+  compile_model: true
 
 # ============================================================================
 # LOGGING AND MONITORING CONFIGURATION
 # ============================================================================
 logging:
   # TensorBoard settings
-  tensorboard:
-    enabled: true
-    log_dir: "./runs"
   
-  # Console logging verbosity: "debug", "info", "warning", "error"
-  level: "info"
+  log_dir: "./output"
   
   # Save training configuration
   save_config: true
   config_save_dir: "./models"
 
 # ============================================================================
-# SAMPLING CONFIGURATION
+# Visualization CONFIGURATION
 # ============================================================================
-sampling:
-  # Number of samples to generate from prior
-  num_prior_samples: 1
-  
-  # Number of x samples per latent sample
-  num_x_samples: 1
-  
-  # Save synthetic samples
-  save_samples: true
-  samples_dir: "./Output/synthetic_data"
+visualize:
+  num_samples: 5
+  num_recon_per: 5
+  num_synthetic: 40
+  num_originals: 4
+  num_synthetic_per: 50
 
 # ============================================================================
 # ADVANCED 
 # ============================================================================
-advanced:
-  # Mixed precision training
-  mixed_precision: true
-  
+advanced: 
   # Number of CPU threads for PyTorch
   num_threads: 0
   

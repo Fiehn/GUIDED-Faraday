@@ -4,7 +4,7 @@ import torch.nn as nn
 import numpy as np
  
 # =============
-# Prior Dsitribution Classes
+# Prior Distribution Classes
 # =============
 class BasePrior(nn.Module, ABC):
     """ Base class for prior distributions. 

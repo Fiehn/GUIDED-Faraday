@@ -39,7 +39,7 @@ class OnlineCVAE(CVAE):
     
     def _convert_to_online_conditioners(self):
         """Convert regular UserProfiler conditioners to online versions."""
-        from Data.Conditioner import OnlineUserProfiler, UserProfiler
+        from data.conditioner import OnlineUserProfiler, UserProfiler
         
         for tag, item in self.conditioner.condition_items.items():
             if isinstance(item, UserProfiler) and not isinstance(item, OnlineUserProfiler):

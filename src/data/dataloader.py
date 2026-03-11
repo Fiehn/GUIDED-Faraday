@@ -16,31 +16,6 @@ sys.path.append(parent_dir)
 from data.normalizer import Normalizer
 
 
-def load_meter_to_feeder_mapping(
-    mapping_path: str = 'topology/cleaned/Cleaned_SM_Topology_mapping.json'
-) -> dict[str, Optional[str]]:
-    """Load meter->feeder mapping from topology JSON.
-
-    Returns a dictionary with string meter ids as keys and feeder labels as values
-    (e.g. ``LvFeeder.975670``). Missing feeder info maps to ``None``.
-    """
-    resolved_path = mapping_path
-    if not os.path.isabs(resolved_path):
-        resolved_path = os.path.join(os.getcwd(), resolved_path)
-
-    if not os.path.exists(resolved_path):
-        raise FileNotFoundError(f"Topology mapping not found: {resolved_path}")
-
-    with open(resolved_path, 'r') as f:
-        raw_mapping = json.load(f)
-
-    meter_to_feeder: dict[str, Optional[str]] = {}
-    for meter, topo in raw_mapping.items():
-        feeder_id = topo.get('Feeder ID') if isinstance(topo, dict) else None
-        meter_to_feeder[str(meter)] = f"LvFeeder.{feeder_id}" if feeder_id is not None else None
-
-    return meter_to_feeder
-
 
 def map_meter_ids_to_feeder_ids(
     meter_ids: Sequence,
@@ -607,50 +582,4 @@ def fit_normalizer_on_files(
     }, stats_path)
     print(f"[Normalizer] Stats fitted on {len(filenames)} file(s) and saved to {stats_path}")
 
-
-# usage
-if __name__ == '__main__':
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    DATA_DIR     = 'data'
-    FILENAMES    = ['test_data_small.csv']  # replace with actual filenames in the data directory
-    FEATURE_COLS = ('hourly_energy_consumption',)
-    METER_COL    = 'meter_number'
-    TS_COL       = 'timestamp_dst'
-
-    norm = Normalizer(method='log1p')
-
-    # Fit once across all available files (cached on disk; instant on subsequent runs)
-    fit_normalizer_on_files(
-        norm, DATA_DIR, FILENAMES, FEATURE_COLS,
-        meter_col=METER_COL, timestamp_dst_col=TS_COL,
-    )
-    norm.to(device)
-
-    # Build a data module for the most recent file
-    dm = SmartMeterDataModule(
-        data_dir         = DATA_DIR,
-        filename         = FILENAMES[-1],
-        meter_col        = METER_COL,
-        timestamp_dst_col= TS_COL,
-        feature_cols     = FEATURE_COLS,
-        window           = WindowSpec(input_len=24, stride=24),
-        batch_size       = 32,
-        normalizer       = norm,
-    )
-    dm.setup()
-
-    print("train meters:", len(dm.train_ids),
-          "val meters:",   len(dm.val_ids),
-          "test meters:",  len(dm.test_ids))
-
-    train_loader = dm.train_dataloader()
-    x, meter_id, times = next(iter(train_loader))
-    x        = x.to(device)
-    meter_id = meter_id.to(device)
-
-    print("x shape:    ", x.shape)        # [B, 24, 2]
-    print("meter_id:   ", meter_id.shape)
-    print("times dtype:", times.dtype)    # int32
 
