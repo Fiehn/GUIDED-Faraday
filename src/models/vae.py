@@ -21,7 +21,6 @@ from src.hierarchical.core import HierarchicalLatentModule
 from src.models.model_utils import CyclicalBetaScheduler, EarlyStopping
 
 
-
 # https://arxiv.org/pdf/2411.03936
 # GuideVAE model implementation
 # Conditional VAE with conditioning on user profiles
