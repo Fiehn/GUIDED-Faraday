@@ -16,7 +16,7 @@ from src.test.run_validation import run_validation
 
 from src.hierarchical.aggregation import *
 from src.hierarchical.config import *
-
+ 
 from src.visualization.visualizer import Visualizer
 from src.visualization.writer import Writer
 

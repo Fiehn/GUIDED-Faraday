@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from Models.priors import *
-from src.Models.model_utils import MultivariateStudentT
+from models.priors import *
+from src.models.model_utils import MultivariateStudentT
 
 # === Gaussian encoder and decoder Model ===
 class GaussianCoder(torch.nn.Module):

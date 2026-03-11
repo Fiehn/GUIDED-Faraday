@@ -4,7 +4,7 @@ class StrategyRegistry:
     """
     Registry for latent-level strategies. Allows plg-in of custom
     encoding/decoding strategies for each level in the hierarchical model.
-    
+     
     usage:
         @StrategyRegistry.register("my_strategy")
         class MyStrategy(LatentLevel):

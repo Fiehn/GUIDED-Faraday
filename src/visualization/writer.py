@@ -1,6 +1,6 @@
 import os
 from matplotlib import pyplot as plt
-
+ 
 class Writer:
     """Lightweight logger that persists scalars, strings, and images to disk.
     

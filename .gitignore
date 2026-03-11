@@ -10,8 +10,10 @@ wheels/
 .venv
 
 # Other
-data/
-models/
-runs/
-Output/
-topology/
+/data/
+/models/
+/runs/
+/output/
+/topology/
+
+output/

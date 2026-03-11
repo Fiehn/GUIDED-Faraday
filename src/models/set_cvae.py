@@ -3,7 +3,7 @@ from src.models.online_cvae import *
 # ==============
 # SET-CVAE class for training on multiple datasets sequentially
 # ==============
-
+ 
 # Notes:
 # - the encoder and decoder are really the only changes tbh, and some data handling
 # - The prior they use is MoG, we should just add a new prior type for that and reuse the same code

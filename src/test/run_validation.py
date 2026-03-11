@@ -21,7 +21,7 @@ from data.dataloader import SmartMeterDataModule, WindowSpec
 from data.normalizer import Normalizer
 from data.conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
 from src.models.cvae import CVAE
-from src.models.vae import VAE
+from src.models.vae import VAE 
 
 from src.test.validate_model import validate_before_training
 

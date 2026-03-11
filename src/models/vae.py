@@ -14,12 +14,11 @@ from models.priors import *
 from data.normalizer import *
 
 from visualization.writer import Writer
-
+ 
 from src.hierarchical.config import HierarchicalConfig
 from src.hierarchical.core import HierarchicalLatentModule
 
 from src.models.model_utils import CyclicalBetaScheduler, EarlyStopping
-
 
 
 # https://arxiv.org/pdf/2411.03936

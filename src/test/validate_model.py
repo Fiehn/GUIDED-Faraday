@@ -25,7 +25,7 @@ parent_dir = os.path.dirname(current_dir)
 root_dir = os.path.dirname(parent_dir)
 sys.path.append(parent_dir)
 sys.path.append(root_dir)
-
+ 
 from models.encoder_decoder_model import *
 from data.conditioner import *
 from src.models.vae import *

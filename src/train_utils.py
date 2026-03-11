@@ -13,7 +13,7 @@ from src.data.normalizer import *
 import matplotlib.pyplot as plt
 import yaml
 from src.visualization.plot_styling import PlotStyle
-
+ 
 # Set up device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
