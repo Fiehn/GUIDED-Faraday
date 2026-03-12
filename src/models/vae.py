@@ -41,6 +41,7 @@ class VAE(nn.Module):
                  decoder_type = "dictionary",
                  prior_type = None,
                  hierarchy_config: HierarchicalConfig = None,
+                 device = "cpu",
                  **_):
         super(VAE, self).__init__()
 
@@ -63,6 +64,8 @@ class VAE(nn.Module):
         self.decoder_type = decoder_type 
         self.prior_type = prior_type
         self.latent_dim = latent_dim
+
+        self.device = device
 
         # 1. Create encoder and decoder and the latent module for the hierarchy if specified
         self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim, type=encoder_type)
@@ -836,7 +839,7 @@ class VAE(nn.Module):
         config_path = os.path.join(log_dir, "training_config.json")
         config = {
             'model_tag': model_tag,
-            'timestamp': time_stamp,
+            'time_stamp': datetime.now().isoformat(),
             'hyperparameters': {
                 'lr': lr,
                 'weight_decay': weight_decay,
@@ -861,7 +864,7 @@ class VAE(nn.Module):
         with open(config_path, 'w') as f:
             json.dump(config, f, indent=4)
         print(f"Training configuration saved to: {config_path}")
-
+        log_dir_tagged = os.path.join(log_dir, model_tag)   # <-- move here
         # === Initialize TensorBoard writer ===
         if writer is None:
             log_dir_tagged = os.path.join(log_dir, model_tag)
@@ -896,12 +899,23 @@ class VAE(nn.Module):
         # === Optional Model Compilation ===
         if compile_model and hasattr(torch, 'compile'):
             compile_mode = 'reduce-overhead' if str(device) != 'cpu' else None
-            self.encoder = torch.compile(self.encoder, mode=compile_mode)
-            self.decoder = torch.compile(self.decoder, mode=compile_mode)
-            if self.hierarchy is not None:
-                self.hierarchy = torch.compile(self.hierarchy, mode=compile_mode)
-            print(f"Model compiled with torch.compile (mode={compile_mode}).")
-
+            try:
+                self.encoder = torch.compile(self.encoder, mode=compile_mode)
+                self.decoder = torch.compile(self.decoder, mode=compile_mode)
+                if self.hierarchy is not None:
+                    self.hierarchy = torch.compile(self.hierarchy, mode=compile_mode)
+                print(f"Model compiled with torch.compile (mode={compile_mode}).")
+            except Exception as e:
+                print(f"torch.compile skipped (not supported in this environment): {e}")
+                try:
+                    compile_mode = 'cudagraphs' if str(device) != 'cpu' else None
+                    self.encoder = torch.compile(self.encoder, mode=compile_mode)
+                    self.decoder = torch.compile(self.decoder, mode=compile_mode)
+                    if self.hierarchy is not None:
+                        self.hierarchy = torch.compile(self.hierarchy, mode=compile_mode)
+                    print(f"Model compiled with torch.compile (mode={compile_mode}).")
+                except Exception as e:
+                    print(f"torch.compile skipped with fallback mode as well: {e}")
 
         # === Training Loop ===
         self.train()

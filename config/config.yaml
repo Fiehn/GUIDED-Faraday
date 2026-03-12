@@ -4,6 +4,9 @@
 # This configuration file centralizes all parameters for model training,
 # data loading, and conditioning. 
 
+skip_validation: false
+verbose: true
+
 # ============================================================================
 # DATA LOADING CONFIGURATION
 # ============================================================================
@@ -40,8 +43,8 @@ data:
   
   # DataLoader settings
   dataloader:
-    batch_size: 64
-    num_workers: 0
+    batch_size: 1024
+    num_workers: 8
     shuffle: false
 
 # ============================================================================
@@ -152,7 +155,7 @@ training:
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 50
+  num_epochs: 10
   
   # Beta (KL weight) settings
   beta: 1.0
@@ -181,7 +184,7 @@ training:
   
   # Number of latent samples for training
   weighted_loss: 10.0
-  compile_model: true
+  compile_model: false
 
 # ============================================================================
 # LOGGING AND MONITORING CONFIGURATION
@@ -189,7 +192,7 @@ training:
 logging:
   # TensorBoard settings
   
-  log_dir: "./output"
+  log_dir: "./models"
   
   # Save training configuration
   save_config: true

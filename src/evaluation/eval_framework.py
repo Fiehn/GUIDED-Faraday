@@ -131,7 +131,8 @@ class EvalFramework:
         conditioner=None, 
         device: str = 'cpu',
         window_size: int = 24,
-        n_synthetic_samples: int = 1000
+        n_synthetic_samples: int = 1000,
+        output_path: str = 'models/eval_results.json'
     ):
         """Initialize evaluation framework.
         
@@ -160,18 +161,20 @@ class EvalFramework:
         self._reconstructed_data: np.ndarray = None  # Cache reconstructed data for metrics that need it
         self._syntheric_data: np.ndarray = None  # Cache synthetic data for metrics that need it
 
+        self.output_path = output_path
+
     def register_all(self):
         self.register_metrics([
-            ReconstructionMSE,
-            ReconstructionRMSE,
-            ReconstructionLogLikelihood,
-            FlexibilityDistance,
-            MaximumMeanDiscrepancy,
-            ACFDistribution,
-            ClassicalStatistics,
-            TSTR,
-            AggregatedProfiles,
-            PerConditionEval
+            ReconstructionMSE(),
+            ReconstructionRMSE(),
+            ReconstructionLogLikelihood(),
+            FlexibilityDistance(),
+            MaximumMeanDiscrepancy(),
+            ACFDistribution(),
+            ClassicalStatistics(),
+            TSTR(),
+            AggregatedProfiles(),
+            PerConditionEval()
         ])
 
     def _is_cvae(self) -> bool:
@@ -286,6 +289,7 @@ class EvalFramework:
             metric.model = self.model
             metric.device = self.device
             metric.normalizer = self.normalizer
+            metric.output_path = self.output_path
 
         for metric in self.synthetic_metrics.values():
             metric.real_data = self._real_data
@@ -293,6 +297,7 @@ class EvalFramework:
             metric.model = self.model
             metric.device = self.device
             metric.normalizer = self.normalizer
+            metric.output_path = self.output_path
 
     def register_metric(self, metric: EvaluationMetric) -> None:
         """Register an evaluation metric.
@@ -463,6 +468,7 @@ class ReconstructionMSE(ReconstructionMetric):
     
     real_data: np.ndarray = None
     reconstructed_data: np.ndarray = None
+    output_path: str = None
     
     @property
     def name(self) -> str:
@@ -498,7 +504,8 @@ class ReconstructionMSE(ReconstructionMetric):
                 'n_samples': int(real.shape[0]),
                 'n_features': int(real.shape[1]),
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
 
         return mse
@@ -509,6 +516,7 @@ class ReconstructionRMSE(ReconstructionMetric):
     
     real_data: np.ndarray = None
     reconstructed_data: np.ndarray = None
+    output_path: str = None
     
     @property
     def name(self) -> str:
@@ -544,7 +552,8 @@ class ReconstructionRMSE(ReconstructionMetric):
                 'n_samples': int(real.shape[0]),
                 'n_features': int(real.shape[1]),
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
 
         return rmse
@@ -611,7 +620,8 @@ class ReconstructionLogLikelihood(ReconstructionMetric):
                 'n_samples': int(real.shape[0]),
                 'n_features': int(real.shape[1]),
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
 
         return mean_log_likelihood
@@ -628,6 +638,7 @@ class FlexibilityDistance(ReconstructionMetric):
     
     real_data: np.ndarray = None
     reconstructed_data: np.ndarray = None
+    output_path: str = None
 
     def __init__(self, tau='auto', normalize=True):
         """
@@ -735,6 +746,7 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
     
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
+    output_path: str = None
 
     def __init__(self, sigma=None, seed=42, max_samples=2000):
         """
@@ -861,7 +873,8 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
                 'n_real_used': int(len(real)),
                 'n_synthetic_used': int(len(synthetic)),
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
 
         return mmd_value
@@ -880,6 +893,7 @@ class ACFDistribution(SyntheticMetric):
 
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
+    output_path: str = None
     
     def __init__(self, window_size=24, max_lag=10):
         """
@@ -978,7 +992,8 @@ class ACFDistribution(SyntheticMetric):
                 'n_real_series': int(len(real_ts)),
                 'n_synthetic_series': int(len(synthetic_ts)),
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
 
         return avg_ks
@@ -988,7 +1003,8 @@ class VisualEvaluation(SyntheticMetric):
     """Visual evaluation of synthetic data"""
     
     real_data: np.ndarray = None
-    synthetic_data: np.ndarray = None   
+    synthetic_data: np.ndarray = None 
+    output_dir: str = None
 
     def __init__(self, output_dir='src/Output/Plots'):
         """
@@ -1111,6 +1127,7 @@ class ClassicalStatistics(SyntheticMetric):
     """
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
+    output_path: str = None
     
     def __init__(self, window_size=24, n_features=1):
         """
@@ -1217,7 +1234,8 @@ class ClassicalStatistics(SyntheticMetric):
                 'real': real_stats,
                 'synthetic': synthetic_stats,
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
 
         return mean_profile_diff
@@ -1287,6 +1305,7 @@ class TSTR(SyntheticMetric):
 
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
+    output_path: str = None
     
     def __init__(self, task='next_step', window_size=24, n_features=1, 
                  predictor_type='linear', epochs=50, random_state=42):
@@ -1467,7 +1486,8 @@ class TSTR(SyntheticMetric):
                 'n_real_test': int(len(real_test)),
                 'n_synthetic_train': int(len(synthetic_train)),
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
         
         return tstr_ratio
@@ -1479,6 +1499,7 @@ class AggregatedProfiles(SyntheticMetric):
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
     normalizer = None
+    output_dir: str = None
     
     def __init__(self, n_samples=100, window_size=24, tau='auto', normalize=True, output_dir='src/Output/Plots'):
         self.n_samples = n_samples
@@ -1539,7 +1560,8 @@ class AggregatedProfiles(SyntheticMetric):
                 'real_aggregated': real_aggregated,
                 'synthetic_aggregated': synth_aggregated,
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=os.path.join(self.output_dir, 'aggregated_profiles_fd_result.json')
         )
         
         return fd_score
@@ -1580,6 +1602,7 @@ class PerConditionEval(SyntheticMetric):
     timestamps: np.ndarray = None
     meter_ids: np.ndarray = None
     feeder_ids: np.ndarray = None
+    output_dir: str = None
 
     def __init__(self, window_size=24, max_lag=10, min_samples_per_group=2, output_dir='src/Output', 
                  verbose=False, predictor_type='linear', tstr_epochs=50,

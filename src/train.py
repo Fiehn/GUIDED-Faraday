@@ -22,6 +22,7 @@ from evaluation.eval_framework import EvalFramework
 
 from src.visualization.plot_styling import PlotStyle
 import gc
+import yaml
 
 def train(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -31,7 +32,7 @@ def train(config):
 
     if not config.skip_validation:
         validation_passed = run_validation(
-            model_type=config.model_type,
+            model_type=config.model.type,
             use_test_data=True,  # use small test data for fast validation
             verbose=config.verbose
         )
@@ -81,10 +82,10 @@ def train(config):
                     decay = 1.0
                     update_frequency = -1
 
-                profiler = UserProfiler(n_topics=config.user_profile.n_topics,
-                    num_clusters=config.user_profile.num_clusters, 
-                    path=config.user_profile.cache_path, 
-                    verbose=config.user_profile.verbose, 
+                profiler = UserProfiler(n_topics=config.conditioning.user_profile.n_topics,
+                    num_clusters=config.conditioning.user_profile.num_clusters, 
+                    path=config.conditioning.user_profile.cache_path, 
+                    verbose=config.conditioning.user_profile.verbose, 
                     decay=decay, 
                     update_frequency=update_frequency)
                 
@@ -97,7 +98,7 @@ def train(config):
             else:
                 print(f"Warning: Unknown condition tag '{condition_tag}' in config. Skipping this conditioner.")
         
-        input_dim = config.window.input_len * len(config.columns.value_cols)
+        input_dim = config.data.window.input_len * len(config.data.columns.value_cols)
         model = CVAE(input_dim=input_dim, latent_dim=config.model.latent_dim, 
                      conditioner=conditioner, dictionary_size=config.model.prior.dictionary_size, 
                      vamp_num_components=config.model.prior.vamp_num_components,
@@ -108,7 +109,7 @@ def train(config):
                      )
         print(f"Initialized CVAE with input_dim={input_dim}, latent_dim={config.model.latent_dim}, encoder_type={config.model.encoder.type}, decoder_type={config.model.decoder.type}, prior_type={config.model.prior.type}, conditioner_tags={config.conditioning.tags}")
     elif config.model.type == "vae":
-        input_dim = config.window.input_len * len(config.columns.value_cols)
+        input_dim = config.data.window.input_len * len(config.data.columns.value_cols)
         model = VAE(input_dim=input_dim, latent_dim=config.model.latent_dim,
                     encoder_type=config.model.encoder.type,
                     decoder_type=config.model.decoder.type,
@@ -124,29 +125,29 @@ def train(config):
     model_tag = model.get_tag()
 
     # === Load Data === 
-    window = WindowSpec(input_len=config.window.input_len, stride=config.window.stride)
-    data_dir = config.data_dir
+    window = WindowSpec(input_len=config.data.window.input_len, stride=config.data.window.stride)
+    data_dir = config.data.data_dir
     # Load data sequentially based on what is in the folder and train the model in an online fashion
     all_data_files = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv") and not f.startswith("test")])
     
-    data_files = config.data_files if len(config.data_files) > 0 else all_data_files
+    data_files = config.data.data_files if len(config.data.data_files) > 0 else all_data_files
     print(f"Data files to be used for training: {data_files}")
     
-    normalizer = Normalizer(method=config.normalizer.method)
+    normalizer = Normalizer(method=config.normalization.method)
     fit_normalizer_on_files(
         normalizer,
         data_dir=data_dir,
         filenames=data_files,
-        feature_cols=config.columns.value_cols,
-        meter_col=config.columns.meter_id,
-        timestamp_dst_col=config.columns.timestamp_dst,
-        train_frac=config.splits.train_ratio,
-        seed=config.splits.random_seed,
+        feature_cols=config.data.columns.value_cols,
+        meter_col=config.data.columns.meter_id,
+        timestamp_dst_col=config.data.columns.timestamp_dst,
+        train_frac=config.data.splits.train_ratio,
+        seed=config.data.splits.random_seed,
     )
 
     all_test_tensors = []
 
-    writer = Writer(log_dir=os.path.join(config.logging.log_dir, model_tag))
+    writer = Writer(log_dir=os.path.join(config.logging.log_dir, model_tag, 'logs'))
     i = 0
     for data_file in data_files:
         i += 1
@@ -174,17 +175,17 @@ def train(config):
         dm = SmartMeterDataModule(
             data_dir=data_dir,
             filename=data_file,
-            meter_col=config.columns.meter_id,
-            timestamp_dst_col=config.columns.timestamp_dst,
-            timestamp_utc_col=config.columns.timestamp_utc,
-            feature_cols=config.columns.value_cols,
+            meter_col=config.data.columns.meter_id,
+            timestamp_dst_col=config.data.columns.timestamp_dst,
+            timestamp_utc_col=config.data.columns.timestamp_utc,
+            feature_cols=config.data.columns.value_cols,
             window=window,
-            batch_size=config.dataloader.batch_size,
-            num_workers=config.dataloader.num_workers,
-            shuffle_train=config.dataloader.shuffle,
-            seed=config.splits.random_seed,
-            train_frac=config.splits.train_ratio,
-            val_frac=config.splits.val_ratio,
+            batch_size=config.data.dataloader.batch_size,
+            num_workers=config.data.dataloader.num_workers,
+            shuffle_train=config.data.dataloader.shuffle,
+            seed=config.data.splits.random_seed,
+            train_frac=config.data.splits.train_ratio,
+            val_frac=config.data.splits.val_ratio,
             max_meters=None,
             normalizer=normalizer,
         )
@@ -221,7 +222,7 @@ def train(config):
             early_stopping_kwargs= {"patience": config.training.early_stopping.patience, "min_delta": config.training.early_stopping.min_delta},
             save_epoch_freq = config.training.checkpointing.save_freq,
             writer = writer,
-            log_dir = os.path.join(config.logging.log_dir, model_tag),
+            log_dir = config.logging.log_dir,
             weighted_loss = config.training.weighted_loss,
             heirarchical_config = hierarchy,
             normalizer = normalizer,
@@ -236,21 +237,26 @@ def train(config):
     )
     combined_test_loader = DataLoader(
         combined_test_ds,
-        batch_size=config.dataloader.batch_size,
+        batch_size=config.data.dataloader.batch_size,
         shuffle=False,
-        num_workers=config.dataloader.num_workers,
+        num_workers=config.data.dataloader.num_workers,
     )
     log_path = os.path.join(config.logging.log_dir, model_tag)
+
+    # SAve training config
+    with open(os.path.join(log_path, 'training_config.yaml'), 'w') as f:
+        yaml.dump(config.config, f)
+
     # === Evaluation ===
     evaluator = EvalFramework(model, combined_test_loader, normalizer, device='cpu')
     evaluator.register_all()
     evaluator.evaluate()
-    evaluator.save_results(os.path.join(log_path, 'eval_results.json'))
+    evaluator.save_results(os.path.join(log_path, 'eval_results_combined.json'))
     
     # === Visualization ===
     visualizer = Visualizer(model = model, writer = writer,
                             plot_style = PlotStyle(),
-                            log_dir = log_path,
+                            log_dir = os.path.join(log_path, 'plots'),
                             device = device,
                             normalizer = normalizer)
     visualizer.visualize(test_loader = combined_test_loader,
@@ -264,8 +270,9 @@ def train(config):
 
 # now we can run either VAE or CVAE test
 if __name__ == "__main__":
-    config = None
-    train(config)
+    from src.config_loader import ConfigLoader
+    config_loader = ConfigLoader(config_path='config/config.yaml')
+    train(config_loader)
 
 
 

@@ -134,7 +134,7 @@ input_dim = window_size * len(feature_cols)
 
 # Create model
 if model_type.upper() == 'CVAE':
-    from src.Data.Conditioner import Conditioner
+    from src.data.conditioner import Conditioner
     conditioner = Conditioner(config=config)
     model = CVAE(input_dim=input_dim, latent_dim=latent_dim, encoder_type=encoder_type, 
                  decoder_type=decoder_type, prior_type=prior_type, conditioner=conditioner)

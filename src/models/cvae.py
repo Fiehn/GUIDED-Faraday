@@ -24,7 +24,7 @@ class CVAE(VAE):
         self.condition_dim = conditioner.get_condition_dim()
         self.latent_dim = int(latent_dim)
 
-        super().__init__(input_dim=input_dim, distribution_dict=distribution_dict, prior_type=prior_type, hierarchy_config=hierarchy_config, **kwargs)
+        super().__init__(input_dim=input_dim, latent_dim=latent_dim, distribution_dict=distribution_dict, prior_type=prior_type, hierarchy_config=hierarchy_config, **kwargs)
 
         # Now override encoder and decoder with conditioned versions
         # Encoder takes [x, c] as input

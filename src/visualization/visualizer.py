@@ -37,6 +37,9 @@ class Visualizer:
             num_originals: Number of original samples to select for synthetic recreation visualization.
             num_synthetic_per: Number of synthetic samples to generate per original sample for synthetic recreation visualization.
         """
+        os.makedirs(self.log_dir, exist_ok=True)
+        if self.model is not None:
+            self.model.to(self.device)
         try:
             print("Visualizing training progress.")
             self.visualize_training_progress()
