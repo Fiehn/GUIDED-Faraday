@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from datetime import datetime
 import json
-from typing import Dict, List, Any, Callable
+from typing import Dict, List, Any
 from abc import ABC, abstractmethod
  
 import os
@@ -14,15 +14,13 @@ sys.path.append(parent_dir)
 
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 from sklearn.decomposition import PCA
-import seaborn as sns
 from scipy.stats import wasserstein_distance
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 from scipy import stats
 
-from train_utils import PlotStyle
+from src.visualization.plot_styling import PlotStyle
 
 try:
     from tabulate import tabulate
@@ -162,6 +160,20 @@ class EvalFramework:
         self._reconstructed_data: np.ndarray = None  # Cache reconstructed data for metrics that need it
         self._syntheric_data: np.ndarray = None  # Cache synthetic data for metrics that need it
 
+    def register_all(self):
+        self.register_metrics([
+            ReconstructionMSE,
+            ReconstructionRMSE,
+            ReconstructionLogLikelihood,
+            FlexibilityDistance,
+            MaximumMeanDiscrepancy,
+            ACFDistribution,
+            ClassicalStatistics,
+            TSTR,
+            AggregatedProfiles,
+            PerConditionEval
+        ])
+
     def _is_cvae(self) -> bool:
         """Check if model is a CVAE based on presence of conditioner on the model."""
         return hasattr(self.model, 'conditioner') and self.model.conditioner is not None
@@ -175,25 +187,17 @@ class EvalFramework:
 
         self.model.eval()
         with torch.no_grad():
-            for batch in self.dataloader:
-                if isinstance(batch, (list, tuple)):
-                    x = batch[0].to(self.device)
-                    meter_id = batch[1] if len(batch) > 1 else None
-                    timestamps = batch[2].to(self.device) if len(batch) > 2 else None
-                else:
-                    x = batch.to(self.device)
-                    meter_id = None
-                    timestamps = None
-
-                x_flat = x.reshape(x.shape[0], -1) if x.dim() == 3 else x
+            for data, meter_ids, timestamps in self.dataloader:
+                data = data.to(self.device)
+                x_flat = data.reshape(data.shape[0], -1) if data.dim() == 3 else data
                 real_batches.append(x_flat.cpu().numpy())
 
-                recon = self._reconstruct(x, meter_id=meter_id, timestamps=timestamps)
+                recon = self._reconstruct(data, meter_id=meter_ids, timestamps=timestamps)
                 recon_batches.append(recon.cpu().numpy())
 
                 if self._is_cvae():
                     # Use the model's own conditioner, not self.conditioner
-                    c = self.model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
+                    c = self.model.conditioner.get_conditions(data, meter_id=meter_ids, timestamps=timestamps)
                     c = self.model.move_to_device(c, device=self.device)
                     condition_batches.append(c.cpu())
 
@@ -253,6 +257,7 @@ class EvalFramework:
         with torch.no_grad():
             if self._is_cvae():
                 # Use real conditions collected during _prepare_data
+                # TODO: GENERATOR HERE!
                 c = self._synthetic_conditions.to(self.device)  # [n_samples, C]
 
                 samples = self.model.sample(
@@ -999,7 +1004,6 @@ class VisualEvaluation(SyntheticMetric):
     def name(self) -> str:
         return "Visual Evaluations"
     
-
     def pca(self) -> None:
         """Generate PCA plots for real vs synthetic data."""
         real_data = self.real_data[:500] if len(self.real_data) > 500 else self.real_data
@@ -2285,74 +2289,3 @@ class PerConditionEval(SyntheticMetric):
         all_mmd_scores = list(mmd_per_day.values()) + list(mmd_per_month.values())
         avg_mmd = np.mean(all_mmd_scores) if all_mmd_scores else 0.0
         return float(avg_mmd)
-
-
-
-# ============================================================================
-# Usage 
-# ============================================================================
-
-if __name__ == "__main__":
-    print("Evaluation Framework - Separate Reconstruction & Synthetic Metrics")
-    print("\n" + "="*70)
-    print("EXAMPLE 1: Run all metrics (reconstruction + synthetic)")
-    print("="*70)
-    print("""
-    from src.eval_framework import EvalFramework
-    from src.eval_framework import (
-        ReconstructionMSE, ReconstructionMAE, KLDivergence,
-        DistributionMatch, TemporalConsistency, PrivacyMetric
-    )
-    
-    # Create evaluator
-    evaluator = EvalFramework(model, dataloader, normalizer, device='cpu')
-    
-    # Register reconstruction metrics
-    evaluator.register_metrics([
-        ReconstructionMSE(),
-        ReconstructionMAE(),
-        KLDivergence(),
-    ])
-    
-    # Register synthetic metrics
-    evaluator.register_metrics([
-        DistributionMatch(),
-        TemporalConsistency(),
-        PrivacyMetric(),
-    ])
-    
-    # Run all metrics (will print reconstruction section, then synthetic section)
-    results = evaluator.evaluate()
-    
-    # Save results
-    evaluator.save_results('Output/eval_results.json')
-    """)
-    
-    print("\n" + "="*70)
-    print("EXAMPLE 2: Run only reconstruction metrics")
-    print("="*70)
-    print("""
-    evaluator = EvalFramework(model, dataloader, normalizer, device='cpu')
-    evaluator.register_metrics([
-        ReconstructionMSE(model, dataloader),
-        KLDivergence(model, dataloader),
-    ])
-    
-    # Only evaluate reconstruction
-    results = evaluator.evaluate_reconstruction_only()
-    """)
-    
-    print("\n" + "="*70)
-    print("EXAMPLE 3: Run only synthetic metrics")
-    print("="*70)
-    print("""
-    evaluator = EvalFramework(model, dataloader, normalizer, device='cpu')
-    evaluator.register_metrics([
-        DistributionMatch(model, dataloader),
-        TemporalConsistency(model, dataloader),
-        PrivacyMetric(model, dataloader),
-    ])
-    
-    # Only evaluate synthetic data
-    results = evaluator.evaluate_synthetic_only()
-    """)

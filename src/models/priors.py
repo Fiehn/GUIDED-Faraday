@@ -4,7 +4,7 @@ import torch.nn as nn
 import numpy as np
  
 # =============
-# Prior Dsitribution Classes
+# Prior Distribution Classes
 # =============
 class BasePrior(nn.Module, ABC):
     """ Base class for prior distributions. 
@@ -139,7 +139,9 @@ class LearnableDictionaryPrior(BasePrior):
     def sample(self, batch_size, num_samples=1):
         sigma = torch.exp(self.log_sigma)
         eps = torch.randn((num_samples, batch_size, self.dictionary_size), device=self.device)
-        return self.mu + eps * sigma
+        # Return samples in dictionary space only (mu in latent space is added after
+        # the SigmaMapper transform in CVAE.sample, matching StandardDictionaryPrior behaviour)
+        return eps * sigma
     def log_prob(self, z):
         params = self.get_params()
         mu = params["mu"]
@@ -262,13 +264,15 @@ def get_prior(prior_type, latent_dim, device="cpu", **kwargs):
     if prior_type == "standard_gaussian":
         return StandardGaussianPrior(latent_dim, device)
     elif prior_type == "learnable_gaussian":
-        return LearnableGaussianPrior(latent_dim, device, **kwargs)
+        gaussian_kwargs = {k: kwargs[k] for k in ("init_mu", "init_sigma") if k in kwargs}
+        return LearnableGaussianPrior(latent_dim, device, **gaussian_kwargs)
     elif prior_type == "standard_dictionary":
         dictionary_size = kwargs.get("dictionary_size", 100)
         return StandardDictionaryPrior(latent_dim, dictionary_size, device)
     elif prior_type == "learnable_dictionary":
         dictionary_size = kwargs.get("dictionary_size", 100)
-        return LearnableDictionaryPrior(latent_dim, dictionary_size, device, **kwargs)
+        dict_kwargs = {k: kwargs[k] for k in ("init_mu", "init_sigma") if k in kwargs}
+        return LearnableDictionaryPrior(latent_dim, dictionary_size, device, **dict_kwargs)
     elif prior_type == "vampprior":
         return VampPrior(
             latent_dim=latent_dim,

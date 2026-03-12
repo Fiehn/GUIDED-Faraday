@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from models.priors import *
-from src.models.model_utils import MultivariateStudentT
 
 # === Gaussian encoder and decoder Model ===
 class GaussianCoder(torch.nn.Module):
@@ -224,10 +223,15 @@ class DictionaryCoder(torch.nn.Module):
         with torch.amp.autocast('cuda', enabled=False): # AMP and Cholesky don't play well together, so we do this part in full precision on GPU (if available)
         # Use PyTorch's MultivariateNormal distribution
         # Using scale_tril with Cholesky decomposition for better numerical stability (should be equivalent to covariance_matrix but more stable)
-            L = torch.linalg.cholesky(Sigma_jittered)
+            # Explicit float32 cast: autocast(enabled=False) stops further downcasting but
+            # does NOT upcast tensors that are already float16, so we must do it manually.
+            mu_fp32 = mu.float()
+            inputs_fp32 = inputs.float()
+            Sigma_fp32 = Sigma_jittered.float()
+            L = torch.linalg.cholesky(Sigma_fp32)
             
-            dist = torch.distributions.MultivariateNormal(loc=mu, scale_tril=L)
-            return dist.log_prob(inputs)
+            dist = torch.distributions.MultivariateNormal(loc=mu_fp32, scale_tril=L)
+            return dist.log_prob(inputs_fp32)
     
     def kl_divergence(self, param_dict_q, prior=None, **_):
         """
@@ -235,7 +239,7 @@ class DictionaryCoder(torch.nn.Module):
 
         For priors that support analytical KL (e.g. StandardDictionaryPrior),
         uses the closed-form multivariate-Gaussian KL.
-
+ 
         For priors that do NOT (e.g. VampPrior), falls back to single-sample
         Monte Carlo:  KL ≈ E_q[log q(z|x) - log p(z)].
         
@@ -251,35 +255,52 @@ class DictionaryCoder(torch.nn.Module):
             return log_q - log_p
 
         # --- Analytical path (Gaussian priors) ---
-        mu_q = param_dict_q["mu"]
-        Sigma_q = self.create_covariance_matrix(param_dict_q)
+        # Compute everything in fp32 with autocast disabled: fp16 rounding in S^T S
+        # accumulates as SigmaMapper weights grow (e.g. after the first training file),
+        # producing tiny negative eigenvalues that fail PyTorch's PositiveDefinite check.
+        with torch.amp.autocast('cuda', enabled=False):
+            param_dict_q_fp32 = {k: v.float() for k, v in param_dict_q.items()}
+            mu_q = param_dict_q_fp32["mu"]
+            Sigma_q = self.create_covariance_matrix(param_dict_q_fp32)
+            D = Sigma_q.shape[-1]
+            jitter = 1e-5 * torch.eye(D, device=Sigma_q.device).unsqueeze(0)
+            Sigma_q = 0.5 * (Sigma_q + Sigma_q.transpose(-1, -2)) + jitter
 
-        if prior is None:
-            # Default to standard normal in output space
-            mu_p = torch.zeros_like(mu_q)
-            Sigma_p = torch.eye(self.output_dim, device=mu_q.device).unsqueeze(0).expand(mu_q.shape[0], -1, -1)
-        else:
-            # Get prior parameters and create covariance
-            prior_params = prior.get_params()
-            batch_size = mu_q.shape[0]
-            prior_params = {k: v.expand(batch_size, -1).to(mu_q.device) for k, v in prior_params.items()}
-            mu_p = prior_params["mu"]
-            Sigma_p = self.create_covariance_matrix(prior_params)
-        
-        # Use analytical KL for multivariate Gaussians
-        try:
-            dist_q = torch.distributions.MultivariateNormal(loc=mu_q, covariance_matrix=Sigma_q)
-            dist_p = torch.distributions.MultivariateNormal(loc=mu_p, covariance_matrix=Sigma_p)
-            return torch.distributions.kl.kl_divergence(dist_q, dist_p)
-        except Exception as e:
-            print(f"Warning: Analytical KL failed, using Monte Carlo: {e}")
-            z = self.reparameterize(param_dict_q, num_samples=1).squeeze(0)  # [B, D]
-            log_q = self.loglikelihood(z, param_dict_q)
             if prior is None:
-                log_p = -0.5 * torch.sum(z ** 2 + torch.log(torch.tensor(2 * torch.pi)), dim=-1)
+                # Default to standard normal in output space
+                mu_p = torch.zeros_like(mu_q)
+                Sigma_p = torch.eye(self.output_dim, device=mu_q.device).unsqueeze(0).expand(mu_q.shape[0], -1, -1)
             else:
-                log_p = prior.log_prob(z)
-            return log_q - log_p
+                # Get prior parameters and create covariance
+                prior_params = prior.get_params()
+                batch_size = mu_q.shape[0]
+                prior_params = {k: v.float().expand(batch_size, -1).to(mu_q.device) for k, v in prior_params.items()}
+                mu_p = prior_params["mu"]
+                if prior_params["sigma"].shape[-1] == self.dictionary_size:
+                    # Prior sigma is in dictionary space — use the PDCC formula
+                    Sigma_p = self.create_covariance_matrix(prior_params)
+                    Sigma_p = 0.5 * (Sigma_p + Sigma_p.transpose(-1, -2)) + jitter
+                else:
+                    # Prior sigma is in output space (e.g. StandardGaussianPrior) — build diagonal covariance
+                    Sigma_p = torch.diag_embed(prior_params["sigma"] ** 2)  # [B, output_dim, output_dim]
+
+            # Use scale_tril (Cholesky) — more numerically stable than passing covariance_matrix directly
+            try:
+                L_q = torch.linalg.cholesky(Sigma_q)
+                L_p = torch.linalg.cholesky(Sigma_p)
+                dist_q = torch.distributions.MultivariateNormal(loc=mu_q, scale_tril=L_q)
+                dist_p = torch.distributions.MultivariateNormal(loc=mu_p, scale_tril=L_p)
+                return torch.distributions.kl.kl_divergence(dist_q, dist_p)
+            except Exception as e:
+                print(f"Warning: Analytical KL failed, using Monte Carlo: {e}")
+
+        z = self.reparameterize(param_dict_q, num_samples=1).squeeze(0)  # [B, D]
+        log_q = self.loglikelihood(z, param_dict_q)
+        if prior is None:
+            log_p = -0.5 * torch.sum(z ** 2 + torch.log(torch.tensor(2 * torch.pi)), dim=-1)
+        else:
+            log_p = prior.log_prob(z)
+        return log_q - log_p
 
 
     def create_covariance_matrix(self, param_dict):
@@ -297,73 +318,6 @@ class DictionaryCoder(torch.nn.Module):
 
     def get_marginal_sigmas(self,param_dict):
         return torch.sqrt(torch.diagonal(self.create_covariance_matrix(param_dict), dim1=-2, dim2=-1))
-
-class DictionaryLogNormalCoder(DictionaryCoder):
-    """ Dictionary-based coder where the underlying distribution is log-normal instead of Gaussian.
-    This means that if log(X) ~ N(mu, Sigma), then X follows a log-normal distribution with parameters mu and Sigma.
-    The reparameterization and log-likelihood are adjusted accordingly.
-    Be aware this decoder fails to produce good results!
-    """
-    def reparameterize(self, param_dict, num_samples=1, **_):
-        # Sample from the underlying Gaussian
-        z_gaussian = super().reparameterize(param_dict, num_samples=num_samples, **_)
-        # Exponentiate to get log-normal samples
-        z = torch.exp(z_gaussian)
-        return z
-    
-    def loglikelihood(self, inputs, param_dict, **_):
-        """
-        Log-likelihood for log-normal distribution with dictionary-based covariance.
-        If log(X) ~ N(mu, Sigma), then:
-        log p(x) = log p_normal(log(x)) - sum(log(x_i))
-                 = -0.5 * (log(x) - mu)^T Sigma^-1 (log(x) - mu) 
-                   - 0.5 * log|Sigma| - d/2 * log(2*pi) - sum(log(x_i))
-        """
-        mu = param_dict["mu"]
-
-        # transform inputs to log space
-        x_safe = torch.clamp(inputs, min=self.eps)  # Avoid log(0)
-        log_x = torch.log(x_safe)
-
-        Sigma = self.create_covariance_matrix(param_dict)
-
-        try:
-            dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=Sigma)
-            log_prob_normal = dist.log_prob(log_x)
-        except Exception as e:
-            print(f"Warning: Covariance matrix issue in loglikelihood: {e}")
-            # Add the marginal std lim to diagonal for stability again
-            Sigma_stable = Sigma + torch.eye(self.output_dim, device=Sigma.device) * (self.marginal_std_lim ** 2)
-            dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=Sigma_stable)
-            log_prob_normal = dist.log_prob(log_x)
-
-        log_prob = log_prob_normal - torch.sum(log_x, dim=-1)  # Jacobian adjustment for log transform
-        return log_prob
-    
-class DictionaryStudentTCoder(DictionaryCoder):
-    """ Dictionary-based coder where the underlying distribution is a multivariate Student's t-distribution instead of Gaussian.
-    This means that if log(X) ~ t(mu, Sigma, df), then X follows a log-Student's t distribution with parameters mu, Sigma, and degrees of freedom df.
-    The reparameterization and log-likelihood are adjusted accordingly.
-    """
-    def __init__(self, *args, df=10.0, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.register_buffer('df', torch.tensor(df, device=self.SigmaMapper.device))  # Degrees of freedom for the Student's t-distribution
-
-    def reparameterize(self, param_dict, num_samples=1, **_):
-        Sigma = self.create_covariance_matrix(param_dict)
-        dist = MultivariateStudentT(loc=param_dict["mu"], scale_tril=torch.linalg.cholesky(Sigma), df=self.df)
-        z = dist.rsample(sample_shape=(num_samples,))
-        return z
-    
-    def loglikelihood(self, inputs, param_dict, **_):
-        Sigma = self.create_covariance_matrix(param_dict)
-        # Use our custom MultivariateStudentT distribution for log-likelihood computation
-        dist = MultivariateStudentT(
-            loc=param_dict["mu"],
-            scale_tril=torch.linalg.cholesky(Sigma),
-            df=self.df
-        )
-        return dist.log_prob(inputs)
     
 # === This is the actual network structure ===
 class Parameterizer(nn.Module):
@@ -546,18 +500,6 @@ def get_encoder_model(input_dim, latent_dim, type, **kwargs):
             output_dim=latent_dim,
             **kwargs
         )
-    elif type == "log_normal_dictionary":
-        return DictionaryLogNormalCoder(
-            input_dim=input_dim,
-            output_dim=latent_dim,
-            **kwargs
-        )
-    elif type == "student_t_dictionary":
-        return DictionaryStudentTCoder(
-            input_dim=input_dim,
-            output_dim=latent_dim,
-            **kwargs
-        )
     else:
         return GaussianCoder(
             input_dim=input_dim,
@@ -568,18 +510,6 @@ def get_encoder_model(input_dim, latent_dim, type, **kwargs):
 def get_decoder_model(latent_dim, output_dim, type, **kwargs):
     if type == "dictionary":
         return DictionaryCoder(
-            input_dim=latent_dim,
-            output_dim=output_dim,
-            **kwargs
-        )
-    elif type == "log_normal_dictionary":
-        return DictionaryLogNormalCoder(
-            input_dim=latent_dim,
-            output_dim=output_dim,
-            **kwargs
-        )
-    elif type == "student_t_dictionary":
-        return DictionaryStudentTCoder(
             input_dim=latent_dim,
             output_dim=output_dim,
             **kwargs

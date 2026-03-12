@@ -5,6 +5,8 @@ import torch
 import pandas as pd
 import os
 import numpy as np
+from sklearn.decomposition import PCA 
+from sklearn.manifold import TSNE
  
 class Visualizer:
     """Class for visualizing training results and model performance."""
@@ -18,6 +20,10 @@ class Visualizer:
         self.normalizer = normalizer
         self.writer = writer
         self.device = device
+    
+    def _is_cvae(self) -> bool:
+        """Check if model is a CVAE based on presence of conditioner on the model."""
+        return hasattr(self.model, 'conditioner') and self.model.conditioner is not None
 
     def visualize(self, test_loader = None, num_samples: int = 5, 
                   num_recon_per: int = 3, num_synthetic: int = 100,
@@ -94,10 +100,6 @@ class Visualizer:
         else:
             print("No loss data available for visualization.")
 
-    def _is_cvae(self) -> bool:
-        """Check if model is a CVAE based on presence of conditioner on the model."""
-        return hasattr(self.model, 'conditioner') and self.model.conditioner is not None
-    
     def visualize_reconstructions(self, test_loader, num_samples: int,
         num_recon_per: int):
         """Visualize original vs reconstructed samples.
@@ -560,4 +562,3 @@ class Visualizer:
         plt.savefig(user_dict_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved User Profiles visualization to {user_dict_path}")
-
