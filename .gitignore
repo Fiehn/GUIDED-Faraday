@@ -12,6 +12,7 @@ data/
 models/
 runs/
 Output/
+topology/
 
 !src/Data/
 !src/Data/*.py
