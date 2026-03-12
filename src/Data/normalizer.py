@@ -1,3 +1,5 @@
+import os
+from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
@@ -127,58 +129,46 @@ class Normalizer:
     """
     Normalizes data using specified methods.
     Supports both numpy arrays and torch tensors.
-    
+
     Methods:
-      - zero_preserved_log: Log-transform non-zero values, mark zeros with special ID
-      - standard: Standard z-score normalization
-      - log1p: log1p(x) - mean / std
-      - online_log1p: stores and recalculates normalization stats per month
+      - zero_preserved_log: Log-transform non-zero values, mark zeros with special sentinel
+      - standard:           Z-score normalisation
+      - log1p:              (log1p(x) - mean) / std 
+
+    The normalizer can be fitted once across multiple files using
+    fit_incremental() / finalise_fit(), and persisted to disk with
+    save() / load() so stats do not need to be recalculated each run.
     """
-    def __init__(self, method='zero_preserved_log'):
-        self.method = method
-        self.fitted = False
-        self.device = 'cpu'
+    def __init__(self, method: str = 'log1p'):
+        self.method  = method
+        self.fitted  = False
+        self.device  = 'cpu'
+        self.epsilon = 1e-8
 
-        # For zero preserved log normalization
-        self.non_zero_mean = None
-        self.non_zero_std = None
+        # zero_preserved_log
+        self.non_zero_mean: Optional[float] = None
+        self.non_zero_std:  Optional[float] = None
         self.zero_id = -3
-        self.shift = 1.0
+        self.shift   = 1.0
 
-        # for log1p normalization, we can use standard mean/std but with log1p transform
-        self.mean = None
-        self.std = None
-        self.epsilon = 1e-8  # for numerical stability in standard normalization
-
-        # for online log1p normalization
-        self.monthly_stats = {}
-        self._global_mean_sum = 0
-        self._global_std_sum = 0
-        self._global_count = 0
+        # standard / log1p
+        self.mean: Optional[torch.Tensor] = None
+        self.std:  Optional[torch.Tensor] = None
     
     # === Helpers ===
     def to(self, device: str | torch.device) -> 'Normalizer':
-        """Move everything to device"""
+        """Move tensor stats to device."""
         self.device = torch.device(device)
 
         def _move(t):
             return t.to(self.device) if isinstance(t, torch.Tensor) else t
-        
-        self.non_zero_mean = _move(self.non_zero_mean)
-        self.non_zero_std = _move(self.non_zero_std)
+
         self.mean = _move(self.mean)
-        self.std = _move(self.std)
-        self._global_mean = _move(self._global_mean)
-        self._global_std = _move(self._global_std)
-
-        for m, stats in self.monthly_stats.items():
-            stats['mean'] = _move(stats['mean'])
-            stats['std']  = _move(stats['std'])
-
+        self.std  = _move(self.std)
         return self
 
     def _to_tensor(self, X) -> torch.Tensor:
-        """ Convert X to float32 on self.device"""
+        """Convert X to float32 on self.device."""
         if isinstance(X, np.ndarray):
             return torch.from_numpy(X.astype(np.float32)).to(self.device)
         return X.float().to(self.device)
@@ -215,16 +205,14 @@ class Normalizer:
         Xt = self._to_tensor(X) # (N,F)
 
         if self.method == 'zero_preserved_log':
-            non_zero_values = Xt[Xt != 0]
-            log_values = torch.log(non_zero_values)
-            self.non_zero_mean = log_values.mean().item()
-            self.non_zero_std = log_values.std().item()
-            self.fitted = True
+            nz = Xt[Xt != 0]
+            log_nz = torch.log(nz)
+            self.non_zero_mean = log_nz.mean().item()
+            self.non_zero_std  = log_nz.std().item()
         elif self.method == 'standard':
-            self.mean = torch.mean(Xt, dim=0, keepdim=True)
-            self.std = torch.std(Xt, dim=0, keepdim=True)
+            self.mean = Xt.mean(dim=0, keepdim=True)
+            self.std  = Xt.std(dim=0,  keepdim=True)
             self.std[self.std == 0] = 1.0
-            self.fitted = True
         elif self.method == 'log1p':
             log1p_values = torch.log1p(Xt)
             self.mean = log1p_values.mean(dim=0, keepdim=True)
@@ -255,8 +243,56 @@ class Normalizer:
             self._global_std[self._global_std == 0] = 1.0
             self.fitted = True
         else:
-            raise ValueError(f"Normalization method {self.method} not recognized.")
-    
+            raise ValueError(f"finalise_fit() not implemented for method '{self.method}'")
+
+        self.fitted = True
+
+        # Release temporary Welford state
+        for attr in ('_wf_n', '_wf_mean', '_wf_M2'):
+            self.__dict__.pop(attr, None)
+
+    # ---------------------------------------------------------------
+    # Persistence
+    # ---------------------------------------------------------------
+
+    def save(self, path: str) -> None:
+        """Save fitted stats to disk.
+
+        The file is a plain torch.save dict and can be re-loaded with
+        Normalizer.load(path).  It is safe to save before moving tensors
+        to GPU; the file always stores stats on CPU.
+        """
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        state = {
+            'method':        self.method,
+            'fitted':        self.fitted,
+            'epsilon':       self.epsilon,
+            'zero_id':       self.zero_id,
+            'shift':         self.shift,
+            'non_zero_mean': self.non_zero_mean,
+            'non_zero_std':  self.non_zero_std,
+            # store tensors on CPU so the file is device-agnostic
+            'mean': self.mean.cpu() if isinstance(self.mean, torch.Tensor) else self.mean,
+            'std':  self.std.cpu()  if isinstance(self.std,  torch.Tensor) else self.std,
+        }
+        torch.save(state, path)
+
+    @classmethod
+    def load(cls, path: str, device: str | torch.device = 'cpu') -> 'Normalizer':
+        """Load a previously saved Normalizer from disk."""
+        state = torch.load(path, map_location='cpu', weights_only=False)
+        norm = cls(method=state['method'])
+        norm.fitted        = state['fitted']
+        norm.epsilon       = state['epsilon']
+        norm.zero_id       = state['zero_id']
+        norm.shift         = state['shift']
+        norm.non_zero_mean = state['non_zero_mean']
+        norm.non_zero_std  = state['non_zero_std']
+        norm.mean          = state['mean']
+        norm.std           = state['std']
+        norm.to(device)
+        return norm
+
     def _zero_preserved_log_transform(self, X: torch.Tensor) -> torch.Tensor:
         is_zero = X == 0
         Y = X.clone()
@@ -274,57 +310,21 @@ class Normalizer:
         Y[is_zero]  = 0.0
         return Y
     
-    def _get_month_stats(self, m_int: int):
-        """Return (mean (1,F), std (1,F)) tensors for a single YYYYMM key."""
-        stats = self.monthly_stats.get(m_int)
-        if stats is not None:
-            return stats['mean'], stats['std']
-        return self._global_mean, self._global_std
-    
-    def _apply_online_log1p(self, X: torch.Tensor, mk: torch.Tensor | None, inverse: bool) -> torch.Tensor:
-        """
-        Per-row normalise (inverse=False) or denormalise (inverse=True).
-        X is already log1p-transformed when inverse=False.
-        """
-        out = torch.empty_like(X)
-
-        if mk is None:
-            mean, std = self._global_mean, self._global_std
-            out = torch.expm1(X * (std + self.epsilon) + mean) if inverse \
-                  else (torch.log1p(X) - mean) / (std + self.epsilon)
-            return out
-
-        for m in mk.unique():
-            m_int   = int(m.item())
-            mask    = mk == m
-            mean, std = self._get_month_stats(m_int)
-            if inverse:
-                out[mask] = torch.expm1(X[mask] * (std + self.epsilon) + mean)
-            else:
-                out[mask] = (torch.log1p(X[mask]) - mean) / (std + self.epsilon)
-        return out
-    
-    def transform(self, X, month_key = None) -> torch.Tensor:
-        """
-        Normalise X.  Always returns a torch.Tensor on self.device.
+    def transform(self, X) -> torch.Tensor:
+        """Normalise X.  Always returns a float32 torch.Tensor on self.device.
 
         Parameters
         ----------
-        X          : array-like or Tensor (N, F)
-        month_key  : 1-D int array/Tensor (N,) of YYYYMM.
-                     Only used for method=='online_log1p'.
+        X : array-like or Tensor (N, F)
         """
         if not self.fitted:
-            raise RuntimeError("Normalizer not fitted. Call fit() first.")
-        
+            raise RuntimeError("Normalizer not fitted. call fit() or finalise_fit() first.")
         Xt = self._to_tensor(X)
-        
+
         if self.method == 'zero_preserved_log':
             return self._zero_preserved_log_transform(Xt)
-
         elif self.method == 'standard':
             return (Xt - self.mean) / (self.std + self.epsilon)
-
         elif self.method == 'log1p':
             return (torch.log1p(Xt) - self.mean) / (self.std + self.epsilon)
 
@@ -339,29 +339,23 @@ class Normalizer:
             return (torch.log1p(Xt) - self.mean) / (self.std + self.epsilon)
         
         else:
-            raise ValueError(f"Normalization method '{self.method}' not recognized.")
+            raise ValueError(f"Unknown normalisation method: '{self.method}'")
 
-    def inverse_transform(self, X, month_key=None) -> torch.Tensor:
-        """
-        Denormalise X back to original scale. Always returns a torch.Tensor on self.device.
+    def inverse_transform(self, X) -> torch.Tensor:
+        """Denormalise X back to the original scale.
 
         Parameters
         ----------
-        X          : array-like or Tensor (N, F)
-        month_key  : 1-D int array/Tensor (N,) of YYYYMM.
-                     Only used for method=='online_log1p'.
+        X : array-like or Tensor (N, F)
         """
         if not self.fitted:
-            raise RuntimeError("Normalizer not fitted – call fit() first.")
-
+            raise RuntimeError("Normalizer not fitted. call fit() or finalise_fit() first.")
         Xt = self._to_tensor(X)
 
         if self.method == 'zero_preserved_log':
             return self._zero_preserved_log_inverse(Xt)
-
         elif self.method == 'standard':
             return Xt * self.std + self.mean
-
         elif self.method == 'log1p':
             return torch.clamp(torch.expm1(Xt * (self.std + self.epsilon) + self.mean), min=0.0)
 
@@ -376,12 +370,7 @@ class Normalizer:
             return torch.clamp(torch.expm1(Xt * (self.std + self.epsilon) + self.mean), min=0.0)
         
         else:
-            raise ValueError(f"Unknown normalization method: '{self.method}'")
-    
-    def _get_monthly_stats(self, month_key: int):
-        """Public alias kept for backward compatibility."""
-        mean, std = self._get_month_stats(int(month_key))
-        return {'mean': mean, 'std': std}
+            raise ValueError(f"Unknown normalisation method: '{self.method}'")
 
 # === RevIN (reversible instance normalization) for online normalization ===
 # Refrence: https://openreview.net/forum?id=cGDAkQo1C0p

@@ -493,7 +493,7 @@ class TestHierarchySaveLoad:
     """Test that HierarchicalConfig survives serialization through the VAE save/load path."""
 
     def _make_vae_with_hierarchy(self):
-        from src.Models import VAE
+        from src.Models.VAE import VAE
         cfg = _make_two_level_config(aggregation="sum", residual=True, top_down=True)
         model = VAE(
             input_dim=24,
@@ -529,7 +529,7 @@ class TestHierarchySaveLoad:
             assert hier_raw["residual_connections"] is True
 
     def test_load_from_checkpoint(self):
-        from src.Models import VAE
+        from src.Models.VAE import VAE
         model = self._make_vae_with_hierarchy()
         model.eval()
         # Run a forward pass so the model is fully initialized
@@ -540,7 +540,7 @@ class TestHierarchySaveLoad:
             model.save_model(save_path=tmpdir, model_name="test_hier_full", device="cpu")
             model_path = os.path.join(tmpdir, "test_hier_full.pt")
 
-            loaded = VAE.load_from_checkpoint(model_path, device="cpu")
+            loaded, normalizer = VAE.load_from_checkpoint(model_path, device="cpu")
             assert loaded.hierarchy is not None
             assert loaded.hierarchy.num_levels == 2
             assert loaded.hierarchy.config.residual_connections is True
@@ -559,8 +559,8 @@ class TestHierarchySaveLoad:
             model.save_model(save_path=tmpdir, model_name="test_rt", device="cpu")
             model_path = os.path.join(tmpdir, "test_rt.pt")
 
-            from src.Models import VAE
-            loaded = VAE.load_from_checkpoint(model_path, device="cpu")
+            from src.Models.VAE import VAE
+            loaded, normalizer = VAE.load_from_checkpoint(model_path, device="cpu")
             assert loaded.hierarchy is not None
             assert loaded.hierarchy.num_levels == model.hierarchy.num_levels
             assert loaded.hierarchy.config.aggregation == model.hierarchy.config.aggregation
@@ -573,7 +573,7 @@ class TestHierarchySaveLoad:
 
     def test_save_load_no_hierarchy(self):
         """A VAE without hierarchy should save/load cleanly (regression guard)."""
-        from src.Models import VAE
+        from src.Models.VAE import VAE
         model = VAE(
             input_dim=24,
             distribution_dict={"latent_dim": 16, "dictionary_size": 50},
@@ -587,7 +587,7 @@ class TestHierarchySaveLoad:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             model.save_model(save_path=tmpdir, model_name="no_hier", device="cpu")
-            loaded = VAE.load_from_checkpoint(
+            loaded, normalizer = VAE.load_from_checkpoint(
                 os.path.join(tmpdir, "no_hier.pt"), device="cpu"
             )
             assert loaded.hierarchy is None
@@ -631,12 +631,12 @@ class TestHierarchyWithRealData:
         self.train_loader = self.dm.train_dataloader()
 
     def _get_batch_flat(self):
-        x, meter_id, timestamps, month_key = next(iter(self.train_loader))
+        x, meter_id, timestamps = next(iter(self.train_loader))
         return x.reshape(x.shape[0], -1), meter_id, timestamps
 
     def test_vae_with_hierarchy_forward(self):
         """VAE + hierarchy forward pass on real data."""
-        from src.Models import VAE
+        from src.Models.VAE import VAE
 
         x_flat, _, _ = self._get_batch_flat()
         input_dim = x_flat.shape[1]
@@ -659,7 +659,7 @@ class TestHierarchyWithRealData:
 
     def test_vae_hierarchy_loss_backprop(self):
         """Full loss computation and backward pass with real data."""
-        from src.Models import VAE
+        from src.Models.VAE import VAE
 
         x_flat, _, _ = self._get_batch_flat()
         input_dim = x_flat.shape[1]
@@ -690,7 +690,7 @@ class TestHierarchyWithRealData:
 
     def test_vae_hierarchy_train_step(self):
         """Full train_core step with real data and hierarchy."""
-        from src.Models import VAE
+        from src.Models.VAE import VAE
 
         x_flat, _, _ = self._get_batch_flat()
         input_dim = x_flat.shape[1]
@@ -715,7 +715,7 @@ class TestHierarchyWithRealData:
 
     def test_save_load_with_real_data(self):
         """Save and reload a hierarchy-equipped VAE, verify structure on real data."""
-        from src.Models import VAE
+        from src.Models.VAE import VAE
 
         x_flat, _, _ = self._get_batch_flat()
         input_dim = x_flat.shape[1]
@@ -737,7 +737,7 @@ class TestHierarchyWithRealData:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             model.save_model(save_path=tmpdir, model_name="hier_real", device="cpu")
-            loaded = VAE.load_from_checkpoint(
+            loaded, normalizer = VAE.load_from_checkpoint(
                 os.path.join(tmpdir, "hier_real.pt"), device="cpu"
             )
             assert loaded.hierarchy is not None

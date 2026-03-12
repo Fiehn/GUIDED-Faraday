@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 import json
 
@@ -13,6 +12,8 @@ from Models.encoder_decoder_model import *
 from Data.Conditioner import *
 from Models.priors import *
 from Data.normalizer import *
+
+from Visualization.Writer import Writer
 
 from src.Hierarchical.config import HierarchicalConfig
 from src.Hierarchical.core import HierarchicalLatentModule
@@ -210,9 +211,7 @@ class VAE(nn.Module):
 
         if isinstance(x, tuple) or isinstance(x, list):
             # Unpack if dataloader returns (x, meter_id, timestamps)
-            if len(x) == 4:
-                x_data, meter_id, timestamps, month_key = x
-            elif len(x) == 3:
+            if len(x) == 3:
                 x_data, meter_id, timestamps = x
             elif len(x) == 2:
                 x_data, meter_id = x
@@ -305,7 +304,7 @@ class VAE(nn.Module):
         return batch
 
 
-    def save_model(self, save_path=None, model_name="trained_model", device="cpu"):
+    def save_model(self, save_path=None, model_name="trained_model", device="cpu", normalizer=None):
         """
         Save model with complete reconstruction information and validation.
         Stores all parameters needed to recreate the model from scratch.
@@ -329,7 +328,7 @@ class VAE(nn.Module):
                 'model_class': self.__class__.__name__,
                 'model_module': self.__class__.__module__,
                 'input_dim': self.input_dim,
-                'save_format_version': 2,  # Track format for future compatibility
+                'save_format_version': 3,  # Track format for future compatibility (normalizer added in v3)
             }
 
             # === Constructor Arguments ===
@@ -346,6 +345,20 @@ class VAE(nn.Module):
             # === Prior Serialization ===
             prior_state = self._serialize_prior()
 
+            # === Normalizer Serialization ===
+            normalizer_state = None
+            if normalizer is not None and hasattr(normalizer, 'fitted') and normalizer.fitted:
+                normalizer_state = {
+                    'method': normalizer.method,
+                    'epsilon': normalizer.epsilon,
+                    'zero_id': normalizer.zero_id,
+                    'shift': normalizer.shift,
+                    'non_zero_mean': normalizer.non_zero_mean,
+                    'non_zero_std': normalizer.non_zero_std,
+                    'mean': normalizer.mean,
+                    'std': normalizer.std,
+                }
+
             # === Build Checkpoint ===
             checkpoint = {
                 'model_state_dict': self.state_dict(),
@@ -353,6 +366,7 @@ class VAE(nn.Module):
                 'constructor_args': constructor_args,
                 'prior_state': prior_state,
                 'model_kwargs': self.model_kwargs,
+                'normalizer_state': normalizer_state,
             }
 
             # === Validate Before Saving ===
@@ -647,11 +661,32 @@ class VAE(nn.Module):
             except Exception as e:
                 print(f"Error initializing prior {prior_state['prior_type']} with args {init_args}: {e}")
 
+        normalizer = self._load_normalizer_from_checkpoint(checkpoint=checkpoint, device="cpu")
         # Load model state
         self.load_state_dict(checkpoint['model_state_dict'])
         self.to(device)
         self.prior.to(device)
         print(f"Model loaded from {load_path}")
+        return normalizer
+    
+    @staticmethod
+    def _load_normalizer_from_checkpoint(checkpoint, device="cpu"):
+        """Load normalizer state from checkpoint if available."""
+        normalizer_state = checkpoint.get('normalizer_state', None)
+        if normalizer_state is not None:
+            try:
+                normalizer = Normalizer(method=normalizer_state['method'], epsilon=normalizer_state['epsilon'])
+                normalizer.zero_id = normalizer_state['zero_id']
+                normalizer.shift = normalizer_state['shift']
+                normalizer.non_zero_mean = normalizer_state['non_zero_mean']
+                normalizer.non_zero_std = normalizer_state['non_zero_std']
+                normalizer.mean = normalizer_state['mean']
+                normalizer.std = normalizer_state['std']
+                print(f"✓ Normalizer loaded from checkpoint")
+                return normalizer
+            except Exception as e:
+                print(f"Warning: Could not load normalizer from checkpoint: {e}")
+        return None
 
     @classmethod
     def load_from_checkpoint(cls, load_path, device="cpu"):
@@ -749,8 +784,9 @@ class VAE(nn.Module):
         else:
             # Normal loading for other prior types
             model.load_model(load_path, device)
-            
-        return model
+        
+        normalizer = cls._load_normalizer_from_checkpoint(checkpoint=checkpoint, device=device)
+        return model, normalizer
 
     def fit(self,
             trainloader,
@@ -773,11 +809,12 @@ class VAE(nn.Module):
             early_stopping_kwargs = {"patience": 10, "min_delta": 0.001},
             save_epoch_freq = 10,
             writer = None,
-            log_dir = './runs/VAE_training',
+            log_dir = './models/',
             model_name = None, # Optionally specify model name for saving
             save_dir = './models/',
+            normalizer = None,
+            compile_model = False, # Whether to use torch.compile for faster training (PyTorch 2.0+)
             weighted_loss = 0.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
-            month_key=None, # Used in RevIN normalization
             **_):
 
         # === Generate a model tag ===
@@ -786,8 +823,8 @@ class VAE(nn.Module):
             model_tag = f"{self.__class__.__name__}_{self.decoder.__class__.__name__}_{time_stamp}"
         else:
             model_tag = f"{model_name}_{time_stamp}"
-        os.makedirs(save_dir, exist_ok=True)
-        model_save_path = os.path.join(save_dir, model_tag)
+        os.makedirs(log_dir, exist_ok=True)
+        model_save_path = os.path.join(log_dir, model_tag)
 
         # === Take Kwarg Inputs ===
         fit_kwargs = dict(locals())
@@ -797,7 +834,7 @@ class VAE(nn.Module):
         self.model_kwargs['model_tag'] = model_tag
         
         # === Save training configuration ===
-        config_path = os.path.join(save_dir, "training_config.json")
+        config_path = os.path.join(log_dir, "training_config.json")
         config = {
             'model_tag': model_tag,
             'timestamp': time_stamp,
@@ -829,9 +866,9 @@ class VAE(nn.Module):
         # === Initialize TensorBoard writer ===
         if writer is None:
             log_dir_tagged = os.path.join(log_dir, model_tag)
-            writer = SummaryWriter(log_dir=log_dir_tagged)
-            print(f"TensorBoard logging to: {log_dir_tagged}")
-            # Log configuration to TensorBoard
+            writer = Writer(log_dir=log_dir_tagged)
+            print(f"Writer logging to: {log_dir_tagged}")
+            # Log configuration to Writer
             writer.add_text('Config/model_tag', model_tag, 0)
             writer.add_text('Config/hyperparameters', json.dumps(config['hyperparameters'], indent=2), 0)
 
@@ -857,11 +894,22 @@ class VAE(nn.Module):
             )
             print(f"Cyclical beta annealing enabled: {beta_scheduler}")
 
+        # === Optional Model Compilation ===
+        if compile_model and hasattr(torch, 'compile'):
+            compile_mode = 'reduce-overhead' if str(device) != 'cpu' else None
+            self.encoder = torch.compile(self.encoder, mode=compile_mode)
+            self.decoder = torch.compile(self.decoder, mode=compile_mode)
+            if self.hierarchy is not None:
+                self.hierarchy = torch.compile(self.hierarchy, mode=compile_mode)
+            print(f"Model compiled with torch.compile (mode={compile_mode}).")
+
+
         # === Training Loop ===
         self.train()
         global_step = 0
         best_val_loss = float('inf')
         best_epoch = 0
+
         for epoch in range(epochs):
             epoch_train_loss = 0.0
             epoch_train_recon = 0.0
@@ -875,14 +923,16 @@ class VAE(nn.Module):
                 current_beta = beta_scheduler.step() if beta_annealing else beta
 
                 batch = self.move_to_device(batch, device)
-                loss_dict = self.train_core(
-                    batch, 
-                    optim, 
-                    beta=current_beta, 
-                    gradient_clip=gradient_clip, 
-                    gradient_clip_kwargs=gradient_clip_kwargs,
-                    weighted_loss=weighted_loss,
-                )
+
+                with torch.amp.autocast(device_type=str(device).split(':')[0], enabled=(str(device) != 'cpu')):
+                    loss_dict = self.train_core(
+                        batch, 
+                        optim, 
+                        beta=current_beta, 
+                        gradient_clip=gradient_clip, 
+                        gradient_clip_kwargs=gradient_clip_kwargs,
+                        weighted_loss=weighted_loss,
+                    )
                 
                 # Accumulate epoch losses
                 epoch_train_loss += loss_dict["loss"].item()
@@ -891,10 +941,10 @@ class VAE(nn.Module):
                 num_batches += 1
                 
                 # Log training metrics per iteration
-                writer.add_scalar('Train/loss_step', loss_dict["loss"].item(), global_step)
-                writer.add_scalar('Train/recon_loglikelihood_step', loss_dict["recon_loglikelihood"].item(), global_step)
-                writer.add_scalar('Train/kl_divergence_step', loss_dict["kl_divergence"].item(), global_step)
-                writer.add_scalar('Train/beta', current_beta, global_step)
+                writer.add_scalar('train_loss', loss_dict["loss"].item(), global_step)
+                writer.add_scalar('train_recon_loglikelihood', loss_dict["recon_loglikelihood"].item(), global_step)
+                writer.add_scalar('train_kl_divergence', loss_dict["kl_divergence"].item(), global_step)
+                writer.add_scalar('train_beta', current_beta, global_step)
 
             # Compute average epoch losses
             avg_train_loss = epoch_train_loss / num_batches
@@ -902,13 +952,13 @@ class VAE(nn.Module):
             avg_train_kl = epoch_train_kl / num_batches
             
             # Log epoch-level training metrics
-            writer.add_scalar('Train/loss_epoch', avg_train_loss, epoch)
-            writer.add_scalar('Train/recon_loglikelihood_epoch', avg_train_recon, epoch)
-            writer.add_scalar('Train/kl_divergence_epoch', avg_train_kl, epoch)
+            writer.add_scalar('train_loss_epoch', avg_train_loss, epoch)
+            writer.add_scalar('train_recon_loglikelihood_epoch', avg_train_recon, epoch)
+            writer.add_scalar('train_kl_divergence_epoch', avg_train_kl, epoch)
             
             # Log learning rate
             current_lr = optim.param_groups[0]['lr']
-            writer.add_scalar('Train/learning_rate', current_lr, epoch)
+            writer.add_scalar('train_learning_rate', current_lr, epoch)
 
             # === Validation Phase ===
             val_loss_dict = None
@@ -916,30 +966,17 @@ class VAE(nn.Module):
                 val_loss_dict = self.validate(valloader, num_samples=validation_num_samples, device=device)
                 
                 # Log validation metrics
-                writer.add_scalar('Val/Epoch/loss', val_loss_dict["loss"], epoch)
-                writer.add_scalar('Val/Epoch/recon_loglikelihood', val_loss_dict["recon_loglikelihood"], epoch)
-                writer.add_scalar('Val/Epoch/kl_divergence', val_loss_dict["kl_divergence"], epoch)
-                
-                # Log train vs val comparison
-                writer.add_scalars('Comparison/loss', {
-                    'train': avg_train_loss,
-                    'val': val_loss_dict["loss"]
-                }, epoch)
-                writer.add_scalars('Comparison/recon', {
-                    'train': avg_train_recon,
-                    'val': val_loss_dict["recon_loglikelihood"]
-                }, epoch)
-                writer.add_scalars('Comparison/kl', {
-                    'train': avg_train_kl,
-                    'val': val_loss_dict["kl_divergence"]
-                }, epoch)
+                writer.add_scalar('val_loss_epoch', val_loss_dict["loss"], epoch)
+                writer.add_scalar('val_recon_loglikelihood_epoch', val_loss_dict["recon_loglikelihood"], epoch)
+                writer.add_scalar('val_kl_divergence_epoch', val_loss_dict["kl_divergence"], epoch)
+
                 
                  # === Save Best Model ===
                 if val_loss_dict["loss"] < best_val_loss:
                     best_val_loss = val_loss_dict["loss"]
                     best_epoch = epoch
-                    best_model_path = os.path.join(save_dir, f"{model_tag}_best.pt")
-                    self.save_model(save_path=save_dir, model_name=f"{model_tag}_best", device=device)
+                    best_model_path = os.path.join(log_dir_tagged, f"{model_tag}_best.pt")
+                    self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_best", device=device, normalizer=normalizer)
                     print(f"    New best model saved (Val Loss: {best_val_loss:.4f})")
 
                 # Print progress
@@ -974,21 +1011,21 @@ class VAE(nn.Module):
             
             # Save Model Checkpoint
             if (epoch + 1) % save_epoch_freq == 0:
-                checkpoint_path = os.path.join(save_dir, f"{model_tag}_epoch_{epoch+1}.pt")
-                self.save_model(save_path=save_dir, model_name=f"{model_tag}_epoch_{epoch+1}", device=device)
+                checkpoint_path = os.path.join(log_dir_tagged, f"{model_tag}_epoch_{epoch+1}.pt")
+                self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_epoch_{epoch+1}", device=device, normalizer=normalizer)
                 print(f"    Checkpoint saved: epoch_{epoch+1}")
         
         # === Training Complete ===
         print(f"\n{'='*60}")
         print(f"Training complete: {model_tag}")
         print(f"Best model: Epoch {best_epoch+1} with Val Loss: {best_val_loss:.4f}")
-        print(f"Model saved to: {os.path.join(save_dir, model_tag)}")
+        print(f"Model saved to: {os.path.join(log_dir_tagged, model_tag)}")
         print(f"{'='*60}\n")
 
-        final_model_path = os.path.join(save_dir, f"{model_tag}_final.pt")
+        final_model_path = os.path.join(log_dir_tagged, f"{model_tag}_final.pt")
         self.to("cpu")
         self.prior.to("cpu")
-        self.save_model(save_path=save_dir, model_name=f"{model_tag}_final", device="cpu")
+        self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_final", device="cpu", normalizer=normalizer)
 
         # Save training summary
         summary = {
@@ -999,7 +1036,7 @@ class VAE(nn.Module):
             'final_train_loss': avg_train_loss,
             'early_stopped': early_stopping and earlystopping.early_stop,
         }
-        summary_path = os.path.join(save_dir, f"{model_tag}_summary.json")
+        summary_path = os.path.join(log_dir_tagged, f"{model_tag}_summary.json")
         with open(summary_path, 'w') as f:
             json.dump(summary, f, indent=4)
 
@@ -1012,8 +1049,8 @@ class VAE(nn.Module):
         # Close writer
         if writer is not None:
             writer.close()
-            print(f"TensorBoard logs saved to: {log_dir}")
-        return model_tag
+            print(f"Writter logs saved to: {log_dir_tagged}")
+        return model_tag, writer
     
     def get_SigmaMapper(self):
         return self.decoder.get_SigmaMapper()

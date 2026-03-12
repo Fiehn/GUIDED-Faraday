@@ -25,11 +25,22 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
+# Windows -> CUDA build. Linux/macOS -> PyPI CPU build (default).
+# To enable CUDA on Linux, add: { index = "pytorch-cu130", marker = "sys_platform == 'linux'" }
+torch = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
 torchvision = [
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["src/test"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

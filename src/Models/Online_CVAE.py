@@ -16,7 +16,13 @@ class OnlineCVAE(CVAE):
         hierarchy_config: HierarchicalConfig = None,
         **kwargs,
     ):
-        super().__init__(input_dim=input_dim, conditioner=conditioner, latent_dim=latent_dim, distribution_dict=distribution_dict, prior_type=prior_type, **kwargs)
+        super().__init__(input_dim=input_dim, 
+                         conditioner=conditioner, 
+                         latent_dim=latent_dim, 
+                         distribution_dict=distribution_dict, 
+                         prior_type=prior_type, 
+                         hierarchy_config=hierarchy_config, 
+                         **kwargs)
         
         # For smart meter data: L=24 hours, F=1 feature
         # input_dim = L * F = 24
@@ -26,7 +32,7 @@ class OnlineCVAE(CVAE):
         if normalizer is not None:
             self.normalizer = normalizer
         else:
-            self.normalizer = Normalizer('online_log1p')
+            self.normalizer = Normalizer('log1p')
         
         # Convert conditioners to online versions
         self._convert_to_online_conditioners()
@@ -67,7 +73,7 @@ class OnlineCVAE(CVAE):
 
         # 1. Unpack batch
         if len(batch) == 4:
-            x, meter_id, timestamps, month_key = batch
+            x, meter_id, timestamps = batch
         elif len(batch) == 3:
             x, meter_id, timestamps = batch
         elif len(batch) == 2:
@@ -123,12 +129,12 @@ class OnlineCVAE(CVAE):
         return loss_dict
     
     @torch.no_grad()
-    def validate(self, valloader, num_samples=1, beta=1.0, device="cpu", month_key=None):
+    def validate(self, valloader, num_samples=1, beta=1.0, device="cpu"):
         self.eval()
         agg = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
         num_batches = 0
 
-        for x, meter_id, timestamps, _ in valloader:
+        for x, meter_id, timestamps in valloader:
             x = x.to(device)
             
             if x.dim() == 2:

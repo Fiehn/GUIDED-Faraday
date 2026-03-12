@@ -83,7 +83,7 @@ class UserProfiler(LatentDirichletAllocation):
         batch_count = 0
         total_timesteps = 0
 
-        for x, meter_id, timestamps, _ in tqdm(train_loader, desc="Clustering batches"):
+        for x, meter_id, timestamps in tqdm(train_loader, desc="Clustering batches"):
             batch_size, seq_len, num_features = x.shape
             x_daily_patterns = x.cpu().numpy().reshape(batch_size, seq_len * num_features)  # [B, L*F]
 
@@ -106,7 +106,7 @@ class UserProfiler(LatentDirichletAllocation):
         # === Phase 2: Create corpus and fit LDA model ===
         meter_corpus = {} # dict: meter_id -> cluster counts
 
-        for x, meter_id, timestamps, _ in tqdm(train_loader, desc="Creating corpus batches"):
+        for x, meter_id, timestamps in tqdm(train_loader, desc="Creating corpus batches"):
             batch_size, seq_len, num_features = x.shape
             x_batch = x.cpu().numpy().reshape(batch_size, seq_len * num_features)  # [B*T, F]
             meter_id_flat = meter_id.cpu().numpy() 
@@ -332,6 +332,24 @@ class UserProfiler(LatentDirichletAllocation):
                 print(f"Loaded model with {len(self.user_profiles_cache)} cached profiles")
                 print(f"Cluster centers shape: {self.cluster_centers_.shape}")
 
+    def get_conditions_no_data(self, meter_id=None, timestamps=None):
+        """Get conditions without providing data (for generation)."""
+        if meter_id is None:
+            print("Warning: meter_id is None in get_conditions_no_data. Returning random profiles.")
+            return self.get_random_conditions(timestamps.shape[0] if timestamps is not None else 1)
+        
+        # Ensure profiles are available for all requested meter_ids
+        missing_meters = [m for m in meter_id if m not in self.user_profiles_cache]
+        if missing_meters:
+            # For missing meters, we can either compute on-the-fly or return random profiles
+            return self.get_random_conditions(len(meter_id))
+        
+        # Now retrieve profiles for all meter_ids
+        profiles = np.zeros((len(meter_id), self.n_topics), dtype=np.float32)
+        for i, m_id in enumerate(meter_id):
+            profiles[i] = self.user_profiles_cache.get(m_id, np.ones(self.n_topics) / self.n_topics)  # Default to uniform
+        
+        return torch.tensor(profiles, dtype=torch.float32)
 
 class OnlineUserProfiler(UserProfiler):
     """
@@ -510,6 +528,30 @@ class OnlineUserProfiler(UserProfiler):
         """
         self.update_model_incremental(x_batch, meter_ids)
         return self._get_profiles_with_decay(x_batch, meter_ids)
+    
+    def get_random_conditions(self, batch_size):
+        return super().get_random_conditions(batch_size)
+    
+    def get_conditions_no_data(self, meter_id=None, timestamps=None):
+        """Get conditions without providing data (for generation)."""
+        if meter_id is None:
+            print("Warning: meter_id is None in get_conditions_no_data. Returning random profiles.")
+            return self.get_random_conditions(timestamps.shape[0] if timestamps is not None else 1)
+        
+        # Ensure profiles are available for all requested meter_ids
+        missing_meters = [m for m in meter_id if m not in self.user_profiles_cache]
+        if missing_meters:
+            # For missing meters, we can either compute on-the-fly or return random profiles
+            # Here we choose to compute on-the-fly using the most recent cluster centers
+            dummy_x = np.zeros((len(missing_meters), 1, self.cluster_centers_.shape[1] // 24))  # Dummy input
+            self._compute_profiles_for_batch(dummy_x, missing_meters, missing_meters)
+        
+        # Now retrieve profiles for all meter_ids
+        profiles = np.zeros((len(meter_id), self.n_topics), dtype=np.float32)
+        for i, m_id in enumerate(meter_id):
+            profiles[i] = self.user_profiles_cache.get(m_id, np.ones(self.n_topics) / self.n_topics)  # Default to uniform
+        
+        return torch.tensor(profiles, dtype=torch.float32)
 
             
 # === Day of week conditioning ===
@@ -543,6 +585,9 @@ class DayOfWeekConditioner():
         random_days = torch.randint(0,7,(batch_size,))
         dow_onehot = F.one_hot(random_days, num_classes=7).float()
         return dow_onehot
+    
+    def get_conditions_no_data(self, meter_id, timestamps):
+        return self.get_conditions(None, meter_id, timestamps)
 
 class MonthOfYearConditioner():
     def __init__(self):
@@ -569,6 +614,9 @@ class MonthOfYearConditioner():
         random_months = torch.randint(0,12,(batch_size,))
         moy_onehot = F.one_hot(random_months, num_classes=12).float()
         return moy_onehot
+    
+    def get_conditions_no_data(self, meter_id, timestamps):
+        return self.get_conditions(None, meter_id, timestamps)
 
 class HolidayConditioner():
     # https://helligdage-dk.dk/helligdage-2024/
@@ -594,31 +642,84 @@ class HolidayConditioner():
     def get_random_conditions(self, batch_size):
         random_holiday = torch.randint(0,2,(batch_size,1)).float()
         return random_holiday
-
-class SchoolHolidayConditioner():
-    def __init__(self):
+    
+    def get_conditions_no_data(self, meter_id, timestamps):
+        return self.get_conditions(None, meter_id, timestamps)
+    
+class HeatpumpConditioner():
+    def __init__(self, topology_path = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
         self.condition_dim = 1
-        # Define school holiday periods (example for Denmark)
-        # Weeks 7, 27-32, 43
+        self.topology_df = pd.read_csv(topology_path)
+    
+    def get_conditions(self, x, meter_id, timestamps):
+        if isinstance(meter_id, torch.Tensor):
+            meter_id = meter_id.cpu().numpy()
         
-    def get_conditions(self,x, meter_id, timestamps):
-        if isinstance(timestamps, torch.Tensor):
-            device = timestamps.device
-            dates = pd.to_datetime(timestamps.cpu().numpy(), unit='s')
-            is_school_holiday = torch.tensor([1.0 if (d.weekofyear in [7,27,28,29,30,31,32,43]) else 0.0 for d in dates], device=device).unsqueeze(1)
-        else:
-            is_school_holiday = []
-            for ts in timestamps:
-                if isinstance(ts, (int, float)):
-                    ts = pd.Timestamp(ts, unit='s')
-                is_school_holiday.append(1.0 if (ts.weekofyear in [7,27,28,29,30,31,32,43]) else 0.0)
-            is_school_holiday = torch.tensor(is_school_holiday, dtype=torch.float32).unsqueeze(1)
-        return is_school_holiday
+        heatpump_status = []
+        for m_id in meter_id:
+            row = self.topology_df[self.topology_df['meter_number'] == m_id]
+            if not row.empty:
+                val = row['has_heat_pump'].iloc[0]
+                if str(val) == "True":
+                    heatpump_status.append(1.0)
+                else:
+                    heatpump_status.append(0.0)
+            else:
+                heatpump_status.append(0.0)
+
+        return torch.tensor(heatpump_status, dtype=torch.float32).unsqueeze(1)
     
     def get_random_conditions(self, batch_size):
-        random_school_holiday = torch.randint(0,2,(batch_size,1)).float()
-        return random_school_holiday
+        random_status = torch.randint(0,2,(batch_size,1)).float()
+        return random_status
+    
+    def get_conditions_no_data(self, meter_id, timestamps):
+        return self.get_conditions(None, meter_id, timestamps)
+    
+class SolarPanelConditioner():
+    def __init__(self, topology_path = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
+        self.condition_dim = 1
+        self.topology_df = pd.read_csv(topology_path)
+    
+    def get_conditions(self, x, meter_id, timestamps):
+        if isinstance(meter_id, torch.Tensor):
+            meter_id = meter_id.cpu().numpy()
+        
+        solar_status = []
+        for m_id in meter_id:
+            row = self.topology_df[self.topology_df['meter_number'] == m_id]
+            if not row.empty:
+                val = row['has_solar_panel'].iloc[0]
+                if str(val) == "True":
+                    solar_status.append(1.0)
+                else:
+                    solar_status.append(0.0)
+            else:
+                solar_status.append(0.0)
 
+        return torch.tensor(solar_status, dtype=torch.float32).unsqueeze(1)
+    
+    def get_random_conditions(self, batch_size):
+        random_status = torch.randint(0,2,(batch_size,1)).float()
+        return random_status
+    
+    def get_conditions_no_data(self, meter_id, timestamps):
+        return self.get_conditions(None, meter_id, timestamps)
+    
+class ElectricVehicleConditioner():
+    # TODO: WAIT FOR EV data to arrive
+    def __init__(self, topology_path = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
+        self.condition_dim = 0
+
+    def get_conditions(self, x, meter_id, timestamps):
+        return None
+    
+    def get_random_conditions(self, batch_size):
+        return None
+    
+    def get_conditions_no_data(self, meter_id, timestamps):
+        return None
+    
 # =============
 # Conditioner Module - Holds an object that creates and determines type of conditioning to be used in Models
 # ============
@@ -668,6 +769,33 @@ class Conditioner():
         
         # Concatenate all conditions along feature dimension
         return torch.cat(conditions, dim=-1)
+    
+    def get_conditions_no_data(self, meter_id=None, timestamps=None):
+        """
+        Get conditions without providing data (for generation).
+        This is useful for conditions that don't depend on the input data, like user profiles or day of week.
+        """
+        conditions = []
+        target_device = None
+        if isinstance(timestamps, torch.Tensor):
+            target_device = timestamps.device
+        elif isinstance(timestamps, np.ndarray):
+            target_device = torch.device('cpu')
+        
+        for tag in self.tags:
+            cond = self.condition_items[tag].get_conditions_no_data(meter_id=meter_id, timestamps=timestamps)
+            if isinstance(cond, np.ndarray):
+                cond = torch.tensor(cond, dtype=torch.float32)
+            if target_device is not None and cond.device != target_device:
+                cond = cond.to(target_device)
+            conditions.append(cond)
+        
+        if len(conditions) == 0:
+            return None
+        
+        # Concatenate all conditions along feature dimension
+        return torch.cat(conditions, dim=-1)
+            
     
     def get_random_conditions(self, batch_size):
         """

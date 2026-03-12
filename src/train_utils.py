@@ -12,23 +12,31 @@ from src.Data.dataloader import *
 from src.Data.normalizer import *
 import matplotlib.pyplot as plt
 import yaml
-
+from src.Visualization.PlotStyling import PlotStyle
 
 # Set up device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Default global plot style instance
+PLOT_STYLE = PlotStyle()
+
+
 def load_model_and_visualize(
         model_path: str,
+        config_path: str = None,
         data_config: dict = None,
         output_dir: str = "Output/Plots",
         device: str = "auto",
         num_reconstructions: int = 3,
         num_synthetic_samples: int = 5,
         num_samples_per_original: int = 3,
-    normalizer_method: str = "log1p",
+        normalizer_method: str = "log1p",
+        return_components: bool = False,
     ):
     """
     Loads a trained model from disk and generates reconstruction and synthetic data visualizations.
+
+    Args:
     model_path: Path to the saved model file.
     data_config: Configuration dictionary for the data module (if needed).
     output_dir: Directory to save the output plots.
@@ -53,7 +61,7 @@ def load_model_and_visualize(
         # the *modules* (VAE.py / CVAE.py), shadowing the class names.
         
         # The load_from_checkpoint method automatically handles both new and legacy formats
-        model = VAE.load_from_checkpoint(model_path, device)
+        model, normalizer = VAE.load_from_checkpoint(model_path, device)
         
         # Get model tag from checkpoint
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
@@ -167,18 +175,48 @@ def load_model_and_visualize(
     )
     viz_path.update(synth_recreation_path)
     
-    summary_path = _save_model_summary(
-        model=model,
-        model_kwargs=checkpoint.get('model_kwargs', {}),
-        output_dir=output_dir,
-        model_tag=model_tag,
-    )
-    viz_path['model_summary'] = summary_path
+    evalutation_path = _run_evaluation_framework(model, test_loader, normalizer, device, output_dir, model_tag)
+    viz_path.update(evalutation_path)
 
     print("All visualizations saved.")
     print(viz_path)
     return viz_path
 
+def _run_evaluation_framework(model, test_loader, normalizer, device, output_dir, model_tag):
+    # Evaluation framework On last test set (from the last file) after all training is done
+    from src.eval_framework import EvalFramework
+    from src.eval_framework import (
+        ReconstructionMSE, ReconstructionMSE, ReconstructionRMSE, ReconstructionLogLikelihood, FlexibilityDistance,
+        MaximumMeanDiscrepancy, ACFDistribution, VisualEvaluation, ClassicalStatistics #, TSTR
+    )
+
+    # Create evaluator
+    evaluator = EvalFramework(model, test_loader, normalizer, device='cpu')
+    
+    # Register reconstruction metrics
+    evaluator.register_metrics([
+        ReconstructionMSE(),
+        ReconstructionRMSE(),
+        ReconstructionLogLikelihood(),
+        FlexibilityDistance(tau='auto', normalize=True),
+    ])
+    
+    # Register synthetic metrics
+    evaluator.register_metrics([
+        MaximumMeanDiscrepancy(max_samples=2000),
+        ACFDistribution(),
+        ClassicalStatistics(),
+        #TSTR(model, test_loader),
+        VisualEvaluation()
+    ])
+    
+    # Run all metrics (will print reconstruction section, then synthetic section)
+    results = evaluator.evaluate()
+    
+    path = os.path.join(output_dir, f"{model_tag}_evaluation_results.yaml")
+    # Save results
+    evaluator.save_results(path)
+    return {"evaluation_results:": path}
 
 def _load_model_legacy(model_path, data_config, output_dir, device, num_reconstructions, num_synthetic_samples, num_samples_per_original):
     """
@@ -406,14 +444,9 @@ def _load_model_legacy(model_path, data_config, output_dir, device, num_reconstr
         model_tag=model_tag,
     )
     viz_path.update(synth_recreation_path)
-    
-    summary_path = _save_model_summary(
-        model=model,
-        model_kwargs=model_kwargs,
-        output_dir=output_dir,
-        model_tag=model_tag,
-    )
-    viz_path['model_summary'] = summary_path
+
+    evalutation_path = _run_evaluation_framework(model, test_loader, normalizer, device, output_dir, model_tag)
+    viz_path.update(evalutation_path)
 
     print("Legacy model loaded and visualizations saved.")
     print(viz_path)
@@ -505,13 +538,6 @@ def visualize_trained_model(
     )
     viz_path.update(user_profile_path)
 
-    summary_path = _save_model_summary(
-        model=model,
-        model_kwargs={},
-        output_dir=output_dir,
-        model_tag=model_tag,
-    )
-    viz_path['model_summary'] = summary_path
     print("All visualizations saved.")
     print(viz_path)
     return viz_path
@@ -529,7 +555,7 @@ def _visualize_reconstructions(
         is_cvae: bool,
     ) -> str:
     with torch.no_grad():
-        x, meter_id, timestamps, _ = next(iter(test_loader))
+        x, meter_id, timestamps = next(iter(test_loader))
         x = x.to(device)
         timestamps = timestamps.to(device)
         x_original = x  # This is normalized
@@ -572,19 +598,19 @@ def _visualize_reconstructions(
             recon_denorm = recon_reshaped.cpu()
 
     num_to_plot = min(num_samples, B)
-    fig, axes = plt.subplots(num_to_plot, 1, figsize=(14, 5 * num_to_plot))
+    fig, axes = plt.subplots(num_to_plot, 1, figsize=PLOT_STYLE.get_figsize(num_to_plot))
     if num_to_plot == 1:
         axes = [axes]
-    recon_colors = ['#e74c3c', '#3498db', '#2ecc71', '#9b59b6', '#f39c12']
     for i in range(num_to_plot):
         # original
         axes[i].plot(
             x_original_denorm[i, :, 0].numpy() if isinstance(x_original_denorm, torch.Tensor) else x_original_denorm[i, :, 0],
             label="Original",
-            marker="o",
-            color="black",
+            marker=PLOT_STYLE.marker,
+            color=PLOT_STYLE.color_original,
             alpha=0.9,
-            linewidth=2,
+            linewidth=PLOT_STYLE.linewidth,
+            linestyle=PLOT_STYLE.linestyle,
             markersize=4
         )
         # reconstructed samples from decoder distribution
@@ -592,10 +618,11 @@ def _visualize_reconstructions(
             axes[i].plot(
                 recon_denorm[s, i, :, 0].numpy() if isinstance(recon_denorm, torch.Tensor) else recon_denorm[s, i, :, 0],
                 label=f"Recon Sample {s+1}",
-                marker="s",
-                color=recon_colors[s % len(recon_colors)],
+                marker=PLOT_STYLE.marker,
+                color=PLOT_STYLE.get_color(s),
                 alpha=0.6,
-                linewidth=1.5,
+                linewidth=PLOT_STYLE.linewidth,
+                linestyle=PLOT_STYLE.linestyle,
                 markersize=3
             )
         if condition_labels is not None:
@@ -618,6 +645,7 @@ def _visualize_reconstructions(
     print(f"Saved reconstruction comparison to {reconstruction_path}")
     return reconstruction_path
 
+
 def _visualize_synthetic_samples(
         model,
         normalizer,
@@ -629,18 +657,14 @@ def _visualize_synthetic_samples(
     ) -> str:
     with torch.no_grad():
         if is_cvae:
-            # Generate samples for each day of the week
+            # Generate num_samples random conditions (don't constrain to 7 days)
             day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            samples_per_day = max(1, num_samples // 7)
             
-            # Create timestamps for a full week
-            all_synthetic_data = []
-            day_labels = []
-            
-            fake_conditions = model.conditioner.get_random_conditions(batch_size=samples_per_day).to(device)
+            # Get random conditions for num_samples
+            fake_conditions = model.conditioner.get_random_conditions(batch_size=num_samples).to(device)
             
             # Extract day of week from one-hot encoded conditions
-            # Assuming conditions are [batch_size, 7] one-hot vectors
+            # Assuming conditions are [batch_size, 7] one-hot vectors for day-of-week
             if fake_conditions.shape[1] == 7:  # day-of-week only
                 day_indices = fake_conditions.argmax(dim=1).cpu().numpy()
                 day_labels = [day_names[idx] for idx in day_indices]
@@ -650,16 +674,11 @@ def _visualize_synthetic_samples(
                 day_indices = dow_part.argmax(dim=1).cpu().numpy()
                 day_labels = [day_names[idx] for idx in day_indices]
 
-
-            # Sample from model
+            # Sample from model with conditions
             samples = model.sample(fake_conditions, num_prior_samples=1, num_x_samples=1, device=device)
-            synthetic_flat = samples[0, 0]  # [samples_per_day, input_dim]
-                
-            all_synthetic_data.append(synthetic_flat)
+            synthetic_flat = samples[0, 0]  # [num_samples, input_dim]
             
-            # Concatenate all samples
-            synthetic_flat = torch.cat(all_synthetic_data, dim=0)  # [total_samples, input_dim]
-            total_samples = synthetic_flat.shape[0]
+            total_samples = num_samples
             
             # Reshape to [num_samples, length, features]
             # input_dim = length * features, so we need to figure out the split
@@ -686,33 +705,30 @@ def _visualize_synthetic_samples(
         else:
             synthetic_data_denorm = synthetic_data.cpu()
     
-    # Plot
+    # Plot all samples on a single plot with different colors
     num_to_plot = synthetic_data.shape[0]
-    fig, axes = plt.subplots(num_to_plot, 1, figsize=(14, 3 * num_to_plot))
-    if num_to_plot == 1:
-        axes = [axes]
+    fig, ax = plt.subplots(figsize=PLOT_STYLE.figsize)
     
     for i in range(num_to_plot):
-        axes[i].plot(
+        label = f"Sample {i+1}"
+        if day_labels[i] is not None:
+            label += f" ({day_labels[i]})"
+        
+        ax.plot(
             synthetic_data_denorm[i, :, 0].numpy() if isinstance(synthetic_data_denorm, torch.Tensor) else synthetic_data_denorm[i, :, 0],
-            label="Synthetic Sample",
-            marker="o",
-            color="#8e44ad",
+            label=label,
+            marker=PLOT_STYLE.marker,
+            color=PLOT_STYLE.get_color(i),
             alpha=0.8,
-            linewidth=2,
+            linewidth=PLOT_STYLE.linewidth,
+            linestyle=PLOT_STYLE.linestyle,
             markersize=4
         )
-        
-        if day_labels[i] is not None:
-            title = f"Synthetic Sample {i+1} | Condition: {day_labels[i]}"
-        else:
-            title = f"Synthetic Sample {i+1}"
-        
-        axes[i].set_title(title, fontsize=11, fontweight='bold')
-        axes[i].set_xlabel("Hour", fontsize=9)
-        axes[i].set_ylabel("Energy (kWh)", fontsize=9)
-        axes[i].legend(loc="upper right", fontsize=9)
-        axes[i].grid(True, alpha=0.3)
+    
+    ax.set_xlabel("Hour", fontsize=11)
+    ax.set_ylabel("Energy (kWh)", fontsize=11)
+    ax.legend(loc="upper right", fontsize=10)
+    ax.grid(True, alpha=0.3)
     
     fig_title = f"{'CVAE' if is_cvae else 'VAE'} Synthetic Samples"
     if is_cvae:
@@ -725,6 +741,7 @@ def _visualize_synthetic_samples(
     plt.close(fig)
     print(f"Saved synthetic samples to {synthetic_path}")
     return synthetic_path
+
 
 def _visualize_sigma_mapper(
         model,
@@ -739,7 +756,7 @@ def _visualize_sigma_mapper(
         print("Model does not have a Sigma Mapper, skipping visualization.")
         return {}
     sigma_mapper = sigma_mapper.cpu().detach().numpy()
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=PLOT_STYLE.figsize)
     cax = ax.matshow(sigma_mapper, cmap='RdBu_r', vmin=-np.abs(sigma_mapper).max(), vmax=np.abs(sigma_mapper).max())
     fig.colorbar(cax)
     ax.set_title("Sigma Mapper Matrix")
@@ -749,6 +766,7 @@ def _visualize_sigma_mapper(
     print(f"Saved Sigma Mapper visualization to {sigma_mapper_path}")
     return {"sigma_mapper": sigma_mapper_path}
 
+
 def _visualize_latent_space(model, test_loader, device, output_dir, model_tag):
     """Visualize latent space via PCA/t-SNE."""
     from sklearn.decomposition import PCA
@@ -757,7 +775,7 @@ def _visualize_latent_space(model, test_loader, device, output_dir, model_tag):
     labels = []
     
     with torch.no_grad():
-        for x, meter_id, timestamps, _ in test_loader:
+        for x, meter_id, timestamps in test_loader:
             x = x.to(device)
             x_flat = x.reshape(x.shape[0], -1)
             
@@ -785,7 +803,7 @@ def _visualize_latent_space(model, test_loader, device, output_dir, model_tag):
     latents_2d = pca.fit_transform(latents)
     
     # Plot
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=PLOT_STYLE.figsize)
     day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     colors = plt.cm.tab10(np.linspace(0, 1, 7))
     
@@ -797,7 +815,7 @@ def _visualize_latent_space(model, test_loader, device, output_dir, model_tag):
             c=[colors[day_idx]],
             label=day_names[day_idx],
             alpha=0.6,
-            s=20
+            s=100
         )
     
     ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})', fontsize=11)
@@ -813,6 +831,7 @@ def _visualize_latent_space(model, test_loader, device, output_dir, model_tag):
     plt.close(fig)
     
     return {'latent_space': save_path}
+
 
 def _visualize_synthetic_recreations(model, test_loader, normalizer, device, output_dir, model_tag):
     """
@@ -838,7 +857,7 @@ def _visualize_synthetic_recreations(model, test_loader, normalizer, device, out
     
     with torch.no_grad():
         # Get a batch from test loader
-        x, meter_id, timestamps, _ = next(iter(test_loader))
+        x, meter_id, timestamps = next(iter(test_loader))
         x = x.to(device)
         timestamps = timestamps.to(device)
         
@@ -896,12 +915,13 @@ def _visualize_synthetic_recreations(model, test_loader, normalizer, device, out
             condition_labels.append(f"Meter {m_id} | {day_name} ({date_str})")
     
     # Create figure
-    fig, axes = plt.subplots(num_originals, 1, figsize=(14, 5 * num_originals))
+    fig, axes = plt.subplots(num_originals, 1, figsize=PLOT_STYLE.get_figsize(num_originals))
     if num_originals == 1:
         axes = [axes]
     
     hours = np.arange(L)
-    synthetic_colors = plt.cm.Blues(np.linspace(0.3, 0.7, num_synthetic_per))
+    # Use PALETTE_COLORS for synthetic samples with slight alpha variation
+    synthetic_alpha_values = np.linspace(0.3, 0.7, num_synthetic_per)
     
     for i in range(num_originals):
         ax = axes[i]
@@ -913,9 +933,10 @@ def _visualize_synthetic_recreations(model, test_loader, normalizer, device, out
                 synth_data = synth_data.numpy()
             ax.plot(
                 hours, synth_data,
-                color=synthetic_colors[s],
-                alpha=0.4,
-                linewidth=1,
+                color=PLOT_STYLE.get_color(s),
+                alpha=synthetic_alpha_values[s],
+                linewidth=PLOT_STYLE.linewidth,
+                linestyle=PLOT_STYLE.linestyle,
                 label='Synthetic' if s == 0 else None
             )
         
@@ -925,13 +946,13 @@ def _visualize_synthetic_recreations(model, test_loader, normalizer, device, out
             mean_data = mean_data.numpy()
         ax.plot(
             hours, mean_data,
-            color='#e74c3c',
-            linewidth=2.5,
+            color=PLOT_STYLE.get_color(0),
+            linewidth=PLOT_STYLE.linewidth,
             linestyle='--',
             label='Mean Synthetic',
-            marker='s',
+            marker=PLOT_STYLE.marker,
             markersize=4,
-            alpha=0.9
+            alpha=0.95
         )
         
         # Plot original (solid, on top)
@@ -940,10 +961,10 @@ def _visualize_synthetic_recreations(model, test_loader, normalizer, device, out
             orig_data = orig_data.numpy()
         ax.plot(
             hours, orig_data,
-            color='black',
-            linewidth=2.5,
+            color=PLOT_STYLE.color_original,
+            linewidth=PLOT_STYLE.linewidth,
             label='Original',
-            marker='o',
+            marker=PLOT_STYLE.marker,
             markersize=5,
             alpha=1.0
         )
@@ -979,12 +1000,13 @@ def _visualize_synthetic_recreations(model, test_loader, normalizer, device, out
     return {"synthetic_recreations": save_path}
     
 
-
 def _visualize_user_dictionary(model, test_loader, device, output_dir, model_tag):
     """Plot the cached user profiles in the UserProfiler conditioner."""
     if not hasattr(model, 'conditioner'):
+        print("Model does not have a conditioner, skipping user profiles visualization.")
         return {}
     if "user_profile" not in model.conditioner.get_condition_tags():
+        print("Model conditioner does not include 'user_profile', skipping user profiles visualization.")
         return {}
     # Access the UserProfiler from condition_items dictionary
     user_profiler: UserProfiler = model.conditioner.condition_items["user_profile"]
@@ -998,8 +1020,8 @@ def _visualize_user_dictionary(model, test_loader, device, output_dir, model_tag
     profiles = np.array([user_profiler.user_profiles_cache[m_id] for m_id in meter_ids])
     
     # [num_users, n_topics]
-    fig, ax = plt.subplots(figsize=(12, 8))
-    cax = ax.matshow(profiles, cmap='plasma', aspect='auto')
+    fig, ax = plt.subplots(figsize=PLOT_STYLE.figsize)
+    cax = ax.matshow(profiles, cmap='RdBu_r', aspect='auto')
     fig.colorbar(cax, label='Topic Probability')
     ax.set_title(f"User Profiles (Topic Distributions) - {len(meter_ids)} users", fontsize=13, fontweight='bold')
     ax.set_xlabel("Topic Index", fontsize=11)
@@ -1016,6 +1038,297 @@ def _visualize_user_dictionary(model, test_loader, device, output_dir, model_tag
     plt.close(fig)
     print(f"Saved User Profiles visualization to {user_dict_path}")
     return {"user_profiles": user_dict_path}
+
+
+def _visualize_training_curves(
+        metrics_history: dict,
+        output_dir: str,
+        model_tag: str,
+) -> dict:
+    """
+    Plot training curves from a metrics history dictionary.
+    Designed to be called during or after training.
+    
+    Args:
+        metrics_history: Dict with structure:
+            {
+                'train': {
+                    'loss': [val1, val2, ...],
+                    'recon_loss': [val1, val2, ...],
+                    'kl_loss': [val1, val2, ...],
+                },
+                'val': {
+                    'loss': [val1, val2, ...],
+                    'recon_loss': [val1, val2, ...],
+                    'kl_loss': [val1, val2, ...],
+                }
+            }
+        output_dir: Directory to save plots
+        model_tag: Tag for filename
+    
+    Returns:
+        Dict with paths to saved plots
+    """
+    if not metrics_history or not any(metrics_history.values()):
+        print("No metrics to plot")
+        return {}
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Group metrics by type
+    metric_groups = {
+        'Total Loss': ['loss', 'total_loss'],
+        'Reconstruction Loss': ['recon', 'reconstruction'],
+        'KL Divergence': ['kl', 'kl_loss', 'divergence'],
+    }
+    
+    saved_paths = {}
+    
+    for group_name, keywords in metric_groups.items():
+        # Find matching metrics from train/val
+        plot_data = {}
+        
+        for split in ['train', 'val']:
+            if split not in metrics_history:
+                continue
+            
+            for metric_name, values in metrics_history[split].items():
+                if any(kw in metric_name.lower() for kw in keywords):
+                    if len(values) > 0:
+                        plot_data[f'{split}_{metric_name}'] = values
+        
+        if not plot_data:
+            continue
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=PLOT_STYLE.figsize)
+        
+        epochs = list(range(1, len(next(iter(plot_data.values()))) + 1))
+        
+        # Plot each metric
+        for i, (metric_label, values) in enumerate(plot_data.items()):
+            ax.plot(epochs, values,
+                   color=PLOT_STYLE.get_color(i),
+                   linewidth=PLOT_STYLE.linewidth,
+                   linestyle='-' if 'train' in metric_label else '--',
+                   marker=PLOT_STYLE.marker,
+                   markersize=3,
+                   label=metric_label,
+                   alpha=0.9)
+        
+        ax.set_xlabel('Epoch', fontsize=11)
+        ax.set_ylabel(group_name, fontsize=11)
+        ax.set_title(f'Training Curves: {group_name}', fontsize=13, fontweight='bold')
+        ax.legend(loc='best', fontsize=9)
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Save
+        safe_name = group_name.lower().replace(' ', '_')
+        save_path = os.path.join(output_dir, f"{model_tag}_training_{safe_name}.png")
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Saved {group_name} training curves to {save_path}")
+        saved_paths[safe_name] = save_path
+    
+    return saved_paths
+
+
+def _visualize_prior_vs_posterior(
+        model,
+        test_loader,
+        device,
+        output_dir: str,
+        model_tag: str,
+        num_samples: int = 1000,
+    ) -> dict:
+    """
+    Compare prior and posterior distributions in 2D (using PCA).
+    Shows if the posterior q(z|x) matches the prior p(z).
+    
+    Args:
+        model: Trained VAE/CVAE model
+        test_loader: DataLoader for test data
+        device: Device to run on
+        output_dir: Directory to save plot
+        model_tag: Tag for filename
+        num_samples: Number of samples to collect
+    
+    Returns:
+        Dict with path to saved plot
+    """
+    from sklearn.decomposition import PCA
+    
+    model.eval()
+    
+    # Collect posterior samples (encode real data)
+    posterior_samples = []
+    with torch.no_grad():
+        for x, meter_id, timestamps in test_loader:
+            if len(posterior_samples) >= num_samples:
+                break
+            
+            x = x.to(device)
+            x_flat = x.reshape(x.shape[0], -1)
+            
+            # Get conditions if CVAE
+            if hasattr(model, 'conditioner'):
+                c = model.conditioner.get_conditions(x, meter_id, timestamps).to(device)
+                enc_in = torch.cat([x_flat, c], dim=-1)
+            else:
+                enc_in = x_flat
+            
+            # Encode to get posterior
+            q_params = model.encoder(enc_in)
+            z = model.encoder.reparameterize(q_params, num_samples=1).squeeze(0)
+            
+            posterior_samples.append(z.cpu().numpy())
+    
+    posterior_samples = np.concatenate(posterior_samples, axis=0)[:num_samples]
+    
+    # Sample from prior
+    with torch.no_grad():
+        prior_samples = model.prior(num_samples, device=device).cpu().numpy()
+    
+    # Reduce to 2D with PCA
+    pca = PCA(n_components=2)
+    all_samples = np.vstack([posterior_samples, prior_samples])
+    all_samples_2d = pca.fit_transform(all_samples)
+    
+    posterior_2d = all_samples_2d[:len(posterior_samples)]
+    prior_2d = all_samples_2d[len(posterior_samples):]
+    
+    # Plot
+    fig, ax = plt.subplots(figsize=PLOT_STYLE.figsize)
+    
+    ax.scatter(prior_2d[:, 0], prior_2d[:, 1],
+              c=PLOT_STYLE.get_color(0), alpha=0.3, s=20, label='Prior p(z)', marker='o')
+    ax.scatter(posterior_2d[:, 0], posterior_2d[:, 1],
+              c=PLOT_STYLE.get_color(2), alpha=0.3, s=20, label='Posterior q(z|x)', marker='^')
+    
+    ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})', fontsize=11)
+    ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})', fontsize=11)
+    ax.set_title('Prior vs Posterior Distribution (PCA)', fontsize=13, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    save_path = os.path.join(output_dir, f"{model_tag}_prior_vs_posterior.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved prior vs posterior comparison to {save_path}")
+    
+    return {'prior_vs_posterior': save_path}
+
+
+def _visualize_user_clustering_quality(
+        model,
+        test_loader,
+        device,
+        output_dir: str,
+        model_tag: str,
+        method: str = 'tsne',
+    ) -> dict:
+    """
+    Visualize user profile clustering quality using t-SNE or UMAP.
+    Shows how well the user profiles separate into clusters.
+    
+    Args:
+        model: Trained CVAE model with UserProfiler
+        test_loader: DataLoader (not used, just for consistency)
+        device: Device
+        output_dir: Directory to save plot
+        model_tag: Tag for filename
+        method: 'tsne' or 'umap'
+    
+    Returns:
+        Dict with path to saved plot
+    """
+    if not hasattr(model, 'conditioner'):
+        print("Model does not have a conditioner, skipping user clustering visualization.")
+        return {}
+    if "user_profile" not in model.conditioner.get_condition_tags():
+        print("Model conditioner does not include 'user_profile', skipping user clustering visualization.")
+        return {}
+    
+    # Get user profiler
+    user_profiler: UserProfiler = model.conditioner.condition_items["user_profile"]
+    
+    if not user_profiler.user_profiles_cache:
+        print("No user profiles cached, skipping visualization.")
+        return {}
+    
+    # Convert cache to matrix
+    meter_ids = sorted(user_profiler.user_profiles_cache.keys())
+    profiles = np.array([user_profiler.user_profiles_cache[m_id] for m_id in meter_ids])
+    
+    # Get cluster assignments (topic with highest probability)
+    cluster_labels = np.argmax(profiles, axis=1)
+    
+    # Dimensionality reduction
+    if method.lower() == 'tsne':
+        from sklearn.manifold import TSNE
+        reducer = TSNE(n_components=2, random_state=42, perplexity=min(30, len(profiles)-1))
+        profiles_2d = reducer.fit_transform(profiles)
+        method_name = 't-SNE'
+    elif method.lower() == 'umap':
+        try:
+            import umap
+            reducer = umap.UMAP(n_components=2, random_state=42)
+            profiles_2d = reducer.fit_transform(profiles)
+            method_name = 'UMAP'
+        except ImportError:
+            print("UMAP not installed, falling back to t-SNE. Install with: pip install umap-learn")
+            from sklearn.manifold import TSNE
+            reducer = TSNE(n_components=2, random_state=42, perplexity=min(30, len(profiles)-1))
+            profiles_2d = reducer.fit_transform(profiles)
+            method_name = 't-SNE'
+    else:
+        from sklearn.manifold import TSNE
+        reducer = TSNE(n_components=2, random_state=42, perplexity=min(30, len(profiles)-1))
+        profiles_2d = reducer.fit_transform(profiles)
+        method_name = 't-SNE'
+    
+    # Calculate silhouette score
+    from sklearn.metrics import silhouette_score
+    if len(np.unique(cluster_labels)) > 1:
+        silhouette = silhouette_score(profiles, cluster_labels)
+    else:
+        silhouette = 0.0
+    
+    # Plot
+    fig, ax = plt.subplots(figsize=PLOT_STYLE.figsize)
+    
+    n_clusters = len(np.unique(cluster_labels))
+    colors = plt.cm.tab10(np.linspace(0, 1, min(n_clusters, 10)))
+    
+    for cluster_id in range(n_clusters):
+        mask = cluster_labels == cluster_id
+        ax.scatter(profiles_2d[mask, 0], profiles_2d[mask, 1],
+                  c=[colors[cluster_id % 10]], 
+                  label=f'Cluster {cluster_id}',
+                  alpha=0.6, s=50, edgecolors='black', linewidth=0.5)
+    
+    ax.set_xlabel(f'{method_name} Component 1', fontsize=11)
+    ax.set_ylabel(f'{method_name} Component 2', fontsize=11)
+    ax.set_title(f'User Profile Clustering ({method_name}) | Silhouette Score: {silhouette:.3f}',
+                fontsize=13, fontweight='bold')
+    
+    # Only show legend if not too many clusters
+    if n_clusters <= 10:
+        ax.legend(loc='best', fontsize=9, ncol=2)
+    
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    save_path = os.path.join(output_dir, f"{model_tag}_user_clustering_{method.lower()}.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved user clustering visualization to {save_path}")
+    
+    return {'user_clustering': save_path}
 
 
 def _save_model_summary(
@@ -1055,6 +1368,130 @@ def _save_model_summary(
         json.dump(summary, f, indent=4)
     print(f"Saved model summary to {summary_path}")
     return summary_path
+
+
+def visualize_trained_model(
+        model,
+        test_loader,
+        normalizer,
+        device,
+        output_dir: str,
+        num_reconstructions: int = 4,
+        num_synthetic_samples: int = 15,
+        num_samples_per_original: int = 15,
+    ) -> dict:
+    """
+    Generates reconstruction and synthetic data visualizations for a trained model.
+    model: Trained model instance.
+    test_loader: DataLoader for the test dataset.
+    normalizer: Normalizer instance used for data normalization.
+    device: Device to run the model on.
+    output_dir: Directory to save the output plots.
+    num_reconstructions: Number of reconstruction samples per original data point.
+    num_synthetic_samples: Number of synthetic samples to generate.
+    num_samples_per_original: Number of reconstruction samples per original data point.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    is_cvae = hasattr(model, 'condition_dim') and model.condition_dim > 0
+    viz_path = {}
+    
+    recon_path = _visualize_reconstructions(
+        model=model,
+        test_loader=test_loader,
+        normalizer=normalizer,
+        device=device,
+        num_samples=num_reconstructions,
+        num_recon_per=num_samples_per_original,
+        output_dir=output_dir,
+        model_tag="01",
+        is_cvae=is_cvae,
+    )
+    viz_path['reconstructions'] = recon_path
+
+    synth_path = _visualize_synthetic_samples(
+        model=model,
+        normalizer=normalizer,
+        device=device,
+        num_samples=num_synthetic_samples,
+        output_dir=output_dir,
+        model_tag="02",
+        is_cvae=is_cvae,
+    )
+    viz_path['synthetic_samples'] = synth_path
+
+    if hasattr(model, 'get_SigmaMapper'):
+        sigma_mapper_path = _visualize_sigma_mapper(
+            model=model,
+            test_loader=test_loader,
+            device=device,
+            output_dir=output_dir,
+            model_tag="03",
+        )
+        viz_path.update(sigma_mapper_path)
+    latent_space_path = _visualize_latent_space(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        output_dir=output_dir,
+        model_tag="04",
+    )
+    viz_path.update(latent_space_path)
+
+    synth_recreation_path = _visualize_synthetic_recreations(
+        model=model,
+        test_loader=test_loader,
+        normalizer=normalizer,
+        device=device,
+        output_dir=output_dir,
+        model_tag="05",
+    )
+    viz_path.update(synth_recreation_path)
+
+    user_profile_path = _visualize_user_dictionary(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        output_dir=output_dir,
+        model_tag="06",
+    )
+    viz_path.update(user_profile_path)
+
+    prior_vs_posterior = _visualize_prior_vs_posterior(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        output_dir=output_dir,
+        model_tag="07",
+    )
+    viz_path.update(prior_vs_posterior)
+
+    user_clustering_quality = _visualize_user_clustering_quality(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        output_dir=output_dir,
+        model_tag="08",
+    )
+    viz_path.update(user_clustering_quality)
+
+
+    trianing_curve = _visualize_training_curves(
+        metrics_history=getattr(model, 'metrics_history', {}),
+        output_dir=output_dir,
+        model_tag="09",
+    )
+    viz_path.update(trianing_curve)
+
+    summary_path = _save_model_summary(
+        model=model,
+        model_kwargs={},
+        output_dir=output_dir,
+        model_tag="00_model_summary",
+    )
+    viz_path['model_summary'] = summary_path
+    print("All visualizations saved.")
+    print(viz_path)
+    return viz_path
 
 
 if __name__ == "__main__":

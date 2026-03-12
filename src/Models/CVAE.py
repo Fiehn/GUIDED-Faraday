@@ -115,7 +115,7 @@ class CVAE(VAE):
     def train_core(self, batch, optim, beta=1.0,weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
         self.train()
         if len(batch) == 4:
-            x, meter_id, timestamps, month_key = batch
+            x, meter_id, timestamps = batch
         elif len(batch) == 3:
             x, meter_id, timestamps = batch
         elif len(batch) == 2:
@@ -150,7 +150,7 @@ class CVAE(VAE):
         agg = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
         num_batches = 0
 
-        for x, meter_id, timestamps, _ in valloader:
+        for x, meter_id, timestamps in valloader:
             # Keep original 3D shape for conditioning
             x_3d = x.to(device)
             
