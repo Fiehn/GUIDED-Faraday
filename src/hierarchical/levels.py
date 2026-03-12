@@ -4,7 +4,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+ 
 from .registry import StrategyRegistry
 
 class LatentLevelBase(ABC,nn.Module):

@@ -1,11 +1,11 @@
-from .PlotStyling import PlotStyle
-from .Writer import Writer
+from .plot_styling import PlotStyle
+from .writer import Writer
 import matplotlib.pyplot as plt
 import torch
 import pandas as pd
 import os
 import numpy as np
-
+ 
 class Visualizer:
     """Class for visualizing training results and model performance."""
     

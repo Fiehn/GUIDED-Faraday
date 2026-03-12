@@ -3,22 +3,22 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
-from Models.encoder_decoder_model import *
-from Data.Conditioner import *
-from src.Models.CVAE import *
-from src.Models.Online_CVAE import *
-from src.Models.VAE import *
-from Data.dataloader import *
-from Data.normalizer import *
+from models.encoder_decoder_model import *
+from data.conditioner import *
+from src.models.cvae import *
+from src.models.online_cvae import *
+from src.models.vae import *
+from data.dataloader import *
+from data.normalizer import *
 from torch.utils.tensorboard import SummaryWriter
 from src.train_utils import *
 from src.test.run_validation import run_validation
 
-from src.Hierarchical.aggregation import *
-from src.Hierarchical.config import *
-
-from src.Visualization.Visualizer import Visualizer
-from src.Visualization.Writer import Writer
+from src.hierarchical.aggregation import *
+from src.hierarchical.config import *
+ 
+from src.visualization.visualizer import Visualizer
+from src.visualization.writer import Writer
 
 from src.eval_framework import EvalFramework
 from src.eval_framework import (

@@ -19,7 +19,7 @@ import tempfile
 import pytest
 import torch
 import torch.nn as nn
-import numpy as np
+import numpy as np 
 
 # ------------------------------------------------------------------
 # Path setup (same pattern as the rest of the repo)
@@ -29,22 +29,22 @@ parent_dir = os.path.dirname(current_dir)
 grandparent_dir = os.path.dirname(parent_dir)
 sys.path.insert(0, grandparent_dir)
 
-from src.Hierarchical.registry import StrategyRegistry
-from src.Hierarchical.config import LevelConfig, HierarchicalConfig
-from src.Hierarchical.levels import (
+from src.hierarchical.registry import StrategyRegistry
+from src.hierarchical.config import LevelConfig, HierarchicalConfig
+from src.hierarchical.levels import (
     LinearLevel,
     StochasticLevel,
     VQLevel,
     InformationBottleneckLevel,
 )
-from src.Hierarchical.aggregation import (
+from src.hierarchical.aggregation import (
     ConcatAggregation,
     SumAggregation,
     GatedAggregation,
     AttentionAggregation,
     _AGGREGATION_STRATEGIES,
 )
-from src.Hierarchical.core import HierarchicalLatentModule
+from src.hierarchical.core import HierarchicalLatentModule
 
 # ------------------------------------------------------------------
 # Fixtures

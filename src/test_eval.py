@@ -1,8 +1,8 @@
 import torch
 from eval_framework import FlexibilityDistance # for reconstruction evaluation
 from eval_framework import VisualEvaluation, ACFDistribution, ClassicalStatistics, TSTR, MaximumMeanDiscrepancy, AggregatedProfiles, PerConditionEval # for distributional evaluation
-from src.Models.VAE import VAE
-from src.Models.CVAE import CVAE
+from src.models.vae import VAE
+from src.models.cvae import CVAE
 import glob
 import os
 import sys
@@ -10,10 +10,10 @@ import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
 from config_loader import load_config
-from src.Data.dataloader import load_meter_to_feeder_mapping, map_meter_ids_to_feeder_ids
+from src.data.dataloader import load_meter_to_feeder_mapping, map_meter_ids_to_feeder_ids
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'test'))
 from src.test.create_test_data import create_test_dataset
-
+ 
 print("="*70)
 print("EVALUATION FRAMEWORK")
 print("="*70)

@@ -17,11 +17,11 @@ parent_dir = os.path.dirname(current_dir)
 grandparent_dir = os.path.dirname(parent_dir)
 sys.path.insert(0, grandparent_dir)
 
-from src.Data.dataloader import SmartMeterDataModule, WindowSpec
-from src.Data.normalizer import Normalizer
-from src.Data.Conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
-from src.Models.CVAE import CVAE
-from src.Models.VAE import VAE
+from src.data.dataloader import SmartMeterDataModule, WindowSpec
+from src.data.normalizer import Normalizer
+from src.data.conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
+from src.models.cvae import CVAE
+from src.models.vae import VAE
 
 # ------------------------------------------------------------------
 # Constants

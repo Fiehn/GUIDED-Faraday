@@ -22,7 +22,7 @@ import os, sys, pytest
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(current_dir)))
-
+ 
 from src.test.validate_model import ModelValidator
 from src.test.conftest import skip_no_data
 
