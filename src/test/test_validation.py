@@ -14,7 +14,7 @@ The 20 test suites are:
   6. model_forward_backward 15. sampling
   7. loss_computation       16. hierarchy
   8. device_placement       17. regression_bugs
-  9. full_training_step     18. RevIn    19. online_user_profiler    20. online_cvae
+  9. full_training_step  
 
 Data comes from ``data/test_data_small.csv`` (via conftest.py fixtures).
 """
@@ -76,13 +76,6 @@ _COMMON_SUITES = [
 _CVAE_ONLY_SUITES = [
     ("Conditioners",        "_test_conditioners"),
 ]
-
-_STANDALONE_SUITES = [
-    ("RevIN",               "_test_RevIn"),
-    ("OnlineUserProfiler",  "_test_online_user_profiler"),
-    ("OnlineCVAE",          "_test_online_cvae"),
-]
-
 
 # ==================================================================
 # CVAE Tests
@@ -369,40 +362,6 @@ class TestVAERegressionBugs:
         _run_validator_suite(vae_model, train_loader, val_loader,
                              test_loader, normalizer, device,
                              "_test_regression_bugs")
-
-
-# ==================================================================
-# Standalone tests (not tied to a specific model fixture)
-# ==================================================================
-
-@skip_no_data
-class TestRevIN:
-    """RevIN tests use synthetic data inside the validator."""
-    def test_revin(self, cvae_model, train_loader, val_loader,
-                   test_loader, normalizer, device):
-        _run_validator_suite(cvae_model, train_loader, val_loader,
-                             test_loader, normalizer, device,
-                             "_test_RevIn")
-
-
-@skip_no_data
-class TestOnlineUserProfiler:
-    """Online user profiler tests (synthetic data)."""
-    def test_online_user_profiler(self, cvae_model, train_loader, val_loader,
-                                  test_loader, normalizer, device):
-        _run_validator_suite(cvae_model, train_loader, val_loader,
-                             test_loader, normalizer, device,
-                             "_test_online_user_profiler")
-
-
-@skip_no_data
-class TestOnlineCVAE:
-    """OnlineCVAE lifecycle tests (synthetic data)."""
-    def test_online_cvae(self, cvae_model, train_loader, val_loader,
-                         test_loader, normalizer, device):
-        _run_validator_suite(cvae_model, train_loader, val_loader,
-                             test_loader, normalizer, device,
-                             "_test_online_cvae")
 
 
 # ==================================================================

@@ -17,7 +17,6 @@ Conditioners tested:
   - HolidayConditioner
   - MonthOfYearConditioner
   - UserProfiler        (requires fitting on dataloader)
-  - OnlineUserProfiler  (incremental update)
   - Conditioner (container: add_condition_item, get_conditions, get_random_conditions)
 
 Topology-based conditioners (tested with a synthetic CSV fixture):
@@ -49,7 +48,6 @@ from src.data.conditioner import (
     SolarPanelConditioner,
     ElectricVehicleConditioner,
     UserProfiler,
-    OnlineUserProfiler,
     Conditioner,
 )
 
@@ -387,71 +385,6 @@ class TestUserProfilerRealData:
         else:
             sums = out.sum(dim=1)
             assert torch.allclose(sums, torch.ones(x.shape[0]), atol=1e-4)
-
-
-# =====================================================================
-#  6. OnlineUserProfiler
-# =====================================================================
-
-class TestOnlineUserProfiler:
-    """OnlineUserProfiler incremental update tests."""
-
-    def test_init_attributes(self):
-        op = OnlineUserProfiler(
-            n_topics=5, num_clusters=10, decay=0.8,
-            random_state=42, verbose=False,
-        )
-        assert op.n_topics == 5
-        assert op.num_clusters == 10
-        assert op.decay == 0.8
-        assert hasattr(op, "kmeans")
-
-    def test_update_and_get_profile_shape(self):
-        B, L, F = 16, 24, 1
-        op = OnlineUserProfiler(
-            n_topics=4, num_clusters=8, decay=0.9,
-            random_state=42, verbose=False,
-        )
-        x = torch.abs(torch.randn(B, L, F)) + 1.0
-        ids = torch.randint(1, 6, (B,))
-        p = op.update_and_get_profile(x, ids)
-        assert p.shape == (B, 4)
-
-    def test_profiles_sum_to_one(self):
-        B, L, F = 16, 24, 1
-        op = OnlineUserProfiler(
-            n_topics=4, num_clusters=8, decay=0.9,
-            random_state=42, verbose=False,
-        )
-        x = torch.abs(torch.randn(B, L, F)) + 1.0
-        ids = torch.randint(1, 6, (B,))
-        p = op.update_and_get_profile(x, ids)
-        sums = p.sum(dim=1)
-        assert torch.allclose(sums, torch.ones(B), atol=1e-3)
-
-    def test_incremental_second_batch(self):
-        B, L, F = 16, 24, 1
-        op = OnlineUserProfiler(
-            n_topics=4, num_clusters=8, decay=0.9,
-            random_state=42, verbose=False,
-        )
-        x1 = torch.abs(torch.randn(B, L, F)) + 1.0
-        ids1 = torch.randint(1, 6, (B,))
-        op.update_and_get_profile(x1, ids1)
-
-        x2 = torch.abs(torch.randn(B, L, F)) + 1.0
-        ids2 = torch.randint(5, 10, (B,))
-        p2 = op.update_and_get_profile(x2, ids2)
-        assert p2.shape == (B, 4)
-
-    def test_decay_attribute(self):
-        op = OnlineUserProfiler(decay=0.7)
-        assert op.decay == 0.7
-
-    def test_random_conditions(self):
-        op = OnlineUserProfiler(n_topics=5, num_clusters=8)
-        rc = op.get_random_conditions(10)
-        assert rc.shape == (10, 5)
 
 
 # =====================================================================

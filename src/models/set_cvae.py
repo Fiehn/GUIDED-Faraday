@@ -1,4 +1,4 @@
-from src.models.online_cvae import *
+from src.models.cvae import *
 
 # ==============
 # SET-CVAE class for training on multiple datasets sequentially
@@ -10,7 +10,7 @@ from src.models.online_cvae import *
 # - the data handling should really just be additions to the base models
 
 
-class SetCVAE(OnlineCVAE):
+class SetCVAE(CVAE):
     ... # TODO: do it
 
 

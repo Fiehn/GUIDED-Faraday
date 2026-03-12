@@ -7,7 +7,6 @@ sys.path.append(parent_dir)
 from models.encoder_decoder_model import *
 from data.conditioner import *
 from src.models.cvae import *
-from src.models.online_cvae import *
 from src.models.vae import *
 from data.dataloader import *
 from data.normalizer import *
@@ -76,17 +75,19 @@ def train(config):
                 conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
             elif condition_tag == "user_profile":
                 if config.conditioning.user_profile.online:
-                    profiler = OnlineUserProfiler(n_topics=config.user_profile.n_topics,
-                        num_clusters=config.user_profile.num_clusters, 
-                        path=config.user_profile.cache_path, 
-                        verbose=config.user_profile.verbose, 
-                        decay=config.conditioning.online_user_profile.decay, 
-                        update_frequency=config.conditioning.online_user_profile.update_frequency)
+                    decay = config.conditioning.online_user_profile.decay
+                    update_frequency = config.conditioning.online_user_profile.update_frequency
                 else:
-                    profiler = UserProfiler(n_topics=config.user_profile.n_topics,
-                        num_clusters=config.user_profile.num_clusters, 
-                        path=config.user_profile.cache_path, 
-                        verbose=config.user_profile.verbose)
+                    decay = 1.0
+                    update_frequency = -1
+
+                profiler = UserProfiler(n_topics=config.user_profile.n_topics,
+                    num_clusters=config.user_profile.num_clusters, 
+                    path=config.user_profile.cache_path, 
+                    verbose=config.user_profile.verbose, 
+                    decay=decay, 
+                    update_frequency=update_frequency)
+                
                 conditioner.add_condition_item("user_profile", profiler)
                     
             elif condition_tag == "holiday":
