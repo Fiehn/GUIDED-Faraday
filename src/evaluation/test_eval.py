@@ -1,6 +1,6 @@
 import torch
 from evaluation.eval_framework import FlexibilityDistance # for reconstruction evaluation
-from evaluation.eval_framework import VisualEvaluation, ACFDistribution, ClassicalStatistics, TSTR, MaximumMeanDiscrepancy, AggregatedProfiles, PerConditionEval # for distributional evaluation
+from evaluation.eval_framework import ACFDistribution, ClassicalStatistics, TSTR, MaximumMeanDiscrepancy, AggregatedProfiles, PerConditionEval # for distributional evaluation
 from src.models.vae import VAE
 from src.models.cvae import CVAE
 import glob
@@ -190,7 +190,6 @@ print("="*70)
 
 # Visual evaluation
 print("\nVisual Evaluation:")
-visual_eval = VisualEvaluation(output_dir='Output/Plots')
 visual_eval.real_data = real_data_subset
 visual_eval.synthetic_data = synthetic_data
 visual_eval.pca()

@@ -1,21 +1,145 @@
 import torch
 import numpy as np
 from datetime import datetime, timedelta
+from typing import Optional
 
-class CandidateGenerator:
+class SyntheticGenerator:
     """
     Generate multiple contiguous days by sampling one 24h window per day
     with correct day-level conditions.
     """
 
-    def __init__(self, model, conditioner, normalizer = None, device = 'cpu'):
+    def __init__(self, model, conditioner=None, normalizer = None, device = 'cpu'):
         self.model = model
-        self.conditioner = conditioner
+        self.conditioner = conditioner if conditioner is not None else getattr(model, 'conditioner', None)
         self.normalizer = normalizer
         self.device = device
+        self._is_cvae = hasattr(model, 'conditioner') and model.conditioner is not None
+
+    @torch.no_grad()
+    def reconstruct(self, input_data: torch.Tensor, num_reconstructions: int = 1,
+                    meter_id: Optional[int] = None, timestamp: Optional[datetime] = None,
+                    new_conditions: Optional[torch.Tensor] = None,):
+        """
+        Reconstruct input data with optional new conditions. If new_conditions is provided,
+        it will be used for the decoding and thus providing a way to manipulate the reconstruction by changing the conditions.
+
+        Args:
+            input_data: [B, 24, F] tensor of original data to reconstruct.
+            new_conditions: Optional [B, C] tensor of new conditions to use for reconstruction.
+                            If None, original conditions from the model will be used.
+        Returns:
+            Reconstructed data tensor of shape [B, 24, F] in original scale.
+        """
+        self.model.eval()
+        self.model.to(self.device)
+        input_data = input_data.to(self.device)
+        if self.normalizer is not None:
+            input_data = self.normalizer.transform(input_data.reshape(-1, input_data.shape[-1])).reshape(input_data.shape)
+        if self._is_cvae and meter_id is not None and timestamp is not None:
+            # Conditions for the encoding are always based on the original meter_id and timestamp, to get the correct latent representation.
+            conditions = self.conditioner.get_conditions(input_data, meter_id, timestamp).to(self.device)
+            
+            # Ensure input_data is flattened appropriately
+            input_data_flat = input_data.reshape(input_data.shape[0], -1)
+            enc_in = torch.cat([input_data_flat, conditions], dim=-1)
+            q_params = self.model.encoder(enc_in) # dict of [B, latent_dim] params
+
+            # Sample latent variables using reparameterization trick - sample z: [S, B, latent_dim]
+            z = self.model.encoder.reparameterize(q_params, num_samples=1)
+    
+            hierarchy_results = None
+            if self.model.hierarchy is not None:
+                S, B, D = z.shape
+                z_flat = z.reshape(S * B, D)
+                hierarchy_results = self.model.hierarchy(z_flat)
+                z_for_decoder = hierarchy_results["output"].reshape(S, B, -1)
+            else:
+                z_for_decoder = z
+            self._last_hierarchy_results = hierarchy_results
+
+            # Add new conditions in the decoder!
+            if new_conditions is not None:
+                conditions = new_conditions.to(self.device)
+
+            c_expanded = conditions.unsqueeze(0).expand(1, -1, -1)
+            
+            dec_in = torch.cat([z_for_decoder, c_expanded], dim=-1)
+            S, B, DC = dec_in.shape
+            dec_in_flat = dec_in.reshape(S * B, DC)
+
+            # Decode latent samples to get reconstruction parameters
+            recon_params = self.model.decoder(dec_in_flat)   # dict of [S*B, D]
+            
+            # reshape recon params back to [S, B, D]
+            for k in recon_params:
+                recon_params[k] = recon_params[k].reshape(S, B, -1)
+
+        else:
+            recon_params, _ = self.model.reconstruct(input_data)
+
+        # recon_params has shape [S, B, D]. We decode each sample s to get [num_reconstructions, B, D]
+        S_dim = recon_params['mu'].shape[0]
+        xs_all = []
+        for s in range(S_dim):
+            params_s = {k: v[s] for k, v in recon_params.items()}
+            xs = self.model.decoder.sample(params_s, num_samples=num_reconstructions) # [num_recon, B, D]
+            xs_all.append(xs)
+            
+        return torch.cat(xs_all, dim=0)  # [S*num_reconstructions, B, D]
 
     @torch.no_grad()
     def generate(
+        self,
+        num_samples: int,
+        meter_id: Optional[int] = None,
+        date = None,
+        conditions: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Generate samples for a single day with given conditions.
+        Args:
+            num_samples: Number of 24h windows to generate.
+            meter_id: Meter ID for user-profile conditioning.
+            date: Optional datetime or unix timestamp for time-based conditioning.
+            conditions: Optional pre-built conditioning tensor [B, C]. If provided,
+                        'meter_id' and 'date' are ignored.
+        Returns:
+            [num_samples, 24, F] tensor in original scale.
+        """
+        self.model.eval()
+        self.model.to(self.device)
+
+        if self._is_cvae and conditions is None:
+            random = False
+            if date is None:
+                random = True
+            elif isinstance(date, (int, float)):
+                date = datetime.fromtimestamp(date)
+            conditions = self._build_conditions(meter_id=meter_id, timestamp=date, random_condition=random)
+        
+        if self._is_cvae:
+            samples = self.model.sample(
+                conditions=conditions,
+                num_prior_samples=num_samples,
+                num_x_samples=1,
+                device=self.device,
+            )  # Usually returns [num_samples, 1, B, D] or [num_samples, B, D]
+        else:
+            samples = self.model.sample(num_samples_prior=num_samples, num_samples_posterior=1, device=self.device)
+        
+        flat = samples.reshape(-1, samples.shape[-1])
+        N = flat.shape[0]
+        F = flat.shape[-1] // 24
+        output = flat.reshape(N, 24, F)  # [N, 24, F]
+
+        if self.normalizer is not None:
+            output = self.normalizer.inverse_transform(output.reshape(-1, F)).reshape(N, 24, F)
+
+        return output, conditions
+    
+    @torch.no_grad()
+    def generate_continous(
         self,
         num_days: int,
         meter_id: int,
@@ -83,9 +207,9 @@ class CandidateGenerator:
             num_x_samples=1,
             device=self.device,
         )
-        flat = samples[0,0,0]
+        flat = samples.reshape(-1)
         F = flat.shape[0] // 24
-        return flat.view(24, F)
+        return flat.reshape(24, F)
     
     def _select_best_continuation(
             self,
@@ -108,9 +232,9 @@ class CandidateGenerator:
             num_x_samples = 1,
             device = self.device
         )
-        candidates = samples[:,0,0]  # [num_candidates, 24*F]
-        F = candidates.shape[1] // 24
-        candidates = candidates.view(num_candidates, 24, F)  # [num_candidates, 24, F]
+        candidates = samples.reshape(num_candidates, -1)
+        F = candidates.shape[-1] // 24
+        candidates = candidates.reshape(num_candidates, 24, F)  # [num_candidates, 24, F]
 
         # === Score each Candidate ===
         # level: |prev_23 - cand_0|²
@@ -128,12 +252,14 @@ class CandidateGenerator:
         best_idx = torch.argmin(total_cost)
         return candidates[best_idx]
     
-    def _build_conditions(self, meter_id: int, timestamp: datetime) -> torch.Tensor:
+    def _build_conditions(self, meter_id: int, timestamp: datetime, random_condition: bool = False) -> torch.Tensor:
         """ Build conditioning tensor for a single day. Returns [1, C] tensor. """
+        if random_condition:
+            return self.conditioner.get_random_conditions(batch_size=1).to(self.device)
         meter_ids = torch.tensor([meter_id], device=self.device)
         unix_ts = int(timestamp.timestamp())
         timestamps = torch.tensor([unix_ts], device=self.device)
-        conditions = self.conditioner.get_conditions_no_data(
+        conditions = self.conditioner.get_conditions(
             meter_id=meter_ids,
             timestamps=timestamps,
         )  # [B, C]

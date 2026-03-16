@@ -159,7 +159,8 @@ class EvalFramework:
 
         self._real_data: np.ndarray = None  # Cache real data for synthetic metrics that need it
         self._reconstructed_data: np.ndarray = None  # Cache reconstructed data for metrics that need it
-        self._syntheric_data: np.ndarray = None  # Cache synthetic data for metrics that need it
+        self._synthetic_data: np.ndarray = None  # Cache synthetic data for metrics that need it
+        self._timestamps: np.ndarray = None  # Cache timestamps for metrics that need it
 
         self.output_path = output_path
 
@@ -187,6 +188,7 @@ class EvalFramework:
         real_batches = []
         recon_batches = []
         condition_batches = []
+        timestamp = []
 
         self.model.eval()
         with torch.no_grad():
@@ -194,6 +196,8 @@ class EvalFramework:
                 data = data.to(self.device)
                 x_flat = data.reshape(data.shape[0], -1) if data.dim() == 3 else data
                 real_batches.append(x_flat.cpu().numpy())
+
+                timestamp.append(timestamps.cpu().numpy())
 
                 recon = self._reconstruct(data, meter_id=meter_ids, timestamps=timestamps)
                 recon_batches.append(recon.cpu().numpy())
@@ -204,6 +208,7 @@ class EvalFramework:
                     c = self.model.move_to_device(c, device=self.device)
                     condition_batches.append(c.cpu())
 
+        self._timestamps = np.concatenate(timestamp, axis=0) if timestamp else None
         self._real_data = np.concatenate(real_batches, axis=0)
         self._reconstructed_data = np.concatenate(recon_batches, axis=0)
 
@@ -290,6 +295,7 @@ class EvalFramework:
             metric.device = self.device
             metric.normalizer = self.normalizer
             metric.output_path = self.output_path
+            metric.timestamps = self._timestamps
 
         for metric in self.synthetic_metrics.values():
             metric.real_data = self._real_data
@@ -298,6 +304,7 @@ class EvalFramework:
             metric.device = self.device
             metric.normalizer = self.normalizer
             metric.output_path = self.output_path
+            metric.timestamps = self._timestamps
 
     def register_metric(self, metric: EvaluationMetric) -> None:
         """Register an evaluation metric.
@@ -997,126 +1004,6 @@ class ACFDistribution(SyntheticMetric):
         )
 
         return avg_ks
-
-
-class VisualEvaluation(SyntheticMetric):
-    """Visual evaluation of synthetic data"""
-    
-    real_data: np.ndarray = None
-    synthetic_data: np.ndarray = None 
-    output_dir: str = None
-
-    def __init__(self, output_dir='src/Output/Plots'):
-        """
-        Args:
-            real_data: numpy array of real data [N, D]
-            synthetic_data: numpy array of synthetic data [M, D]
-            output_dir: Directory to save plots
-        """
-        self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
-    
-    @property
-    def name(self) -> str:
-        return "Visual Evaluations"
-    
-    def pca(self) -> None:
-        """Generate PCA plots for real vs synthetic data."""
-        real_data = self.real_data[:500] if len(self.real_data) > 500 else self.real_data
-        synthetic_data = self.synthetic_data[:500] if len(self.synthetic_data) > 500 else self.synthetic_data
-        
-        # Verify same number of features
-        if real_data.shape[1] != synthetic_data.shape[1]:
-            min_features = min(real_data.shape[1], synthetic_data.shape[1])
-            real_data = real_data[:, :min_features]
-            synthetic_data = synthetic_data[:, :min_features]
-        
-        # Apply PCA
-        pca = PCA(n_components=min(3, real_data.shape[1], synthetic_data.shape[1]))
-        pca_real = pca.fit_transform(real_data)
-        pca_synthetic = pca.transform(synthetic_data)
-        print(f'  PCA Explained Variance: {pca.explained_variance_ratio_}')
-        
-        # Plot
-        fig = plt.figure(figsize=(16, 6))
-        
-        # Real data
-        ax1 = fig.add_subplot(121, projection='3d')
-        ax1.scatter(pca_real[:, 0], pca_real[:, 1], pca_real[:, 2], 
-                   alpha=0.5, label='Real', s=20, c='blue')
-        ax1.set_title('Real Data (PCA)')
-        ax1.set_xlabel('PC1')
-        ax1.set_ylabel('PC2')
-        ax1.set_zlabel('PC3')
-        
-        # Synthetic data
-        ax2 = fig.add_subplot(122, projection='3d')
-        ax2.scatter(pca_synthetic[:, 0], pca_synthetic[:, 1], pca_synthetic[:, 2], 
-                   alpha=0.5, label='Synthetic', s=20, c='red')
-        ax2.set_title('Synthetic Data (PCA)')
-        ax2.set_xlabel('PC1')
-        ax2.set_ylabel('PC2')
-        ax2.set_zlabel('PC3')
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, 'pca_comparison.pdf'), format='pdf')
-        plt.close()
-    
-    def tsne(self) -> None:
-        """Generate t-SNE plots for real vs synthetic data."""
-        # Use smaller subset for t-SNE
-        real_data = self.real_data[:500] if len(self.real_data) > 500 else self.real_data
-        synthetic_data = self.synthetic_data[:500] if len(self.synthetic_data) > 500 else self.synthetic_data
-        
-        # Verify same number of features
-        if real_data.shape[1] != synthetic_data.shape[1]:
-            min_features = min(real_data.shape[1], synthetic_data.shape[1])
-            real_data = real_data[:, :min_features]
-            synthetic_data = synthetic_data[:, :min_features]
-        
-        # Combine for t-SNE
-        combined = np.vstack([real_data, synthetic_data])
-        labels = np.hstack([np.zeros(len(real_data)), np.ones(len(synthetic_data))])
-
-        n_samples = combined.shape[0]
-        if n_samples < 3:
-            raise ValueError(f"Need at least 3 samples for t-SNE, got {n_samples}.")
-
-        # Perplexity must be strictly less than n_samples
-        perplexity = min(30, n_samples - 1)
-        # Keep a sensible lower bound for stability when possible
-        if perplexity < 5 and n_samples >= 6:
-            perplexity = 5
-        
-        # Apply t-SNE
-        tsne = TSNE(n_components=2, learning_rate='auto', random_state=42, perplexity=perplexity)
-        tsne_result = tsne.fit_transform(combined)
-        
-        # Plot
-        fig, ax = plt.subplots(figsize=(10, 8))
-        mask_real = labels == 0
-        mask_synthetic = labels == 1
-        ax.scatter(tsne_result[mask_real, 0], tsne_result[mask_real, 1], 
-                  alpha=0.6, label='Real', s=30, c='blue')
-        ax.scatter(tsne_result[mask_synthetic, 0], tsne_result[mask_synthetic, 1], 
-                  alpha=0.6, label='Synthetic', s=30, c='red')
-        ax.set_title('t-SNE: Real vs Synthetic Data')
-        ax.set_xlabel('t-SNE 1')
-        ax.set_ylabel('t-SNE 2')
-        ax.legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, 'tsne_comparison.pdf'), format='pdf')
-        plt.close()
-    
-    def compute(self) -> float:
-        """Generate visual evaluation plots and return success indicator."""
-        try:
-            self.pca()
-            self.tsne()
-            print(f"  Visual evaluation plots saved to {self.output_dir}")
-            return 1.0  # Success
-        except Exception as e:
-            print(f"  Error generating visualizations: {e}")
-            return 0.0  # Failure
 
 
 class ClassicalStatistics(SyntheticMetric):
@@ -2002,14 +1889,15 @@ class PerConditionEval(SyntheticMetric):
         if self.real_data is None or self.synthetic_data is None:
             raise ValueError("PerConditionEval requires injected real_data and synthetic_data.")
         if self.timestamps is None:
-            raise ValueError("PerConditionEval requires injected timestamps.")
+            raise ValueError("PerConditionEval requires injected timestamps for per-condition grouping.")
+
 
         real_data = np.asarray(self.real_data)
         synthetic_data = np.asarray(self.synthetic_data)
         timestamps = np.asarray(self.timestamps)
 
         if len(real_data) != len(synthetic_data):
-            raise ValueError(f"Real ({len(real_data)}) and synthetic ({len(synthetic_data)}) data must have same length")
+            synthetic_data = synthetic_data[:len(real_data)]
         if len(real_data) != len(timestamps):
             raise ValueError(f"Data length ({len(real_data)}) must match timestamps length ({len(timestamps)})")
         if real_data.ndim != 2 or synthetic_data.ndim != 2:

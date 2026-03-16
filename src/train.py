@@ -248,7 +248,7 @@ def train(config):
         yaml.dump(config.config, f)
 
     # === Evaluation ===
-    evaluator = EvalFramework(model, combined_test_loader, normalizer, device='cpu')
+    evaluator = EvalFramework(model, combined_test_loader, normalizer, device='cpu', output_path=os.path.join(log_path, 'eval_results.json'))
     evaluator.register_all()
     evaluator.evaluate()
     evaluator.save_results(os.path.join(log_path, 'eval_results_combined.json'))

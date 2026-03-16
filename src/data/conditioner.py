@@ -607,6 +607,16 @@ class Conditioner():
     def get_condition_dim(self):
         return int(self.condition_dim)
 
+    def get_condition_indexes(self, tag):
+        if tag not in self.tags:
+            raise ValueError(f"Condition tag '{tag}' not found in Conditioner.")
+        idx = 0
+        for t in self.tags:
+            if t == tag:
+                return (idx, idx + self.condition_items[t].condition_dim)
+            idx += self.condition_items[t].condition_dim
+        raise ValueError(f"Condition tag '{tag}' not found in Conditioner.")
+
     def save(self, path):
         self.path = path
         with open(path, "wb") as f:
