@@ -383,7 +383,7 @@ class TestEvalFrameworkUnit:
 
 def _build_cvae(input_dim, conditioner, device):
     """Build a CVAE model (avoids conftest fixture import issue)."""
-    from src.Models.CVAE import CVAE as CVAEClass
+    from src.models.cvae import CVAE as CVAEClass
     model = CVAEClass(
         input_dim=input_dim,
         latent_dim=4,

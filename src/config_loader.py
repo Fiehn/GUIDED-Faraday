@@ -361,7 +361,7 @@ class ExperimentConfig:
     
     def to_data_kwargs(self) -> Dict:
         """Convert config to kwargs for data loading."""
-        from Data.dataloader import WindowSpec
+        from data.dataloader import WindowSpec
         
         data_config = self.loader.get_section('data')
         return {

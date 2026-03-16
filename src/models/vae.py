@@ -32,6 +32,8 @@ from src.models.model_utils import CyclicalBetaScheduler, EarlyStopping
 #   - encoder and decoder are modular and can be swapped out
 # ==============
 class VAE(nn.Module):
+    """Base VAE class with modular encoder, decoder, prior and hierarchical latent space.
+    """
     def __init__(self,
                  input_dim=24,
                  latent_dim=32,
