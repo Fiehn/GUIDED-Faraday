@@ -7,12 +7,16 @@ import os
 import numpy as np
 from sklearn.decomposition import PCA 
 from sklearn.manifold import TSNE
+
+from src.models.generators import SyntheticGenerator
+from src.data.conditioner import UserProfiler
  
 class Visualizer:
     """Class for visualizing training results and model performance."""
     
     def __init__(self, plot_style: PlotStyle, log_dir: str, 
                  model = None, normalizer = None,  writer = None, 
+                 conditioner = None,
                  device = "cpu"):
         self.plot_style = plot_style
         self.log_dir = log_dir
@@ -20,6 +24,7 @@ class Visualizer:
         self.normalizer = normalizer
         self.writer = writer
         self.device = device
+        self.generator = SyntheticGenerator(model=model, normalizer=normalizer, conditioner=conditioner, device=device)
     
     def _is_cvae(self) -> bool:
         """Check if model is a CVAE based on presence of conditioner on the model."""
@@ -45,12 +50,11 @@ class Visualizer:
             self.visualize_training_progress()
         except Exception as e:
             print(f"Error visualizing training progress: {e}")
-        try:
-            if test_loader is not None:
-                print("Visualizing reconstructions.")
-                self.visualize_reconstructions(num_samples=num_samples, num_recon_per=num_recon_per, test_loader=test_loader)
-        except Exception as e:
-            print(f"Error visualizing reconstructions: {e}")
+        
+        if test_loader is not None:
+            print("Visualizing reconstructions.")
+            self.visualize_reconstructions(num_samples=num_samples, num_recon_per=num_recon_per, test_loader=test_loader)
+    
         try:
             print("Visualizing synthetic samples.")
             self.visualize_synthetic(num_samples=num_synthetic)
@@ -76,6 +80,16 @@ class Visualizer:
             self.visualize_user_dict()
         except Exception as e:
             print(f"Error visualizing user profiles: {e}")
+        try:
+            print("Visualizing PCA comparison.")
+            self.pca_compared(test_loader=test_loader)
+        except Exception as e:
+            print(f"Error visualizing PCA comparison: {e}")
+        try:
+            print("Visualizing t-SNE comparison.")
+            self.tsne_compared(test_loader=test_loader)
+        except Exception as e:
+            print(f"Error visualizing t-SNE comparison: {e}")
     
     def visualize_training_progress(self):
         """Visualize training progress using scalars from the writer."""
@@ -116,35 +130,11 @@ class Visualizer:
             return
         
         self.model.eval()
-        with torch.no_grad():
-            x, meter_id, timestamps = next(iter(test_loader))
-            x = x.to(self.device)
-            timestamps = timestamps.to(self.device)
-            x_original = x  # This is normalized
-            x_flat = x.reshape(x.shape[0], -1)
-            if self._is_cvae():
-                recon_params, _ = self.model.reconstruct(x_flat,meter_ids=meter_id, timestamps=timestamps, num_samples=1)
-                condition_labels = []
-                for ts in timestamps.cpu():
-                    dt = pd.Timestamp(ts.item(), unit='s')
-                    day_name = self.plot_style.get_day_names(short=False)[dt.dayofweek]
-                    date_str = dt.strftime("%Y-%m-%d")
-                    condition_labels.append(f"{day_name} ({date_str})")
-            else:
-                recon_params = self.model.reconstruct(x_flat, num_samples=1)
-                condition_labels = [f"Sample {i}" for i in range(x.shape[0])]
-            
-        # Remove the samples dimension from recon_params (they have shape [1, B, D])
-        # and then sample multiple times from the decoder distribution
-        recon_params_single = {}
-        for key, value in recon_params.items():
-            if value.dim() == 3 and value.shape[0] == 1:
-                recon_params_single[key] = value.squeeze(0)  # [B, D]
-            else:
-                recon_params_single[key] = value
-        
-        # Now sample from decoder distribution multiple times
-        recon_samples = self.model.decoder.sample(recon_params_single, num_samples=num_recon_per)  # [num_recon_per, B, D]
+        input_data = next(iter(test_loader))
+        x_original, meter_id, timestamps = input_data
+        x_original = x_original.to(self.device)
+
+        recon_samples = self.generator.reconstruct(x_original, num_recon_per, meter_id=meter_id, timestamp=timestamps)
         
         S, B, D = recon_samples.shape
         L, F = x_original.shape[1], x_original.shape[2]
@@ -158,6 +148,7 @@ class Visualizer:
             recon_denorm = recon_reshaped.cpu()
 
         num_to_plot = min(num_samples, B)
+        condition_labels = None
         fig, axes = plt.subplots(num_to_plot, 1, figsize=self.plot_style.get_figsize(num_to_plot))
         if num_to_plot == 1:
             axes = [axes]
@@ -174,17 +165,17 @@ class Visualizer:
                 markersize=4
             )
             # reconstructed samples from decoder distribution
-        for s in range(num_recon_per):
-            axes[i].plot(
-                recon_denorm[s, i, :, 0].detach().cpu().numpy() if isinstance(recon_denorm, torch.Tensor) else recon_denorm[s, i, :, 0],
-                label=f"Recon Sample {s+1}",
-                marker=self.plot_style.marker,
-                color=self.plot_style.get_color(s),
-                alpha=0.6,
-                linewidth=self.plot_style.linewidth,
-                linestyle=self.plot_style.linestyle,
-                markersize=3
-            )
+            for s in range(num_recon_per):
+                axes[i].plot(
+                    recon_denorm[s, i, :, 0].detach().cpu().numpy() if isinstance(recon_denorm, torch.Tensor) else recon_denorm[s, i, :, 0],
+                    label=f"Recon Sample {s+1}",
+                    marker=self.plot_style.marker,
+                    color=self.plot_style.get_color(s),
+                    alpha=0.6,
+                    linewidth=self.plot_style.linewidth,
+                    linestyle=self.plot_style.linestyle,
+                    markersize=3
+                )
             if condition_labels is not None:
                 title = f"Sample {i+1} - Energy Consumption | Condition: {condition_labels[i]}"
             else:
@@ -202,7 +193,6 @@ class Visualizer:
         reconstruction_path = os.path.join(self.log_dir, f"reconstruction.pdf")
         plt.savefig(reconstruction_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
-        print(f"Saved reconstruction comparison to {reconstruction_path}")
     
     def visualize_synthetic(self, num_samples: int):
         """Visualize synthetic samples generated by the model."""
@@ -210,54 +200,34 @@ class Visualizer:
             print("Model and normalizer are required for synthetic sample visualization.")
             return
         
-        self.model.eval()
-        with torch.no_grad():
-            if self._is_cvae():
-                fake_conditions = self.model.conditioner.get_random_conditions(batch_size=num_samples).to(self.device)
-                # Extract day of week from one-hot encoded conditions
-                if fake_conditions.shape[1] == 7:  # day-of-week only
-                    day_indices = fake_conditions.argmax(dim=1).cpu().numpy()
-                    day_labels = [self.plot_style.get_day_names(short=False)[idx] for idx in day_indices]
-                else:
-                    # If multiple conditions concatenated, extract first 7 dims
-                    dow_part = fake_conditions[:, :7]
-                    day_indices = dow_part.argmax(dim=1).cpu().numpy()
-                    day_labels = [self.plot_style.get_day_names(short=False)[idx] for idx in day_indices]
-                # Sample from model with conditions
-                samples = self.model.sample(fake_conditions, num_prior_samples=1, num_x_samples=1, device=self.device)
-                synthetic_flat = samples[0, 0]  # [num_samples, input_dim]
-                
-                total_samples = num_samples
-                window_len = 24  # This should match your data's window length (TODO)
-                num_features = synthetic_flat.shape[1] // window_len
-                synthetic_data = synthetic_flat.reshape(total_samples, window_len, num_features)
-            else:
-                # VAE: sample from prior
-                samples_dict = self.model.sample(num_samples_prior=num_samples, num_samples_posterior=1, device=self.device)
-                synthetic_flat = samples_dict["samples"][:, 0, 0, :]  # [num_samples, input_dim]
-                
-                # Reshape
-                window_len = 24
-                num_features = synthetic_flat.shape[1] // window_len
-                synthetic_data = synthetic_flat.reshape(num_samples, window_len, num_features)
-                day_labels = [None] * num_samples
-            # Denormalize
-            if self.normalizer is not None:
-                synthetic_data_denorm = self.normalizer.inverse_transform(synthetic_data.cpu())
-            else:
-                synthetic_data_denorm = synthetic_data.cpu()
-    
+        synthetic_data, conditions = self.generator.generate(num_samples=num_samples)
+
+        day_labels = None
+        if self._is_cvae() and conditions is not None:
+            if "day_of_week" in self.model.conditioner.get_condition_tags():
+                day_of_week_idx = self.model.conditioner.get_condition_indexes("day_of_week")
+                if day_of_week_idx is not None:
+                    day_labels = []
+                    for c in conditions.cpu():
+                        if c.dim() > 0:
+                            day_onehot = c[day_of_week_idx[0]:day_of_week_idx[1]]
+                            day_idx = torch.argmax(day_onehot).item()
+                            day_name = self.plot_style.get_day_names(short=False)[day_idx]
+                            day_labels.append(day_name)
+                        else:
+                            day_labels.append("Unknown")
+
         # Plot all samples on a single plot with different colors
         num_to_plot = synthetic_data.shape[0]
         fig, ax = plt.subplots(figsize=self.plot_style.figsize)
 
         for i in range(num_to_plot):
             label = f"Sample {i+1}"
-            if day_labels[i] is not None:
-                label += f" ({day_labels[i]})"
+            if day_labels is not None and len(day_labels) > 0:
+                label += f" ({day_labels[min(i, len(day_labels)-1)]})"
             
             ax.plot(
-                synthetic_data_denorm[i, :, 0].numpy() if isinstance(synthetic_data_denorm, torch.Tensor) else synthetic_data_denorm[i, :, 0],
+                synthetic_data[i, :, 0].cpu().numpy() if isinstance(synthetic_data, torch.Tensor) else synthetic_data[i, :, 0],
                 label=label,
                 marker=self.plot_style.marker,
                 color=self.plot_style.get_color(i),
@@ -342,11 +312,11 @@ class Visualizer:
             plt.tight_layout()
             save_path = os.path.join(self.log_dir, f"PCA_latent_space.pdf")
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Saved: {save_path}")
             plt.close(fig)
         
         if tSNE:
-            tsne = TSNE(n_components=2, n_jobs=1)
+            perplexity = min(30, (latents.shape[0] - 1) // 3)  # Rule of thumb for perplexity
+            tsne = TSNE(n_components=2, perplexity=perplexity)
             latents_2d = tsne.fit_transform(latents)
             fig, ax = plt.subplots(figsize=self.plot_style.figsize)
             ax.scatter(
@@ -362,7 +332,6 @@ class Visualizer:
             plt.tight_layout()
             save_path = os.path.join(self.log_dir, f"tSNE_latent_space.pdf")
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Saved: {save_path}")
             plt.close(fig)
     
     def visualize_synthetic_recreations(self, test_loader, num_originals: int = 4, num_synthetic_per: int = 50):
@@ -407,13 +376,7 @@ class Visualizer:
             c = self.model.move_to_device(c, device=self.device)
             
             # Generate synthetic samples with the SAME conditions
-            # Shape: [num_prior_samples, num_x_samples, B, D]
-            synthetic_samples = self.model.sample(
-                conditions=c,
-                num_prior_samples=num_synthetic_per,
-                num_x_samples=1,
-                device=self.device
-            )
+            synthetic_samples, _ = self.generator.generate(num_samples=num_synthetic_per, conditions=c)
             
             # Reshape: [num_synthetic_per, 1, num_originals, D] -> [num_synthetic_per, num_originals, D]
             synthetic_samples = synthetic_samples.squeeze(1)  # [num_synthetic_per, num_originals, D]
@@ -425,15 +388,12 @@ class Visualizer:
             # Compute mean synthetic sample
             mean_synthetic = synthetic_reshaped.mean(dim=0)  # [num_originals, L, F]
             
-            # Denormalize
             if self.normalizer is not None:
                 x_denorm = self.normalizer.inverse_transform(x_selected.cpu())
-                synthetic_denorm = self.normalizer.inverse_transform(synthetic_reshaped.cpu())
-                mean_synthetic_denorm = self.normalizer.inverse_transform(mean_synthetic.cpu())
             else:
                 x_denorm = x_selected.cpu()
-                synthetic_denorm = synthetic_reshaped.cpu()
-                mean_synthetic_denorm = mean_synthetic.cpu()
+            synthetic_denorm = synthetic_reshaped.cpu()
+            mean_synthetic_denorm = mean_synthetic.cpu()
             
             # Get condition labels
             condition_labels = []
@@ -526,12 +486,11 @@ class Visualizer:
         save_path = os.path.join(self.log_dir, f"synthetic_recreations.pdf")
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
-        print(f"Saved synthetic recreations to {save_path}")
 
     def visualize_user_dict(self):
         """Plot the cached user profiles in the UserProfiler conditioner."""
-        if not hasattr(self.model, 'conditioner'):
-            print("Model does not have a conditioner, skipping user profiles visualization.")
+        if not self._is_cvae():
+            print("Model is not a CVAE, skipping user profiles visualization.")
             return {}
         if "user_profile" not in self.model.conditioner.get_condition_tags():
             print("Model conditioner does not include 'user_profile', skipping user profiles visualization.")
@@ -564,4 +523,126 @@ class Visualizer:
         plt.tight_layout()
         plt.savefig(user_dict_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
-        print(f"Saved User Profiles visualization to {user_dict_path}")
+    
+    def pca_compared(self, test_loader):
+        """
+        Generate syntetic samples and compare with real values in PCA space.
+        """
+        # Get the conditions of real data:
+        x, meter_id, timestamps = next(iter(test_loader))
+        x = x.to(self.device)
+        timestamps = timestamps.to(self.device)
+        c = self.model.conditioner.get_conditions(x,meter_id,timestamps).to(self.device)
+
+        # Generate synthetic samples with the SAME conditions
+        synthetic_samples, _ = self.generator.generate(
+            num_samples=x.shape[-1],
+            conditions=c
+        )
+
+        if self.normalizer is not None:
+            x_denorm = self.normalizer.inverse_transform(x.cpu())
+        else:
+            x_denorm = x.cpu().numpy()
+
+        if isinstance(x_denorm, torch.Tensor):
+            x_denorm = x_denorm.numpy()
+        if isinstance(synthetic_samples, torch.Tensor):
+            synthetic_samples = synthetic_samples.numpy()
+
+        x_denorm_flat = x_denorm.reshape(x_denorm.shape[0], -1)
+        synthetic_flat = synthetic_samples.reshape(synthetic_samples.shape[0], -1)
+
+        # Reshape synthetic samples to match original data shape
+        num_samples = synthetic_samples.shape[0]
+        pca = PCA(n_components=min(3, x_denorm_flat.shape[1], synthetic_flat.shape[1]))
+        pca_real = pca.fit_transform(x_denorm_flat)
+        pca_synthetic = pca.transform(synthetic_flat)
+
+        fig = plt.figure(figsize=(16, 6))
+        
+        # Real data
+        ax1 = fig.add_subplot(121, projection='3d')
+        ax1.scatter(pca_real[:, 0], pca_real[:, 1], pca_real[:, 2], 
+                   alpha=0.5, label='Real', s=20, c='blue')
+        ax1.set_title('Real Data (PCA)')
+        ax1.set_xlabel('PC1')
+        ax1.set_ylabel('PC2')
+        ax1.set_zlabel('PC3')
+        
+        # Synthetic data
+        ax2 = fig.add_subplot(122, projection='3d')
+        ax2.scatter(pca_synthetic[:, 0], pca_synthetic[:, 1], pca_synthetic[:, 2], 
+                   alpha=0.5, label='Synthetic', s=20, c='red')
+        ax2.set_title('Synthetic Data (PCA)')
+        ax2.set_xlabel('PC1')
+        ax2.set_ylabel('PC2')
+        ax2.set_zlabel('PC3')
+        plt.tight_layout()
+
+        pca_comparison_path = os.path.join(self.log_dir, f"pca_comparison.pdf")
+        plt.savefig(pca_comparison_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+    def tsne_compared(self,test_loader):
+        """Generate t-SNE plots for real vs synthetic data."""
+        # Get conditions of real data
+        x, meter_id, timestamps = next(iter(test_loader))
+        x = x.to(self.device)
+        timestamps = timestamps.to(self.device)
+        c = self.model.conditioner.get_conditions(x,meter_id,timestamps).to(self.device)
+        # Generate synthetic samples with the SAME conditions
+        synthetic_samples, _ = self.generator.generate(
+            num_samples=x.shape[-1],
+            conditions=c
+        )
+        if self.normalizer is not None:
+            x_denorm = self.normalizer.inverse_transform(x.cpu())
+        else:
+            x_denorm = x.cpu().numpy()
+
+        if isinstance(x_denorm, torch.Tensor):
+            x_denorm = x_denorm.numpy()
+        if isinstance(synthetic_samples, torch.Tensor):
+            synthetic_samples = synthetic_samples.numpy()
+
+        x_denorm_flat = x_denorm.reshape(x_denorm.shape[0], -1)
+        synthetic_flat = synthetic_samples.reshape(synthetic_samples.shape[0], -1)
+
+        # Combine for t-SNE
+        combined = np.vstack([x_denorm_flat, synthetic_flat])
+        labels = np.hstack([np.zeros(len(x_denorm_flat)), np.ones(len(synthetic_flat))])
+
+        n_samples = combined.shape[0]
+        if n_samples < 3:
+            raise ValueError(f"Need at least 3 samples for t-SNE, got {n_samples}.")
+
+        # Perplexity must be strictly less than n_samples
+        perplexity = min(30, n_samples - 1)
+        # Keep a sensible lower bound for stability when possible
+        if perplexity < 5 and n_samples >= 6:
+            perplexity = 5
+        
+        # Apply t-SNE
+        tsne = TSNE(n_components=2, learning_rate='auto', random_state=42, perplexity=perplexity)
+        tsne_result = tsne.fit_transform(combined)
+        
+        # Plot
+        fig, ax = plt.subplots(figsize=(10, 8))
+        mask_real = labels == 0
+        mask_synthetic = labels == 1
+        ax.scatter(tsne_result[mask_real, 0], tsne_result[mask_real, 1], 
+                  alpha=0.6, label='Real', s=30, c='blue')
+        ax.scatter(tsne_result[mask_synthetic, 0], tsne_result[mask_synthetic, 1], 
+                  alpha=0.6, label='Synthetic', s=30, c='red')
+        ax.set_title('t-SNE: Real vs Synthetic Data')
+        ax.set_xlabel('t-SNE 1')
+        ax.set_ylabel('t-SNE 2')
+        ax.legend()
+        plt.tight_layout()
+        tsne_comparison_path = os.path.join(self.log_dir, f"tsne_comparison.pdf")
+        plt.savefig(tsne_comparison_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    
+
+                                                                            

@@ -15,7 +15,7 @@ data:
   data_dir: "./data"
   
   # CSV filename to load
-  data_files: []
+  data_files: ["test_data_small.csv",]
   
   # CSV column specifications
   columns:
@@ -43,7 +43,7 @@ data:
   
   # DataLoader settings
   dataloader:
-    batch_size: 1024
+    batch_size: 258
     num_workers: 8
     shuffle: false
 
@@ -66,7 +66,7 @@ model:
   type: "cvae"
   
   # Device for training: "cpu" or "cuda"
-  device: "cuda"
+  device: "cpu"
   
   # Latent dimension (size of latent vector z)
   latent_dim: 32
@@ -74,14 +74,14 @@ model:
   # Encoder configuration
   encoder:
     type: "dictionary"  # Options: "dictionary", "mlp", etc.
-    hidden_dims: [512, 256, 128]
+    hidden_dims: [256, 256, 128]
     dropout: 0.2
     activation: "relu"
   
   # Decoder configuration
   decoder:
     type: "dictionary"  # Options: "dictionary", "mlp", "gaussian_mlp"
-    hidden_dims: [128, 256, 512]
+    hidden_dims: [128, 256, 256]
     dropout: 0.2
     activation: "relu"
     likelihood: "gaussian"  # Options: "gaussian", "student_t"
