@@ -114,7 +114,7 @@ class VAE(nn.Module):
             # z shape: [S, B, latent_dim]
             S,B,D = z.shape
             z_flat = z.reshape(S * B, D)  # Flatten for hierarchy: [S*B, latent_dim]
-            hierarchy_results = self.hierarchy(z_flat)  # Pass through hierarchy
+            hierarchy_results = self.hierarchy.forward(z_flat)  # Pass through hierarchy
             z_for_decoder = hierarchy_results["z"].reshape(S, B, -1)  # Reshape back to [S, B, output_dim]
         else:
             z_for_decoder = z
@@ -185,7 +185,7 @@ class VAE(nn.Module):
         posterior_loglikelihood = self.encoder.loglikelihood(posterior_params_dict)
         prior_loglikelihood = self.prior.log_prob(posterior_params_dict['z'])
         
-        return (posterior_loglikelihood.sum(-1) + recon_loglikelihood.sum(-1) - prior_loglikelihood.sum(-1)).mean(dim=0)
+        return (recon_loglikelihood.sum(-1) + prior_loglikelihood.sum(-1) - posterior_loglikelihood.sum(-1)).mean(dim=0)
     
     def loss(self, inputs, recon_params_dict, posterior_params_dict, beta: float = 1.0, weighted_loss: float = 0.0, **_):
         # Compute reconstruction log-likelihood
@@ -197,7 +197,8 @@ class VAE(nn.Module):
 
         # Weighted loss (set weighted_loss > 0 to enable) - gives more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
         weights = 1.0 + weighted_loss * torch.abs(inputs).mean(dim=-1)
-        recon_loglikelihood = (recon_loglikelihood * weights).mean() 
+        weights = weights / weights.mean() # Should not change the overall scale of the loss, just reweight samples within the batch (This will hopefully allow vamp to work!)
+        recon_loglikelihood = (recon_loglikelihood * weights).mean()
 
         loss = -(recon_loglikelihood - beta * kl_div)
 

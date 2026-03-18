@@ -67,7 +67,7 @@ class Visualizer:
             print(f"Error visualizing sigma mapper: {e}")
         try:
             print("Visualizing latent space.")
-            self.visualize_latent_space(test_loader=test_loader)
+            #self.visualize_latent_space(test_loader=test_loader)
         except Exception as e:
             print(f"Error visualizing latent space: {e}")
         try:
@@ -290,6 +290,8 @@ class Visualizer:
                 z = self.model.encoder.reparameterize(q_params, num_samples=1).squeeze(0)
                 
                 latents.append(z.cpu().numpy())
+                if len(latents) >= 1000:  # Limit to 1000 samples for visualization
+                    break
         
         latents = np.concatenate(latents, axis=0)
         labels = np.array(labels)

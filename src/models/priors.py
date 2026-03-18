@@ -49,7 +49,7 @@ class StandardGaussianPrior(BasePrior):
         return {"mu": self.mu, "sigma": self.sigma}
     
     def sample(self, batch_size, num_samples=1):
-        return torch.randn((num_samples, batch_size, self.latent_dim), device=self.device)
+        return torch.randn((num_samples, batch_size, self.latent_dim), device=self.sigma.device)
     
     def log_prob(self, z):
         # log prob of standard normal
@@ -76,7 +76,7 @@ class LearnableGaussianPrior(BasePrior):
     
     def sample(self, batch_size, num_samples=1):
         sigma = torch.exp(self.log_sigma)
-        eps = torch.randn((num_samples, batch_size, self.latent_dim), device=self.device)
+        eps = torch.randn((num_samples, batch_size, self.latent_dim), device=sigma.device)
         return self.mu + eps * sigma
     
     def log_prob(self, z):
@@ -103,7 +103,7 @@ class StandardDictionaryPrior(BasePrior):
         return {"mu": self.mu, "sigma": self.sigma}
     
     def sample(self, batch_size, num_samples=1):
-        eps = torch.randn(num_samples, batch_size, self.dictionary_size, device=self.device)
+        eps = torch.randn(num_samples, batch_size, self.dictionary_size, device=self.sigma.device)
         return eps  # Will be mapped by SigmaMapper in encoder
     
     def log_prob(self, z):
@@ -138,7 +138,7 @@ class LearnableDictionaryPrior(BasePrior):
         return {"mu": self.mu, "sigma": torch.exp(self.log_sigma)}
     def sample(self, batch_size, num_samples=1):
         sigma = torch.exp(self.log_sigma)
-        eps = torch.randn((num_samples, batch_size, self.dictionary_size), device=self.device)
+        eps = torch.randn((num_samples, batch_size, self.dictionary_size), device=sigma.device)
         # Return samples in dictionary space only (mu in latent space is added after
         # the SigmaMapper transform in CVAE.sample, matching StandardDictionaryPrior behaviour)
         return eps * sigma
@@ -146,7 +146,7 @@ class LearnableDictionaryPrior(BasePrior):
         params = self.get_params()
         mu = params["mu"]
         sigma = params["sigma"]
-        return None # TODO: To get log prob in output space, we need to map z back to dictionary space. This requires the inverse of the SigmaMapper used in the encoder. Not implemented yet.
+        return -0.5 * (((z - mu) / sigma) ** 2 + 2 * torch.log(sigma) + torch.log(2 * torch.pi)).sum(dim=-1) # TODO: verify correctness
     def forward(self, batch_size):
         sigma = torch.exp(self.log_sigma)
         return {"mu": self.mu.expand(batch_size, -1), "sigma": sigma.expand(batch_size, -1)}

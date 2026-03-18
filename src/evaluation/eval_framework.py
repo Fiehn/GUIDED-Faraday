@@ -44,7 +44,7 @@ def _to_json_serializable(obj: Any) -> Any:
 
 
 def _save_standalone_metric_result(metric_key: str, payload: Dict[str, Any],
-                                   output_file: str = 'src/Output/eval_results.json') -> None:
+                                   output_file: str = 'models/eval_results.json') -> None:
     """Save/update standalone metric results in the shared per-condition JSON file."""
     try:
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -1388,13 +1388,11 @@ class AggregatedProfiles(SyntheticMetric):
     normalizer = None
     output_dir: str = None
     
-    def __init__(self, n_samples=100, window_size=24, tau='auto', normalize=True, output_dir='src/Output/Plots'):
+    def __init__(self, n_samples=100, window_size=24, tau='auto', normalize=True):
         self.n_samples = n_samples
         self.window_size = window_size
         self.tau = tau
         self.normalize = normalize
-        self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
     
     @property
     def name(self) -> str:
@@ -1448,7 +1446,7 @@ class AggregatedProfiles(SyntheticMetric):
                 'synthetic_aggregated': synth_aggregated,
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
             },
-            output_file=os.path.join(self.output_dir, 'aggregated_profiles_fd_result.json')
+            output_file=self.output_path or 'models/eval_results.json'
         )
         
         return fd_score
@@ -1467,7 +1465,13 @@ class AggregatedProfiles(SyntheticMetric):
         ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, 'aggregated_profiles_comparison.png'), dpi=150)
+        
+        # Ensure output_path doesn't contain a filename
+        base_dir = os.path.dirname(self.output_path) if self.output_path and self.output_path.endswith('.json') else self.output_path
+        plot_dir = os.path.join(base_dir, 'Plots') if base_dir else 'Plots'
+        os.makedirs(plot_dir, exist_ok=True)
+        
+        plt.savefig(os.path.join(plot_dir, 'aggregated_profiles_comparison.png'), dpi=150, bbox_inches='tight')
         plt.close()
         
 
@@ -1491,21 +1495,19 @@ class PerConditionEval(SyntheticMetric):
     feeder_ids: np.ndarray = None
     output_dir: str = None
 
-    def __init__(self, window_size=24, max_lag=10, min_samples_per_group=2, output_dir='src/Output', 
+    def __init__(self, window_size=24, max_lag=10, min_samples_per_group=2, 
                  verbose=False, predictor_type='linear', tstr_epochs=50,
                  feeder_mapping_path='topology/cleaned/Cleaned_SM_Topology_mapping.json',
                  min_samples_per_feeder=5):
         self.window_size = window_size
         self.max_lag = max_lag
         self.min_samples_per_group = min_samples_per_group
-        self.output_dir = output_dir
         self.verbose = verbose
         self.predictor_type = predictor_type
         self.tstr_epochs = tstr_epochs
         self.feeder_mapping_path = feeder_mapping_path
         self.min_samples_per_feeder = min_samples_per_feeder
         self._meter_to_feeder = None
-        os.makedirs(output_dir, exist_ok=True)
 
         self.results_by_condition = {
             'mmd': {
@@ -1547,7 +1549,6 @@ class PerConditionEval(SyntheticMetric):
             window_size=window_size,
             tau='auto',
             normalize=True,
-            output_dir=os.path.join(output_dir, 'Plots')
         )
 
     @property
@@ -1612,6 +1613,7 @@ class PerConditionEval(SyntheticMetric):
         try:
             self.aggregated_profiles_calculator.real_data = real_subset
             self.aggregated_profiles_calculator.synthetic_data = synthetic_subset
+            self.aggregated_profiles_calculator.output_path = self.output_path
             return float(self.aggregated_profiles_calculator.compute())
         except Exception as e:
             if self.verbose:
@@ -1763,7 +1765,8 @@ class PerConditionEval(SyntheticMetric):
         feeder_ids: np.ndarray = None,
     ) -> Dict[str, str]:
         """Create bar charts of aggregated real vs synthetic consumption by day and month."""
-        plots_dir = os.path.join(self.output_dir, 'Plots')
+        base_dir = os.path.dirname(self.output_path) if self.output_path and self.output_path.endswith('.json') else self.output_path
+        plots_dir = os.path.join(base_dir, 'Plots') if base_dir else 'Plots'
         os.makedirs(plots_dir, exist_ok=True)
         
         # Plot style
@@ -1891,6 +1894,11 @@ class PerConditionEval(SyntheticMetric):
         if self.timestamps is None:
             raise ValueError("PerConditionEval requires injected timestamps for per-condition grouping.")
 
+        self.mmd_calculator.output_path = self.output_path
+        self.acf_calculator.output_path = self.output_path
+        self.classical_statistics_calculator.output_path = self.output_path
+        self.tstr_calculator.output_path = self.output_path
+        self.aggregated_profiles_calculator.output_path = self.output_path
 
         real_data = np.asarray(self.real_data)
         synthetic_data = np.asarray(self.synthetic_data)
@@ -1898,8 +1906,20 @@ class PerConditionEval(SyntheticMetric):
 
         if len(real_data) != len(synthetic_data):
             synthetic_data = synthetic_data[:len(real_data)]
-        if len(real_data) != len(timestamps):
-            raise ValueError(f"Data length ({len(real_data)}) must match timestamps length ({len(timestamps)})")
+
+        # Ensure lengths match before creating masking arrays
+        min_len = min(len(real_data), len(timestamps))
+        real_data = real_data[:min_len]
+        synthetic_data = synthetic_data[:min_len]
+        timestamps = timestamps[:min_len]
+        
+        # Save plots
+        self._plot_aggregated_profiles_bars(
+            real_data, synthetic_data, 
+            np.array([datetime.utcfromtimestamp(ts).weekday() for ts in timestamps]),
+            np.array([datetime.utcfromtimestamp(ts).month for ts in timestamps]),
+            self._resolve_feeder_ids(len(real_data))
+        )
         if real_data.ndim != 2 or synthetic_data.ndim != 2:
             raise ValueError(f"Expected 2D arrays [N, D], got real={real_data.shape}, synthetic={synthetic_data.shape}")
         if real_data.shape[1] != self.window_size or synthetic_data.shape[1] != self.window_size:

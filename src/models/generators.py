@@ -59,7 +59,7 @@ class SyntheticGenerator:
             conditions = self.conditioner.get_conditions(input_data, meter_id, timestamp).to(self.device)
             
             # Ensure input_data is flattened appropriately
-            input_data_flat = input_data.reshape(input_data.shape[0], -1)
+            input_data_flat = input_data.reshape(input_data.shape[0], -1).to(self.device)
             enc_in = torch.cat([input_data_flat, conditions], dim=-1)
             q_params = self.model.encoder(enc_in) # dict of [B, latent_dim] params
 
@@ -70,8 +70,8 @@ class SyntheticGenerator:
             if self.model.hierarchy is not None:
                 S, B, D = z.shape
                 z_flat = z.reshape(S * B, D)
-                hierarchy_results = self.model.hierarchy(z_flat)
-                z_for_decoder = hierarchy_results["output"].reshape(S, B, -1)
+                hierarchy_results = self.model.hierarchy.forward(z_flat)
+                z_for_decoder = hierarchy_results["z"].reshape(S, B, -1)
             else:
                 z_for_decoder = z
             self._last_hierarchy_results = hierarchy_results

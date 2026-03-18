@@ -80,8 +80,8 @@ class CVAE(VAE):
         if self.hierarchy is not None:
             S, B, D = z.shape
             z_flat = z.reshape(S * B, D)
-            hierarchy_results = self.hierarchy(z_flat)
-            z_for_decoder = hierarchy_results["output"].reshape(S, B, -1)
+            hierarchy_results = self.hierarchy.forward(z_flat)
+            z_for_decoder = hierarchy_results["z"].reshape(S, B, -1)
         else:
             z_for_decoder = z
         self._last_hierarchy_results = hierarchy_results
@@ -219,8 +219,8 @@ class CVAE(VAE):
         if self.hierarchy is not None:
             S, B, D = z.shape
             z_flat = z.reshape(S * B, D)
-            hierarchy_results = self.hierarchy(z_flat)
-            z = hierarchy_results["output"].reshape(S, B, -1)
+            hierarchy_results = self.hierarchy.forward(z_flat)
+            z = hierarchy_results["z"].reshape(S, B, -1)
 
         # Expand c to [S, B, C]
         c_expanded = c.unsqueeze(0).expand(num_prior_samples, B, -1)

@@ -15,7 +15,7 @@ data:
   data_dir: "./data"
   
   # CSV filename to load
-  data_files: ["test_data_small.csv",]
+  data_files: ["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
   
   # CSV column specifications
   columns:
@@ -43,8 +43,8 @@ data:
   
   # DataLoader settings
   dataloader:
-    batch_size: 258
-    num_workers: 8
+    batch_size: 4096
+    num_workers: 6
     shuffle: false
 
 # ============================================================================
@@ -66,7 +66,7 @@ model:
   type: "cvae"
   
   # Device for training: "cpu" or "cuda"
-  device: "cpu"
+  device: "cuda"
   
   # Latent dimension (size of latent vector z)
   latent_dim: 32
@@ -99,7 +99,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["user_profile", "day_of_week", "month_of_year"]  # List of conditioning tags to use
+  tags: ["day_of_week", "month_of_year","user_profile"]  # List of conditioning tags to use ["day_of_week", "month_of_year", "user_profile", "holiday"]
   
   # User profiling (based on LDA)
   user_profile:
@@ -112,14 +112,14 @@ conditioning:
   
   # Online user profiling (for OnlineCVAE)
   online_user_profile:
-    decay: 0.99
-    update_frequency: 470  # update every N batches
+    decay: 0.95
+    update_frequency: 258  # update every N batches
 
 # ============================================================================
 # HIERARCHICAL LATENT SPACE
 # ============================================================================
 hierarchy:
-  enabled: false
+  enabled: true
   levels: ["linear", "linear", "linear"] # eg. ["linear", "StochasticLevel", "VQLevel"]
   latent_dims: [64, 32, 16] # latent dimensions for each level
   top_down: [false, false, false] # whether to use top-down connections for each level
@@ -167,7 +167,7 @@ training:
     ratio: 0.5 # fraction of each cycle for warmup (0-1)
   
   # Weighted loss 
-  weighted_loss: 15.0  # Set > 0 to enable (e.g., 0.1)
+  weighted_loss: 0.0  # Set > 0 to enable (e.g., 0.1)
   
   # Early stopping
   early_stopping:

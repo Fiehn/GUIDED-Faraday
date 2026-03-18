@@ -146,8 +146,8 @@ def train(config):
     )
 
     all_test_tensors = []
-
-    writer = Writer(log_dir=os.path.join(config.logging.log_dir, model_tag, 'logs'))
+    log_path = os.path.join(config.logging.log_dir, model_tag)
+    writer = Writer(log_dir=os.path.join(log_path, 'logs'))
 
     # SAve training config
     with open(os.path.join(log_path, 'training_config.yaml'), 'w') as f:
@@ -205,9 +205,10 @@ def train(config):
         train_loader = dm.train_dataloader()
         val_loader = dm.val_dataloader()
 
-        if i == 1 and model.conditioner.condition_items.get("user_profile").is_fitted == False:
-            print("Fitting user profile conditioner on first training file...")
-            model.conditioner.condition_items["user_profile"].fit(train_loader)
+        if i == 1 and model.conditioner.condition_items.get("user_profile") is not None:
+            if model.conditioner.condition_items.get("user_profile").is_fitted == False:
+                print("Fitting user profile conditioner on first training file...")
+                model.conditioner.condition_items["user_profile"].fit(train_loader)
 
         model_tag, writer = model.fit(
             trainloader = train_loader,
@@ -246,7 +247,7 @@ def train(config):
         shuffle=False,
         num_workers=config.data.dataloader.num_workers,
     )
-    log_path = os.path.join(config.logging.log_dir, model_tag)
+    
 
     # === Evaluation ===
     evaluator = EvalFramework(model, combined_test_loader, normalizer, device='cpu', output_path=os.path.join(log_path, 'eval_results.json'))
