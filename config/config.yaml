@@ -5,7 +5,7 @@
 # data loading, and conditioning. 
 
 skip_validation: false
-verbose: true
+verbose: false
 
 # ============================================================================
 # DATA LOADING CONFIGURATION
@@ -88,7 +88,7 @@ model:
   
   # Prior configuration
   prior:
-    type: "standard_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
+    type: "vampprior"  # Options: "standard_gaussian", "standard_dictionary", 
                                  # "learnable_gaussian", "learnable_dictionary", "vamp"
     dictionary_size: 100
     vamp_num_components: 20
@@ -104,8 +104,8 @@ conditioning:
   # User profiling (based on LDA)
   user_profile:
     online: true
-    n_topics: 10 # number of LDA topics
-    num_clusters: 100 # number of KMeans clusters for "words"
+    n_topics: 20 # number of LDA topics
+    num_clusters: 200 # number of KMeans clusters for "words"
     random_state: 42
     cache_path: "./models/UserProfiles/user_profiles.pkl"
     verbose: false
@@ -155,7 +155,7 @@ training:
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 10
+  num_epochs: 7
   
   # Beta (KL weight) settings
   beta: 1.0
@@ -167,12 +167,12 @@ training:
     ratio: 0.5 # fraction of each cycle for warmup (0-1)
   
   # Weighted loss 
-  weighted_loss: 0.0  # Set > 0 to enable (e.g., 0.1)
+  weighted_loss: 15.0  # Set > 0 to enable (e.g., 0.1)
   
   # Early stopping
   early_stopping:
     enabled: true
-    patience: 15 # stop if no improvement for N validations
+    patience: 5 # stop if no improvement for N validations
     min_delta: 0.001 # minimum improvement threshold
   
   # Model checkpointing
@@ -182,8 +182,6 @@ training:
     save_best_model: true
     save_final_model: true
   
-  # Number of latent samples for training
-  weighted_loss: 10.0
   compile_model: false
 
 # ============================================================================

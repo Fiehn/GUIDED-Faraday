@@ -356,12 +356,11 @@ class ExperimentConfig:
         return {
             'batch_size': self.batch_size,
             'num_workers': self.loader.get('data.dataloader.num_workers', 0),
-            'pin_memory': self.loader.get('data.dataloader.pin_memory', False),
         }
     
     def to_data_kwargs(self) -> Dict:
         """Convert config to kwargs for data loading."""
-        from Data.dataloader import WindowSpec
+        from data.dataloader import WindowSpec
         
         data_config = self.loader.get_section('data')
         return {

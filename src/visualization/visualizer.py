@@ -346,7 +346,7 @@ class Visualizer:
             plt.close(fig)
         
         if tSNE:
-            tsne = TSNE(n_components=2)
+            tsne = TSNE(n_components=2, n_jobs=1)
             latents_2d = tsne.fit_transform(latents)
             fig, ax = plt.subplots(figsize=self.plot_style.figsize)
             ax.scatter(

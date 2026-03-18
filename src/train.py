@@ -148,6 +148,11 @@ def train(config):
     all_test_tensors = []
 
     writer = Writer(log_dir=os.path.join(config.logging.log_dir, model_tag, 'logs'))
+
+    # SAve training config
+    with open(os.path.join(log_path, 'training_config.yaml'), 'w') as f:
+        yaml.dump(config.config, f)
+
     i = 0
     for data_file in data_files:
         i += 1
@@ -242,10 +247,6 @@ def train(config):
         num_workers=config.data.dataloader.num_workers,
     )
     log_path = os.path.join(config.logging.log_dir, model_tag)
-
-    # SAve training config
-    with open(os.path.join(log_path, 'training_config.yaml'), 'w') as f:
-        yaml.dump(config.config, f)
 
     # === Evaluation ===
     evaluator = EvalFramework(model, combined_test_loader, normalizer, device='cpu')
