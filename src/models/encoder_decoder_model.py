@@ -173,11 +173,14 @@ class DictionaryCoder(torch.nn.Module):
     
     def forward(self, inputs):
         param_dict = self.parameterizer(inputs)
-        param_dict["sigma"] = torch.nn.functional.relu(param_dict["sigma"]).clamp(self.sigma_lower_lim, self.sigma_upper_lim)
+        #param_dict["sigma"] = torch.nn.functional.relu(param_dict["sigma"]).clamp(self.sigma_lower_lim, self.sigma_upper_lim)
         # TODO: They clamp mu as well?? Check later
 
-        # TODO: this should be a more stable approach?:
-        # param_dict["sigma"] = F.softplus(param_dict["sigma"]).clamp(self.sigma_lower_lim, self.sigma_upper_lim)
+        # The actual max allowed out of the clamp is (upper - lower)
+        max_allowed_softplus = self.sigma_upper_lim - self.sigma_lower_lim
+        # The upper limit is kinda not nessecary except as a safety precaution against collapse
+        # The lower limit is implemented here by a constant added to the softplus output, which ensures that sigma is always above the lower limit (since softplus is always positive)
+        param_dict["sigma"] = F.softplus(param_dict["sigma"]).clamp(max=max_allowed_softplus) + self.sigma_lower_lim
         return param_dict
 
     def reparameterize(self, param_dict, num_samples=1, **_):
@@ -219,19 +222,12 @@ class DictionaryCoder(torch.nn.Module):
         # Add jitter and use Cholesky — always PD, more numerically stable (It should have been stable but it seems to be an issue in practice, Maybe the heirarchy is causing some instability? I will need to check this later)
         jitter = 1e-5 * torch.eye(D, device=Sigma.device, dtype=Sigma.dtype).unsqueeze(0)
         Sigma_jittered = Sigma + jitter
-
-        with torch.amp.autocast('cuda', enabled=False): # AMP and Cholesky don't play well together, so we do this part in full precision on GPU (if available)
-        # Use PyTorch's MultivariateNormal distribution
+        
         # Using scale_tril with Cholesky decomposition for better numerical stability (should be equivalent to covariance_matrix but more stable)
-            # Explicit float32 cast: autocast(enabled=False) stops further downcasting but
-            # does NOT upcast tensors that are already float16, so we must do it manually.
-            mu_fp32 = mu.float()
-            inputs_fp32 = inputs.float()
-            Sigma_fp32 = Sigma_jittered.float()
-            L = torch.linalg.cholesky(Sigma_fp32)
-            
-            dist = torch.distributions.MultivariateNormal(loc=mu_fp32, scale_tril=L)
-            return dist.log_prob(inputs_fp32)
+        L = torch.linalg.cholesky(Sigma)
+        
+        dist = torch.distributions.MultivariateNormal(loc=mu, scale_tril=L)
+        return dist.log_prob(inputs)
     
     def kl_divergence(self, param_dict_q, prior=None, **_):
         """
@@ -239,7 +235,7 @@ class DictionaryCoder(torch.nn.Module):
 
         For priors that support analytical KL (e.g. StandardDictionaryPrior),
         uses the closed-form multivariate-Gaussian KL.
- 
+
         For priors that do NOT (e.g. VampPrior), falls back to single-sample
         Monte Carlo:  KL ≈ E_q[log q(z|x) - log p(z)].
         
@@ -255,52 +251,36 @@ class DictionaryCoder(torch.nn.Module):
             return log_q - log_p
 
         # --- Analytical path (Gaussian priors) ---
-        # Compute everything in fp32 with autocast disabled: fp16 rounding in S^T S
-        # accumulates as SigmaMapper weights grow (e.g. after the first training file),
-        # producing tiny negative eigenvalues that fail PyTorch's PositiveDefinite check.
-        with torch.amp.autocast('cuda', enabled=False):
-            param_dict_q_fp32 = {k: v.float() for k, v in param_dict_q.items()}
-            mu_q = param_dict_q_fp32["mu"]
-            Sigma_q = self.create_covariance_matrix(param_dict_q_fp32)
-            D = Sigma_q.shape[-1]
-            jitter = 1e-5 * torch.eye(D, device=Sigma_q.device).unsqueeze(0)
-            Sigma_q = 0.5 * (Sigma_q + Sigma_q.transpose(-1, -2)) + jitter
+        mu_q = param_dict_q["mu"]
+        Sigma_q = self.create_covariance_matrix(param_dict_q)
 
-            if prior is None:
-                # Default to standard normal in output space
-                mu_p = torch.zeros_like(mu_q)
-                Sigma_p = torch.eye(self.output_dim, device=mu_q.device).unsqueeze(0).expand(mu_q.shape[0], -1, -1)
-            else:
-                # Get prior parameters and create covariance
-                prior_params = prior.get_params()
-                batch_size = mu_q.shape[0]
-                prior_params = {k: v.float().expand(batch_size, -1).to(mu_q.device) for k, v in prior_params.items()}
-                mu_p = prior_params["mu"]
-                if prior_params["sigma"].shape[-1] == self.dictionary_size:
-                    # Prior sigma is in dictionary space — use the PDCC formula
-                    Sigma_p = self.create_covariance_matrix(prior_params)
-                    Sigma_p = 0.5 * (Sigma_p + Sigma_p.transpose(-1, -2)) + jitter
-                else:
-                    # Prior sigma is in output space (e.g. StandardGaussianPrior) — build diagonal covariance
-                    Sigma_p = torch.diag_embed(prior_params["sigma"] ** 2)  # [B, output_dim, output_dim]
-
-            # Use scale_tril (Cholesky) — more numerically stable than passing covariance_matrix directly
-            try:
-                L_q = torch.linalg.cholesky(Sigma_q)
-                L_p = torch.linalg.cholesky(Sigma_p)
-                dist_q = torch.distributions.MultivariateNormal(loc=mu_q, scale_tril=L_q)
-                dist_p = torch.distributions.MultivariateNormal(loc=mu_p, scale_tril=L_p)
-                return torch.distributions.kl.kl_divergence(dist_q, dist_p)
-            except Exception as e:
-                print(f"Warning: Analytical KL failed, using Monte Carlo: {e}")
-
-        z = self.reparameterize(param_dict_q, num_samples=1).squeeze(0)  # [B, D]
-        log_q = self.loglikelihood(z, param_dict_q)
         if prior is None:
-            log_p = -0.5 * torch.sum(z ** 2 + torch.log(torch.tensor(2 * torch.pi)), dim=-1)
+            # Default to standard normal in output space
+            mu_p = torch.zeros_like(mu_q)
+            Sigma_p = torch.eye(self.output_dim, device=mu_q.device).unsqueeze(0).expand(mu_q.shape[0], -1, -1)
         else:
-            log_p = prior.log_prob(z)
-        return log_q - log_p
+            # Get prior parameters and create covariance
+            prior_params = prior.get_params()
+            batch_size = mu_q.shape[0]
+            prior_params = {k: v.expand(batch_size, -1).to(mu_q.device) for k, v in prior_params.items()}
+            mu_p = prior_params["mu"]
+            Sigma_p = self.create_covariance_matrix(prior_params)
+        
+        # Use analytical KL for multivariate Gaussians
+        try:
+            dist_q = torch.distributions.MultivariateNormal(loc=mu_q, covariance_matrix=Sigma_q)
+            dist_p = torch.distributions.MultivariateNormal(loc=mu_p, covariance_matrix=Sigma_p)
+            return torch.distributions.kl.kl_divergence(dist_q, dist_p)
+        except Exception as e:
+            print(f"Warning: Analytical KL failed, using Monte Carlo: {e}")
+            z = self.reparameterize(param_dict_q, num_samples=1).squeeze(0)  # [B, D]
+            log_q = self.loglikelihood(z, param_dict_q)
+            if prior is None:
+                log_p = -0.5 * torch.sum(z ** 2 + torch.log(torch.tensor(2 * torch.pi)), dim=-1)
+            else:
+                log_p = prior.log_prob(z)
+            return log_q - log_p
+
 
 
     def create_covariance_matrix(self, param_dict):
@@ -452,7 +432,7 @@ class NNBlock(nn.Module):
             layers = [nn.Linear(self.input_dim, self.num_neurons), nn.ReLU()]
 
         if self.batch_norm:
-            layers.append(nn.BatchNorm1d(self.num_neurons))
+            layers.append(nn.LayerNorm(self.num_neurons))
         if self.dropout:
             layers.append(nn.Dropout(self.dropout_rate * 0.5))  # Less dropout in the first layer
         return nn.Sequential(*layers)

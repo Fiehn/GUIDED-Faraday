@@ -322,7 +322,7 @@ class GAN(nn.Module):
             n_critic=None,
             **_,
     ):
-        from src.Models.model_utils import EarlyStopping
+        from src.models.model_utils import EarlyStopping
 
         if n_critic is not None:
             self.n_critic = n_critic

@@ -1,6 +1,6 @@
 import torch
 from evaluation.eval_framework import FlexibilityDistance # for reconstruction evaluation
-from evaluation.eval_framework import VisualEvaluation, ACFDistribution, ClassicalStatistics, TSTR, MaximumMeanDiscrepancy, AggregatedProfiles, PerConditionEval # for distributional evaluation
+from evaluation.eval_framework import ACFDistribution, ClassicalStatistics, TSTR, MaximumMeanDiscrepancy, AggregatedProfiles, PerConditionEval # for distributional evaluation
 from src.models.vae import VAE
 from src.models.cvae import CVAE
 import glob
@@ -134,7 +134,7 @@ input_dim = window_size * len(feature_cols)
 
 # Create model
 if model_type.upper() == 'CVAE':
-    from src.Data.Conditioner import Conditioner
+    from src.data.conditioner import Conditioner
     conditioner = Conditioner(config=config)
     model = CVAE(input_dim=input_dim, latent_dim=latent_dim, encoder_type=encoder_type, 
                  decoder_type=decoder_type, prior_type=prior_type, conditioner=conditioner)

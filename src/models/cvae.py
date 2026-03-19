@@ -24,7 +24,7 @@ class CVAE(VAE):
         self.condition_dim = conditioner.get_condition_dim()
         self.latent_dim = int(latent_dim)
 
-        super().__init__(input_dim=input_dim, distribution_dict=distribution_dict, prior_type=prior_type, hierarchy_config=hierarchy_config, **kwargs)
+        super().__init__(input_dim=input_dim, latent_dim=latent_dim, distribution_dict=distribution_dict, prior_type=prior_type, hierarchy_config=hierarchy_config, **kwargs)
 
         # Now override encoder and decoder with conditioned versions
         # Encoder takes [x, c] as input
@@ -80,8 +80,8 @@ class CVAE(VAE):
         if self.hierarchy is not None:
             S, B, D = z.shape
             z_flat = z.reshape(S * B, D)
-            hierarchy_results = self.hierarchy(z_flat)
-            z_for_decoder = hierarchy_results["output"].reshape(S, B, -1)
+            hierarchy_results = self.hierarchy.forward(z_flat)
+            z_for_decoder = hierarchy_results["z"].reshape(S, B, -1)
         else:
             z_for_decoder = z
         self._last_hierarchy_results = hierarchy_results
@@ -115,20 +115,28 @@ class CVAE(VAE):
     def train_core(self, batch, optim, beta=1.0,weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
         self.train()
         if len(batch) == 4:
-            x, meter_id, timestamps = batch
+            x, c, meter_id, timestamps = batch
+            if c.numel() == 0 or c.shape[-1] != self.condition_dim:
+                c = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
+            c = self.move_to_device(c, device=x.device)
         elif len(batch) == 3:
             x, meter_id, timestamps = batch
+            c = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
+            c = self.move_to_device(c, device=x.device)
         elif len(batch) == 2:
-             x, meter_id = batch
+            x, meter_id = batch
+            timestamps = None
+            c = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
+            c = self.move_to_device(c, device=x.device)
         else:
             x = batch
+            c = self.conditioner.get_conditions(x)
+            meter_id = None
+            timestamps = None
+            c = self.move_to_device(c, device=x.device)
 
         # Prep inputs: [B, L, F] -> [B, D] if needed
         x = self._prep_inputs(x)
-
-        # Compute conditions
-        c = self.conditioner.get_conditions(x, meter_id, timestamps)
-        c = self.move_to_device(c, device=x.device)
 
         # Forward pass
         recon_params, q_params = self.forward(x, c, num_samples=1)
@@ -150,16 +158,31 @@ class CVAE(VAE):
         agg = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
         num_batches = 0
 
-        for x, meter_id, timestamps in valloader:
+        for batch in valloader:
+            if len(batch) == 4:
+                x, c, meter_id, timestamps = batch
+                if c.numel() == 0 or c.shape[-1] != self.condition_dim:
+                    c = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
+            elif len(batch) == 3:
+                x, meter_id, timestamps = batch
+                c = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
+            elif len(batch) == 2:
+                x, meter_id = batch
+                timestamps = None
+                c = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
+            else:
+                x = batch[0] if isinstance(batch, (list, tuple)) else batch
+                c = self.conditioner.get_conditions(x)
+                meter_id = None
+                timestamps = None
+                
+            c = self.move_to_device(c, device=device)
+
             # Keep original 3D shape for conditioning
             x_3d = x.to(device)
             
             # Flatten for model
             x_flat = self._prep_inputs(x_3d)  # [B, D]
-
-            # Get conditions - PASS 3D tensor
-            c = self.conditioner.get_conditions(x_3d, meter_id=meter_id, timestamps=timestamps)
-            c = self.move_to_device(c, device=device)
 
             # Forward pass
             recon_params, q_params = self.forward(x_flat, c, num_samples=1)
@@ -219,8 +242,8 @@ class CVAE(VAE):
         if self.hierarchy is not None:
             S, B, D = z.shape
             z_flat = z.reshape(S * B, D)
-            hierarchy_results = self.hierarchy(z_flat)
-            z = hierarchy_results["output"].reshape(S, B, -1)
+            hierarchy_results = self.hierarchy.forward(z_flat)
+            z = hierarchy_results["z"].reshape(S, B, -1)
 
         # Expand c to [S, B, C]
         c_expanded = c.unsqueeze(0).expand(num_prior_samples, B, -1)

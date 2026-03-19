@@ -383,7 +383,7 @@ class TestEvalFrameworkUnit:
 
 def _build_cvae(input_dim, conditioner, device):
     """Build a CVAE model (avoids conftest fixture import issue)."""
-    from src.Models.CVAE import CVAE as CVAEClass
+    from src.models.cvae import CVAE as CVAEClass
     model = CVAEClass(
         input_dim=input_dim,
         latent_dim=4,
@@ -422,8 +422,8 @@ class TestReconstructionMSEIntegration:
 
     def test_runs_and_returns_finite(self, input_dim, conditioner, train_loader, device):
         model = _build_cvae(input_dim, conditioner, device)
-        x, meter_id, timestamps = next(iter(train_loader))
-        x, meter_id, timestamps = x.to(device), meter_id.to(device), timestamps.to(device)
+        x, c, meter_id, timestamps = next(iter(train_loader))
+        x, c, meter_id, timestamps = x.to(device), c.to(device), meter_id.to(device), timestamps.to(device)
 
         x_flat, recon = _reconstruct_batch(model, x, meter_id, timestamps, device)
 
@@ -441,8 +441,8 @@ class TestReconstructionRMSEIntegration:
 
     def test_runs_and_returns_finite(self, input_dim, conditioner, train_loader, device):
         model = _build_cvae(input_dim, conditioner, device)
-        x, meter_id, timestamps = next(iter(train_loader))
-        x, meter_id, timestamps = x.to(device), meter_id.to(device), timestamps.to(device)
+        x, c, meter_id, timestamps = next(iter(train_loader))
+        x, c, meter_id, timestamps = x.to(device), c.to(device), meter_id.to(device), timestamps.to(device)
 
         x_flat, recon = _reconstruct_batch(model, x, meter_id, timestamps, device)
 
@@ -460,8 +460,8 @@ class TestFlexibilityDistanceIntegration:
 
     def test_runs_and_returns_finite(self, input_dim, conditioner, train_loader, device):
         model = _build_cvae(input_dim, conditioner, device)
-        x, meter_id, timestamps = next(iter(train_loader))
-        x, meter_id, timestamps = x.to(device), meter_id.to(device), timestamps.to(device)
+        x, c, meter_id, timestamps = next(iter(train_loader))
+        x, c, meter_id, timestamps = x.to(device), c.to(device), meter_id.to(device), timestamps.to(device)
 
         x_flat, recon = _reconstruct_batch(model, x, meter_id, timestamps, device)
 

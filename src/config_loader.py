@@ -11,6 +11,22 @@ import torch
 import warnings
  
 
+class AttrDict:
+    """Wraps a dict for recursive attribute-style access."""
+    def __init__(self, d):
+        object.__setattr__(self, '_d', d)
+
+    def __getattr__(self, key):
+        try:
+            val = object.__getattribute__(self, '_d')[key]
+        except KeyError:
+            raise AttributeError(f"Config has no key '{key}'")
+        return AttrDict(val) if isinstance(val, dict) else val
+
+    def __repr__(self):
+        return f"AttrDict({object.__getattribute__(self, '_d')})"
+
+
 class ConfigError(Exception):
     """Exception raised for configuration errors."""
     pass
@@ -156,6 +172,14 @@ class ConfigLoader:
         else:
             raise ConfigError(f"Unsupported format: {format}")
     
+    def __getattr__(self, name):
+        # Only called when normal attribute lookup fails (i.e. not config/config_path/defaults_path)
+        try:
+            val = self.config[name]
+        except KeyError:
+            raise AttributeError(f"Config has no key '{name}'")
+        return AttrDict(val) if isinstance(val, dict) else val
+
     def __repr__(self):
         return f"ConfigLoader(config_path={self.config_path}, sections={list(self.config.keys())})"
 
@@ -332,12 +356,11 @@ class ExperimentConfig:
         return {
             'batch_size': self.batch_size,
             'num_workers': self.loader.get('data.dataloader.num_workers', 0),
-            'pin_memory': self.loader.get('data.dataloader.pin_memory', False),
         }
     
     def to_data_kwargs(self) -> Dict:
         """Convert config to kwargs for data loading."""
-        from Data.dataloader import WindowSpec
+        from data.dataloader import WindowSpec
         
         data_config = self.loader.get_section('data')
         return {

@@ -44,7 +44,7 @@ def _to_json_serializable(obj: Any) -> Any:
 
 
 def _save_standalone_metric_result(metric_key: str, payload: Dict[str, Any],
-                                   output_file: str = 'output/eval_results.json') -> None:
+                                   output_file: str = 'models/eval_results.json') -> None:
     """Save/update standalone metric results in the shared per-condition JSON file."""
     try:
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -169,9 +169,7 @@ class EvalFramework:
         device: str = 'cpu',
         window_size: int = 24,
         n_synthetic_samples: int = 1000,
-        output_dir: str = 'output',
-        prepared_data: Dict[str, Any] = None,
-        evaluation_title: str = 'EVALUATION FRAMEWORK'
+        output_path: str = 'models/eval_results.json'
     ):
         """Initialize evaluation framework.
         
@@ -201,23 +199,22 @@ class EvalFramework:
 
         self._real_data: np.ndarray = None  # Cache real data for synthetic metrics that need it
         self._reconstructed_data: np.ndarray = None  # Cache reconstructed data for metrics that need it
-        self._syntheric_data: np.ndarray = None  # Cache synthetic data for metrics that need it
-        self._timestamps: np.ndarray = None  # Cache timestamps aligned with real data
-        self._meter_ids: np.ndarray = None  # Cache meter ids aligned with real data
+        self._synthetic_data: np.ndarray = None  # Cache synthetic data for metrics that need it
+        self._timestamps: np.ndarray = None  # Cache timestamps for metrics that need it
+
+        self.output_path = output_path
 
     def register_all(self):
         self.register_metrics([
-            ReconstructionMSE,
-            ReconstructionRMSE,
-            ReconstructionLogLikelihood,
-            FlexibilityDistance,
-            MaximumMeanDiscrepancy,
-            VisualEvaluation(output_dir=self.output_dir),
-            ACFDistribution(window_size=self.window_size),
-            ClassicalStatistics(window_size=self.window_size, n_features=1),
-            TSTR(window_size=self.window_size, n_features=1),
-            AggregatedProfiles(window_size=self.window_size, output_dir=self.output_dir),
-            PerConditionEval(window_size=self.window_size, output_dir=self.output_dir)
+            ReconstructionRMSE(),
+            ReconstructionLogLikelihood(),
+            FlexibilityDistance(),
+            MaximumMeanDiscrepancy(),
+            ACFDistribution(),
+            ClassicalStatistics(),
+            TSTR(),
+            AggregatedProfiles(),
+            PerConditionEval()
         ])
 
     def _is_cvae(self) -> bool:
@@ -243,27 +240,26 @@ class EvalFramework:
         real_batches = []
         recon_batches = []
         condition_batches = []
-        timestamp_batches = []
-        meter_id_batches = []
+        timestamp = []
 
         self.model.eval()
         with torch.no_grad():
-            for data, meter_ids, timestamps in self.dataloader:
+            for data, c, meter_ids, timestamps in self.dataloader:
                 data = data.to(self.device)
+                c = c.to(self.device)
                 x_flat = data.reshape(data.shape[0], -1) if data.dim() == 3 else data
                 real_batches.append(x_flat.cpu().numpy())
-                meter_id_batches.append(np.asarray(meter_ids.cpu().numpy()).reshape(-1))
-                timestamp_batches.append(np.asarray(timestamps.cpu().numpy()).reshape(-1))
+
+                timestamp.append(timestamps.cpu().numpy())
 
                 recon = self._reconstruct(data, meter_id=meter_ids, timestamps=timestamps)
                 recon_batches.append(recon.cpu().numpy())
 
                 if self._is_cvae():
                     # Use the model's own conditioner, not self.conditioner
-                    c = self.model.conditioner.get_conditions(data, meter_id=meter_ids, timestamps=timestamps)
-                    c = self.model.move_to_device(c, device=self.device)
                     condition_batches.append(c.cpu())
 
+        self._timestamps = np.concatenate(timestamp, axis=0) if timestamp else None
         self._real_data = np.concatenate(real_batches, axis=0)
         self._reconstructed_data = np.concatenate(recon_batches, axis=0)
         self._meter_ids = np.concatenate(meter_id_batches, axis=0) if meter_id_batches else None
@@ -351,6 +347,8 @@ class EvalFramework:
             metric.model = self.model
             metric.device = self.device
             metric.normalizer = self.normalizer
+            metric.output_path = self.output_path
+            metric.timestamps = self._timestamps
 
         for metric in self.synthetic_metrics.values():
             metric.real_data = self._real_data
@@ -358,6 +356,8 @@ class EvalFramework:
             metric.model = self.model
             metric.device = self.device
             metric.normalizer = self.normalizer
+            metric.output_path = self.output_path
+            metric.timestamps = self._timestamps
 
             # PerConditionEval needs aligned timestamps and 24h windows (consumption feature only)
             if isinstance(metric, PerConditionEval):
@@ -687,6 +687,7 @@ class ReconstructionMSE(ReconstructionMetric):
     
     real_data: np.ndarray = None
     reconstructed_data: np.ndarray = None
+    output_path: str = None
     
     @property
     def name(self) -> str:
@@ -722,7 +723,8 @@ class ReconstructionMSE(ReconstructionMetric):
                 'n_samples': int(real.shape[0]),
                 'n_features': int(real.shape[1]),
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
 
         return mse
@@ -733,6 +735,7 @@ class ReconstructionRMSE(ReconstructionMetric):
     
     real_data: np.ndarray = None
     reconstructed_data: np.ndarray = None
+    output_path: str = None
     
     @property
     def name(self) -> str:
@@ -768,7 +771,8 @@ class ReconstructionRMSE(ReconstructionMetric):
                 'n_samples': int(real.shape[0]),
                 'n_features': int(real.shape[1]),
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
 
         return rmse
@@ -835,7 +839,8 @@ class ReconstructionLogLikelihood(ReconstructionMetric):
                 'n_samples': int(real.shape[0]),
                 'n_features': int(real.shape[1]),
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
 
         return mean_log_likelihood
@@ -852,6 +857,7 @@ class FlexibilityDistance(ReconstructionMetric):
     
     real_data: np.ndarray = None
     reconstructed_data: np.ndarray = None
+    output_path: str = None
 
     def __init__(self, tau='auto', normalize=True):
         """
@@ -958,6 +964,7 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
     
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
+    output_path: str = None
 
     def __init__(self, sigma=None, seed=42, max_samples=2000):
         """
@@ -1084,7 +1091,8 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
                 'n_real_used': int(len(real)),
                 'n_synthetic_used': int(len(synthetic)),
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
 
         return mmd_value
@@ -1103,6 +1111,7 @@ class ACFDistribution(SyntheticMetric):
 
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
+    output_path: str = None
     
     def __init__(self, window_size=24, max_lag=10):
         """
@@ -1201,7 +1210,8 @@ class ACFDistribution(SyntheticMetric):
                 'n_real_series': int(len(real_ts)),
                 'n_synthetic_series': int(len(synthetic_ts)),
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
 
         return avg_ks
@@ -1334,6 +1344,7 @@ class ClassicalStatistics(SyntheticMetric):
     """
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
+    output_path: str = None
     
     def __init__(self, window_size=24, n_features=1):
         """
@@ -1440,7 +1451,8 @@ class ClassicalStatistics(SyntheticMetric):
                 'real': real_stats,
                 'synthetic': synthetic_stats,
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
 
         return mean_profile_diff
@@ -1510,6 +1522,7 @@ class TSTR(SyntheticMetric):
 
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
+    output_path: str = None
     
     def __init__(self, task='next_step', window_size=24, n_features=1, 
                  predictor_type='linear', epochs=50, random_state=42):
@@ -1690,7 +1703,8 @@ class TSTR(SyntheticMetric):
                 'n_real_test': int(len(real_test)),
                 'n_synthetic_train': int(len(synthetic_train)),
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
         
         return tstr_ratio
@@ -1702,14 +1716,14 @@ class AggregatedProfiles(SyntheticMetric):
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
     normalizer = None
+    output_dir: str = None
     
+    def __init__(self, n_samples=100, window_size=24, tau='auto', normalize=True):
     def __init__(self, n_samples=100, window_size=24, tau='auto', normalize=True, output_dir='output'):
         self.n_samples = n_samples
         self.window_size = window_size
         self.tau = tau
         self.normalize = normalize
-        self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
     
     @property
     def name(self) -> str:
@@ -1776,7 +1790,8 @@ class AggregatedProfiles(SyntheticMetric):
                 'real_aggregated': real_aggregated,
                 'synthetic_aggregated': synth_aggregated,
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
-            }
+            },
+            output_file=self.output_path or 'models/eval_results.json'
         )
         
         return fd_score
@@ -1795,7 +1810,13 @@ class AggregatedProfiles(SyntheticMetric):
         ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, 'aggregated_profiles_comparison.png'), dpi=150)
+        
+        # Ensure output_path doesn't contain a filename
+        base_dir = os.path.dirname(self.output_path) if self.output_path and self.output_path.endswith('.json') else self.output_path
+        plot_dir = os.path.join(base_dir, 'Plots') if base_dir else 'Plots'
+        os.makedirs(plot_dir, exist_ok=True)
+        
+        plt.savefig(os.path.join(plot_dir, 'aggregated_profiles_comparison.png'), dpi=150, bbox_inches='tight')
         plt.close()
         
 
@@ -1817,22 +1838,21 @@ class PerConditionEval(SyntheticMetric):
     timestamps: np.ndarray = None
     meter_ids: np.ndarray = None
     feeder_ids: np.ndarray = None
+    output_dir: str = None
 
-    def __init__(self, window_size=24, max_lag=10, min_samples_per_group=2, output_dir='output', 
+    def __init__(self, window_size=24, max_lag=10, min_samples_per_group=2, 
                  verbose=False, predictor_type='linear', tstr_epochs=50,
                  feeder_mapping_path='topology/cleaned/Cleaned_SM_Topology_mapping.json',
                  min_samples_per_feeder=5):
         self.window_size = window_size
         self.max_lag = max_lag
         self.min_samples_per_group = min_samples_per_group
-        self.output_dir = output_dir
         self.verbose = verbose
         self.predictor_type = predictor_type
         self.tstr_epochs = tstr_epochs
         self.feeder_mapping_path = feeder_mapping_path
         self.min_samples_per_feeder = min_samples_per_feeder
         self._meter_to_feeder = None
-        os.makedirs(output_dir, exist_ok=True)
 
         self.results_by_condition = {
             'mmd': {
@@ -1874,7 +1894,6 @@ class PerConditionEval(SyntheticMetric):
             window_size=window_size,
             tau='auto',
             normalize=True,
-            output_dir=output_dir
         )
 
     @property
@@ -1939,6 +1958,7 @@ class PerConditionEval(SyntheticMetric):
         try:
             self.aggregated_profiles_calculator.real_data = real_subset
             self.aggregated_profiles_calculator.synthetic_data = synthetic_subset
+            self.aggregated_profiles_calculator.output_path = self.output_path
             return float(self.aggregated_profiles_calculator.compute())
         except Exception as e:
             if self.verbose:
@@ -2090,7 +2110,8 @@ class PerConditionEval(SyntheticMetric):
         feeder_ids: np.ndarray = None,
     ) -> Dict[str, str]:
         """Create bar charts of aggregated real vs synthetic consumption by day and month."""
-        plots_dir = self.output_dir
+        base_dir = os.path.dirname(self.output_path) if self.output_path and self.output_path.endswith('.json') else self.output_path
+        plots_dir = os.path.join(base_dir, 'Plots') if base_dir else 'Plots'
         os.makedirs(plots_dir, exist_ok=True)
         
         # Plot style
@@ -2216,16 +2237,34 @@ class PerConditionEval(SyntheticMetric):
         if self.real_data is None or self.synthetic_data is None:
             raise ValueError("PerConditionEval requires injected real_data and synthetic_data.")
         if self.timestamps is None:
-            raise ValueError("PerConditionEval requires injected timestamps.")
+            raise ValueError("PerConditionEval requires injected timestamps for per-condition grouping.")
+
+        self.mmd_calculator.output_path = self.output_path
+        self.acf_calculator.output_path = self.output_path
+        self.classical_statistics_calculator.output_path = self.output_path
+        self.tstr_calculator.output_path = self.output_path
+        self.aggregated_profiles_calculator.output_path = self.output_path
 
         real_data = np.asarray(self.real_data)
         synthetic_data = np.asarray(self.synthetic_data)
         timestamps = np.asarray(self.timestamps)
 
         if len(real_data) != len(synthetic_data):
-            raise ValueError(f"Real ({len(real_data)}) and synthetic ({len(synthetic_data)}) data must have same length")
-        if len(real_data) != len(timestamps):
-            raise ValueError(f"Data length ({len(real_data)}) must match timestamps length ({len(timestamps)})")
+            synthetic_data = synthetic_data[:len(real_data)]
+
+        # Ensure lengths match before creating masking arrays
+        min_len = min(len(real_data), len(timestamps))
+        real_data = real_data[:min_len]
+        synthetic_data = synthetic_data[:min_len]
+        timestamps = timestamps[:min_len]
+        
+        # Save plots
+        self._plot_aggregated_profiles_bars(
+            real_data, synthetic_data, 
+            np.array([datetime.utcfromtimestamp(ts).weekday() for ts in timestamps]),
+            np.array([datetime.utcfromtimestamp(ts).month for ts in timestamps]),
+            self._resolve_feeder_ids(len(real_data))
+        )
         if real_data.ndim != 2 or synthetic_data.ndim != 2:
             raise ValueError(f"Expected 2D arrays [N, D], got real={real_data.shape}, synthetic={synthetic_data.shape}")
         if real_data.shape[1] != self.window_size or synthetic_data.shape[1] != self.window_size:

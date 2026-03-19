@@ -32,6 +32,8 @@ from src.models.model_utils import CyclicalBetaScheduler, EarlyStopping
 #   - encoder and decoder are modular and can be swapped out
 # ==============
 class VAE(nn.Module):
+    """Base VAE class with modular encoder, decoder, prior and hierarchical latent space.
+    """
     def __init__(self,
                  input_dim=24,
                  latent_dim=32,
@@ -42,6 +44,7 @@ class VAE(nn.Module):
                  prior_type = None,
                  device="cpu",
                  hierarchy_config: HierarchicalConfig = None,
+                 device = "cpu",
                  **_):
         super(VAE, self).__init__()
 
@@ -64,6 +67,8 @@ class VAE(nn.Module):
         self.decoder_type = decoder_type 
         self.prior_type = prior_type
         self.latent_dim = latent_dim
+
+        self.device = device
 
         # 1. Create encoder and decoder and the latent module for the hierarchy if specified
         self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim, type=encoder_type, dictionary_size=dictionary_size)
@@ -110,7 +115,7 @@ class VAE(nn.Module):
             # z shape: [S, B, latent_dim]
             S,B,D = z.shape
             z_flat = z.reshape(S * B, D)  # Flatten for hierarchy: [S*B, latent_dim]
-            hierarchy_results = self.hierarchy(z_flat)  # Pass through hierarchy
+            hierarchy_results = self.hierarchy.forward(z_flat)  # Pass through hierarchy
             z_for_decoder = hierarchy_results["z"].reshape(S, B, -1)  # Reshape back to [S, B, output_dim]
         else:
             z_for_decoder = z
@@ -181,7 +186,7 @@ class VAE(nn.Module):
         posterior_loglikelihood = self.encoder.loglikelihood(posterior_params_dict)
         prior_loglikelihood = self.prior.log_prob(posterior_params_dict['z'])
         
-        return (posterior_loglikelihood.sum(-1) + recon_loglikelihood.sum(-1) - prior_loglikelihood.sum(-1)).mean(dim=0)
+        return (recon_loglikelihood.sum(-1) + prior_loglikelihood.sum(-1) - posterior_loglikelihood.sum(-1)).mean(dim=0)
     
     def loss(self, inputs, recon_params_dict, posterior_params_dict, beta: float = 1.0, weighted_loss: float = 0.0, **_):
         # Compute reconstruction log-likelihood
@@ -193,7 +198,8 @@ class VAE(nn.Module):
 
         # Weighted loss (set weighted_loss > 0 to enable) - gives more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
         weights = 1.0 + weighted_loss * torch.abs(inputs).mean(dim=-1)
-        recon_loglikelihood = (recon_loglikelihood * weights).mean() 
+        weights = weights / weights.mean() # Should not change the overall scale of the loss, just reweight samples within the batch (This will hopefully allow vamp to work!)
+        recon_loglikelihood = (recon_loglikelihood * weights).mean()
 
         loss = -(recon_loglikelihood - beta * kl_div)
 
@@ -837,7 +843,7 @@ class VAE(nn.Module):
         config_path = os.path.join(log_dir, "training_config.json")
         config = {
             'model_tag': model_tag,
-            'timestamp': time_stamp,
+            'time_stamp': datetime.now().isoformat(),
             'hyperparameters': {
                 'lr': lr,
                 'weight_decay': weight_decay,
@@ -862,7 +868,7 @@ class VAE(nn.Module):
         with open(config_path, 'w') as f:
             json.dump(config, f, indent=4)
         print(f"Training configuration saved to: {config_path}")
-
+        log_dir_tagged = os.path.join(log_dir, model_tag)   # <-- move here
         # === Initialize TensorBoard writer ===
         if writer is None:
             log_dir_tagged = os.path.join(log_dir, model_tag)
@@ -897,12 +903,23 @@ class VAE(nn.Module):
         # === Optional Model Compilation ===
         if compile_model and hasattr(torch, 'compile'):
             compile_mode = 'reduce-overhead' if str(device) != 'cpu' else None
-            self.encoder = torch.compile(self.encoder, mode=compile_mode)
-            self.decoder = torch.compile(self.decoder, mode=compile_mode)
-            if self.hierarchy is not None:
-                self.hierarchy = torch.compile(self.hierarchy, mode=compile_mode)
-            print(f"Model compiled with torch.compile (mode={compile_mode}).")
-
+            try:
+                self.encoder = torch.compile(self.encoder, mode=compile_mode)
+                self.decoder = torch.compile(self.decoder, mode=compile_mode)
+                if self.hierarchy is not None:
+                    self.hierarchy = torch.compile(self.hierarchy, mode=compile_mode)
+                print(f"Model compiled with torch.compile (mode={compile_mode}).")
+            except Exception as e:
+                print(f"torch.compile skipped (not supported in this environment): {e}")
+                try:
+                    compile_mode = 'cudagraphs' if str(device) != 'cpu' else None
+                    self.encoder = torch.compile(self.encoder, mode=compile_mode)
+                    self.decoder = torch.compile(self.decoder, mode=compile_mode)
+                    if self.hierarchy is not None:
+                        self.hierarchy = torch.compile(self.hierarchy, mode=compile_mode)
+                    print(f"Model compiled with torch.compile (mode={compile_mode}).")
+                except Exception as e:
+                    print(f"torch.compile skipped with fallback mode as well: {e}")
 
         # === Training Loop ===
         self.train()
@@ -1056,6 +1073,7 @@ class VAE(nn.Module):
     
     def get_SigmaMapper(self):
         return self.decoder.get_SigmaMapper()
+
 
 
 

@@ -252,6 +252,7 @@ class SmartMeterDataModule:
         val_frac: float = 0.1,
         max_meters: Optional[int] = None,
         normalizer = None,
+        conditioner = None,
     ):
         self.loader = SmartMeterCSV(
             data_dir=data_dir,
@@ -272,6 +273,7 @@ class SmartMeterDataModule:
         self.max_meters = max_meters
 
         self.normalizer = normalizer
+        self.conditioner = conditioner
 
         self._train_ds = None 
         self._val_ds = None
@@ -309,6 +311,7 @@ class SmartMeterDataModule:
         # fit normalizer if provided
         
         self._fit_normalizer()
+        self._fit_conditioner()
 
         self._train_ds  = self._make_dataset(self.train_ids)
         self._val_ds    = self._make_dataset(self.val_ids)
@@ -318,6 +321,71 @@ class SmartMeterDataModule:
         # This halves peak memory when the DataModule stays alive during training.
         self.loader.df = None
         gc.collect()
+
+    def _yield_train_batches(self):
+        """Yields batches of preprocessed (x, meter_id, timestamps) for training data."""
+        L = self.window.input_len
+        for mid in self.train_ids:
+            meter_df = self.loader.meter_frame(mid)
+            if meter_df.empty:
+                continue
+
+            values_np = meter_df[self.feature_cols].to_numpy(dtype=np.float32)
+            times_np  = (meter_df.index.view(np.int64) // 10**9).astype(np.int32)
+
+            if self.normalizer is not None and hasattr(self.normalizer, 'transform'):
+                values_t = self.normalizer.transform(values_np)
+                if isinstance(values_t, np.ndarray):
+                    values_t = torch.from_numpy(values_t)
+                values_t = values_t.cpu().to(torch.float32)
+            else:
+                values_t = torch.from_numpy(values_np)
+
+            T = values_t.shape[0]
+            if T < L:
+                continue
+
+            starts_np = np.arange(0, T - L + 1, self.window.stride, dtype=np.int64)
+            valid     = [s for s in starts_np.tolist()
+                         if not values_t[s: s + L].isnan().any().item()]
+            if not valid:
+                continue
+
+            starts_t  = torch.tensor(valid, dtype=torch.long)
+            idx       = starts_t.unsqueeze(1) + torch.arange(L, dtype=torch.long)
+            x_windows = values_t[idx]
+
+            meter_t = torch.full((len(valid),), mid, dtype=torch.long)
+            times_t = torch.from_numpy(times_np)[starts_t]
+
+            for i in range(0, len(x_windows), self.batch_size):
+                yield x_windows[i:i+self.batch_size], meter_t[i:i+self.batch_size], times_t[i:i+self.batch_size]
+
+    def _fit_conditioner(self):
+        """Fit conditioner on training meters only, streamed one meter at a time.
+
+        If the conditioner is already fitted (e.g. pre-fitted across multiple
+        files) this method is a no-op, so the existing state is preserved.
+
+        """
+        if self.conditioner is None or "user_profile" not in self.conditioner.get_condition_tags():
+            return  # nothing to fit
+        
+        user_profiler = self.conditioner.condition_items["user_profile"]
+        
+        if getattr(user_profiler, 'is_fitted', False):
+            print("[Conditioner] UserProfiler already fitted. Performing incremental update...")
+            for x_batch, m_batch, _ in self._yield_train_batches():
+                user_profiler.update_model_incremental(x_batch, m_batch)
+        else:
+            print("[Conditioner] Fitting UserProfiler via multi-pass streaming...")
+            class StreamLoader:
+                def __init__(self, dm):
+                    self.dm = dm
+                def __iter__(self):
+                    return self.dm._yield_train_batches()
+                
+            user_profiler.fit(StreamLoader(self))
 
     def _fit_normalizer(self):
         """Fit normalizer on training meters only, streamed one meter at a time.
@@ -371,6 +439,7 @@ class SmartMeterDataModule:
         F = len(self.feature_cols)
 
         all_x:      list[torch.Tensor] = []
+        all_cond:   list[torch.Tensor] = []
         all_meter:  list[torch.Tensor] = []
         all_times:  list[torch.Tensor] = []
 
@@ -408,23 +477,48 @@ class SmartMeterDataModule:
             x_windows = values_t[idx]                                                # (W, L, F)
 
             times_t = torch.from_numpy(times_np)
+
+            # Conditioner
+            meter_t = torch.full((len(valid),), mid, dtype=torch.long)
+            time_windows = times_t[starts_t]
+            if self.conditioner is not None:
+                c_windows = self.conditioner.get_conditions(
+                    x=x_windows, 
+                    meter_id=meter_t, 
+                    timestamps=time_windows
+                )
+                all_cond.append(c_windows)
+
             all_x.append(x_windows)
-            all_meter.append(torch.full((len(valid),), mid, dtype=torch.long))
-            all_times.append(times_t[starts_t])
+            all_meter.append(meter_t)
+            all_times.append(time_windows)
 
         if not all_x:
-            # Return empty dataset with correct shapes so DataLoaders don't crash
-            return TensorDataset(
+            # Handle empty datasets safely by returning a TensorDataset with the correct column structure but zero rows.
+            tensors = [
                 torch.empty(0, L, F, dtype=torch.float32),
                 torch.empty(0, dtype=torch.long),
-                torch.empty(0, dtype=torch.int32),
-            )
+                torch.empty(0, dtype=torch.int32)
+            ]
+            if self.conditioner is not None:
+                tensors.insert(1, torch.empty(0, self.conditioner.get_condition_dim(), dtype=torch.float32))
+            else:
+                tensors.insert(1, torch.empty(0, 0, dtype=torch.float32))
+            return TensorDataset(*tensors)
 
-        return TensorDataset(
-            torch.cat(all_x,      dim=0),  # (N, L, F)
-            torch.cat(all_meter,  dim=0),  # (N,)
-            torch.cat(all_times,  dim=0),  # (N,)
-        )
+        tensors = [
+            torch.cat(all_x,     dim=0),  # (N, L, F)
+            torch.cat(all_meter, dim=0),  # (N,)
+            torch.cat(all_times, dim=0),  # (N,)
+        ]
+        
+        # Insert conditions as the second element if they exist, or empty tensor to maintain 4-tuple unpacking
+        if self.conditioner is not None:
+            tensors.insert(1, torch.cat(all_cond, dim=0)) # (N, Cond_Dim)
+        else:
+            tensors.insert(1, torch.empty((tensors[0].shape[0], 0), dtype=torch.float32))
+
+        return TensorDataset(*tensors)
 
     def get_normalizer(self):
         return self.normalizer

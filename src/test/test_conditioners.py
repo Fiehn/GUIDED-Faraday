@@ -17,7 +17,6 @@ Conditioners tested:
   - HolidayConditioner
   - MonthOfYearConditioner
   - UserProfiler        (requires fitting on dataloader)
-  - OnlineUserProfiler  (incremental update)
   - Conditioner (container: add_condition_item, get_conditions, get_random_conditions)
 
 Topology-based conditioners (tested with a synthetic CSV fixture):
@@ -49,7 +48,6 @@ from src.data.conditioner import (
     SolarPanelConditioner,
     ElectricVehicleConditioner,
     UserProfiler,
-    OnlineUserProfiler,
     Conditioner,
 )
 
@@ -266,11 +264,12 @@ class TestUserProfilerSynthetic:
         B, L, F = 32, 24, 1
         torch.manual_seed(42)
         x = torch.abs(torch.randn(B, L, F)) + 0.5
+        c = torch.zeros(B, dtype=torch.long)
         meter_ids = torch.randint(1, 6, (B,))
         timestamps = torch.arange(B, dtype=torch.float64) * 3600
 
         from torch.utils.data import TensorDataset, DataLoader
-        ds = TensorDataset(x, meter_ids, timestamps)
+        ds = TensorDataset(x, c, meter_ids, timestamps)
         self.loader = DataLoader(ds, batch_size=16, shuffle=False)
 
         self.profiler = UserProfiler(
@@ -286,13 +285,13 @@ class TestUserProfilerSynthetic:
         assert self.profiler.condition_dim == self.n_topics
 
     def test_get_conditions_shape(self):
-        x, meter_ids, ts = next(iter(self.loader))
+        x, c, meter_ids, ts = next(iter(self.loader))
         out = self.profiler.get_conditions(x, meter_id=meter_ids, timestamps=ts)
         assert out.shape == (x.shape[0], self.n_topics)
 
     def test_profiles_sum_to_one(self):
         """Dirichlet samples should sum to ~1."""
-        x, meter_ids, ts = next(iter(self.loader))
+        x, c, meter_ids, ts = next(iter(self.loader))
         out = self.profiler.get_conditions(x, meter_id=meter_ids, timestamps=ts)
         if isinstance(out, np.ndarray):
             sums = out.sum(axis=1)
@@ -302,7 +301,7 @@ class TestUserProfilerSynthetic:
             assert torch.allclose(sums, torch.ones(x.shape[0]), atol=1e-4)
 
     def test_profiles_non_negative(self):
-        x, meter_ids, ts = next(iter(self.loader))
+        x, c, meter_ids, ts = next(iter(self.loader))
         out = self.profiler.get_conditions(x, meter_id=meter_ids, timestamps=ts)
         if isinstance(out, np.ndarray):
             assert (out >= 0).all()
@@ -351,13 +350,13 @@ class TestUserProfilerSynthetic:
 
     def test_missing_meter_id_raises(self):
         """get_conditions without meter_id should raise."""
-        x, _, ts = next(iter(self.loader))
+        x, c, meter_ids, ts = next(iter(self.loader))
         with pytest.raises(ValueError, match="meter_id"):
             self.profiler.get_conditions(x, meter_id=None, timestamps=ts)
 
     def test_3d_and_2d_input(self):
         """get_conditions should work with both [B,L,F] and [B,D] inputs."""
-        x, meter_ids, ts = next(iter(self.loader))
+        x, c, meter_ids, ts = next(iter(self.loader))
         out_3d = self.profiler.get_conditions(x, meter_id=meter_ids, timestamps=ts)
 
         x_flat = x.reshape(x.shape[0], -1)
@@ -379,7 +378,7 @@ class TestUserProfilerRealData:
         )
         profiler.fit(train_loader)
 
-        x, meter_ids, ts = next(iter(train_loader))
+        x, c, meter_ids, ts = next(iter(train_loader))
         out = profiler.get_conditions(x, meter_id=meter_ids, timestamps=ts)
         assert out.shape == (x.shape[0], 3)
         if isinstance(out, np.ndarray):
@@ -387,71 +386,6 @@ class TestUserProfilerRealData:
         else:
             sums = out.sum(dim=1)
             assert torch.allclose(sums, torch.ones(x.shape[0]), atol=1e-4)
-
-
-# =====================================================================
-#  6. OnlineUserProfiler
-# =====================================================================
-
-class TestOnlineUserProfiler:
-    """OnlineUserProfiler incremental update tests."""
-
-    def test_init_attributes(self):
-        op = OnlineUserProfiler(
-            n_topics=5, num_clusters=10, decay=0.8,
-            random_state=42, verbose=False,
-        )
-        assert op.n_topics == 5
-        assert op.num_clusters == 10
-        assert op.decay == 0.8
-        assert hasattr(op, "kmeans")
-
-    def test_update_and_get_profile_shape(self):
-        B, L, F = 16, 24, 1
-        op = OnlineUserProfiler(
-            n_topics=4, num_clusters=8, decay=0.9,
-            random_state=42, verbose=False,
-        )
-        x = torch.abs(torch.randn(B, L, F)) + 1.0
-        ids = torch.randint(1, 6, (B,))
-        p = op.update_and_get_profile(x, ids)
-        assert p.shape == (B, 4)
-
-    def test_profiles_sum_to_one(self):
-        B, L, F = 16, 24, 1
-        op = OnlineUserProfiler(
-            n_topics=4, num_clusters=8, decay=0.9,
-            random_state=42, verbose=False,
-        )
-        x = torch.abs(torch.randn(B, L, F)) + 1.0
-        ids = torch.randint(1, 6, (B,))
-        p = op.update_and_get_profile(x, ids)
-        sums = p.sum(dim=1)
-        assert torch.allclose(sums, torch.ones(B), atol=1e-3)
-
-    def test_incremental_second_batch(self):
-        B, L, F = 16, 24, 1
-        op = OnlineUserProfiler(
-            n_topics=4, num_clusters=8, decay=0.9,
-            random_state=42, verbose=False,
-        )
-        x1 = torch.abs(torch.randn(B, L, F)) + 1.0
-        ids1 = torch.randint(1, 6, (B,))
-        op.update_and_get_profile(x1, ids1)
-
-        x2 = torch.abs(torch.randn(B, L, F)) + 1.0
-        ids2 = torch.randint(5, 10, (B,))
-        p2 = op.update_and_get_profile(x2, ids2)
-        assert p2.shape == (B, 4)
-
-    def test_decay_attribute(self):
-        op = OnlineUserProfiler(decay=0.7)
-        assert op.decay == 0.7
-
-    def test_random_conditions(self):
-        op = OnlineUserProfiler(n_topics=5, num_clusters=8)
-        rc = op.get_random_conditions(10)
-        assert rc.shape == (10, 5)
 
 
 # =====================================================================
@@ -789,7 +723,7 @@ class TestConditionerRealDataIntegration:
 
     def test_full_conditioner_on_real_data(self, train_loader, conditioner):
         """Conditioner fixture (from conftest) should work on real batches."""
-        x, meter_id, timestamps = next(iter(train_loader))
+        x, c, meter_id, timestamps = next(iter(train_loader))
         out = conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
         if isinstance(out, np.ndarray):
             out = torch.tensor(out, dtype=torch.float32)
@@ -798,7 +732,7 @@ class TestConditionerRealDataIntegration:
 
     def test_individual_conditioners_on_real_data(self, train_loader, conditioner):
         """Each sub-conditioner should return correct shapes."""
-        x, meter_id, timestamps = next(iter(train_loader))
+        x, c, meter_id, timestamps = next(iter(train_loader))
         for tag in conditioner.get_condition_tags():
             item = conditioner.condition_items[tag]
             cond = item.get_conditions(x, meter_id=meter_id, timestamps=timestamps)

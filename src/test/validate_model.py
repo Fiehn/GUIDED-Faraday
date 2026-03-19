@@ -51,9 +51,10 @@ class ValidationResult:
 
 def _get_batch(loader, device="cpu"):
     """Grab one batch and move tensors to *device*."""
-    x, meter_id, timestamps = next(iter(loader))
+    x, c, meter_id, timestamps = next(iter(loader))
     return (
         x.to(device),
+        c.to(device),
         meter_id.to(device),
         timestamps.to(device),
     )
@@ -77,7 +78,7 @@ class ModelValidator:
 
     Parameters
     ----------
-    model : VAE | CVAE | OnlineCVAE
+    model : VAE | CVAE
         The model to validate.
     train_loader, val_loader, test_loader : DataLoader
         PyTorch data loaders for train / val / test splits.
@@ -155,9 +156,6 @@ class ModelValidator:
         if getattr(self.model, "hierarchy", None) is not None:
             self._test_hierarchy()
         self._test_regression_bugs()
-        self._test_RevIn()
-        self._test_online_user_profiler()
-        self._test_online_cvae()
 
         return self._generate_report()
 
@@ -240,7 +238,7 @@ class ModelValidator:
             print("\n[2] Testing Data Pipeline...")
 
         try:
-            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
+            x, c, meter_id, timestamps = _get_batch(self.train_loader, self.device)
 
             if x.dim() != 3:
                 self._add_result("Data: Input Shape", False,
@@ -301,7 +299,7 @@ class ModelValidator:
             print("\n[3] Testing Conditioners...")
 
         try:
-            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
+            x, c, meter_id, timestamps = _get_batch(self.train_loader, self.device)
             B = x.shape[0]
 
             conditions = self.model.conditioner.get_conditions(
@@ -358,7 +356,7 @@ class ModelValidator:
             print("\n[4] Testing Encoder/Decoder...")
 
         try:
-            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
+            x, c, meter_id, timestamps = _get_batch(self.train_loader, self.device)
             B, L, F = x.shape
             x_flat = x.reshape(B, -1)
 
@@ -484,7 +482,7 @@ class ModelValidator:
 
         try:
             self.model.train()
-            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
+            x, c, meter_id, timestamps = _get_batch(self.train_loader, self.device)
             B, L, F = x.shape
             x_flat = x.reshape(B, -1)
 
@@ -546,7 +544,7 @@ class ModelValidator:
 
         try:
             self.model.eval()
-            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
+            x, c, meter_id, timestamps = _get_batch(self.train_loader, self.device)
             x_flat = x.reshape(x.shape[0], -1)
 
             with torch.no_grad():
@@ -636,7 +634,7 @@ class ModelValidator:
                 else:
                     self._add_result("Device: Prior", True, f"{prior_dev}")
 
-            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
+            x, c, meter_id, timestamps = _get_batch(self.train_loader, self.device)
             if self.is_cvae:
                 c = self.model.conditioner.get_conditions(
                     x, meter_id=meter_id, timestamps=timestamps)
@@ -665,7 +663,7 @@ class ModelValidator:
 
         try:
             self.model.train()
-            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
+            x, c, meter_id, timestamps = _get_batch(self.train_loader, self.device)
             B, L, F = x.shape
             x_flat = x.reshape(B, -1)
             optim = torch.optim.Adam(self.model.parameters(), lr=1e-3)
@@ -834,7 +832,7 @@ class ModelValidator:
             model_copy.train()
             opt = torch.optim.Adam(model_copy.parameters(), lr=1e-3)
 
-            x, meter_id, timestamps = _get_batch(self.train_loader, self.device)
+            x, c, meter_id, timestamps = _get_batch(self.train_loader, self.device)
 
             losses = []
             n_steps = 5
@@ -1079,7 +1077,7 @@ class ModelValidator:
 
         if self.is_cvae and "user_profile" in self.model.conditioner.get_condition_tags():
             try:
-                x, meter_id, timestamps = _get_batch(
+                x, c, meter_id, timestamps = _get_batch(
                     self.train_loader, self.device)
                 up = self.model.conditioner.condition_items["user_profile"]
                 x_2d = x.reshape(x.shape[0], -1)
@@ -1109,272 +1107,6 @@ class ModelValidator:
                                      "torch.Tensor")
             except Exception as e:
                 self._add_result("Regression: Random Cond", False, str(e))
-
-    # ==================================================================
-    # 18. RevIN (IndexedLogRevIN)
-    # ==================================================================
-
-    def _test_RevIn(self):
-        """Reversible instance normalization -- synthetic test."""
-        if self.verbose:
-            print("\n[18] Testing RevIN...")
-
-        try:
-            from Data.normalizer import IndexedLogRevIN
-
-            B, L, F, eps = 8, 24, 5, 1e-5
-            revin = IndexedLogRevIN(num_features=F, eps=eps, affine=True)
-
-            torch.manual_seed(42)
-            x = torch.abs(torch.randn(B, L, F) * 2.0 + 5.0)
-            ts = torch.tensor([1640995200 + i * 86400 for i in range(B)])
-
-            xn = revin(x.clone(), mode="norm", timestamp=ts)
-            if xn.shape != x.shape:
-                self._add_result("RevIN: Norm Shape", False, f"{xn.shape}")
-                return
-            self._add_result("RevIN: Norm Shape", True, f"{xn.shape}")
-
-            std = torch.std(xn, dim=1)
-            if torch.allclose(std, torch.zeros_like(std), atol=1e-6):
-                self._add_result("RevIN: Variance", False, "Zero after norm")
-            else:
-                self._add_result("RevIN: Variance", True,
-                                 f"std [{std.min().item():.4f}, {std.max().item():.4f}]")
-
-            xd = revin(xn.clone(), mode="denorm")
-            rel_err = (x - xd).abs().max().item() / (x.abs().max().item() + 1e-8)
-            if rel_err > 1e-3:
-                self._add_result("RevIN: Round-trip", False,
-                                 f"rel err = {rel_err:.6f}")
-            else:
-                self._add_result("RevIN: Round-trip", True,
-                                 f"rel err = {rel_err:.6f}")
-
-            from torch.utils.data import TensorDataset, DataLoader as DL
-            dl = DL(TensorDataset(x, ts, ts), batch_size=B)
-            revin.update_monthly_stats(dl, month_key=202201)
-            if 202201 in revin.monthly_stats:
-                self._add_result("RevIN: Monthly Stats", True, "Stored")
-            else:
-                self._add_result("RevIN: Monthly Stats", False, "Not stored")
-
-            for tag, xt in [("constant", torch.ones(2, L, F) * 3.0),
-                             ("zeros", torch.zeros(2, L, F))]:
-                try:
-                    out = revin(xt.clone(), mode="norm")
-                    ok = not (torch.isnan(out).any() or torch.isinf(out).any())
-                    self._add_result(f"RevIN: {tag}", ok,
-                                     "Clean" if ok else "NaN/Inf")
-                except Exception as e:
-                    self._add_result(f"RevIN: {tag}", False, str(e))
-
-            if revin.affine:
-                ok = (hasattr(revin, "weight") and hasattr(revin, "bias")
-                      and revin.weight.shape == torch.Size([F])
-                      and revin.bias.shape == torch.Size([F]))
-                self._add_result("RevIN: Affine Params", ok,
-                                 "Correct shapes" if ok else "Bad shapes")
-
-        except ImportError:
-            self._add_result("RevIN: Import", False,
-                             "Could not import IndexedLogRevIN")
-        except Exception as e:
-            self._add_result("RevIN: Overall", False,
-                             f"{type(e).__name__}: {e}")
-            if self.verbose:
-                traceback.print_exc()
-
-    # ==================================================================
-    # 19. Online User Profiler
-    # ==================================================================
-
-    def _test_online_user_profiler(self):
-        """OnlineUserProfiler -- synthetic incremental-update test."""
-        if self.verbose:
-            print("\n[19] Testing Online User Profiler...")
-
-        try:
-            from Data.Conditioner import OnlineUserProfiler
-
-            B, L, F, K, T = 16, 24, 2, 10, 5
-            op = OnlineUserProfiler(
-                n_topics=T, num_clusters=K, decay=0.8,
-                random_state=42, verbose=False)
-
-            if not hasattr(op, "kmeans"):
-                self._add_result("OnlineProf: Init", False, "Missing kmeans")
-                return
-            self._add_result("OnlineProf: Init", True,
-                             f"topics={T}, clusters={K}")
-
-            torch.manual_seed(42)
-            x1 = torch.abs(torch.randn(B, L, F)) + 1.0
-            ids1 = torch.randint(0, 10, (B,))
-            p1 = op.update_and_get_profile(x1, ids1)
-
-            if p1.shape != (B, T):
-                self._add_result("OnlineProf: Batch1", False,
-                                 f"Shape {p1.shape}")
-            else:
-                self._add_result("OnlineProf: Batch1", True,
-                                 f"Shape {p1.shape}")
-                sums = torch.sum(p1, dim=1)
-                ok = torch.allclose(sums, torch.ones(B), atol=1e-4)
-                self._add_result("OnlineProf: Normalized", ok,
-                                 "Sum ~ 1" if ok else f"Sums: {sums[:5]}")
-
-            if not op.kmeans_initialized:
-                self._add_result("OnlineProf: KMeans", False, "Not init")
-            else:
-                self._add_result("OnlineProf: KMeans", True,
-                                 f"Centers {op.cluster_centers_.shape}")
-
-            x2 = torch.abs(torch.randn(B, L, F)) + 1.0
-            ids2 = torch.randint(5, 15, (B,))
-            p2 = op.update_and_get_profile(x2, ids2)
-            self._add_result("OnlineProf: Incremental",
-                             p2.shape == (B, T), f"Shape {p2.shape}")
-
-            try:
-                rc = op.get_random_conditions(8)
-                self._add_result("OnlineProf: Interface",
-                                 rc.shape == (8, T), f"Shape {rc.shape}")
-            except Exception as e:
-                self._add_result("OnlineProf: Interface", False, str(e))
-
-            if hasattr(op, "decay") and op.decay != 1.0:
-                self._add_result("OnlineProf: Decay", True,
-                                 f"decay = {op.decay}")
-            else:
-                self._add_result("OnlineProf: Decay", False, "No decay")
-
-        except ImportError:
-            self._add_result("OnlineProf: Import", False, "Could not import")
-        except Exception as e:
-            self._add_result("OnlineProf: Overall", False,
-                             f"{type(e).__name__}: {e}")
-            if self.verbose:
-                traceback.print_exc()
-
-    # ==================================================================
-    # 20. Online CVAE
-    # ==================================================================
-
-    def _test_online_cvae(self):
-        """OnlineCVAE lifecycle: init, train, sample, reconstruct."""
-        if self.verbose:
-            print("\n[20] Testing Online CVAE...")
-
-        try:
-            from src.Models.Online_CVAE import OnlineCVAE
-            from Data.Conditioner import (Conditioner, DayOfWeekConditioner,
-                                         OnlineUserProfiler)
-
-            input_dim, latent, B = 24, 8, 16
-
-            cond = Conditioner()
-            cond.add_condition_item("day_of_week", DayOfWeekConditioner())
-            cond.add_condition_item("user_profile", OnlineUserProfiler(
-                n_topics=5, num_clusters=10, decay=0.9,
-                update_frequency=5, random_state=42, verbose=False,
-            ))
-
-            norm = Normalizer("log1p")
-            try:
-                ocvae = OnlineCVAE(
-                    input_dim=input_dim, conditioner=cond,
-                    latent_dim=latent, prior_type="standard_dictionary",
-                    device=self.device, normalizer=norm,
-                )
-                ocvae.to(self.device)
-                self._add_result("OnlineCVAE: Init", True, "OK")
-            except Exception as e:
-                self._add_result("OnlineCVAE: Init", False, str(e))
-                return
-
-            td = torch.abs(torch.randn(B, 24, 1, device=self.device)) + 1.0
-            ids = torch.randint(1, 11, (B,), device=self.device)
-            ts = torch.randint(0, 365 * 24, (B,), device=self.device)
-            norm.fit(td)
-
-            # Train
-            try:
-                ocvae.train()
-                opt = torch.optim.Adam(ocvae.parameters(), lr=1e-3)
-                ld1 = ocvae.train_core((td, ids, ts), opt, beta=1.0)
-                loss1 = ld1["loss"].item()
-                if not np.isfinite(loss1):
-                    self._add_result("OnlineCVAE: Train", False,
-                                     f"loss = {loss1}")
-                    return
-                self._add_result("OnlineCVAE: Train", True,
-                                 f"loss = {loss1:.4f}")
-            except Exception as e:
-                self._add_result("OnlineCVAE: Train", False, str(e))
-                return
-
-            # Sample
-            try:
-                ocvae.eval()
-                sc = ocvae.conditioner.get_random_conditions(2)
-                sc = _to_tensor(sc, self.device)
-                samples = ocvae.sample(
-                    conditions=sc, num_prior_samples=4, num_x_samples=1,
-                    device=str(self.device)
-                )
-                exp = (4, 1, 2, input_dim)
-                self._add_result(
-                    "OnlineCVAE: Sample",
-                    samples.shape == exp,
-                    f"Shape {samples.shape}"
-                    + ("" if samples.shape == exp else f" != {exp}"))
-            except Exception as e:
-                self._add_result("OnlineCVAE: Sample", False, str(e))
-
-            # Second batch
-            try:
-                ocvae.train()
-                td2 = torch.abs(
-                    torch.randn(B, 24, 1, device=self.device)) + 1.0
-                ids2 = torch.randint(5, 15, (B,), device=self.device)
-                ld2 = ocvae.train_core((td2, ids2, ts + 86400), opt, beta=1.0)
-                self._add_result("OnlineCVAE: Incremental", True,
-                                 f"loss = {ld2['loss'].item():.4f}")
-            except Exception as e:
-                self._add_result("OnlineCVAE: Incremental", False, str(e))
-
-            # Reconstruct
-            try:
-                ocvae.eval()
-                with torch.no_grad():
-                    rp, qp = ocvae.reconstruct(
-                        td[:4], ids[:4], ts[:4], num_samples=1)
-                exp_r = (1, 4, input_dim)
-                self._add_result("OnlineCVAE: Reconstruct",
-                                 rp["mu"].shape == exp_r,
-                                 f"Shape {rp['mu'].shape}")
-            except Exception as e:
-                self._add_result("OnlineCVAE: Reconstruct", False, str(e))
-
-            # Memory
-            up = ocvae.conditioner.condition_items.get("user_profile")
-            if hasattr(up, "user_profiles_cache"):
-                self._add_result(
-                    "OnlineCVAE: Memory", True,
-                    f"Cached: {len(up.user_profiles_cache)} users, ")
-            else:
-                self._add_result("OnlineCVAE: Memory", False,
-                                 "No profile cache")
-
-        except ImportError:
-            self._add_result("OnlineCVAE: Import", False,
-                             "Could not import OnlineCVAE")
-        except Exception as e:
-            self._add_result("OnlineCVAE: Overall", False,
-                             f"{type(e).__name__}: {e}")
-            if self.verbose:
-                traceback.print_exc()
 
     # ==================================================================
     # Report
