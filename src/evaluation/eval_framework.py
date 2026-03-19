@@ -44,7 +44,7 @@ def _to_json_serializable(obj: Any) -> Any:
 
 
 def _save_standalone_metric_result(metric_key: str, payload: Dict[str, Any],
-                                   output_file: str = 'src/Output/eval_results.json') -> None:
+                                   output_file: str = 'output/eval_results.json') -> None:
     """Save/update standalone metric results in the shared per-condition JSON file."""
     try:
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -67,6 +67,43 @@ def _save_standalone_metric_result(metric_key: str, payload: Dict[str, Any],
             json.dump(existing, f, indent=2)
     except Exception as e:
         print(f"Warning: failed to save standalone metric '{metric_key}' to {output_file}: {e}")
+
+
+def _flatten_windows(data: np.ndarray) -> np.ndarray:
+    arr = np.asarray(data)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D array [N, L], got {arr.shape}")
+    return arr.reshape(arr.shape[0], -1)
+
+
+def _flatten_phase_first(data: np.ndarray) -> np.ndarray:
+    arr = np.asarray(data)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3D array [N, F, L], got {arr.shape}")
+    return arr.reshape(arr.shape[0], -1)
+
+
+def _inverse_transform_phase_first(data: np.ndarray, normalizer) -> np.ndarray:
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3D array [N, F, L], got {arr.shape}")
+    if normalizer is None or not hasattr(normalizer, 'inverse_transform'):
+        return arr
+
+    tensor = torch.tensor(arr, dtype=torch.float32)
+    tensor = tensor.transpose(1, 2)  # [N, L, F] for feature-last normalizers
+    restored = normalizer.inverse_transform(tensor).detach().cpu().numpy()
+    return np.transpose(restored, (0, 2, 1))
+
+
+def _rank_phases_by_total_consumption(data: np.ndarray) -> np.ndarray:
+    arr = np.asarray(data)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3D array [N, F, L], got {arr.shape}")
+
+    totals = arr.sum(axis=2)
+    order = np.argsort(-totals, axis=1)
+    return np.take_along_axis(arr, order[:, :, None], axis=1)
 
 
 class EvaluationMetric(ABC):
@@ -131,7 +168,10 @@ class EvalFramework:
         conditioner=None, 
         device: str = 'cpu',
         window_size: int = 24,
-        n_synthetic_samples: int = 1000
+        n_synthetic_samples: int = 1000,
+        output_dir: str = 'output',
+        prepared_data: Dict[str, Any] = None,
+        evaluation_title: str = 'EVALUATION FRAMEWORK'
     ):
         """Initialize evaluation framework.
         
@@ -150,6 +190,9 @@ class EvalFramework:
 
         self.window_size = window_size
         self.n_synthetic_samples = n_synthetic_samples
+        self.output_dir = output_dir
+        self.prepared_data = prepared_data
+        self.evaluation_title = evaluation_title
         
         # Metrics storage 
         self.reconstruction_metrics: Dict[str, ReconstructionMetric] = {}
@@ -159,6 +202,8 @@ class EvalFramework:
         self._real_data: np.ndarray = None  # Cache real data for synthetic metrics that need it
         self._reconstructed_data: np.ndarray = None  # Cache reconstructed data for metrics that need it
         self._syntheric_data: np.ndarray = None  # Cache synthetic data for metrics that need it
+        self._timestamps: np.ndarray = None  # Cache timestamps aligned with real data
+        self._meter_ids: np.ndarray = None  # Cache meter ids aligned with real data
 
     def register_all(self):
         self.register_metrics([
@@ -167,11 +212,12 @@ class EvalFramework:
             ReconstructionLogLikelihood,
             FlexibilityDistance,
             MaximumMeanDiscrepancy,
-            ACFDistribution,
-            ClassicalStatistics,
-            TSTR,
-            AggregatedProfiles,
-            PerConditionEval
+            VisualEvaluation(output_dir=self.output_dir),
+            ACFDistribution(window_size=self.window_size),
+            ClassicalStatistics(window_size=self.window_size, n_features=1),
+            TSTR(window_size=self.window_size, n_features=1),
+            AggregatedProfiles(window_size=self.window_size, output_dir=self.output_dir),
+            PerConditionEval(window_size=self.window_size, output_dir=self.output_dir)
         ])
 
     def _is_cvae(self) -> bool:
@@ -180,10 +226,25 @@ class EvalFramework:
     
     def _prepare_data(self) -> None:
         """Extract real data, reconstructed data, and synthetic data for metrics that need it."""
+        if self.prepared_data is not None:
+            self._real_data = np.asarray(self.prepared_data.get('real_data'))
+            self._reconstructed_data = np.asarray(self.prepared_data.get('reconstructed_data'))
+            self._synthetic_data = np.asarray(self.prepared_data.get('synthetic_data'))
+            self._timestamps = self.prepared_data.get('timestamps')
+            self._meter_ids = self.prepared_data.get('meter_ids')
+
+            print("Preparing data for evaluation metrics...")
+            print(f"  Real: {self._real_data.shape} | "
+                  f"Reconstructed: {self._reconstructed_data.shape} | "
+                  f"Synthetic: {self._synthetic_data.shape}")
+            return
+
         print("Preparing data for evaluation metrics...")
         real_batches = []
         recon_batches = []
         condition_batches = []
+        timestamp_batches = []
+        meter_id_batches = []
 
         self.model.eval()
         with torch.no_grad():
@@ -191,6 +252,8 @@ class EvalFramework:
                 data = data.to(self.device)
                 x_flat = data.reshape(data.shape[0], -1) if data.dim() == 3 else data
                 real_batches.append(x_flat.cpu().numpy())
+                meter_id_batches.append(np.asarray(meter_ids.cpu().numpy()).reshape(-1))
+                timestamp_batches.append(np.asarray(timestamps.cpu().numpy()).reshape(-1))
 
                 recon = self._reconstruct(data, meter_id=meter_ids, timestamps=timestamps)
                 recon_batches.append(recon.cpu().numpy())
@@ -203,6 +266,8 @@ class EvalFramework:
 
         self._real_data = np.concatenate(real_batches, axis=0)
         self._reconstructed_data = np.concatenate(recon_batches, axis=0)
+        self._meter_ids = np.concatenate(meter_id_batches, axis=0) if meter_id_batches else None
+        self._timestamps = np.concatenate(timestamp_batches, axis=0) if timestamp_batches else None
 
         if self._is_cvae() and condition_batches:
             all_conditions = torch.cat(condition_batches, dim=0)
@@ -294,18 +359,56 @@ class EvalFramework:
             metric.device = self.device
             metric.normalizer = self.normalizer
 
+            # PerConditionEval needs aligned timestamps and 24h windows (consumption feature only)
+            if isinstance(metric, PerConditionEval):
+                n = min(len(self._real_data), len(self._synthetic_data))
+                real = np.asarray(self._real_data)[:n]
+                synth = np.asarray(self._synthetic_data)[:n]
+
+                # Denormalize in full shape first (if normalizer is available), then select feature 0.
+                if self.normalizer is not None and hasattr(self.normalizer, 'inverse_transform'):
+                    if real.ndim == 2 and real.shape[1] % metric.window_size == 0:
+                        f_real = real.shape[1] // metric.window_size
+                        real_t = torch.tensor(real, dtype=torch.float32).reshape(-1, metric.window_size, f_real)
+                        real = self.normalizer.inverse_transform(real_t).detach().cpu().numpy().reshape(-1, metric.window_size * f_real)
+                    if synth.ndim == 2 and synth.shape[1] % metric.window_size == 0:
+                        f_synth = synth.shape[1] // metric.window_size
+                        synth_t = torch.tensor(synth, dtype=torch.float32).reshape(-1, metric.window_size, f_synth)
+                        synth = self.normalizer.inverse_transform(synth_t).detach().cpu().numpy().reshape(-1, metric.window_size * f_synth)
+
+                # Convert flattened [N, L*F] -> [N, L] by selecting feature 0
+                if real.ndim == 2 and real.shape[1] != metric.window_size and real.shape[1] % metric.window_size == 0:
+                    f_real = real.shape[1] // metric.window_size
+                    real = real.reshape(-1, metric.window_size, f_real)[:, :, 0]
+                if synth.ndim == 2 and synth.shape[1] != metric.window_size and synth.shape[1] % metric.window_size == 0:
+                    f_synth = synth.shape[1] // metric.window_size
+                    synth = synth.reshape(-1, metric.window_size, f_synth)[:, :, 0]
+
+                metric.real_data = real
+                metric.synthetic_data = synth
+                metric.timestamps = (np.asarray(self._timestamps)[:n] if self._timestamps is not None else None)
+                metric.meter_ids = (np.asarray(self._meter_ids)[:n] if self._meter_ids is not None else None)
+
     def register_metric(self, metric: EvaluationMetric) -> None:
         """Register an evaluation metric.
         
         Args:
             metric: Instance of ReconstructionMetric or SyntheticMetric
         """
+        # Accept metric classes for convenience (e.g., from register_all)
+        if isinstance(metric, type):
+            if issubclass(metric, EvaluationMetric):
+                metric = metric()
+            else:
+                raise ValueError(f"Metric class {metric} must inherit from EvaluationMetric")
+
         if isinstance(metric, ReconstructionMetric):
             self.reconstruction_metrics[metric.name] = metric
         elif isinstance(metric, SyntheticMetric):
             self.synthetic_metrics[metric.name] = metric
         else:
-            raise ValueError(f"Metric {metric.name} must inherit from ReconstructionMetric or SyntheticMetric")
+            metric_label = getattr(metric, 'name', metric.__class__.__name__)
+            raise ValueError(f"Metric {metric_label} must inherit from ReconstructionMetric or SyntheticMetric")
     
     def register_metrics(self, metrics: List[EvaluationMetric]) -> None:
         """Register multiple metrics at once.
@@ -324,7 +427,7 @@ class EvalFramework:
             Dictionary mapping metric names to values
         """
         print("\n" + "="*70)
-        print("EVALUATION FRAMEWORK")
+        print(self.evaluation_title)
         print("="*70 + "\n")
         
         # Prepare data for metrics that need it (reconstructions, synthetic samples)
@@ -367,13 +470,13 @@ class EvalFramework:
         self._print_results_table()
         
         return self.results
-    
+
     def evaluate_reconstruction_only(self) -> Dict[str, float]:
         """Run only reconstruction metrics."""
         print("\n" + "="*70)
         print("RECONSTRUCTION EVALUATION")
         print("="*70 + "\n")
-        
+
         self.results = {}
         for name, metric in self.reconstruction_metrics.items():
             print(f"  {name}...", end=" ", flush=True)
@@ -384,16 +487,16 @@ class EvalFramework:
             except Exception as e:
                 print(f"Error: {e}")
                 self.results[name] = None
-        
+
         self._print_results_table()
         return self.results
-    
+
     def evaluate_synthetic_only(self) -> Dict[str, float]:
         """Run only synthetic data metrics."""
         print("\n" + "="*70)
         print("SYNTHETIC DATA EVALUATION")
         print("="*70 + "\n")
-        
+
         self.results = {}
         for name, metric in self.synthetic_metrics.items():
             print(f"  {name}...", end=" ", flush=True)
@@ -404,17 +507,16 @@ class EvalFramework:
             except Exception as e:
                 print(f"Error: {e}")
                 self.results[name] = None
-        
+
         self._print_results_table()
         return self.results
-    
+
     def _print_results_table(self) -> None:
         """Print results in a formatted table."""
         print("\n" + "="*70)
         print("EVALUATION RESULTS")
         print("="*70 + "\n")
-        
-        # Build table data
+
         table_data = []
         for name, value in self.results.items():
             if value is not None:
@@ -424,34 +526,156 @@ class EvalFramework:
                     table_data.append([name, str(value)])
             else:
                 table_data.append([name, "ERROR"])
-        
-        # Print table
+
         headers = ["Metric", "Value"]
         print(tabulate(table_data, headers=headers, tablefmt="grid"))
         print()
-    
+
     def get_results(self) -> Dict[str, float]:
         """Get cached results from last evaluation."""
         return self.results.copy()
-    
+
     def save_results(self, output_path: str) -> None:
-        """Save results to JSON file.
-        
-        Args:
-            output_path: Path to save JSON results
-        """
+        """Save results to JSON file."""
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        
-        # Convert None values to string for JSON
         results_serializable = {
             k: v if v is not None else "ERROR"
             for k, v in self.results.items()
         }
-        
         with open(output_path, 'w') as f:
             json.dump(results_serializable, f, indent=2)
-        
         print(f"Results saved to {output_path}")
+
+
+class PhasedEvaluationSuite:
+    """Run separate evaluation views for multi-phase data while preserving the original one-phase evaluator."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        dataloader: torch.utils.data.DataLoader,
+        normalizer=None,
+        conditioner=None,
+        device: str = 'cpu',
+        window_size: int = 96,
+        n_synthetic_samples: int = 1000,
+        output_dir: str = 'output',
+    ):
+        self.model = model
+        self.dataloader = dataloader
+        self.normalizer = normalizer
+        self.conditioner = conditioner
+        self.device = device
+        self.window_size = int(window_size)
+        self.n_synthetic_samples = int(n_synthetic_samples)
+        self.output_dir = output_dir
+
+    def _prepare_base_framework(self) -> EvalFramework:
+        framework = EvalFramework(
+            self.model,
+            self.dataloader,
+            normalizer=self.normalizer,
+            conditioner=self.conditioner,
+            device=self.device,
+            window_size=self.window_size,
+            n_synthetic_samples=self.n_synthetic_samples,
+            output_dir=self.output_dir,
+            evaluation_title='PHASED DATA PREPARATION',
+        )
+        framework._prepare_data()
+        return framework
+
+    def _extract_phase_first(self, flat_data: np.ndarray, label: str) -> np.ndarray:
+        arr = np.asarray(flat_data)
+        if arr.ndim != 2:
+            raise ValueError(f"Expected 2D flattened array for {label}, got {arr.shape}")
+        if arr.shape[1] % self.window_size != 0:
+            raise ValueError(
+                f"Flattened {label} dimension {arr.shape[1]} is not divisible by window_size {self.window_size}"
+            )
+        n_features = arr.shape[1] // self.window_size
+        return arr.reshape(arr.shape[0], n_features, self.window_size)
+
+    def _run_prepared_eval(self, prepared_data: Dict[str, Any], output_dir: str, title: str, output_path: str) -> Dict[str, float]:
+        evaluator = EvalFramework(
+            self.model,
+            self.dataloader,
+            normalizer=None,
+            conditioner=self.conditioner,
+            device='cpu',
+            window_size=self.window_size,
+            n_synthetic_samples=self.n_synthetic_samples,
+            output_dir=output_dir,
+            prepared_data=prepared_data,
+            evaluation_title=title,
+        )
+        evaluator.register_all()
+        results = evaluator.evaluate()
+        evaluator.save_results(output_path)
+        return results
+
+    def evaluate(self) -> Dict[str, Any]:
+        os.makedirs(self.output_dir, exist_ok=True)
+        base = self._prepare_base_framework()
+
+        real_phase = self._extract_phase_first(base._real_data, 'real data')
+        recon_phase = self._extract_phase_first(base._reconstructed_data, 'reconstructed data')
+        synthetic_phase = self._extract_phase_first(base._synthetic_data, 'synthetic data')
+
+        real_denorm = _inverse_transform_phase_first(real_phase, self.normalizer)
+        recon_denorm = _inverse_transform_phase_first(recon_phase, self.normalizer)
+        synthetic_denorm = _inverse_transform_phase_first(synthetic_phase, self.normalizer)
+
+        aggregated_dir = os.path.join(self.output_dir, 'aggregated_phase_eval')
+        os.makedirs(aggregated_dir, exist_ok=True)
+        aggregated_prepared = {
+            'real_data': _flatten_windows(real_denorm.sum(axis=1)),
+            'reconstructed_data': _flatten_windows(recon_denorm.sum(axis=1)),
+            'synthetic_data': _flatten_windows(synthetic_denorm.sum(axis=1)),
+            'timestamps': base._timestamps,
+            'meter_ids': base._meter_ids,
+        }
+        aggregate_results = self._run_prepared_eval(
+            prepared_data=aggregated_prepared,
+            output_dir=aggregated_dir,
+            title='AGGREGATED 3-PHASE EVALUATION',
+            output_path=os.path.join(aggregated_dir, 'eval_results.json'),
+        )
+
+        ranked_real = _rank_phases_by_total_consumption(real_denorm)
+        ranked_recon = _rank_phases_by_total_consumption(recon_denorm)
+        ranked_synth = _rank_phases_by_total_consumption(synthetic_denorm)
+
+        ranked_results = {}
+        num_phases = ranked_real.shape[1]
+        for phase_idx in range(num_phases):
+            phase_number = phase_idx + 1
+            phase_dir = os.path.join(self.output_dir, f'ranked_phase_{phase_number}_eval')
+            os.makedirs(phase_dir, exist_ok=True)
+            prepared = {
+                'real_data': _flatten_windows(ranked_real[:, phase_idx, :]),
+                'reconstructed_data': _flatten_windows(ranked_recon[:, phase_idx, :]),
+                'synthetic_data': _flatten_windows(ranked_synth[:, phase_idx, :]),
+                'timestamps': base._timestamps,
+                'meter_ids': base._meter_ids,
+            }
+            ranked_results[f'phase_{phase_number}'] = self._run_prepared_eval(
+                prepared_data=prepared,
+                output_dir=phase_dir,
+                title=f'RANKED PHASE {phase_number} EVALUATION',
+                output_path=os.path.join(phase_dir, 'eval_results.json'),
+            )
+
+        summary = {
+            'aggregated_phase': aggregate_results,
+            'ranked_phases': ranked_results,
+        }
+
+        summary_path = os.path.join(self.output_dir, 'phased_eval_summary.json')
+        with open(summary_path, 'w') as f:
+            json.dump(_to_json_serializable(summary), f, indent=2)
+        print(f"Phased evaluation summary saved to {summary_path}")
+        return summary
 
 
 # ============================================================================
@@ -725,7 +949,6 @@ class FlexibilityDistance(ReconstructionMetric):
 # ============================================================================
 
 
-
 class MaximumMeanDiscrepancy(SyntheticMetric):
     """Maximum Mean Discrepancy (MMD) between real and synthetic data.
     
@@ -990,7 +1213,7 @@ class VisualEvaluation(SyntheticMetric):
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None   
 
-    def __init__(self, output_dir='src/Output/Plots'):
+    def __init__(self, output_dir='output/Plots'):
         """
         Args:
             real_data: numpy array of real data [N, D]
@@ -1480,7 +1703,7 @@ class AggregatedProfiles(SyntheticMetric):
     synthetic_data: np.ndarray = None
     normalizer = None
     
-    def __init__(self, n_samples=100, window_size=24, tau='auto', normalize=True, output_dir='src/Output/Plots'):
+    def __init__(self, n_samples=100, window_size=24, tau='auto', normalize=True, output_dir='output'):
         self.n_samples = n_samples
         self.window_size = window_size
         self.tau = tau
@@ -1496,10 +1719,24 @@ class AggregatedProfiles(SyntheticMetric):
         """Aggregate real and synthetic data, then compute Flexibility Distance."""
         real_data = np.asarray(self.real_data)
         synthetic_data = np.asarray(self.synthetic_data)
+
+        def _inverse_if_possible(arr: np.ndarray) -> np.ndarray:
+            if self.normalizer is None or not hasattr(self.normalizer, 'inverse_transform'):
+                return arr
+
+            t = torch.tensor(arr, dtype=torch.float32)
+            if t.ndim == 2 and t.shape[1] % self.window_size == 0:
+                n_features = t.shape[1] // self.window_size
+                t = t.reshape(-1, self.window_size, n_features)
+                t = self.normalizer.inverse_transform(t)
+                t = t.reshape(t.shape[0], -1)
+            else:
+                t = self.normalizer.inverse_transform(t)
+            return t.detach().cpu().numpy()
         
-        # Denormalize synthetic data if normalizer is available
-        if self.normalizer is not None and hasattr(self.normalizer, 'inverse_transform'):
-            synthetic_data = self.normalizer.inverse_transform(synthetic_data).detach().cpu().numpy()
+        # Denormalize both real and synthetic consistently when possible
+        real_data = _inverse_if_possible(real_data)
+        synthetic_data = _inverse_if_possible(synthetic_data)
 
         # Extract consumption only (feature 0)
         real_n_features = real_data.shape[1] // self.window_size
@@ -1581,7 +1818,7 @@ class PerConditionEval(SyntheticMetric):
     meter_ids: np.ndarray = None
     feeder_ids: np.ndarray = None
 
-    def __init__(self, window_size=24, max_lag=10, min_samples_per_group=2, output_dir='src/Output', 
+    def __init__(self, window_size=24, max_lag=10, min_samples_per_group=2, output_dir='output', 
                  verbose=False, predictor_type='linear', tstr_epochs=50,
                  feeder_mapping_path='topology/cleaned/Cleaned_SM_Topology_mapping.json',
                  min_samples_per_feeder=5):
@@ -1637,7 +1874,7 @@ class PerConditionEval(SyntheticMetric):
             window_size=window_size,
             tau='auto',
             normalize=True,
-            output_dir=os.path.join(output_dir, 'Plots')
+            output_dir=output_dir
         )
 
     @property
@@ -1853,7 +2090,7 @@ class PerConditionEval(SyntheticMetric):
         feeder_ids: np.ndarray = None,
     ) -> Dict[str, str]:
         """Create bar charts of aggregated real vs synthetic consumption by day and month."""
-        plots_dir = os.path.join(self.output_dir, 'Plots')
+        plots_dir = self.output_dir
         os.makedirs(plots_dir, exist_ok=True)
         
         # Plot style

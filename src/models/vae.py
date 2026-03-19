@@ -40,6 +40,7 @@ class VAE(nn.Module):
                  encoder_type = "dictionary",
                  decoder_type = "dictionary",
                  prior_type = None,
+                 device="cpu",
                  hierarchy_config: HierarchicalConfig = None,
                  **_):
         super(VAE, self).__init__()
@@ -65,7 +66,7 @@ class VAE(nn.Module):
         self.latent_dim = latent_dim
 
         # 1. Create encoder and decoder and the latent module for the hierarchy if specified
-        self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim, type=encoder_type)
+        self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim, type=encoder_type, dictionary_size=dictionary_size)
 
         # Hierarchical latent module (optional) - can be used to add multiple levels of latent variables with different strategies and connections between them
         self.hierarchy = None
@@ -77,7 +78,7 @@ class VAE(nn.Module):
             )
             self.decoder_input_dim = self.hierarchy.output_dim
             
-        self.decoder = get_decoder_model(latent_dim=self.decoder_input_dim, output_dim=input_dim, type=decoder_type)
+        self.decoder = get_decoder_model(latent_dim=self.decoder_input_dim, output_dim=input_dim, type=decoder_type, dictionary_size=dictionary_size)
 
         # 2. Create prior after encoder (VampPrior needs a reference to the encoder)
         if prior_type is None:

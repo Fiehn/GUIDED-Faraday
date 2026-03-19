@@ -18,12 +18,5 @@ topology/
 
 !src/Data/
 !src/Data/*.py
-<<<<<<< HEAD
-topology/
-=======
-
-!src/Data/
-!src/Data/*.py
->>>>>>> 3e6c786 (Dataloading for threephase data, needs testing and evaluation)
 
 output/

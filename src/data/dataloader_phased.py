@@ -14,12 +14,12 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
-from Data.normalizer import Normalizer
+from data.normalizer import Normalizer
 
 @dataclass(frozen=True)
 class WindowSpec:
-    input_len: int # length of input window - how many past hours go into the model as x
-    stride: int = 1 # how many hours to move the window each step
+    input_len: int # length of input window (number of timesteps)
+    stride: int = 1 # number of timesteps to move the window each step
 
 
 class StreamingParquetBuffer(IterableDataset):
@@ -47,6 +47,8 @@ class StreamingParquetBuffer(IterableDataset):
         self.num_workers = num_workers
 
         self.feature_cols = ['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3']
+        self.time_col_candidates = ['timestamp_dst', 'timestamp', 'timestamp_utc']
+        self.base_frequency = '15min'
     
     def _push_to_buffer(self, item):
         self.buffer[self.ptr] = item
@@ -58,6 +60,61 @@ class StreamingParquetBuffer(IterableDataset):
             raise ValueError(f"Buffer size {self.current_size} is less than the minimum required {self.min_buffer_size} for sampling.")
         idx = random.randrange(self.current_size)
         return self.buffer[idx]
+
+    def _extract_meter_id(self, file_path: str) -> int:
+        basename = os.path.basename(file_path)
+        return int(basename.replace('sm_', '').replace('.parquet', ''))
+
+    def _select_columns(self, file_cols):
+        cols_to_load = []
+        rename_map = {}
+
+        for base_feat in self.feature_cols:
+            matched_col = next((actual_col for actual_col in file_cols if actual_col.startswith(base_feat)), None)
+            if matched_col is not None:
+                cols_to_load.append(matched_col)
+                rename_map[matched_col] = base_feat
+
+        time_col_name = next((col for col in file_cols if col.lower() in self.time_col_candidates), None)
+        if time_col_name is not None and time_col_name not in cols_to_load:
+            cols_to_load.append(time_col_name)
+
+        return cols_to_load, rename_map, time_col_name
+
+    def _prepare_time_index(self, df: pd.DataFrame, time_col_name: Optional[str]) -> pd.DataFrame:
+        if time_col_name and time_col_name in df.columns:
+            time_values = df[time_col_name]
+            df = df.drop(columns=[time_col_name])
+        else:
+            time_values = df.index
+
+        time_index = pd.to_datetime(time_values, errors='coerce', utc=True)
+        prepared = df.copy()
+        prepared.index = time_index
+        prepared = prepared[~prepared.index.isna()]
+        prepared = prepared[~prepared.index.duplicated(keep='last')]
+        prepared = prepared.sort_index()
+        return prepared
+
+    def _impute_to_base_frequency(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+
+        full_index = pd.date_range(start=df.index.min(), end=df.index.max(), freq=self.base_frequency, tz=df.index.tz)
+        return df.reindex(full_index)
+
+    def _load_file_dataframe(self, file_path: str):
+        parquet_file = pq.ParquetFile(file_path)
+        file_cols = parquet_file.schema.names
+        cols_to_load, rename_map, time_col_name = self._select_columns(file_cols)
+
+        if not cols_to_load:
+            return None, None
+
+        df = pq.read_table(file_path, columns=cols_to_load).to_pandas()
+        df = df.rename(columns=rename_map)
+        meter_id = self._extract_meter_id(file_path)
+        return self._prepare_time_index(df, time_col_name), meter_id
     
     def __iter__(self):
         # === Multiprocessing traffic control ===
@@ -76,75 +133,45 @@ class StreamingParquetBuffer(IterableDataset):
 
         # === Lazy parquet streaming ===
         for file in files_for_this_worker:
-            # Open parquet file for streaming (does not load entire file into memory)
-            parquet_file = pq.ParquetFile(file)
-            file_cols = parquet_file.schema.names
-
-            # Identify which columns to load based on the feature_cols and the actual columns in the file (which have meter_id suffixes), and create a mapping to rename them to the base feature names
-            cols_to_load = []
-            rename_map = {}
-            for base_feat in self.feature_cols:
-                for actual_col in file_cols:
-                    if actual_col.startswith(base_feat):
-                        cols_to_load.append(actual_col)
-                        rename_map[actual_col] = base_feat
-                        break
-            # Get timestamps we guess as to how its saved
-            time_col_name = None
-            for col in file_cols:
-                if col.lower() in ['timestamp_dst']:
-                    cols_to_load.append(col)
-                    time_col_name = col
-                    break
-
-            # If the file has absolutely none of our features, skip it
-            if not cols_to_load:
+            file_df, meter_id = self._load_file_dataframe(file)
+            if file_df is None or meter_id is None:
                 continue
 
-            # Only load the exact matched columns to save RAM
-            for batch in parquet_file.iter_batches(columns=cols_to_load, batch_size=10000):
-                chunk_df = batch.to_pandas()
-                chunk_df = chunk_df.rename(columns=rename_map)
+            sequences = self._extract_sequences(file_df, meter_id)
 
-                # ZERO-PADDING: If a user is missing L2, create the column and fill with 0s TODO: possibly add flag as set-vae might know what to do
-                for feat in self.feature_cols:
-                    if feat not in chunk_df.columns:
-                        chunk_df[feat] = 0.0
+            for seq, cond in sequences:
+                # Apply normalization if normalizer is provided
+                if self.normalizer is not None:
+                    # seq shape is [24, 3], broadcasting with [3,]
+                    seq = self.normalizer.transform(seq)
+                seq = seq.T
 
-                # Extract meter_id from the original file path (safest method)
-                meter_id = int(os.path.basename(file).replace('sm_', '').replace('.parquet', ''))
+                # Push the (seq, cond) pair into the replay buffer
+                self._push_to_buffer((seq, cond))
 
-                sequences = self._extract_sequences(chunk_df, meter_id, time_col_name)
-
-                for seq, cond in sequences:
-                    # Apply normalization if normalizer is provided
-                    if self.normalizer is not None:
-                        # seq shape is [24, 3], broadcasting with [3,]
-                        seq = self.normalizer.transform(seq)
-                        seq = seq.T
-
-                    # Push the (seq, cond) pair into the replay buffer
-                    self._push_to_buffer((seq, cond))
-
-                    # Yield only when the buffer is adequately mixed
-                    if self.current_size >= self.min_buffer_size:
-                        # The yield pauses the loop right here until PyTorch needs more data
-                        yield self._sample_from_buffer()
+                # Yield only when the buffer is adequately mixed
+                if self.current_size >= self.min_buffer_size:
+                    # The yield pauses the loop right here until PyTorch needs more data
+                    yield self._sample_from_buffer()
     
-    def _extract_sequences(self, df, meter_id, time_col_name):
+    def _extract_sequences(self, df, meter_id):
         sequences = []
 
-        if time_col_name and time_col_name in df.columns:
-            # If PyArrow loaded it as a normal column
-            time_data = df[time_col_name]
-        else:
-            # If PyArrow automatically restored it as the Pandas Index
-            time_data = df.index
-        df['timestamp'] = pd.to_datetime(time_data).astype(np.int64) // 10**9
-        df = df.reset_index(drop=True)
+        if self.window_spec is None:
+            raise ValueError("window_spec must be provided for phased parquet streaming.")
 
-        # Force exact order of features
-        values = df[self.feature_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0).astype(np.float32).values 
+        for feat in self.feature_cols:
+            if feat not in df.columns:
+                df[feat] = np.nan
+
+        phase_df = df[self.feature_cols].apply(pd.to_numeric, errors='coerce')
+        phase_df = self._impute_to_base_frequency(phase_df)
+
+        if phase_df.empty:
+            return sequences
+
+        timestamps = (phase_df.index.view('int64') // 10**9).astype(np.int64)
+        values = phase_df.fillna(0.0).astype(np.float32).to_numpy()
 
         for start in range(0, len(values) - self.window_spec.input_len + 1, self.window_spec.stride):
             end = start + self.window_spec.input_len
@@ -153,12 +180,13 @@ class StreamingParquetBuffer(IterableDataset):
             window = torch.tensor(values[start:end], dtype=torch.float32)
             
             meter_ids = torch.full((self.window_spec.input_len,), meter_id, dtype=torch.long)
-            timestamps = torch.tensor(df['timestamp'].values[start:end], dtype=torch.long)
-            condition = torch.stack([meter_ids, timestamps], dim=0)  # [2, seq_len]
+            window_timestamps = torch.tensor(timestamps[start:end], dtype=torch.long)
+            condition = torch.stack([meter_ids, window_timestamps], dim=0)  # [2, seq_len]
             
             sequences.append((window, condition))
         
         return sequences
+
 
 class SMPhaseData:
     def __init__(
@@ -221,13 +249,14 @@ class SMPhaseData:
         return [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.parquet')]
     
 
-
 if __name__ == "__main__":
     normalizer = Normalizer(method='log1p_phase')
     normalizer.fit(X = None)  # This will compute and save the normalization stats to 'normalization_stats.json'
     # Example usage
     data_module = SMPhaseData(
-        data_dir='F:\Data\processed_data\second_batch\individual_sm_datasets\cleaned_profiles',
+        # data_dir='/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/cleaned_profiles',
+        data_dir='/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles',
+        # data_dir='F:\Data\processed_data\second_batch\individual_sm_datasets\cleaned_profiles',
         window_spec=WindowSpec(input_len=24, stride=1),
         batch_size=32,
         replay_buffer_capacity=10000,

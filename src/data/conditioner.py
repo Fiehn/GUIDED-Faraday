@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import math
 import json
 import os
  
@@ -366,7 +367,7 @@ class OnlineUserProfiler(UserProfiler):
         if meter_id is None:
             raise ValueError("meter_id is required for OnlineUserProfiler.get_conditions()")
         
-        if data is None:
+        if data is not None:
             # Update model if needed
             self._maybe_update_model(data, meter_id)
         
@@ -409,18 +410,29 @@ class OnlineUserProfiler(UserProfiler):
         if len(x_valid) == 0:
             return  # No valid data to update with
         
+        # MiniBatchKMeans requires n_samples >= n_clusters on each partial_fit call.
+        # For small batches, upsample with replacement to avoid runtime failure.
+        if x_valid.shape[0] < self.num_clusters:
+            repeat_factor = int(math.ceil(self.num_clusters / max(1, x_valid.shape[0])))
+            idx = np.tile(np.arange(x_valid.shape[0]), repeat_factor)[:self.num_clusters]
+            x_kmeans = x_valid[idx]
+            meter_ids_kmeans = meter_ids_valid[idx]
+        else:
+            x_kmeans = x_valid
+            meter_ids_kmeans = meter_ids_valid
+
         # Update cluster centers incrementally
-        self.kmeans.partial_fit(x_valid)
+        self.kmeans.partial_fit(x_kmeans)
         self.cluster_centers_ = self.kmeans.cluster_centers_
         self.kmeans_initialized = True
         
         # Create corpus for this batch
         if self.cluster_centers_ is not None:
-            labels = cdist(x_valid, self.cluster_centers_).argmin(axis=1)
+            labels = cdist(x_kmeans, self.cluster_centers_).argmin(axis=1)
             
             # Count clusters per user
             meter_corpus = {}
-            for m_id, label in zip(meter_ids_valid, labels):
+            for m_id, label in zip(meter_ids_kmeans, labels):
                 if m_id not in meter_corpus:
                     meter_corpus[m_id] = np.zeros(self.num_clusters, dtype=np.int32)
                 meter_corpus[m_id][label] += 1

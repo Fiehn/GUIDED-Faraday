@@ -8,8 +8,12 @@
 # DATA LOADING CONFIGURATION
 # ============================================================================
 data:
-  # Directory where CSV files are stored
-  data_dir: "./data"
+  # Data mode: "csv" (SmartMeterDataModule) or "phased_parquet" (StreamingParquetBuffer)
+  mode: "phased_parquet"
+
+  # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
+  # data_dir: "./data/cleaned_profiles"
+  data_dir: "./data/raw_profiles"
   
   # CSV filename to load
   data_files: []
@@ -35,8 +39,8 @@ data:
   
   # Windowing configuration
   window:
-    input_len: 24  # 24-hour windows
-    stride: 24     # Non-overlapping windows (one per day)
+    input_len: 96  # 24-hour windows (24 hours * 4 readings per hour)
+    stride: 96     # Non-overlapping windows (one per day)
   
   # DataLoader settings
   dataloader:
@@ -44,12 +48,20 @@ data:
     num_workers: 0
     shuffle: false
 
+  # Phased parquet streaming settings (used by SetGuideVAE phased training)
+  phased:
+    replay_buffer_capacity: 512
+    min_buffer_size: 8
+    num_workers: 0
+    steps_per_epoch: 100
+    eval_batches: 5
+
 # ============================================================================
 # NORMALIZATION CONFIGURATION
 # ============================================================================
 normalization:
-  # Type of normalization: "log1p", "student_t", "zero_preserved_log"
-  method: "log1p"
+  # Type of normalization: "log1p", "student_t", "zero_preserved_log", "log1p_phase"
+  method: "log1p_phase"
   
   # Log1p specific parameters
   log1p:
@@ -59,8 +71,8 @@ normalization:
 # MODEL ARCHITECTURE CONFIGURATION
 # ============================================================================
 model:
-  # Model type: "vae", "cvae", "online_cvae"
-  type: "cvae"
+  # Model type: "vae", "cvae", "online_cvae", "set_guide_vae"
+  type: "set_guide_vae"
   
   # Device for training: "cpu" or "cuda"
   device: "cuda"
@@ -87,8 +99,16 @@ model:
   prior:
     type: "standard_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
                                  # "learnable_gaussian", "learnable_dictionary", "vamp"
-    dictionary_size: 100
+    dictionary_size: 512         # Must be > input_dim (96 timesteps × 3 phases = 288)
     vamp_num_components: 20
+
+  # SetGuideVAE set-encoder architecture configuration
+  set:
+    hidden_dim: 128
+    num_heads: 4
+    num_inds: 16
+    num_blocks: 2
+    num_features: 3
 
 # ============================================================================
 # CONDITIONING CONFIGURATION (for CVAE)
@@ -179,9 +199,14 @@ training:
     save_best_model: true
     save_final_model: true
   
-  # Number of latent samples for training
-  weighted_loss: 10.0
+  # Optional compile
   compile_model: true
+
+  # Tiny phased smoke-run settings for quick SetGuideVAE wiring checks
+  smoke:
+    max_files: 2
+    max_steps: 20
+    batch_size: 8
 
 # ============================================================================
 # LOGGING AND MONITORING CONFIGURATION

@@ -8,12 +8,13 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 import os
 
-def compute_normalization_stats(sm_files, 
-                                feature_cols, 
-                                save_path = "normalization_stats.json", 
-                                valid_ids_json_path = "data\Timeseries_info\Timeseries_info.json"):
+def compute_normalization_stats(sm_files,
+                                feature_cols,
+                                save_path="normalization_stats.json",
+                                valid_ids_json_path=None,
+                                use_cache=True):
     """Compute the mean and standard deviation for normalization across all Parquet files."""
-    if os.path.exists(save_path):
+    if use_cache and os.path.exists(save_path):
         with open(save_path, 'r') as f:
             stats = json.load(f)
             mean = np.array(stats['log_mean'])
@@ -21,9 +22,22 @@ def compute_normalization_stats(sm_files,
             return mean, std
         
     if sm_files is None:
-        # Find all Parquet files in the default data directory
-        data_dir = 'F:\Data\processed_data\second_batch\individual_sm_datasets\cleaned_profiles'
-        sm_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.parquet')]
+        # Portable defaults for local project layouts
+        cwd = os.getcwd()
+        candidate_dirs = [
+            os.path.join(cwd, 'data', 'raw_profiles'),
+            os.path.join(cwd, 'data', 'cleaned_profiles'),
+            os.path.join(cwd, 'data'),
+        ]
+        sm_files = []
+        for data_dir in candidate_dirs:
+            if os.path.isdir(data_dir):
+                for root, _, files in os.walk(data_dir):
+                    for f in files:
+                        if f.endswith('.parquet'):
+                            sm_files.append(os.path.join(root, f))
+                if sm_files:
+                    break
     
     if not sm_files:
         raise ValueError("No Parquet files found for normalization stats computation.")
@@ -31,23 +45,24 @@ def compute_normalization_stats(sm_files,
     if not feature_cols:
         raise ValueError("No feature columns specified for normalization stats computation.")
 
-    # === Filter by Timeseries_info JSON if provided ===
-    print("Loading valid IDs...")
-    with open(valid_ids_json_path, 'r') as f:
-        valid_data = json.load(f)
-        # Convert to a set for O(1) lightning-fast lookups
-        valid_ids = set(valid_data['id_list_of_sms_with_data']) 
-        
-    filtered_sm_files = []
-    for file in sm_files:
-        # Extract the ID from the filename (e.g., "sm_100025.parquet" -> "100025")
-        basename = os.path.basename(file)
-        file_id = basename.replace('sm_', '').replace('.parquet', '')
-        
-        if file_id in valid_ids:
-            filtered_sm_files.append(file)
-            
-    print(f"Filtered files: Kept {len(filtered_sm_files)} out of {len(sm_files)} original files.")
+    # === Optional filter by Timeseries_info JSON ===
+    filtered_sm_files = list(sm_files)
+    if valid_ids_json_path is not None and os.path.exists(valid_ids_json_path):
+        print("Loading valid IDs...")
+        with open(valid_ids_json_path, 'r') as f:
+            valid_data = json.load(f)
+            valid_ids = set(valid_data.get('id_list_of_sms_with_data', []))
+
+        filtered_sm_files = []
+        for file in sm_files:
+            basename = os.path.basename(file)
+            file_id = basename.replace('sm_', '').replace('.parquet', '')
+            if file_id in valid_ids:
+                filtered_sm_files.append(file)
+
+        print(f"Filtered files: Kept {len(filtered_sm_files)} out of {len(sm_files)} original files.")
+    else:
+        print(f"No valid_ids filter applied. Using {len(filtered_sm_files)} files.")
 
 
     total_sum = np.zeros(len(feature_cols))
@@ -188,7 +203,7 @@ class Normalizer:
             raise ValueError(f"month_key length {mk.shape[0]} != X rows {n_rows}")
         return mk 
 
-    def fit(self, X, month_key = None):
+    def fit(self, X, month_key=None, sm_files=None, stats_path='normalization_stats.json'):
         """Fit the normalizer.
         Parameters:
         X : array-like (N,F)
@@ -197,7 +212,13 @@ class Normalizer:
         if X is None:
             # For log1p_phase, we can compute the stats from the entire dataset using the compute_normalization_stats function
             if self.method == 'log1p_phase':
-                self.mean, self.std = compute_normalization_stats(sm_files=None, feature_cols=['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3'], save_path='normalization_stats.json')
+                self.mean, self.std = compute_normalization_stats(
+                    sm_files=sm_files,
+                    feature_cols=['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3'],
+                    save_path=stats_path,
+                    valid_ids_json_path=None,
+                    use_cache=True,
+                )
                 self.fitted = True
                 return
             else:

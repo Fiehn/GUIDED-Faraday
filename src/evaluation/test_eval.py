@@ -190,12 +190,12 @@ print("="*70)
 
 # Visual evaluation
 print("\nVisual Evaluation:")
-visual_eval = VisualEvaluation(output_dir='Output/Plots')
+visual_eval = VisualEvaluation(output_dir='output/Plots')
 visual_eval.real_data = real_data_subset
 visual_eval.synthetic_data = synthetic_data
 visual_eval.pca()
 visual_eval.tsne()
-print("PCA and t-SNE plots saved to Output/Plots")
+print("PCA and t-SNE plots saved to output/Plots")
 
 # ACF Distribution metric
 acf_metric = ACFDistribution(window_size=window_size, max_lag=10)
@@ -258,7 +258,7 @@ per_condition_eval = PerConditionEval(
     window_size=window_size, 
     max_lag=10,
     min_samples_per_group=2,
-    output_dir='src/Output/',
+    output_dir='output/',
     verbose=True,
     predictor_type='linear',
     tstr_epochs=50,
