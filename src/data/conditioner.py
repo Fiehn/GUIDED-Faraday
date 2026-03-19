@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 # LDA conditions and user profiles
 # =============
 from sklearn.decomposition import LatentDirichletAllocation
-from sklearn.cluster import KMeans, MiniBatchKMeans
+from sklearn.cluster import MiniBatchKMeans
 from scipy.spatial.distance import cdist
 import pickle
 from tqdm import tqdm

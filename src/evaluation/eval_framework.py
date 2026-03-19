@@ -166,7 +166,6 @@ class EvalFramework:
 
     def register_all(self):
         self.register_metrics([
-            ReconstructionMSE(),
             ReconstructionRMSE(),
             ReconstructionLogLikelihood(),
             FlexibilityDistance(),
