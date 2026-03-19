@@ -13,7 +13,8 @@ data:
 
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
-  data_dir: "./data/raw_profiles"
+  # data_dir: "./data/raw_profiles"
+  data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
   
   # CSV filename to load
   data_files: []
@@ -44,15 +45,15 @@ data:
   
   # DataLoader settings
   dataloader:
-    batch_size: 64
-    num_workers: 0
+    batch_size: 524
+    num_workers: 6
     shuffle: false
 
   # Phased parquet streaming settings (used by SetGuideVAE phased training)
   phased:
-    replay_buffer_capacity: 512
-    min_buffer_size: 8
-    num_workers: 0
+    replay_buffer_capacity: 20000
+    min_buffer_size: 2048
+    num_workers: 6
     steps_per_epoch: 100
     eval_batches: 5
 
@@ -97,7 +98,7 @@ model:
   
   # Prior configuration
   prior:
-    type: "standard_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
+    type: "learnable_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
                                  # "learnable_gaussian", "learnable_dictionary", "vamp"
     dictionary_size: 512         # Must be > input_dim (96 timesteps × 3 phases = 288)
     vamp_num_components: 20
@@ -121,7 +122,7 @@ conditioning:
   # User profiling (based on LDA)
   user_profile:
     online: true
-    n_topics: 10 # number of LDA topics
+    n_topics: 20 # number of LDA topics
     num_clusters: 100 # number of KMeans clusters for "words"
     random_state: 42
     cache_path: "./models/UserProfiles/user_profiles.pkl"
@@ -228,7 +229,7 @@ visualize:
   num_recon_per: 5
   num_synthetic: 40
   num_originals: 4
-  num_synthetic_per: 50
+  num_synthetic_per: 10
 
 # ============================================================================
 # ADVANCED 

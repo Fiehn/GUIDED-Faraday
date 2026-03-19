@@ -58,36 +58,37 @@ class StandardGaussianPrior(BasePrior):
     def forward(self, batch_size):
         return {"mu": self.mu.expand(batch_size, -1), "sigma": self.sigma.expand(batch_size, -1)}
     
-class LearnableGaussianPrior(BasePrior):
-    """ Learnable Gaussian Prior N(mu, sigma) """
-    def __init__(self, latent_dim, device="cpu", init_mu = None, init_sigma = None):
+class LearnableDictionaryPrior(BasePrior):
+    """ Learnable Gaussian Prior N(mu, sigma) in dictionary space """
+    def __init__(self, latent_dim, dictionary_size, device="cpu", init_mu = None, init_sigma = None):
         super().__init__(latent_dim, device)
-        # Learnable parameters
+        self.dictionary_size = dictionary_size
+
         if init_mu is None:
             init_mu = torch.zeros((1, latent_dim))
         if init_sigma is None:
-            init_sigma = torch.ones((1, latent_dim))
+            init_sigma = torch.ones((1, dictionary_size))
 
         self.mu = nn.Parameter(init_mu.to(device))
         self.log_sigma = nn.Parameter(torch.log(init_sigma.to(device)))  # We learn log(sigma) for stability
 
     def get_params(self):
         return {"mu": self.mu, "sigma": torch.exp(self.log_sigma)}
-    
     def sample(self, batch_size, num_samples=1):
         sigma = torch.exp(self.log_sigma)
-        eps = torch.randn((num_samples, batch_size, self.latent_dim), device=self.device)
-        return self.mu + eps * sigma
-    
+        eps = torch.randn((num_samples, batch_size, self.dictionary_size), device=sigma.device)
+        # Return samples in dictionary space only (mu in latent space is added after
+        # the SigmaMapper transform in CVAE.sample, matching StandardDictionaryPrior behaviour)
+        return eps * sigma
     def log_prob(self, z):
         params = self.get_params()
         mu = params["mu"]
         sigma = params["sigma"]
         return -0.5 * (((z - mu) / sigma) ** 2 + 2 * torch.log(sigma) + torch.log(2 * torch.pi)).sum(dim=-1) # TODO: verify correctness
-    
     def forward(self, batch_size):
         sigma = torch.exp(self.log_sigma)
         return {"mu": self.mu.expand(batch_size, -1), "sigma": sigma.expand(batch_size, -1)}
+
     
 class StandardDictionaryPrior(BasePrior):
     """ Standard Normal Prior N(0, I) in dictionary space - non-learnable """

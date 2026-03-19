@@ -255,7 +255,7 @@ if __name__ == "__main__":
     # Example usage
     data_module = SMPhaseData(
         # data_dir='/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/cleaned_profiles',
-        data_dir='/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles',
+        data_dir='F:\Data\processed_data\second_batch\individual_sm_datasets\raw_profiles',
         # data_dir='F:\Data\processed_data\second_batch\individual_sm_datasets\cleaned_profiles',
         window_spec=WindowSpec(input_len=24, stride=1),
         batch_size=32,

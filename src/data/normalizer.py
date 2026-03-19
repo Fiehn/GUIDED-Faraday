@@ -134,6 +134,7 @@ def compute_normalization_stats(sm_files,
             if std[i] == 0:
                 std[i] = 1.0
 
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     with open(save_path, 'w') as f:
         json.dump({'log_mean': mean.tolist(), 'log_std': std.tolist()}, f)
 

@@ -335,6 +335,9 @@ def train(config):
         parquet_paths = sorted([p for p in parquet_paths if os.path.exists(p)])
         if len(parquet_paths) == 0:
             raise ValueError(f"No parquet files found for phased mode in: {data_dir}")
+        
+        # TODO: REMOVE THIS:
+        parquet_paths = parquet_paths[:1000]  # temporary limit for testing
 
         print(f"Phased mode enabled. Using {len(parquet_paths)} parquet file(s).")
 
