@@ -191,8 +191,9 @@ class EvalFramework:
 
         self.model.eval()
         with torch.no_grad():
-            for data, meter_ids, timestamps in self.dataloader:
+            for data, c, meter_ids, timestamps in self.dataloader:
                 data = data.to(self.device)
+                c = c.to(self.device)
                 x_flat = data.reshape(data.shape[0], -1) if data.dim() == 3 else data
                 real_batches.append(x_flat.cpu().numpy())
 
@@ -203,8 +204,6 @@ class EvalFramework:
 
                 if self._is_cvae():
                     # Use the model's own conditioner, not self.conditioner
-                    c = self.model.conditioner.get_conditions(data, meter_id=meter_ids, timestamps=timestamps)
-                    c = self.model.move_to_device(c, device=self.device)
                     condition_batches.append(c.cpu())
 
         self._timestamps = np.concatenate(timestamp, axis=0) if timestamp else None

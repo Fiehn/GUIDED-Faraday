@@ -133,7 +133,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         batch_count = 0
         total_timesteps = 0
 
-        for data, meter_id, timestamps in tqdm(train_loader, desc="Clustering batches"):
+        for data, c, meter_id, timestamps in tqdm(train_loader, desc="Clustering batches"):
             batch_size, seq_len, num_features = data.shape
             data_flat = data.cpu().numpy().reshape(batch_size, seq_len * num_features)  # [B, L*F]
 
@@ -157,7 +157,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         # === Phase 2: Create corpus and fit LDA model ===
         meter_corpus = {} # dict: meter_id -> cluster counts
 
-        for data, meter_id, timestamps in tqdm(train_loader, desc="Creating corpus batches"):
+        for data, c, meter_id, timestamps in tqdm(train_loader, desc="Creating corpus batches"):
             batch_size, seq_len, num_features = data.shape
             data_batch = data.cpu().numpy().reshape(batch_size, seq_len * num_features)  # [B*T, F]
             meter_id_flat = meter_id.cpu().numpy() 

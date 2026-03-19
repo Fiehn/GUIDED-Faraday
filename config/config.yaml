@@ -5,7 +5,7 @@
 # data loading, and conditioning. 
 
 skip_validation: false
-verbose: false
+verbose: true
 
 # ============================================================================
 # DATA LOADING CONFIGURATION
@@ -15,7 +15,7 @@ data:
   data_dir: "./data"
   
   # CSV filename to load
-  data_files: ["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
+  data_files: ["test_data_small.csv"] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
   
   # CSV column specifications
   columns:

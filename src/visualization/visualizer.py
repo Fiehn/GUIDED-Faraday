@@ -131,7 +131,7 @@ class Visualizer:
         
         self.model.eval()
         input_data = next(iter(test_loader))
-        x_original, meter_id, timestamps = input_data
+        x_original, c, meter_id, timestamps = input_data
         x_original = x_original.to(self.device)
 
         recon_samples = self.generator.reconstruct(x_original, num_recon_per, meter_id=meter_id, timestamp=timestamps)
@@ -359,8 +359,9 @@ class Visualizer:
         self.model.eval()
         with torch.no_grad():
             # Get a batch from test loader
-            x, meter_id, timestamps = next(iter(test_loader))
+            x, c, meter_id, timestamps = next(iter(test_loader))
             x = x.to(self.device)
+            c = c.to(self.device)
             timestamps = timestamps.to(self.device)
             
             # Select a few samples
@@ -531,10 +532,10 @@ class Visualizer:
         Generate syntetic samples and compare with real values in PCA space.
         """
         # Get the conditions of real data:
-        x, meter_id, timestamps = next(iter(test_loader))
+        x, c, meter_id, timestamps = next(iter(test_loader))
         x = x.to(self.device)
+        c = c.to(self.device)
         timestamps = timestamps.to(self.device)
-        c = self.model.conditioner.get_conditions(x,meter_id,timestamps).to(self.device)
 
         # Generate synthetic samples with the SAME conditions
         synthetic_samples, _ = self.generator.generate(
@@ -589,10 +590,10 @@ class Visualizer:
     def tsne_compared(self,test_loader):
         """Generate t-SNE plots for real vs synthetic data."""
         # Get conditions of real data
-        x, meter_id, timestamps = next(iter(test_loader))
+        x, c, meter_id, timestamps = next(iter(test_loader))
         x = x.to(self.device)
+        c = c.to(self.device)
         timestamps = timestamps.to(self.device)
-        c = self.model.conditioner.get_conditions(x,meter_id,timestamps).to(self.device)
         # Generate synthetic samples with the SAME conditions
         synthetic_samples, _ = self.generator.generate(
             num_samples=x.shape[-1],

@@ -193,22 +193,19 @@ def train(config):
             val_frac=config.data.splits.val_ratio,
             max_meters=None,
             normalizer=normalizer,
+            conditioner=conditioner,
         )
         dm.setup()
 
         all_test_tensors.append((
             dm._test_ds.tensors[0].clone(),  # (N, L, F)
-            dm._test_ds.tensors[1].clone(),  # (N,) meter ids
-            dm._test_ds.tensors[2].clone(),  # (N,) timestamps
+            dm._test_ds.tensors[1].clone(),  # (N, Cond)
+            dm._test_ds.tensors[2].clone(),  # (N,) meter ids
+            dm._test_ds.tensors[3].clone(),  # (N,) timestamps
         ))
 
         train_loader = dm.train_dataloader()
         val_loader = dm.val_dataloader()
-
-        if i == 1 and model.conditioner.condition_items.get("user_profile") is not None:
-            if model.conditioner.condition_items.get("user_profile").is_fitted == False:
-                print("Fitting user profile conditioner on first training file...")
-                model.conditioner.condition_items["user_profile"].fit(train_loader)
 
         model_tag, writer = model.fit(
             trainloader = train_loader,
@@ -237,9 +234,10 @@ def train(config):
         )
 
     combined_test_ds = TensorDataset(
-    torch.cat([t[0] for t in all_test_tensors], dim=0),
-    torch.cat([t[1] for t in all_test_tensors], dim=0),
-    torch.cat([t[2] for t in all_test_tensors], dim=0),
+        torch.cat([t[0] for t in all_test_tensors], dim=0),
+        torch.cat([t[1] for t in all_test_tensors], dim=0),
+        torch.cat([t[2] for t in all_test_tensors], dim=0),
+        torch.cat([t[3] for t in all_test_tensors], dim=0),
     )
     combined_test_loader = DataLoader(
         combined_test_ds,

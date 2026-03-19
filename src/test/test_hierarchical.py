@@ -631,14 +631,14 @@ class TestHierarchyWithRealData:
         self.train_loader = self.dm.train_dataloader()
 
     def _get_batch_flat(self):
-        x, meter_id, timestamps = next(iter(self.train_loader))
-        return x.reshape(x.shape[0], -1), meter_id, timestamps
+        x, c, meter_id, timestamps = next(iter(self.train_loader))
+        return x.reshape(x.shape[0], -1), c, meter_id, timestamps
 
     def test_vae_with_hierarchy_forward(self):
         """VAE + hierarchy forward pass on real data."""
         from src.models.vae import VAE
 
-        x_flat, _, _ = self._get_batch_flat()
+        x_flat, c, meter_id, timestamps = self._get_batch_flat()
         input_dim = x_flat.shape[1]
 
         cfg = HierarchicalConfig(aggregation="concat")
@@ -661,7 +661,7 @@ class TestHierarchyWithRealData:
         """Full loss computation and backward pass with real data."""
         from src.models.vae import VAE
 
-        x_flat, _, _ = self._get_batch_flat()
+        x_flat, c, meter_id, timestamps = self._get_batch_flat()
         input_dim = x_flat.shape[1]
 
         cfg = HierarchicalConfig(aggregation="sum")
@@ -692,7 +692,7 @@ class TestHierarchyWithRealData:
         """Full train_core step with real data and hierarchy."""
         from src.models.vae import VAE
 
-        x_flat, _, _ = self._get_batch_flat()
+        x_flat, c, meter_id, timestamps = self._get_batch_flat()
         input_dim = x_flat.shape[1]
 
         cfg = HierarchicalConfig(aggregation="sum")
@@ -717,7 +717,7 @@ class TestHierarchyWithRealData:
         """Save and reload a hierarchy-equipped VAE, verify structure on real data."""
         from src.models.vae import VAE
 
-        x_flat, _, _ = self._get_batch_flat()
+        x_flat, c, meter_id, timestamps = self._get_batch_flat()
         input_dim = x_flat.shape[1]
 
         cfg = HierarchicalConfig(aggregation="sum", residual_connections=True)
