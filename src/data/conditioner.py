@@ -852,7 +852,7 @@ class ElectricVehicleConditioner():
     
     def get_conditions_no_data(self, meter_id, timestamps):
         return None
-    
+
 # =============
 # Conditioner Module - Holds an object that creates and determines type of conditioning to be used in Models
 # ============

@@ -20,8 +20,8 @@ sys.path.insert(0, grandparent_dir)
 from src.data.dataloader import SmartMeterDataModule, WindowSpec
 from src.data.normalizer import Normalizer
 from src.data.conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
-from src.models.cvae import CVAE
-from src.models.vae import VAE
+from src.model.cvae import CVAE
+from src.model.vae import VAE
 
 # ------------------------------------------------------------------
 # Constants

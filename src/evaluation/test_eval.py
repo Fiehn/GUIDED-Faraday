@@ -1,8 +1,8 @@
 import torch
 from evaluation.eval_framework import FlexibilityDistance # for reconstruction evaluation
 from evaluation.eval_framework import ACFDistribution, ClassicalStatistics, TSTR, MaximumMeanDiscrepancy, AggregatedProfiles, PerConditionEval # for distributional evaluation
-from src.models.vae import VAE
-from src.models.cvae import CVAE
+from src.model.vae import VAE
+from src.model.cvae import CVAE
 import glob
 import os
 import sys

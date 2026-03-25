@@ -20,8 +20,8 @@ sys.path.insert(0, project_root)
 from data.dataloader import SmartMeterDataModule, WindowSpec
 from data.normalizer import Normalizer
 from data.conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
-from src.models.cvae import CVAE
-from src.models.vae import VAE 
+from src.model.cvae import CVAE
+from src.model.vae import VAE 
 
 from src.test.validate_model import validate_before_training
 

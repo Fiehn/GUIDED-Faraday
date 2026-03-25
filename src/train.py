@@ -7,17 +7,17 @@ from xml.parsers.expat import model
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
-from models.encoder_decoder_model import *
+from model.encoder_decoder_model import *
 from data.conditioner import *
-from src.models.cvae import *
-from models.set_guide_vae import *
-from src.models.vae import *
+from src.model.cvae import *
+from src.model.set import *
+from src.model.vae import *
 from data.dataloader import *
 from data.dataloader_phased import StreamingParquetBuffer, WindowSpec as PhaseWindowSpec
 from data.normalizer import *
 from src.test.run_validation import run_validation
-from src.models.hierarchical.aggregation import *
-from src.models.hierarchical.config import *
+from src.model.hierarchical.aggregation import *
+from src.model.hierarchical.config import *
 from src.visualization.visualizer import Visualizer
 from src.visualization.writer import Writer
 from evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
@@ -339,7 +339,7 @@ def train(config):
             raise ValueError(f"No parquet files found for phased mode in: {data_dir}")
         
         # TODO: REMOVE THIS:
-        parquet_paths = parquet_paths[:1000]  # temporary limit for testing
+        parquet_paths = parquet_paths[:10]  # temporary limit for testing
 
         print(f"Phased mode enabled. Using {len(parquet_paths)} parquet file(s).")
 
@@ -362,7 +362,10 @@ def train(config):
             print(f"Warning: phased_parquet mode currently expects normalization.method='log1p_phase'. Got '{norm_method}'. Continuing without normalization.")
         if conditioner.condition_items.get("user_profile") is not None:
             conditioner.condition_items.get("user_profile", None).fit_on_files(parquet_paths)  # Fit user profiler on all data files for phased mode
-
+        if config.window.aggregated and config.window.input_len != 24:
+            print(f"Warning: window.aggregated is True but window.input_len is {config.window.input_len}. For hourly aggregation, consider setting input_len to 24.")
+            config.window.input_len = 24
+            config.window.stride = 24
         phase_window = PhaseWindowSpec(input_len=config.window.input_len, stride=config.window.stride)
         train_ds = StreamingParquetBuffer(
             sm_files=parquet_paths,
@@ -371,6 +374,7 @@ def train(config):
             window_spec=phase_window,
             normalizer=normalizer,
             num_workers=phased_workers,
+            hourly_aggregation=config.window.aggregated
         )
         train_loader = DataLoader(
             train_ds,

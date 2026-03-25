@@ -8,17 +8,17 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir) 
-from models.encoder_decoder_model import *
+from model.encoder_decoder_model import *
 from data.conditioner import *
-from models.priors import *
+from model.priors import *
 from data.normalizer import *
 
 from visualization.writer import Writer
  
-from src.models.hierarchical.config import HierarchicalConfig
-from src.models.hierarchical.core import HierarchicalLatentModule
+from src.model.hierarchical.config import HierarchicalConfig
+from src.model.hierarchical.core import HierarchicalLatentModule
 
-from src.models.model_utils import CyclicalBetaScheduler, EarlyStopping
+from src.model.model_utils import CyclicalBetaScheduler, EarlyStopping
 
 
 # https://arxiv.org/pdf/2411.03936
@@ -779,7 +779,7 @@ class VAE(nn.Module):
             init_args = prior_state.get('init_args', {})
             
             import importlib
-            from models.priors import VampPrior
+            from model.priors import VampPrior
             
             # Create VampPrior with encoder reference 
             model.prior = VampPrior(
