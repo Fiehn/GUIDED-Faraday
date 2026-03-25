@@ -61,11 +61,17 @@ config = _load_config()
 # Load data 
 
 
-# Configuration for 3-phase parquet data
+# Analysis data source configuration
+# Options: "phased_parquet" or "hourly_csv"
+analysis_data_mode = "hourly_csv"
 data_dir_parquet = "data/raw_profiles"
+# hourly_csv_path = "data/test_data_eval.csv"
+hourly_csv_path = "data/hourly_measurements_2023_10.csv"
+analysis_freq = "1h" if analysis_data_mode == "hourly_csv" else "15min"
+
 output_dir_data_analysis = "output/data_analysis"
 os.makedirs(output_dir_data_analysis, exist_ok=True)
-window_spec = WindowSpec(input_len=96, stride=96)  # 24-hour windows
+window_spec = WindowSpec(input_len=96, stride=96)  # used for phased loader only
 plot_style = PlotStyle()
 
 
@@ -82,49 +88,49 @@ def save_json(payload: dict, filename: str) -> str:
         json.dump(payload, f, indent=2, default=str)
     return path
 
-# Initialize normalizer and fit it on the parquet files
-normalizer_3phase = Normalizer(method="log1p_phase")
+if analysis_data_mode == "phased_parquet":
+    normalizer_3phase = Normalizer(method="log1p_phase")
+    parquet_files = glob.glob(f"{data_dir_parquet}/*.parquet")
+    print(f"Found {len(parquet_files)} parquet files")
 
-# Find parquet files to fit normalizer
-parquet_files = glob.glob(f"{data_dir_parquet}/*.parquet")
-print(f"Found {len(parquet_files)} parquet files")
+    if len(parquet_files) > 0:
+        normalizer_3phase.fit(X=None, sm_files=parquet_files)
+        print(f"  Normalizer fitted on {len(parquet_files)} files")
+        print(f"  Normalizer mean: {normalizer_3phase.mean}")
+        print(f"  Normalizer std: {normalizer_3phase.std}")
+    else:
+        print(f"  No parquet files found in {data_dir_parquet}")
+        print(f"  Available files: {glob.glob(f'{data_dir_parquet}/*')[:5]}")
+        normalizer_3phase = None
 
-if len(parquet_files) > 0:
-    # Fit normalizer on the data
-    normalizer_3phase.fit(X=None, sm_files=parquet_files)  
-    print(f"  Normalizer fitted on {len(parquet_files)} files")
-    print(f"  Normalizer mean: {normalizer_3phase.mean}")
-    print(f"  Normalizer std: {normalizer_3phase.std}")
+    sm_phase_data = SMPhaseData(
+        data_dir=data_dir_parquet,
+        filename=None,
+        window_spec=window_spec,
+        batch_size=32,
+        replay_buffer_capacity=5000,
+        train_frac=0.8,
+        val_frac=0.1,
+        test_frac=0.1,
+        normalizer=normalizer_3phase,
+        num_workers=config.data.phased.num_workers,
+        seed=42
+    )
+    sm_phase_data.setup()
+    print("Loaded 3-phase data from parquet files")
+    print(f"Train loader: {sm_phase_data.train_loader}")
 else:
-    print(f"  No parquet files found in {data_dir_parquet}")
-    print(f"  Available files: {glob.glob(f'{data_dir_parquet}/*')[:5]}")
     normalizer_3phase = None
+    sm_phase_data = None
+    if not os.path.exists(hourly_csv_path):
+        raise FileNotFoundError(f"Hourly CSV file not found: {hourly_csv_path}")
+    print(f"Loaded hourly CSV mode from: {hourly_csv_path}")
 
-# Initialize SMPhaseData loader
-sm_phase_data = SMPhaseData(
-    data_dir=data_dir_parquet,
-    filename=None,
-    window_spec=window_spec,
-    batch_size=32, # config.dataloader.batch_size
-    replay_buffer_capacity=5000, # config.data.phased.replay_buffer_capacity
-    train_frac=0.8,
-    val_frac=0.1,
-    test_frac=0.1,
-    normalizer=normalizer_3phase,
-    num_workers=config.data.phased.num_workers,
-    seed=42
-)
-
-# Setup the data loaders
-sm_phase_data.setup()
-print("Loaded 3-phase data from parquet files")
-print(f"Train loader: {sm_phase_data.train_loader}")
-
-# Sanity-check preview from phased train loader.
+# Preview from phased train loader.
 # Keep disabled by default for small datasets where the replay buffer may not
 # reach the minimum sampling threshold.
 preview_train_loader_sample = False
-if preview_train_loader_sample:
+if preview_train_loader_sample and sm_phase_data is not None:
     train_batch = None
     try:
         train_batch = next(iter(sm_phase_data.train_loader))
@@ -172,12 +178,25 @@ if preview_train_loader_sample:
 # ----------------------------------------------------------------------------
 ##############################################################################
 # Plotting each phase & aggregated
-# Plotting: Set `selected_meter` and `selected_day` in the next cell to plot a specific smart meter and exact day.
+# Plotting: `selected_meter` and `selected_day` to plot a specific smart meter and exact day.
 
 class SmartMeterDayPlotter:
-    def __init__(self, data_dir_parquet: str, verbose: bool = False):
+    def __init__(
+        self,
+        data_dir_parquet: str,
+        verbose: bool = False,
+        data_mode: str = "phased_parquet",
+        hourly_csv_path: str = None,
+        interval_freq: str = "15min",
+        hourly_energy_col: str = "hourly_energy_consumption",
+    ):
         self.data_dir_parquet = data_dir_parquet
         self.verbose = verbose
+        self.data_mode = data_mode
+        self.hourly_csv_path = hourly_csv_path
+        self.interval_freq = interval_freq
+        self.hourly_energy_col = hourly_energy_col
+        self.hourly_df = None
         self.meter_to_file = self._build_meter_file_map()
 
     def _log(self, msg: str):
@@ -185,6 +204,17 @@ class SmartMeterDayPlotter:
             print(msg)
 
     def _build_meter_file_map(self):
+        if self.data_mode == "hourly_csv":
+            if self.hourly_csv_path is None or (not os.path.exists(self.hourly_csv_path)):
+                raise FileNotFoundError(f"Hourly CSV not found: {self.hourly_csv_path}")
+
+            self.hourly_df = pd.read_csv(self.hourly_csv_path)
+            if "meter_number" not in self.hourly_df.columns:
+                raise ValueError("Hourly CSV must contain 'meter_number' column")
+
+            meters = sorted(pd.to_numeric(self.hourly_df["meter_number"], errors="coerce").dropna().astype(int).unique().tolist())
+            return {meter: self.hourly_csv_path for meter in meters}
+
         parquet_files = sorted(glob.glob(f"{self.data_dir_parquet}/*.parquet"))
         meter_to_file = {}
         for p in parquet_files:
@@ -249,32 +279,58 @@ class SmartMeterDayPlotter:
         if selected_meter not in self.meter_to_file:
             raise ValueError(f"Meter {selected_meter} not found. Choose one of: {available_meters}")
 
-        parquet_path = self.meter_to_file[selected_meter]
-        self._log(f"Using file: {parquet_path}")
+        if self.data_mode == "hourly_csv":
+            if self.hourly_df is None:
+                self.hourly_df = pd.read_csv(self.hourly_csv_path)
 
-        df_raw = pd.read_parquet(parquet_path)
-        self._log(f"Columns in file: {list(df_raw.columns)}")
-        self._log(f"Index type: {type(df_raw.index).__name__}")
+            df_meter = self.hourly_df[pd.to_numeric(self.hourly_df["meter_number"], errors="coerce") == selected_meter].copy()
+            if df_meter.empty:
+                raise ValueError(f"No rows found for meter {selected_meter} in hourly CSV")
 
-        time_col = self._pick_time_column(df_raw)
-        if time_col is None:
-            raise ValueError("No usable timestamp source found. " + f"Columns were: {list(df_raw.columns)}")
+            time_col = self._pick_time_column(df_meter)
+            if time_col is None:
+                raise ValueError("No usable timestamp source found in hourly CSV")
 
-        l1_col = self._pick_col(df_raw.columns, "active_power_p14_l1")
-        l2_col = self._pick_col(df_raw.columns, "active_power_p14_l2")
-        l3_col = self._pick_col(df_raw.columns, "active_power_p14_l3")
+            if self.hourly_energy_col not in df_meter.columns:
+                raise ValueError(f"Hourly CSV missing required column: {self.hourly_energy_col}")
 
-        if l1_col is None and l2_col is None and l3_col is None:
-            raise ValueError("No phase columns found (active_power_p14_l1/l2/l3). " + f"Columns were: {list(df_raw.columns)}")
+            timestamp_series = df_meter.index if time_col == "__index__" else df_meter[time_col]
+            agg_kwh = pd.to_numeric(df_meter[self.hourly_energy_col], errors="coerce").fillna(0.0)
+            agg_wh = agg_kwh * 1000.0
 
-        timestamp_series = df_raw.index if time_col == "__index__" else df_raw[time_col]
+            df = pd.DataFrame({
+                "timestamp": pd.to_datetime(timestamp_series, utc=True, errors="coerce"),
+                "L1": agg_wh,
+                "L2": 0.0,
+                "L3": 0.0,
+            }).dropna(subset=["timestamp"]).sort_values("timestamp")
+        else:
+            parquet_path = self.meter_to_file[selected_meter]
+            self._log(f"Using file: {parquet_path}")
 
-        df = pd.DataFrame({
-            "timestamp": pd.to_datetime(timestamp_series, utc=True, errors="coerce"),
-            "L1": pd.to_numeric(df_raw[l1_col], errors="coerce") if l1_col else np.nan,
-            "L2": pd.to_numeric(df_raw[l2_col], errors="coerce") if l2_col else np.nan,
-            "L3": pd.to_numeric(df_raw[l3_col], errors="coerce") if l3_col else np.nan,
-        }).dropna(subset=["timestamp"]).sort_values("timestamp")
+            df_raw = pd.read_parquet(parquet_path)
+            self._log(f"Columns in file: {list(df_raw.columns)}")
+            self._log(f"Index type: {type(df_raw.index).__name__}")
+
+            time_col = self._pick_time_column(df_raw)
+            if time_col is None:
+                raise ValueError("No usable timestamp source found. " + f"Columns were: {list(df_raw.columns)}")
+
+            l1_col = self._pick_col(df_raw.columns, "active_power_p14_l1")
+            l2_col = self._pick_col(df_raw.columns, "active_power_p14_l2")
+            l3_col = self._pick_col(df_raw.columns, "active_power_p14_l3")
+
+            if l1_col is None and l2_col is None and l3_col is None:
+                raise ValueError("No phase columns found (active_power_p14_l1/l2/l3). " + f"Columns were: {list(df_raw.columns)}")
+
+            timestamp_series = df_raw.index if time_col == "__index__" else df_raw[time_col]
+
+            df = pd.DataFrame({
+                "timestamp": pd.to_datetime(timestamp_series, utc=True, errors="coerce"),
+                "L1": pd.to_numeric(df_raw[l1_col], errors="coerce") if l1_col else np.nan,
+                "L2": pd.to_numeric(df_raw[l2_col], errors="coerce") if l2_col else np.nan,
+                "L3": pd.to_numeric(df_raw[l3_col], errors="coerce") if l3_col else np.nan,
+            }).dropna(subset=["timestamp"]).sort_values("timestamp")
 
         df = df.set_index("timestamp")
         df[["L1", "L2", "L3"]] = df[["L1", "L2", "L3"]].fillna(0.0)
@@ -315,7 +371,7 @@ class SmartMeterDayPlotter:
             max_day = df.index.max().strftime("%Y-%m-%d")
             raise ValueError(f"No data for meter {selected_meter} on {selected_day}. Available date range: {min_day} to {max_day}")
 
-        full_idx = pd.date_range(day_start, day_end - pd.Timedelta(minutes=15), freq="15min", tz="UTC")
+        full_idx = pd.date_range(start=day_start, end=day_end, freq=self.interval_freq, tz="UTC", inclusive="left")
         day_df = day_df.reindex(full_idx).fillna(0.0)
         day_df["Aggregated"] = day_df[["L1", "L2", "L3"]].sum(axis=1)
 
@@ -325,27 +381,48 @@ class SmartMeterDayPlotter:
         self._log(str(day_df.head()))
         self._log(f"Day total (aggregated): {day_df['Aggregated'].sum() / 1000.0:.3f} kWh")
 
-        fig, axes = plt.subplots(4, 1, figsize=plot_style.get_figsize(height_multiplier=2.2), sharex=True)
-        labels = ["L1", "L2", "L3", "Aggregated"]
-        line_colors = [plot_style.get_color(0), plot_style.get_color(1), plot_style.get_color(2), plot_style.get_color_original()]
-
-        for i, col in enumerate(labels):
-            axes[i].plot(
+        if self.data_mode == "hourly_csv":
+            fig, ax = plt.subplots(1, 1, figsize=plot_style.get_figsize(height_multiplier=1.2), sharex=True)
+            ax.plot(
                 day_df.index,
-                day_df[col].values,
+                day_df["Aggregated"].values,
                 linewidth=plot_style.linewidth,
                 alpha=0.9,
                 marker=plot_style.marker,
                 markersize=4,
                 linestyle=plot_style.linestyle,
-                color=line_colors[i],
+                color=plot_style.get_color_original(),
             )
-            axes[i].set_title(f"SM {selected_meter} | {selected_day} | {col}")
-            axes[i].set_ylabel("Energy (Wh)")
-            axes[i].grid(True, alpha=0.3)
-            axes[i].legend([f"Total: {day_df[col].sum() / 1000.0:.2f} kWh"], loc="upper right")
+            ax.set_title(f"SM {selected_meter} | {selected_day} | Aggregated")
+            ax.set_ylabel("Energy (Wh)")
+            ax.set_xlabel("Time (UTC)")
+            ax.grid(True, alpha=0.3)
+            ax.legend([f"Total: {day_df['Aggregated'].sum() / 1000.0:.2f} kWh"], loc="upper right")
+            labels = ["Aggregated"]
+            line_colors = [plot_style.get_color_original()]
+        else:
+            fig, axes = plt.subplots(4, 1, figsize=plot_style.get_figsize(height_multiplier=2.2), sharex=True)
+            labels = ["L1", "L2", "L3", "Aggregated"]
+            line_colors = [plot_style.get_color(0), plot_style.get_color(1), plot_style.get_color(2), plot_style.get_color_original()]
 
-        axes[-1].set_xlabel("Time (UTC)")
+            for i, col in enumerate(labels):
+                axes[i].plot(
+                    day_df.index,
+                    day_df[col].values,
+                    linewidth=plot_style.linewidth,
+                    alpha=0.9,
+                    marker=plot_style.marker,
+                    markersize=4,
+                    linestyle=plot_style.linestyle,
+                    color=line_colors[i],
+                )
+                axes[i].set_title(f"SM {selected_meter} | {selected_day} | {col}")
+                axes[i].set_ylabel("Energy (Wh)")
+                axes[i].grid(True, alpha=0.3)
+                axes[i].legend([f"Total: {day_df[col].sum() / 1000.0:.2f} kWh"], loc="upper right")
+
+            axes[-1].set_xlabel("Time (UTC)")
+
         plt.tight_layout()
         day_plot_path = os.path.join(output_dir_data_analysis, f"sm_{selected_meter}_{selected_day}_timeseries.png")
         fig.savefig(day_plot_path, dpi=200, bbox_inches="tight")
@@ -353,14 +430,22 @@ class SmartMeterDayPlotter:
         print(f"Saved plot: {day_plot_path}")
 
         if show_distribution:
-            fig, axes = plt.subplots(2, 2, figsize=plot_style.get_figsize(height_multiplier=1.5))
-            for idx, (ax, col) in enumerate(zip(axes.flatten(), labels)):
-                hist_color = line_colors[idx]
-                ax.hist(day_df[col].values, bins=40, edgecolor="black", alpha=0.75, color=hist_color)
-                ax.set_title(f"{col} distribution")
+            if self.data_mode == "hourly_csv":
+                fig, ax = plt.subplots(1, 1, figsize=plot_style.get_figsize(height_multiplier=1.0))
+                ax.hist(day_df["Aggregated"].values, bins=40, edgecolor="black", alpha=0.75, color=plot_style.get_color_original())
+                ax.set_title("Aggregated distribution")
                 ax.set_xlabel("Energy (Wh)")
                 ax.set_ylabel("Frequency")
                 ax.grid(True, alpha=0.3)
+            else:
+                fig, axes = plt.subplots(2, 2, figsize=plot_style.get_figsize(height_multiplier=1.5))
+                for idx, (ax, col) in enumerate(zip(axes.flatten(), labels)):
+                    hist_color = line_colors[idx]
+                    ax.hist(day_df[col].values, bins=40, edgecolor="black", alpha=0.75, color=hist_color)
+                    ax.set_title(f"{col} distribution")
+                    ax.set_xlabel("Energy (Wh)")
+                    ax.set_ylabel("Frequency")
+                    ax.grid(True, alpha=0.3)
             plt.tight_layout()
             dist_plot_path = os.path.join(output_dir_data_analysis, f"sm_{selected_meter}_{selected_day}_distribution.png")
             fig.savefig(dist_plot_path, dpi=200, bbox_inches="tight")
@@ -384,24 +469,21 @@ class CoverageAnalyzer:
         self.plotter = plotter
         self.freq = freq
 
+    def _interval_label(self) -> str:
+        return str(self.freq).replace(" ", "")
+
+    def _intervals_per_day(self) -> int:
+        delta = pd.to_timedelta(self.freq)
+        return int(pd.Timedelta(days=1) / delta)
+
     def compute_meter_coverage_metrics(self, meter_id: int):
-        parquet_path = self.plotter.meter_to_file[meter_id]
-        df_raw = pd.read_parquet(parquet_path)
-
-        time_col = self.plotter._pick_time_column(df_raw)
-        if time_col is None:
-            return {
-                'meter_id': meter_id,
-                'file': os.path.basename(parquet_path),
-                'error': 'No timestamp source found'
-            }
-
-        timestamp_series = df_raw.index if time_col == '__index__' else df_raw[time_col]
-        ts = pd.to_datetime(timestamp_series, utc=True, errors='coerce').dropna()
+        source_path = self.plotter.meter_to_file[meter_id]
+        df = self.plotter._load_meter_dataframe(meter_id)
+        ts = pd.DatetimeIndex(df.index)
         if len(ts) == 0:
             return {
                 'meter_id': meter_id,
-                'file': os.path.basename(parquet_path),
+                'file': os.path.basename(source_path),
                 'error': 'No valid timestamps'
             }
 
@@ -415,6 +497,8 @@ class CoverageAnalyzer:
         observed_intervals = int(observed_aligned.sum())
         missing_intervals = int(expected_intervals - observed_intervals)
         missing_rate = float(missing_intervals / expected_intervals) if expected_intervals > 0 else np.nan
+        interval_label = self._interval_label()
+        intervals_per_day = self._intervals_per_day()
 
         # Gaps: contiguous runs of missing 15-min intervals
         missing_mask = observed_aligned.eq(0)
@@ -430,28 +514,29 @@ class CoverageAnalyzer:
             max_gap_intervals = 0
             avg_gap_intervals = 0.0
 
-        # Full days = 96 expected 15-min intervals and all observed
+        # Full days = expected intervals/day and all observed
         per_day_expected = observed_aligned.groupby(observed_aligned.index.floor('D')).size()
         per_day_observed = observed_aligned.groupby(observed_aligned.index.floor('D')).sum()
-        full_days = int(((per_day_expected == 96) & (per_day_observed == 96)).sum())
-        complete_days = int((per_day_expected == 96).sum())
+        full_days = int(((per_day_expected == intervals_per_day) & (per_day_observed == intervals_per_day)).sum())
+        complete_days = int((per_day_expected == intervals_per_day).sum())
 
-        return {
+        metrics = {
             'meter_id': int(meter_id),
-            'file': os.path.basename(parquet_path),
+            'file': os.path.basename(source_path),
             'start_utc': ts.min(),
             'end_utc': ts.max(),
-            'expected_intervals_15min': expected_intervals,
-            'observed_intervals_15min': observed_intervals,
-            'missing_intervals_15min': missing_intervals,
+            f'expected_intervals_{interval_label}': expected_intervals,
+            f'observed_intervals_{interval_label}': observed_intervals,
+            f'missing_intervals_{interval_label}': missing_intervals,
             'missing_rate': missing_rate,
             'coverage_rate': float(1.0 - missing_rate) if pd.notna(missing_rate) else np.nan,
-            'num_gap_runs_15min': num_gap_runs,
-            'max_gap_intervals_15min': max_gap_intervals,
-            'avg_gap_intervals_15min': avg_gap_intervals,
-            'full_days_96_of_96': full_days,
-            'days_with_96_expected': complete_days,
+            f'num_gap_runs_{interval_label}': num_gap_runs,
+            f'max_gap_intervals_{interval_label}': max_gap_intervals,
+            f'avg_gap_intervals_{interval_label}': avg_gap_intervals,
+            f'full_days_{intervals_per_day}_of_{intervals_per_day}': full_days,
+            f'days_with_{intervals_per_day}_expected': complete_days,
         }
+        return metrics
 
     def report_all_meters(self, sort_by='missing_rate', ascending=False):
         rows = []
@@ -621,8 +706,8 @@ class PhaseBalanceAnalyzer:
 # This plots the distributions using all available timesteps from all parquet files (L1, L2, L3, and Aggregated).
 
 class DistributionAnalyzer:
-    def __init__(self, data_dir_parquet: str, exclude_zeros: bool = True, verbose: bool = False):
-        self.data_dir_parquet = data_dir_parquet
+    def __init__(self, plotter: SmartMeterDayPlotter, exclude_zeros: bool = True, verbose: bool = False):
+        self.plotter = plotter
         self.exclude_zeros = exclude_zeros
         self.verbose = verbose
 
@@ -631,27 +716,14 @@ class DistributionAnalyzer:
             print(msg)
 
     def compute_and_save(self):
-        all_parquet_files = sorted(glob.glob(f"{self.data_dir_parquet}/*.parquet"))
-        if len(all_parquet_files) == 0:
-            raise ValueError(f"No parquet files found in: {self.data_dir_parquet}")
-
         all_l1, all_l2, all_l3 = [], [], []
         processed = 0
 
-        for file_path in all_parquet_files:
-            df_file = pd.read_parquet(file_path)
-
-            l1 = next((c for c in df_file.columns if c.startswith("active_power_p14_l1")), None)
-            l2 = next((c for c in df_file.columns if c.startswith("active_power_p14_l2")), None)
-            l3 = next((c for c in df_file.columns if c.startswith("active_power_p14_l3")), None)
-
-            if l1 is None and l2 is None and l3 is None:
-                self._log(f"Skipping {os.path.basename(file_path)} (no active_power_p14_l* columns)")
-                continue
-
-            s1 = pd.to_numeric(df_file[l1], errors="coerce").fillna(0.0).to_numpy() if l1 is not None else np.zeros(len(df_file), dtype=float)
-            s2 = pd.to_numeric(df_file[l2], errors="coerce").fillna(0.0).to_numpy() if l2 is not None else np.zeros(len(df_file), dtype=float)
-            s3 = pd.to_numeric(df_file[l3], errors="coerce").fillna(0.0).to_numpy() if l3 is not None else np.zeros(len(df_file), dtype=float)
+        for meter_id in self.plotter.available_meters():
+            df_meter = self.plotter._load_meter_dataframe(meter_id)
+            s1 = pd.to_numeric(df_meter["L1"], errors="coerce").fillna(0.0).to_numpy()
+            s2 = pd.to_numeric(df_meter["L2"], errors="coerce").fillna(0.0).to_numpy()
+            s3 = pd.to_numeric(df_meter["L3"], errors="coerce").fillna(0.0).to_numpy()
 
             all_l1.append(s1)
             all_l2.append(s2)
@@ -659,20 +731,24 @@ class DistributionAnalyzer:
             processed += 1
 
         if processed == 0:
-            raise ValueError("No parquet files with 3-phase active power columns were processed.")
+            raise ValueError("No meter data was processed for distribution analysis.")
 
         L1_all = np.concatenate(all_l1)
         L2_all = np.concatenate(all_l2)
         L3_all = np.concatenate(all_l3)
         Agg_all = L1_all + L2_all + L3_all
 
-        raw_series_list = [L1_all, L2_all, L3_all, Agg_all]
-        titles = [
-            "L1 full-series distribution (all files)",
-            "L2 full-series distribution (all files)",
-            "L3 full-series distribution (all files)",
-            "Aggregated full-series distribution (all files)",
-        ]
+        if self.plotter.data_mode == "hourly_csv":
+            raw_series_list = [Agg_all]
+            titles = ["Aggregated full-series distribution (all files)"]
+        else:
+            raw_series_list = [L1_all, L2_all, L3_all, Agg_all]
+            titles = [
+                "L1 full-series distribution (all files)",
+                "L2 full-series distribution (all files)",
+                "L3 full-series distribution (all files)",
+                "Aggregated full-series distribution (all files)",
+            ]
 
         series_list = []
         kept_counts = {}
@@ -685,15 +761,26 @@ class DistributionAnalyzer:
                 kept_counts[title] = {"kept": int(len(series)), "total": int(len(series))}
                 series_list.append(series)
 
-        fig, axes = plt.subplots(2, 2, figsize=plot_style.get_figsize(height_multiplier=1.7))
-        dist_colors = [plot_style.get_color(0), plot_style.get_color(1), plot_style.get_color(2), plot_style.get_color_original()]
-        for idx, (ax, data, title) in enumerate(zip(axes.flatten(), series_list, titles)):
-            ax.hist(data, bins=120, edgecolor="black", alpha=0.75, color=dist_colors[idx])
+        if self.plotter.data_mode == "hourly_csv":
+            fig, ax = plt.subplots(1, 1, figsize=plot_style.get_figsize(height_multiplier=1.0))
+            data = series_list[0]
+            title = titles[0]
+            ax.hist(data, bins=120, edgecolor="black", alpha=0.75, color=plot_style.get_color_original())
             suffix = " (zeros excluded)" if self.exclude_zeros else ""
             ax.set_title(f"{title}{suffix}")
             ax.set_xlabel("Energy (Wh)")
             ax.set_ylabel("Frequency")
             ax.grid(True, alpha=0.3)
+        else:
+            fig, axes = plt.subplots(2, 2, figsize=plot_style.get_figsize(height_multiplier=1.7))
+            dist_colors = [plot_style.get_color(0), plot_style.get_color(1), plot_style.get_color(2), plot_style.get_color_original()]
+            for idx, (ax, data, title) in enumerate(zip(axes.flatten(), series_list, titles)):
+                ax.hist(data, bins=120, edgecolor="black", alpha=0.75, color=dist_colors[idx])
+                suffix = " (zeros excluded)" if self.exclude_zeros else ""
+                ax.set_title(f"{title}{suffix}")
+                ax.set_xlabel("Energy (Wh)")
+                ax.set_ylabel("Frequency")
+                ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
         full_dist_plot_path = os.path.join(output_dir_data_analysis, "full_series_phase_distributions.png")
@@ -734,31 +821,12 @@ class SeasonalityAnalyzer:
 
     def compute_stats(self):
         """Analyze calendar effects across aggregated load data."""
-        all_parquet_files = sorted(glob.glob(f"{self.plotter.data_dir_parquet}/*.parquet"))
-
         all_data = []
-        for file_path in all_parquet_files:
-            df_raw = pd.read_parquet(file_path)
-            time_col = self.plotter._pick_time_column(df_raw)
-            if time_col is None:
-                continue
-
-            timestamp_series = df_raw.index if time_col == '__index__' else df_raw[time_col]
-            l1 = next((c for c in df_raw.columns if c.startswith('active_power_p14_l1')), None)
-            l2 = next((c for c in df_raw.columns if c.startswith('active_power_p14_l2')), None)
-            l3 = next((c for c in df_raw.columns if c.startswith('active_power_p14_l3')), None)
-
-            if all(c is None for c in [l1, l2, l3]):
-                continue
-
-            s1 = pd.to_numeric(df_raw[l1], errors='coerce').fillna(0.0).to_numpy() if l1 else np.zeros(len(df_raw))
-            s2 = pd.to_numeric(df_raw[l2], errors='coerce').fillna(0.0).to_numpy() if l2 else np.zeros(len(df_raw))
-            s3 = pd.to_numeric(df_raw[l3], errors='coerce').fillna(0.0).to_numpy() if l3 else np.zeros(len(df_raw))
-            agg = s1 + s2 + s3
-
+        for meter_id in self.plotter.available_meters():
+            df_meter = self.plotter._load_meter_dataframe(meter_id)
             df_temp = pd.DataFrame({
-                'timestamp': pd.to_datetime(timestamp_series, utc=True, errors='coerce'),
-                'agg_wh': agg
+                'timestamp': df_meter.index,
+                'agg_wh': pd.to_numeric(df_meter['Aggregated'], errors='coerce').fillna(0.0).values,
             }).dropna(subset=['timestamp']).sort_values('timestamp')
 
             df_temp['month'] = df_temp['timestamp'].dt.month
@@ -810,11 +878,26 @@ class SeasonalityAnalyzer:
 # OUTPUT 
 
 
+def make_plotter(verbose: bool = False) -> SmartMeterDayPlotter:
+    return SmartMeterDayPlotter(
+        data_dir_parquet=data_dir_parquet,
+        verbose=verbose,
+        data_mode=analysis_data_mode,
+        hourly_csv_path=hourly_csv_path,
+        interval_freq=analysis_freq,
+        hourly_energy_col="hourly_energy_consumption",
+    )
+
+
 
 
 # Plotting each phase & aggregated
-plotter = SmartMeterDayPlotter(data_dir_parquet=data_dir_parquet, verbose=False)
-selected_meter = 116
+plotter = make_plotter(verbose=False)
+available_meters = plotter.available_meters()
+if len(available_meters) == 0:
+    raise ValueError("No meters available for analysis in current data source")
+
+selected_meter = 116 if 116 in available_meters else available_meters[0]
 selected_day = "auto"  # or e.g. "2024-02-01"
 day_df = plotter.plot_day(
     selected_meter=selected_meter,
@@ -829,18 +912,22 @@ day_df_path = save_df(day_df.reset_index().rename(columns={"index": "timestamp_u
 
 
 # Coverage/completeness analysis
-plotter = SmartMeterDayPlotter(data_dir_parquet=data_dir_parquet, verbose=False)
-coverage_analyzer = CoverageAnalyzer(plotter=plotter, freq='15min')
+plotter = make_plotter(verbose=False)
+coverage_analyzer = CoverageAnalyzer(plotter=plotter, freq=analysis_freq)
 coverage_df = coverage_analyzer.report_all_meters()
+interval_label = analysis_freq.replace(" ", "")
+intervals_per_day = int(pd.Timedelta(days=1) / pd.to_timedelta(analysis_freq))
 display_cols = [
-    'meter_id', 'missing_rate', 'missing_intervals_15min', 'num_gap_runs_15min',
-    'max_gap_intervals_15min', 'full_days_96_of_96', 'days_with_96_expected',
-    'expected_intervals_15min', 'observed_intervals_15min'
+    'meter_id', 'missing_rate',
+    f'missing_intervals_{interval_label}',
+    f'num_gap_runs_{interval_label}',
+    f'max_gap_intervals_{interval_label}',
+    f'full_days_{intervals_per_day}_of_{intervals_per_day}',
+    f'days_with_{intervals_per_day}_expected',
+    f'expected_intervals_{interval_label}',
+    f'observed_intervals_{interval_label}',
 ]
-if all(col in coverage_df.columns for col in display_cols):
-    coverage_display_df = coverage_df[display_cols]
-else:
-    coverage_display_df = coverage_df
+coverage_display_df = coverage_df[[col for col in display_cols if col in coverage_df.columns]]
 
 coverage_path = save_df(coverage_df, "coverage_all_meters.csv")
 coverage_display_path = save_df(coverage_display_df, "coverage_display_subset.csv")
@@ -861,8 +948,8 @@ else:
 
 
 # Daily profile stats for all meters
-plotter = SmartMeterDayPlotter(data_dir_parquet=data_dir_parquet, verbose=False)
-daily_profile_analyzer = DailyProfileAnalyzer(plotter=plotter, freq='15min')
+plotter = make_plotter(verbose=False)
+daily_profile_analyzer = DailyProfileAnalyzer(plotter=plotter, freq=analysis_freq)
 all_daily_stats_df, daily_summary_df = daily_profile_analyzer.report_all_meters()
 
 daily_all_path = save_df(all_daily_stats_df, "daily_profile_all_meter_days.csv")
@@ -880,7 +967,7 @@ daily_global_summary_path = save_json(
 
 
 # Phase balance analysis for all meters
-plotter = SmartMeterDayPlotter(data_dir_parquet=data_dir_parquet, verbose=False)
+plotter = make_plotter(verbose=False)
 phase_balance_analyzer = PhaseBalanceAnalyzer(plotter=plotter)
 phase_balance_df = phase_balance_analyzer.report_all_meters()
 phase_balance_path = save_df(phase_balance_df, "phase_balance_per_meter.csv")
@@ -895,7 +982,7 @@ phase_balance_summary_path = save_json(
 
 # Full-series distributions across all meters
 distribution_analyzer = DistributionAnalyzer(
-    data_dir_parquet=data_dir_parquet,
+    plotter=plotter,
     exclude_zeros=True,
     verbose=False,
 )
@@ -904,7 +991,7 @@ full_dist_plot_path, distribution_summary_path = distribution_analyzer.compute_a
 
 
 # Run seasonality analysis
-plotter = SmartMeterDayPlotter(data_dir_parquet=data_dir_parquet, verbose=False)
+plotter = make_plotter(verbose=False)
 seasonality_analyzer = SeasonalityAnalyzer(plotter=plotter)
 month_stats, wd_we_stats, weekday_stats = seasonality_analyzer.compute_stats()
 
