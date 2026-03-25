@@ -1718,7 +1718,6 @@ class AggregatedProfiles(SyntheticMetric):
     normalizer = None
     output_dir: str = None
     
-    def __init__(self, n_samples=100, window_size=24, tau='auto', normalize=True):
     def __init__(self, n_samples=100, window_size=24, tau='auto', normalize=True, output_dir='output'):
         self.n_samples = n_samples
         self.window_size = window_size

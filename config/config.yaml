@@ -17,10 +17,11 @@ data:
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
   # data_dir: "./data/raw_profiles"
-  data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+  # data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+  data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
   
   # CSV filename to load
-  data_files: ["test_data_small.csv"] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
+  data_files: [] #["test_data_small.csv"] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
   
   # CSV column specifications
   columns:
@@ -55,8 +56,8 @@ data:
   # Phased parquet streaming settings (used by SetGuideVAE phased training)
   phased:
     replay_buffer_capacity: 20000
-    min_buffer_size: 2048
-    num_workers: 6
+    min_buffer_size: 128
+    num_workers: 0
     steps_per_epoch: 100
     eval_batches: 5
 
@@ -119,8 +120,8 @@ model:
 # ============================================================================
 conditioning:
   # Enable/disable conditioning
-
-  tags: ["day_of_week", "month_of_year","user_profile"]  # List of conditioning tags to use ["day_of_week", "month_of_year", "user_profile", "holiday"]
+  # tags: ["day_of_week", "month_of_year", "user_profiles"]  # List of conditioning tags to use ["day_of_week", "month_of_year", "user_profile", "holiday"]
+  tags: ["day_of_week", "month_of_year"]  # List of conditioning tags to use ["day_of_week", "month_of_year", "user_profile", "holiday"]
   
   # User profiling (based on LDA)
   user_profile:
@@ -130,11 +131,6 @@ conditioning:
     random_state: 42
     cache_path: "./models/UserProfiles/user_profiles.pkl"
     verbose: false
-  
-  # Online user profiling (for OnlineCVAE)
-  online_user_profile:
-    decay: 0.95
-    update_frequency: 258  # update every N batches
 
 # ============================================================================
 # HIERARCHICAL LATENT SPACE
@@ -204,12 +200,6 @@ training:
     save_final_model: true
   
   compile_model: false
-
-  # Tiny phased smoke-run settings for quick SetGuideVAE wiring checks
-  smoke:
-    max_files: 2
-    max_steps: 20
-    batch_size: 8
 
 # ============================================================================
 # LOGGING AND MONITORING CONFIGURATION

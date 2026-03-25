@@ -44,7 +44,6 @@ class VAE(nn.Module):
                  prior_type = None,
                  device="cpu",
                  hierarchy_config: HierarchicalConfig = None,
-                 device = "cpu",
                  **_):
         super(VAE, self).__init__()
 

@@ -10,7 +10,7 @@ sys.path.append(parent_dir)
 from models.encoder_decoder_model import *
 from data.conditioner import *
 from src.models.cvae import *
-from models.set_guide_vae import *
+from models.set import *
 from src.models.vae import *
 from data.dataloader import *
 from data.dataloader_phased import StreamingParquetBuffer, WindowSpec as PhaseWindowSpec

@@ -188,7 +188,7 @@ class SetGuideVAE(CVAE):
         recon_params = self.decoder(dec_in_flat)
         for k in recon_params:
             recon_params[k] = recon_params[k].reshape(S, B, -1)
-        return recon_params, q_params
+        return recon_params, q_params 
 
     def train_core(self, batch, optim, beta=1.0, weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
         self.train()
