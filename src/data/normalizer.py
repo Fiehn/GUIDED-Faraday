@@ -18,6 +18,21 @@ class Normalizer:
     The normalizer can be fitted once across multiple files using
     fit_incremental() / finalise_fit(), and persisted to disk with
     save() / load() so stats do not need to be recalculated each run.
+
+    Args:
+        method (str): Normalisation method to use ('zero_preserved_log', 'standard', or 'log1p'). Defaults to 'log1p'.
+
+    Attributes:
+        method (str): The normalisation method in use.
+        fitted (bool): Indicates if the normalizer has been fitted.
+        device (str | torch.device): The device tensors are stored on.
+        epsilon (float): Small value to prevent division by zero. Defaults to 1e-8.
+        non_zero_mean (float | None): Mean of non-zero values (for 'zero_preserved_log').
+        non_zero_std (float | None): Standard deviation of non-zero values (for 'zero_preserved_log').
+        zero_id (int): Sentinel value for zeros (for 'zero_preserved_log').
+        shift (float): Shift applied after normalisation (for 'zero_preserved_log').
+        mean (torch.Tensor | None): Mean of the data (for 'standard' and 'log1p').
+        std (torch.Tensor | None): Standard deviation of the data (for 'standard' and 'log1p').
     """
     def __init__(self, method: str = 'log1p'):
         self.method  = method
@@ -47,22 +62,25 @@ class Normalizer:
         self.std  = _move(self.std)
         return self
 
-    def _to_tensor(self, X) -> torch.Tensor:
+    def _to_tensor(self, X: np.ndarray | torch.Tensor) -> torch.Tensor:
         """Convert X to float32 on self.device."""
         if isinstance(X, np.ndarray):
             return torch.from_numpy(X.astype(np.float32)).to(self.device)
         return X.float().to(self.device)
 
-    def fit(self, X) -> 'Normalizer':
-        """Fit the normalizer on a full dataset at once.
+    def fit(self, X: np.ndarray | torch.Tensor) -> 'Normalizer':
+        """
+        Fit the normalizer on a full dataset at once.
 
         For large datasets spread across multiple files prefer the incremental
         API (fit_incremental() per chunk, then finalise_fit()) which keeps peak
         RAM at O(one chunk) and is numerically equivalent.
 
-        Parameters
-        ----------
-        X : array-like (N, F)
+        Args:
+            X (np.ndarray | torch.Tensor): The data to fit. Shape (N, F).
+
+        Returns:
+            Normalizer: The fitted normalizer instance.
         """
         Xt = self._to_tensor(X)
 
@@ -112,16 +130,16 @@ class Normalizer:
         new_M2   = M2_a + M2_b + delta ** 2 * (n_a * n_b / n)
         return n, new_mean, new_M2
 
-    def fit_incremental(self, X_chunk) -> None:
-        """Stream one chunk of data through the Welford online algorithm.
-
-        Parameters
-        ----------
-        X_chunk : array-like (N, F)
+    def fit_incremental(self, X_chunk: np.ndarray | torch.Tensor) -> None:
+        """
+        Stream one chunk of data through the Welford online algorithm.
 
         Call finalise_fit() once all chunks have been streamed to commit
         the stats.  This is numerically equivalent to fit() but keeps
         peak RAM at O(one chunk) regardless of dataset size.
+
+        Args:
+            X_chunk (np.ndarray | torch.Tensor): A chunk of data to process. Shape (N, F).
         """
         Xt = self._to_tensor(X_chunk)   # (N, F)
         F  = Xt.shape[1]
@@ -235,11 +253,14 @@ class Normalizer:
         return Y
     
     def transform(self, X) -> torch.Tensor:
-        """Normalise X.  Always returns a float32 torch.Tensor on self.device.
+        """
+        Normalise X.  Always returns a float32 torch.Tensor on self.device.
 
-        Parameters
-        ----------
-        X : array-like or Tensor (N, F)
+        Args:
+            X (np.ndarray | torch.Tensor): The data to transform. Shape (N, F).
+
+        Returns:
+            torch.Tensor: The normalised data.
         """
         if not self.fitted:
             raise RuntimeError("Normalizer not fitted. call fit() or finalise_fit() first.")
@@ -255,11 +276,14 @@ class Normalizer:
             raise ValueError(f"Unknown normalisation method: '{self.method}'")
 
     def inverse_transform(self, X) -> torch.Tensor:
-        """Denormalise X back to the original scale.
+        """
+        Denormalise X back to the original scale.
 
-        Parameters
-        ----------
-        X : array-like or Tensor (N, F)
+        Args:
+            X (np.ndarray | torch.Tensor): The normalised data. Shape (N, F).
+
+        Returns:
+            torch.Tensor: The denormalised data on the original scale.
         """
         if not self.fitted:
             raise RuntimeError("Normalizer not fitted. call fit() or finalise_fit() first.")

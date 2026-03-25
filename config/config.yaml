@@ -113,7 +113,6 @@ conditioning:
   # Online user profiling (for OnlineCVAE)
   online_user_profile:
     decay: 0.95
-    update_frequency: 258  # update every N batches
 
 # ============================================================================
 # HIERARCHICAL LATENT SPACE

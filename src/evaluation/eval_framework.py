@@ -45,7 +45,12 @@ def _to_json_serializable(obj: Any) -> Any:
 
 def _save_standalone_metric_result(metric_key: str, payload: Dict[str, Any],
                                    output_file: str = 'models/eval_results.json') -> None:
-    """Save/update standalone metric results in the shared per-condition JSON file."""
+    """Save/update standalone metric results in the shared per-condition JSON file.
+    Args:
+        metric_key (str): Key for the metric.
+        payload (Dict[str, Any]): Metric results to save.
+        output_file (str): Path to the output JSON file.
+    """
     try:
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
@@ -85,12 +90,7 @@ class EvaluationMetric(ABC):
 
 
 class ReconstructionMetric(EvaluationMetric):
-    """Base class for reconstruction evaluation metrics.
-    
-    These metrics evaluate how well the model reconstructs real data:
-    - Input: real data from dataloader
-    - Output: compare original vs reconstructed
-    """
+    """Base class for reconstruction evaluation metrics."""
     
     @abstractmethod
     def compute(self) -> float:
@@ -99,12 +99,7 @@ class ReconstructionMetric(EvaluationMetric):
 
 
 class SyntheticMetric(EvaluationMetric):
-    """Base class for synthetic data evaluation metrics.
-    
-    These metrics evaluate properties of generated synthetic data:
-    - Input: model samples from prior (or with conditions)
-    - Output: compare synthetic vs real distributions
-    """
+    """Base class for synthetic data evaluation metrics."""
     
     @abstractmethod
     def compute(self) -> float:
@@ -115,20 +110,50 @@ class SyntheticMetric(EvaluationMetric):
 class EvalFramework:
     """
     Evaluation framework that runs multiple evaluation metrics and displays results in a table.
+    Will handle all necessary data preparation (reconstructions, synthetic samples) and inject them 
+    into metrics that need them, so each metric can focus on its specific computation logic.
     
     Usage:
         evaluator = EvalFramework(model, dataloader, normalizer, device='cpu')
         evaluator.register_metric(MyMetric(model, dataloader))
         evaluator.register_metric(AnotherMetric(model, dataloader))
         results = evaluator.evaluate()
+    
+    Args:
+        model (nn.Module): Trained model to evaluate
+        dataloader (DataLoader): DataLoader for evaluation data
+        normalizer: Normalizer object (if needed by metrics)
+        conditioner: Conditioner object (for CVAE, if needed by metrics)
+        device (str): Device to run evaluation on ('cpu' or 'cuda')
+        window_size (int): Window size for reconstruction metrics that need it
+        n_synthetic_samples (int): Number of synthetic samples to generate for synthetic metrics
+        output_path (str): Path to save JSON results for standalone metrics
+
+    Attributes:
+        model (nn.Module): The model being evaluated
+        dataloader (DataLoader): DataLoader for evaluation data
+        normalizer: Normalizer object (if needed by metrics)
+        conditioner: Conditioner object (for CVAE, if needed by metrics)
+        device (str): Device to run evaluation on
+        window_size (int): Window size for reconstruction metrics that need it
+        n_synthetic_samples (int): Number of synthetic samples to generate for synthetic metrics
+        output_path (str): Path to save JSON results for standalone metrics
+        reconstruction_metrics (Dict[str, ReconstructionMetric]): Registered reconstruction metrics
+        synthetic_metrics (Dict[str, SyntheticMetric]): Registered synthetic data metrics
+        results (Dict[str, float]): Cached results from last evaluation
+        _real_data (np.ndarray): Cached real data for metrics that need it
+        _reconstructed_data (np.ndarray): Cached reconstructed data for metrics that need it
+        _synthetic_data (np.ndarray): Cached synthetic data for metrics that need it
+        _timestamps (np.ndarray): Cached timestamps for metrics that need it
+
     """
     
     def __init__(
         self, 
         model: nn.Module, 
         dataloader: torch.utils.data.DataLoader,
-        normalizer=None,
-        conditioner=None, 
+        normalizer = None,
+        conditioner = None, 
         device: str = 'cpu',
         window_size: int = 24,
         n_synthetic_samples: int = 1000,
@@ -164,7 +189,8 @@ class EvalFramework:
 
         self.output_path = output_path
 
-    def register_all(self):
+    def register_all(self) -> None:
+        """Convenience method to register all default metrics."""
         self.register_metrics([
             ReconstructionRMSE(),
             ReconstructionLogLikelihood(),
@@ -182,7 +208,10 @@ class EvalFramework:
         return hasattr(self.model, 'conditioner') and self.model.conditioner is not None
     
     def _prepare_data(self) -> None:
-        """Extract real data, reconstructed data, and synthetic data for metrics that need it."""
+        """Extract real data, reconstructed data, and synthetic data for metrics that need it.
+        For reconstruction metrics, we need to run the model's encoder-decoder on the evaluation data to get reconstructions. 
+        For synthetic metrics, we need to sample from the model's prior (using real conditions if it's a CVAE)
+         to get synthetic data. This method handles all of that and caches the results for use in metrics."""
         print("Preparing data for evaluation metrics...")
         real_batches = []
         recon_batches = []
@@ -228,8 +257,18 @@ class EvalFramework:
               f"Reconstructed: {self._reconstructed_data.shape} | "
               f"Synthetic: {self._synthetic_data.shape}")
     
-    def _reconstruct(self, x: torch.Tensor, meter_id=None, timestamps=None) -> torch.Tensor:
-        """Reconstruct via encoder-decoder, using real conditions for CVAE."""
+    def _reconstruct(self, x: torch.Tensor, 
+                     meter_id: torch.Tensor | int | None = None, 
+                     timestamps: torch.Tensor | None=None) -> torch.Tensor:
+        """Reconstruct via encoder-decoder, using real conditions for CVAE.
+        Args:
+            x (torch.Tensor): Input data batch `(bathc_size, seq_len, features)` or `(batch_size, features)`
+            meter_id (torch.Tensor | int | None): Meter IDs for the batch (for CVAE conditioning)
+            timestamps (torch.Tensor | None): Timestamps for the batch (for CVAE conditioning)
+            
+        Returns:
+            torch.Tensor: Reconstructed data of shape `(batch_size, features)`
+        """
         with torch.no_grad():
             x_flat = x.reshape(x.shape[0], -1) if x.dim() == 3 else x
 
@@ -259,7 +298,14 @@ class EvalFramework:
         return recon  # [B, D]
     
     def _generate_synthetic(self, n_samples: int) -> np.ndarray:
-        """Sample from prior using real conditions to match the real data distribution."""
+        """Sample from prior using real conditions to match the real data distribution.
+         For CVAE, conditions are sampled from the real conditions collected during reconstruction preparation.
+         For non-CVAE, conditions are not used.
+         Args:
+            n_samples (int): Number of synthetic samples to generate
+         Returns:
+             np.ndarray: Synthetic samples of shape (n_samples, features)
+        """
         with torch.no_grad():
             if self._is_cvae():
                 # Use real conditions collected during _prepare_data
@@ -305,10 +351,9 @@ class EvalFramework:
             metric.timestamps = self._timestamps
 
     def register_metric(self, metric: EvaluationMetric) -> None:
-        """Register an evaluation metric.
-        
+        """Register an evaluation metric. 
         Args:
-            metric: Instance of ReconstructionMetric or SyntheticMetric
+            metric: An instance of ReconstructionMetric or SyntheticMetric
         """
         if isinstance(metric, ReconstructionMetric):
             self.reconstruction_metrics[metric.name] = metric
@@ -319,7 +364,6 @@ class EvalFramework:
     
     def register_metrics(self, metrics: List[EvaluationMetric]) -> None:
         """Register multiple metrics at once.
-        
         Args:
             metrics: List of ReconstructionMetric or SyntheticMetric instances
         """
@@ -331,7 +375,7 @@ class EvalFramework:
         Run all registered evaluation metrics (reconstruction + synthetic) and return results.
         
         Returns:
-            Dictionary mapping metric names to values
+            Dict[str, float]: Dictionary mapping metric names to their computed values
         """
         print("\n" + "="*70)
         print("EVALUATION FRAMEWORK")
@@ -379,7 +423,10 @@ class EvalFramework:
         return self.results
     
     def evaluate_reconstruction_only(self) -> Dict[str, float]:
-        """Run only reconstruction metrics."""
+        """Run only reconstruction metrics.
+        Returns:
+            Dict[str, float]: Dictionary mapping reconstruction metric names to their computed values
+        """
         print("\n" + "="*70)
         print("RECONSTRUCTION EVALUATION")
         print("="*70 + "\n")
@@ -399,7 +446,10 @@ class EvalFramework:
         return self.results
     
     def evaluate_synthetic_only(self) -> Dict[str, float]:
-        """Run only synthetic data metrics."""
+        """Run only synthetic data metrics.
+        Returns:
+            Dict[str, float]: Dictionary mapping synthetic metric names to their computed values
+        """
         print("\n" + "="*70)
         print("SYNTHETIC DATA EVALUATION")
         print("="*70 + "\n")
@@ -448,7 +498,7 @@ class EvalFramework:
         """Save results to JSON file.
         
         Args:
-            output_path: Path to save JSON results
+            output_path (str): Path to save JSON results
         """
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         
@@ -469,7 +519,9 @@ class EvalFramework:
 # ============================================================================
 
 class ReconstructionMSE(ReconstructionMetric):
-    """Mean squared error on reconstruction."""
+    """Mean squared error on reconstruction.
+        mean((real - recon)^2) over all elements. Lower is better.
+    """
     
     real_data: np.ndarray = None
     reconstructed_data: np.ndarray = None
@@ -517,7 +569,9 @@ class ReconstructionMSE(ReconstructionMetric):
 
 
 class ReconstructionRMSE(ReconstructionMetric):
-    """Mean absolute error on reconstruction."""
+    """Root mean squared error on reconstruction.
+        sqrt(mean((real - recon)^2)) over all elements. Lower is better.
+    """
     
     real_data: np.ndarray = None
     reconstructed_data: np.ndarray = None
@@ -565,7 +619,10 @@ class ReconstructionRMSE(ReconstructionMetric):
 
 
 class ReconstructionLogLikelihood(ReconstructionMetric):
-    """Log-likelihood of reconstruction."""
+    """Log-likelihood of reconstruction.
+     Higher is better. Uses a simple isotropic Gaussian likelihood approximation:
+     x | x_hat ~ N(x_hat, sigma^2 I), where sigma^2 is estimated from residuals.
+     """
 
     real_data: np.ndarray = None
     reconstructed_data: np.ndarray = None
@@ -639,18 +696,21 @@ class FlexibilityDistance(ReconstructionMetric):
     given two equal-length series, build a cost matrix combining amplitude
     differences and temporal shifts, then solve a linear assignment to obtain
     the minimum reshaping cost.
+
+        Cost matrix C(i,j) = |X_i - Y_j| + |i - j| * tau, where tau is a temporal scaling factor.
+
+        The final FD is the average cost per sample (optionally normalized by series length).
+    
+        Args:
+            tau (str): Temporal scaling factor. Use 'auto' to set tau = data_range / D.
+            normalize (bool): If True, divide per-sample cost by D (per-hour average).
     """
     
     real_data: np.ndarray = None
     reconstructed_data: np.ndarray = None
     output_path: str = None
 
-    def __init__(self, tau='auto', normalize=True):
-        """
-        Args:
-            tau: Temporal scaling factor. Use 'auto' to set tau = data_range / D.
-            normalize: If True, divide per-sample cost by D (per-hour average).
-        """
+    def __init__(self, tau: str = 'auto', normalize: bool = True):
         self.tau = tau
         self.normalize = normalize
     
@@ -659,17 +719,17 @@ class FlexibilityDistance(ReconstructionMetric):
         return "Flexibility Distance"
     
     @staticmethod
-    def compute_fd_between_series(x: np.ndarray, y: np.ndarray, tau='auto', normalize=True) -> float:
+    def compute_fd_between_series(x: np.ndarray, y: np.ndarray, tau: str = 'auto', normalize: bool = True) -> float:
         """Compute flexibility distance between two time series.
         
         Args:
-            x: First time series [T]
-            y: Second time series [T]
-            tau: Temporal scaling factor ('auto' or float)
-            normalize: If True, divide cost by series length
+            x (np.ndarray): First time series [T]
+            y (np.ndarray): Second time series [T]
+            tau (str): Temporal scaling factor ('auto' or float)
+            normalize (bool): If True, divide cost by series length
             
         Returns:
-            Flexibility distance value
+            float: Flexibility distance (lower is better)
         """
         series_len = len(x)
         indices = np.arange(series_len)
@@ -703,7 +763,7 @@ class FlexibilityDistance(ReconstructionMetric):
         3. Return average FD across windows (optionally normalized per hour)
         
         Returns:
-            Flexibility Distance (lower is better, 0 = perfect reconstruction)
+            float: Flexibility Distance (lower is better, 0 = perfect reconstruction)
         """
         if self.real_data is None or self.reconstructed_data is None:
             raise ValueError(
@@ -747,19 +807,29 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
     
     MMD measures the distance between two distributions using a kernel-based approach.
     Uses RBF (Gaussian) kernel with automatic bandwidth selection via median heuristic.
+
+        Implementation inspired by:
+        - https://en.wikipedia.org/wiki/Maximum_mean_discrepancy
+        - ??
+
+    Math definition:
+    MMD^2(P, Q) = E_{x,x' ~ P}[k(x,x')] + E_{y,y' ~ Q}[k(y,y')] - 2 E_{x ~ P, y ~ Q}[k(x,y)]
+     where k is the RBF kernel: k(x,y) = exp(-||x-y||^2 / (2*sigma^2))
+     and sigma is the kernel bandwidth, which can be set via median heuristic or provided by the user.
+     Lower MMD means the synthetic distribution is closer to the real distribution, with 0 indicating identical distributions (under the kernel).
+        Note: MMD is a distance metric, not a likelihood, so lower is better.
+
+    Args:
+        sigma (float): RBF kernel bandwidth. If None, uses median heuristic.
+        seed (int): Random seed for reproducibility
+        max_samples (int): Maximum number of samples to use for median heuristic (for efficiency)
     """
     
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
     output_path: str = None
 
-    def __init__(self, sigma=None, seed=42, max_samples=2000):
-        """
-        Args:
-            sigma: RBF kernel bandwidth. If None, uses median heuristic.
-            seed: Random seed for reproducibility
-            max_samples: Maximum number of samples to use for median heuristic (for efficiency)
-        """
+    def __init__(self, sigma: float | None = None, seed: int = 42, max_samples: int = 2000):
         self.sigma = sigma
         self.seed = seed
         self.max_samples = max_samples
@@ -768,29 +838,29 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
     def name(self) -> str:
         return "Maximum Mean Discrepancy (MMD)"
     
-    def _rbf_kernel(self, X, Y, sigma):
+    def _rbf_kernel(self, X: np.ndarray, Y: np.ndarray, sigma: float) -> np.ndarray:
         """Compute RBF (Gaussian) kernel matrix between X and Y.
         
         Args:
-            X: array [n, d]
-            Y: array [m, d]
-            sigma: kernel bandwidth
+            X (np.ndarray): array [n, d]
+            Y (np.ndarray): array [m, d]
+            sigma (float): kernel bandwidth
             
         Returns:
-            RBF kernel matrix [n, m]
+            np.ndarray: kernel matrix [n, m]
         """
         sq_dists = cdist(X, Y, metric="sqeuclidean")
         return np.exp(-sq_dists / (2 * sigma ** 2))
     
-    def _median_heuristic_sigma(self, Z, max_points=2000):
+    def _median_heuristic_sigma(self, Z: np.ndarray, max_points: int =  2000) -> float:
         """Estimate kernel bandwidth using median pairwise distance.
         
         Args:
-            Z: array [n, d] - combined data
-            max_points: max points to use for efficiency
+            Z (np.ndarray): array [n, d] - combined data
+            max_points (int): max points to use for efficiency
             
         Returns:
-            Estimated bandwidth sigma
+            float: estimated sigma value
         """
         
         rng = np.random.default_rng(self.seed)
@@ -801,16 +871,16 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
         med = np.median(dists[dists > 0])
         return float(med) if med > 0 else 1.0
     
-    def _mmd_rbf_unbiased(self, X, Y, sigma=None):
+    def _mmd_rbf_unbiased(self, X: np.ndarray, Y: np.ndarray, sigma: float | None = None) -> float:
         """Compute MMD^2 statistic using RBF kernel.
         
         Args:
-            X: array [n, d] - real data
-            Y: array [m, d] - synthetic data
-            sigma: kernel bandwidth (auto-estimate if None)
+            X (np.ndarray): array [n, d] - real data
+            Y (np.ndarray): array [m, d] - synthetic data
+            sigma (float | None): kernel bandwidth (auto-estimate if None)
             
         Returns:
-            MMD^2 value
+            float: MMD^2 statistic (lower is better)
         """
         X = np.asarray(X)
         Y = np.asarray(Y)
@@ -842,7 +912,7 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
         """Compute MMD metric.
         
         Returns:
-            MMD value (lower is better, 0 = identical distributions)
+            float: MMD value (lower is better, 0 = identical distributions)
         """
         rng = np.random.default_rng(self.seed)
 
@@ -894,6 +964,18 @@ class ACFDistribution(SyntheticMetric):
     For each lag, we compute ACF values across all time series, then compare
     the distributions using Kolmogorov-Smirnov (KS) test. The final metric is the
     average KS statistic across all lags.
+
+    mathical definition:
+    1. For each time series, compute ACF values for lags 1 to max_l
+    2. For each lag, collect ACF values across all series to get two distributions (real vs synthetic)
+    3. Compute KS statistic for each lag: KS_lag = sup_x |F_real(x) - F_synthetic(x)|
+    4. Average KS statistic across lags: ACFDistribution = (1/max_lag) sum_{lag=1}^{max_lag} KS_lag
+    
+    Lower ACFDistribution means the synthetic data has a more similar temporal dependence structure to the real data, with 0 indicating identical ACF distributions.
+
+    Args:
+    window_size (int): Length of each time series window (e.g., 24 hours)
+    max_lag (int): Maximum lag to compute ACF for (default: 10)
     """
 
     real_data: np.ndarray = None
@@ -901,13 +983,6 @@ class ACFDistribution(SyntheticMetric):
     output_path: str = None
     
     def __init__(self, window_size=24, max_lag=10):
-        """
-        Args:
-            real_data: numpy array [N, D] where D = window_size * n_features
-            synthetic_data: numpy array [M, D] where D = window_size * n_features
-            window_size: Length of each time series window (e.g., 24 hours)
-            max_lag: Maximum lag to compute ACF for (default: 10)
-        """
         self.window_size = window_size
         self.max_lag = max_lag
     
@@ -920,11 +995,11 @@ class ACFDistribution(SyntheticMetric):
         Compute autocorrelation function for a single time series.
         
         Args:
-            time_series: 1D array of length T
-            max_lag: Maximum lag to compute
+            time_series (np.ndarray): 1D array of length T
+            max_lag (int): Maximum lag to compute
             
         Returns:
-            Array of ACF values for lags 1 to max_lag
+            np.ndarray: Array of ACF values for lags 1 to max_lag
         """
         n = len(time_series)
         mean = np.mean(time_series)
@@ -945,7 +1020,7 @@ class ACFDistribution(SyntheticMetric):
         Compute ACF distribution matching metric.
         
         Returns:
-            Average KS statistic across all lags (lower is better, 0 = perfect match)
+            float: Average KS statistic across all lags (lower is better, 0 = perfect match)
         """
         
         # Reshape data to separate time series
@@ -1009,17 +1084,14 @@ class ClassicalStatistics(SyntheticMetric):
     
     Computes and compares basic statistical properties including mean, variance,
     min/max, quantiles, and standard deviation across time for both datasets.
+        Provides a comprehensive overview of how well the synthetic data captures the 
+        central tendencies and variability of the real data, both overall and at each time step.
     """
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
     output_path: str = None
     
     def __init__(self, window_size=24, n_features=1):
-        """
-        Args:
-            window_size: Length of time series window (default: 24 hours)
-            n_features: Number of features (default: 1 for consumption only)
-        """
         self.window_size = window_size
         self.n_features = n_features
     
@@ -1027,14 +1099,14 @@ class ClassicalStatistics(SyntheticMetric):
     def name(self) -> str:
         return "Classical Statistics"
     
-    def _compute_stats(self, data):
+    def _compute_stats(self, data: np.ndarray) -> Dict[str, Any]:
         """Compute classical statistics for a dataset.
         
         Args:
-            data: numpy array [N, D] where D = window_size * n_features
+            data (np.ndarray): numpy array [N, D] where D = window_size * n_features
             
         Returns:
-            Dictionary with statistical measures
+            Dict[str, Any]: Dictionary with statistical measures
         """
         data = np.asarray(data)
         if data.ndim != 2:
@@ -1085,8 +1157,8 @@ class ClassicalStatistics(SyntheticMetric):
     def compute(self) -> Dict[str, Any]:
         """Compute and compare classical statistics between real and synthetic data.
         
-        Returns:
-            Dictionary containing both real and synthetic statistics
+        Returns: TODO: THIS IS NOT TRUE IT IS CURRENTLY A FLOAT VALUE (MAE OF MEAN PROFILES)
+            Dict[str, Any]: Dictionary containing both real and synthetic statistics
         """
         real_stats = self._compute_stats(self.real_data)
         synthetic_stats = self._compute_stats(self.synthetic_data)
@@ -1186,23 +1258,21 @@ class TSTR(SyntheticMetric):
     Based on: https://arxiv.org/abs/1706.02633
     
     Predicts next timestep given previous timesteps.
+
+    Args:
+        task (str): Prediction task - 'next_step' (predict hour 24 from hours 0-23) or 'x_steps_ahead' (predict hour ? from previous hours)
+        window_size (int): Length of time series window (default: 24)
+        n_features (int): Number of features (default: 1 for consumption)
+        predictor_type (str): Type of predictor ('linear', 'mlp', 'lstm')
+        epochs (int): Training epochs for predictor
     """
 
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
     output_path: str = None
     
-    def __init__(self, task='next_step', window_size=24, n_features=1, 
-                 predictor_type='linear', epochs=50, random_state=42):
-        """
-        Args:
-            task: Prediction task - 'next_step' (predict hour 24 from hours 0-23)
-            window_size: Length of time series window (default: 24)
-            n_features: Number of features (default: 1 for consumption)
-            predictor_type: Type of predictor ('linear', 'mlp', 'lstm')
-            epochs: Training epochs for predictor
-            random_state: Random seed
-        """
+    def __init__(self, task: str = 'next_step', window_size: int = 24, n_features: int = 1, 
+                 predictor_type: str = 'linear', epochs: int = 50, random_state: int = 42):
         self.task = task
         self.window_size = window_size
         self.n_features = n_features
@@ -1217,17 +1287,17 @@ class TSTR(SyntheticMetric):
     def name(self) -> str:
         return "TSTR (Train on Synthetic, Test on Real)"
     
-    def _prepare_prediction_data(self, data):
+    def _prepare_prediction_data(self, data: np.ndarray):
         """
         Prepare data for prediction task.
         For 'next_step': X = hours 0-22, y = hour 23 
         For x days ahead: X = ?, y = hour ? 
         
         Args:
-            data: [N, window_size * n_features]
+            data (np.ndarray): [N, window_size * n_features]
             
         Returns:
-            X: [N, input_features], y: [N, 1]
+            Tuple[np.ndarray, np.ndarray]:  X = [N, input_features], y = [N, 1]
         """
         # Reshape to [N, window_size, n_features] and extract consumption (feature 0)
         if data.ndim != 2:
@@ -1253,8 +1323,13 @@ class TSTR(SyntheticMetric):
         
         return X, y
     
-    def _create_predictor(self, input_dim):
-        """Create a simple predictor model."""
+    def _create_predictor(self, input_dim: int):
+        """Create a simple predictor model.
+        Args:
+            input_dim (int): Number of input features
+        Returns:
+            nn.Module: PyTorch model
+        """
         if self.predictor_type == 'linear':
             model = nn.Linear(input_dim, 1)
         elif self.predictor_type == 'mlp':
@@ -1270,8 +1345,15 @@ class TSTR(SyntheticMetric):
         
         return model
     
-    def _train_predictor(self, X, y, model):
-        """Train predictor model."""
+    def _train_predictor(self, X: np.ndarray, y: np.ndarray, model: nn.Module):
+        """Train predictor model.
+        Args:
+            X (np.ndarray): Training features [N, input_dim]
+            y (np.ndarray): Training targets [N, 1]
+            model (nn.Module): PyTorch model to train
+        Returns:
+            nn.Module: Trained model
+        """
         X_tensor = torch.FloatTensor(X)
         y_tensor = torch.FloatTensor(y)
         
@@ -1288,8 +1370,15 @@ class TSTR(SyntheticMetric):
         
         return model
     
-    def _evaluate_predictor(self, X, y, model):
-        """Evaluate predictor and return MSE."""
+    def _evaluate_predictor(self, X: np.ndarray, y: np.ndarray, model: nn.Module):
+        """Evaluate predictor and return MSE.
+        Args:
+            X (np.ndarray): Test features [N, input_dim]
+            y (np.ndarray): Test targets [N, 1]
+            model (nn.Module): Trained PyTorch model
+        Returns:
+            float: Mean Squared Error on test set
+        """
         X_tensor = torch.FloatTensor(X)
         y_tensor = torch.FloatTensor(y)
         
@@ -1305,7 +1394,7 @@ class TSTR(SyntheticMetric):
         Compute TSTR metric.
         
         Returns:
-            Ratio of TSTR performance to TRTR performance (closer to 1.0 is better)
+            float: Ratio of TSTR performance to TRTR performance (closer to 1.0 is better)
         """
         if self.real_data is None or self.synthetic_data is None:
             raise ValueError("TSTR requires injected real_data and synthetic_data before compute().")
@@ -1379,14 +1468,29 @@ class TSTR(SyntheticMetric):
 
 
 class AggregatedProfiles(SyntheticMetric):
-    """Aggregate samples from real and synthetic data and compute Flexibility Distance between aggregated profiles."""
+    """Aggregate samples from real and synthetic data and compute Flexibility Distance between aggregated profiles.
+     This metric evaluates how well the synthetic data captures the overall consumption patterns when multiple samples are aggregated together, 
+     which is important for understanding collective behavior and flexibility in energy consumption.
+     Steps:
+     1. Randomly sample N time series from real and synthetic datasets (e.g.,
+     2. Aggregate by summing consumption across the sampled series at each time step to create an "aggregated profile" for real and synthetic data.
+     3. Compute Flexibility Distance between the two aggregated profiles to assess similarity in overall patterns and flexibility.
+     4. Optionally, plot the aggregated profiles for visual comparison.
+     Lower Flexibility Distance indicates that the synthetic data captures the collective consumption patterns of the real data more closely, with 0 indicating identical aggregated profiles.
+    
+    Args:
+    n_samples (int): Number of time series to sample and aggregate (default: 100)
+    window_size (int): Length of each time series window (default: 24)
+    tau (int or 'auto'): Time delay for Flexibility Distance (default: 'auto, which uses median heuristic)
+    normalize (bool): Whether to normalize the distance by the variability of the real data (default: True) 
+    """
     
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
     normalizer = None
     output_dir: str = None
     
-    def __init__(self, n_samples=100, window_size=24, tau='auto', normalize=True):
+    def __init__(self, n_samples: int = 100, window_size: int = 24, tau: str = 'auto', normalize: bool = True):
         self.n_samples = n_samples
         self.window_size = window_size
         self.tau = tau
@@ -1449,8 +1553,12 @@ class AggregatedProfiles(SyntheticMetric):
         
         return fd_score
     
-    def _plot_aggregated_profiles(self, real_aggregated, synth_aggregated):
-        """Plot aggregated real and synthetic profiles."""
+    def _plot_aggregated_profiles(self, real_aggregated: np.ndarray, synth_aggregated: np.ndarray):
+        """Plot aggregated real and synthetic profiles.
+        Args:
+            real_aggregated (np.ndarray): Aggregated profile from real data
+            synth_aggregated (np.ndarray): Aggregated profile from synthetic data
+        """
         fig, ax = plt.subplots(figsize=(14, 6))
         timesteps = np.arange(len(real_aggregated))
         ax.plot(timesteps, real_aggregated, label='Real Aggregated', 
@@ -1483,7 +1591,19 @@ class PerConditionEval(SyntheticMetric):
     - TSTR per day-of-week and month (train/test on real, train on synthetic, test on real holdout)
     - AggregatedProfiles per day-of-week and month (aggregate samples within each group and compare profiles)
 
-    Can be tested using test_eval.py
+        Also includes AggregatedProfiles per feeder (aggregate samples by feeder and compare profiles), which is important for understanding how well the synthetic data captures patterns at the feeder level, which can be critical for grid management and planning.
+
+        This comprehensive per-condition evaluation framework allows us to assess synthetic data quality across multiple dimensions and conditions, providing insights into where the synthetic data performs well and where it may need improvement.
+
+    Args:
+    window_size (int): Length of time series windows (default: 24 for hourly data)
+    max_lag (int): Maximum lag for ACFDistribution (default: 10)
+    min_samples_per_group (int): Minimum samples required in each group to compute metrics (default: 2)
+    verbose (bool): Whether to print detailed debug information during computation (default: False)
+    predictor_type (str): Predictor type for TSTR ('linear', 'mlp', etc.) (default: 'linear')
+    tstr_epochs (int): Training epochs for TSTR predictor (default: 50)
+    feeder_mapping_path (str): Path to JSON file mapping meter IDs to feeder IDs (default: 'topology/cleaned/Cleaned_SM_Topology_mapping.json')
+    min_samples_per_feeder (int): Minimum samples required per feeder to compute AggregatedProfiles (default: 5)
     """
 
     real_data: np.ndarray = None
@@ -1493,10 +1613,10 @@ class PerConditionEval(SyntheticMetric):
     feeder_ids: np.ndarray = None
     output_dir: str = None
 
-    def __init__(self, window_size=24, max_lag=10, min_samples_per_group=2, 
-                 verbose=False, predictor_type='linear', tstr_epochs=50,
-                 feeder_mapping_path='topology/cleaned/Cleaned_SM_Topology_mapping.json',
-                 min_samples_per_feeder=5):
+    def __init__(self, window_size: int = 24, max_lag: int = 10, min_samples_per_group: int = 2,
+                 verbose: bool = False, predictor_type: str = 'linear', tstr_epochs: int = 50,
+                 feeder_mapping_path: str = 'topology/cleaned/Cleaned_SM_Topology_mapping.json',
+                 min_samples_per_feeder: int = 5):
         self.window_size = window_size
         self.max_lag = max_lag
         self.min_samples_per_group = min_samples_per_group

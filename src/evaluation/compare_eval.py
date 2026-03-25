@@ -16,15 +16,54 @@ except ImportError:
         return str(data)
 
 class ModelComparator:
-    """Class to compare evaluation results across multiple models."""
+    """Class to compare evaluation results across multiple models.
+    Usage:
+        comparator = ModelComparator(output_dir="comparison_results")
+        comparator.add_model("Model A", "path/to/model_a_eval.json")
+        comparator.add_model("Model B", "path/to/model_b_eval.json")
+        comparator.compare()
+    
+    This will generate a comparison table and bar charts for all scalar metrics found in the eval JSON files.
+    The best value for each metric will be highlighted with a star in the plots.
+    
+    The output will be saved in the specified output directory.
+    
+    Args:
+        output_dir (str): Directory to save comparison results (plots and table).
+    """
 
     def __init__(self, output_dir: str = "evaluation_comparison"):
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         self.models_data = {}
 
+    def _get_metric_direction(self, metric: str) -> str:
+        """Return the target direction for a given metric. 
+        This is used to determine if higher or lower values are better, or if the metric should be close to 1 or 0.
+        Args:
+            metric (str): Name of the metric
+        Returns:            
+            str: A string indicating the direction (e.g., '(↑)', '(↓)', '(1)', '(0)')
+        """
+        is_max = any(term in metric for term in ['LogLikelihood', 'Accuracy', 'Score', 'R2'])
+        is_one = ('TSTR' in metric)
+        is_zero = ('MMD' in metric or 'MaximumMeanDiscrepancy' in metric)
+        
+        if is_one:
+            return '(1)'
+        elif is_zero:
+            return '(0)'
+        elif is_max:
+            return '(↑)'
+        else:
+            return '(↓)'
+
     def add_model(self, model_name: str, eval_json_path: str):
-        """Add a model's evaluation results to the comparator."""
+        """Add a model's evaluation results to the comparator.
+        Args:
+            model_name (str): Name of the model (used for labeling)
+            eval_json_path (str): Path to the model's eval_results.json file
+        """
         if not os.path.exists(eval_json_path):
             print(f"File not found: {eval_json_path}")
             return
@@ -55,7 +94,8 @@ class ModelComparator:
                 
         table_data = []
         for metric in sorted(all_metrics):
-            row = [metric]
+            direction_str = self._get_metric_direction(metric)
+            row = [f"{metric} {direction_str}"]
             for model_name, data in self.models_data.items():
                 val = data.get('standalone_metrics', {}).get(metric, {}).get('value', 'N/A')
                 if isinstance(val, float):
@@ -100,9 +140,10 @@ class ModelComparator:
         # --- Normalization for Average Plotting ---
         scores_dict = {m: {} for m in models} # model -> {metric -> normalized_score (0 to 1)}
         for metric in scalar_metrics:
-            is_max = any(term in metric for term in ['LogLikelihood', 'Accuracy', 'Score', 'R2'])
-            is_one = ('TSTR' in metric)
-            is_zero = ('MMD' in metric or 'MaximumMeanDiscrepancy' in metric)
+            direction = self._get_metric_direction(metric)
+            is_max = direction == '(↑)'
+            is_one = direction == '(1)'
+            is_zero = direction == '(0)'
             
             raw_vals = []
             for m in models:
@@ -140,14 +181,14 @@ class ModelComparator:
             
             self.models_data[m].setdefault('standalone_metrics', {})
             if recon_scores:
-                self.models_data[m]['standalone_metrics']['Avg MinMax Reconstruction Score'] = {'value': float(np.mean(recon_scores))}
+                self.models_data[m]['standalone_metrics']['Avg MinMax Reconstruction Score (↑)'] = {'value': float(np.mean(recon_scores))}
             if synth_scores:
-                self.models_data[m]['standalone_metrics']['Avg MinMax Synthetic Score'] = {'value': float(np.mean(synth_scores))}
+                self.models_data[m]['standalone_metrics']['Avg MinMax Synthetic Score (↑)'] = {'value': float(np.mean(synth_scores))}
                 
-        if any(recon_metrics) and 'Avg MinMax Reconstruction Score' not in scalar_metrics:
-            scalar_metrics.append('Avg MinMax Reconstruction Score')
-        if any(synth_metrics) and 'Avg MinMax Synthetic Score' not in scalar_metrics:
-            scalar_metrics.append('Avg MinMax Synthetic Score')
+        if any(recon_metrics) and 'Avg MinMax Reconstruction Score (↑)' not in scalar_metrics:
+            scalar_metrics.append('Avg MinMax Reconstruction Score (↑)')
+        if any(synth_metrics) and 'Avg MinMax Synthetic Score (↑)' not in scalar_metrics:
+            scalar_metrics.append('Avg MinMax Synthetic Score (↑)')
         # --- END Normalization ---
         
         n_metrics = len(scalar_metrics)
@@ -224,7 +265,8 @@ class ModelComparator:
                                 textcoords='offset points', ha='center', va=va, 
                                 fontsize=12, color='black', alpha=0.8)
                 
-            ax.set_title(metric, fontsize=11, fontweight='bold')
+            direction_str = self._get_metric_direction(metric)
+            ax.set_title(f"{metric} {direction_str}", fontsize=11, fontweight='bold')
             ax.set_xticks([]) # Remove x-axis tick completely for cleaner look
             
             # Format y-axis minimally
