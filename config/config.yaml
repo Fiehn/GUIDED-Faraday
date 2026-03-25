@@ -44,6 +44,7 @@ data:
   
   # Windowing configuration
   window:
+    aggregated: false # whether to aggregate 15-min data to hourly (for phased parquet mode) change the following to 24 hours
     input_len: 96  # 24-hour windows (24 hours * 4 readings per hour)
     stride: 96     # Non-overlapping windows (one per day)
   

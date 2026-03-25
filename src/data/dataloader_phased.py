@@ -31,6 +31,7 @@ class StreamingParquetBuffer(IterableDataset):
                  window_spec: Optional[WindowSpec] = None,
                  normalizer: Optional[Normalizer] = None,
                  num_workers: int = 0,
+                 hourly_aggregation: bool = False
                  ):
         self.sm_files = sm_files
         self.replay_buffer_capacity = replay_buffer_capacity
@@ -45,10 +46,13 @@ class StreamingParquetBuffer(IterableDataset):
         self.window_spec = window_spec
         self.normalizer = normalizer
         self.num_workers = num_workers
-
+        self.aggregation = hourly_aggregation
         self.feature_cols = ['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3']
         self.time_col_candidates = ['timestamp_dst', 'timestamp', 'timestamp_utc']
-        self.base_frequency = '15min'
+        if self.aggregation:
+            self.base_frequency = '1H'
+        else:
+            self.base_frequency = '15min'
     
     def _push_to_buffer(self, item):
         self.buffer[self.ptr] = item
@@ -101,6 +105,10 @@ class StreamingParquetBuffer(IterableDataset):
             return df
 
         full_index = pd.date_range(start=df.index.min(), end=df.index.max(), freq=self.base_frequency, tz=df.index.tz)
+        # Aggregate to base frequency if needed
+        if self.aggregation:
+            df = df.resample(self.base_frequency).sum()
+
         return df.reindex(full_index)
 
     def _load_file_dataframe(self, file_path: str):
@@ -203,6 +211,7 @@ class SMPhaseData:
             normalizer: Optional[Normalizer] = None,
             num_workers: int = 0,
             time_series_info_json: Optional[str] = None,
+            hourly_aggregation: bool = False,
             **kwargs
     ):
         if filename is not None:
@@ -225,6 +234,7 @@ class SMPhaseData:
         self.train_loader = None
         self.val_loader = None
         self.test_loader = None
+        self.aggregation = hourly_aggregation
 
     def setup(self) -> None:
         # Create the streaming dataset
@@ -233,7 +243,8 @@ class SMPhaseData:
             replay_buffer_capacity=self.replay_buffer_capacity,
             window_spec=self.window_spec,
             normalizer=self.normalizer,
-            num_workers=self.num_workers
+            num_workers=self.num_workers,
+            hourly_aggregation=self.aggregation
         )
 
         # Create the DataLoaders with the streaming dataset

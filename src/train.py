@@ -359,7 +359,10 @@ def train(config):
             print("Using phased normalizer: log1p_phase")
         else:
             print(f"Warning: phased_parquet mode currently expects normalization.method='log1p_phase'. Got '{norm_method}'. Continuing without normalization.")
-
+        if config.window.aggregated and config.window.input_len != 24:
+            print(f"Warning: window.aggregated is True but window.input_len is {config.window.input_len}. For hourly aggregation, consider setting input_len to 24.")
+            config.window.input_len = 24
+            config.window.stride = 24
         phase_window = PhaseWindowSpec(input_len=config.window.input_len, stride=config.window.stride)
         train_ds = StreamingParquetBuffer(
             sm_files=parquet_paths,
@@ -368,6 +371,7 @@ def train(config):
             window_spec=phase_window,
             normalizer=normalizer,
             num_workers=phased_workers,
+            hourly_aggregation=config.window.aggregated
         )
         train_loader = DataLoader(
             train_ds,
