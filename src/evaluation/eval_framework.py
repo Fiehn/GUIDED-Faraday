@@ -169,7 +169,10 @@ class EvalFramework:
         device: str = 'cpu',
         window_size: int = 24,
         n_synthetic_samples: int = 1000,
-        output_path: str = 'models/eval_results.json'
+        output_path: str = 'models/eval_results.json',
+        output_dir: str = 'models',
+        prepared_data: Dict[str, Any] = None,
+        evaluation_title: str = 'EVALUATION RESULTS',
     ):
         """Initialize evaluation framework.
         
@@ -240,26 +243,45 @@ class EvalFramework:
         real_batches = []
         recon_batches = []
         condition_batches = []
-        timestamp = []
+        meter_id_batches = []
+        timestamp_batches = []
 
         self.model.eval()
         with torch.no_grad():
-            for data, c, meter_ids, timestamps in self.dataloader:
+            for batch in self.dataloader:
+                if len(batch) == 4:
+                    data, c, meter_ids, timestamps = batch
+                elif len(batch) == 3:
+                    data, meter_ids, timestamps = batch
+                    c = None
+                elif len(batch) == 2:
+                    data, meter_ids = batch
+                    timestamps = None
+                    c = None
+                else:
+                    data = batch[0] if isinstance(batch, (list, tuple)) else batch
+                    meter_ids = None
+                    timestamps = None
+                    c = None
+                
                 data = data.to(self.device)
-                c = c.to(self.device)
+                if self._is_cvae():
+                    if c is None or (hasattr(c, 'numel') and c.numel() == 0) or (hasattr(self.model, 'condition_dim') and c.shape[-1] != self.model.condition_dim):
+                        c = self.conditioner.get_conditions(data, meter_id=meter_ids, timestamps=timestamps)
+                    c = c.to(self.device)
+                    condition_batches.append(c.cpu())
+
                 x_flat = data.reshape(data.shape[0], -1) if data.dim() == 3 else data
                 real_batches.append(x_flat.cpu().numpy())
 
-                timestamp.append(timestamps.cpu().numpy())
+                if timestamps is not None:
+                    timestamp_batches.append(timestamps.cpu().numpy())
+                if meter_ids is not None:
+                    meter_id_batches.append(meter_ids.cpu().numpy())
 
                 recon = self._reconstruct(data, meter_id=meter_ids, timestamps=timestamps)
                 recon_batches.append(recon.cpu().numpy())
 
-                if self._is_cvae():
-                    # Use the model's own conditioner, not self.conditioner
-                    condition_batches.append(c.cpu())
-
-        self._timestamps = np.concatenate(timestamp, axis=0) if timestamp else None
         self._real_data = np.concatenate(real_batches, axis=0)
         self._reconstructed_data = np.concatenate(recon_batches, axis=0)
         self._meter_ids = np.concatenate(meter_id_batches, axis=0) if meter_id_batches else None
@@ -1719,7 +1741,6 @@ class AggregatedProfiles(SyntheticMetric):
     output_dir: str = None
     
     def __init__(self, n_samples=100, window_size=24, tau='auto', normalize=True):
-    def __init__(self, n_samples=100, window_size=24, tau='auto', normalize=True, output_dir='output'):
         self.n_samples = n_samples
         self.window_size = window_size
         self.tau = tau

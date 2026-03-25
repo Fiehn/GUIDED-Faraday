@@ -44,7 +44,6 @@ class VAE(nn.Module):
                  prior_type = None,
                  device="cpu",
                  hierarchy_config: HierarchicalConfig = None,
-                 device = "cpu",
                  **_):
         super(VAE, self).__init__()
 
@@ -128,7 +127,7 @@ class VAE(nn.Module):
         return recon_params_dict, posterior_params_dict
     
     @torch.no_grad()
-    def sample(self, num_samples_prior = 1, num_samples_posterior = 1):
+    def sample(self, num_samples_prior = 1, num_samples_posterior = 1, **kwargs):
         """Sample from prior and decode."""
         self.eval()
 
@@ -147,14 +146,14 @@ class VAE(nn.Module):
         # Flatten for decoder: [S*B, latent_dim]
         S, B, D = z.shape
         z_flat = z.reshape(S * B, D)
-        
+
         # Decode
         recon_params_dict = self.decoder(z_flat)
-        
+
         # Reshape back: [S*B, output_dim] -> [S, B, output_dim]
         for k in recon_params_dict:
             recon_params_dict[k] = recon_params_dict[k].reshape(S, B, -1)
-        
+
         # Sample from decoder
         samples_all = []
         for s in range(S):
@@ -344,7 +343,7 @@ class VAE(nn.Module):
             constructor_args['distribution_dict'] = distribution_dict
 
             # === CVAE-Specific Information ===
-            if self.__class__.__name__ == "CVAE":
+            if hasattr(self, 'conditioner') and self.conditioner is not None:
                 model_info = self._serialize_cvae_info(model_info)
 
             # === Prior Serialization ===
@@ -491,7 +490,7 @@ class VAE(nn.Module):
                                         self.input_dim + getattr(self, 'condition_dim', 0)),
                     'num_components': getattr(prior, 'num_components', 20),
                 }
-            elif isinstance(prior, (StandardGaussianPrior, LearnableGaussianPrior)):
+            elif isinstance(prior, (StandardGaussianPrior)):
                 prior_state['init_args'] = {
                     'latent_dim': getattr(prior, 'latent_dim', self.latent_dim),
                 }
@@ -680,13 +679,16 @@ class VAE(nn.Module):
         normalizer_state = checkpoint.get('normalizer_state', None)
         if normalizer_state is not None:
             try:
-                normalizer = Normalizer(method=normalizer_state['method'], epsilon=normalizer_state['epsilon'])
+                normalizer = Normalizer(method=normalizer_state['method'])
+                if 'epsilon' in normalizer_state:
+                    normalizer.epsilon = normalizer_state['epsilon']
                 normalizer.zero_id = normalizer_state['zero_id']
                 normalizer.shift = normalizer_state['shift']
                 normalizer.non_zero_mean = normalizer_state['non_zero_mean']
                 normalizer.non_zero_std = normalizer_state['non_zero_std']
                 normalizer.mean = normalizer_state['mean']
                 normalizer.std = normalizer_state['std']
+                normalizer.fitted = True
                 print(f"✓ Normalizer loaded from checkpoint")
                 return normalizer
             except Exception as e:
@@ -694,7 +696,7 @@ class VAE(nn.Module):
         return None
 
     @classmethod
-    def load_from_checkpoint(cls, load_path, device="cpu"):
+    def load_from_checkpoint(cls, load_path, device="cpu", **kwargs):
         """
         Load a model instance completely from a saved checkpoint.
         """
@@ -707,6 +709,15 @@ class VAE(nn.Module):
         constructor_args = checkpoint['constructor_args']
         model_class_name = model_info['model_class']
 
+        if 'model_kwargs' in checkpoint:
+            for k, v in checkpoint['model_kwargs'].items():
+                if k not in constructor_args:
+                    constructor_args[k] = v
+                    
+        for k, v in kwargs.items():
+            if k not in ('device', 'conditioner') and k not in constructor_args:
+                constructor_args[k] = v
+
         hier_raw = constructor_args.get('hierarchy_config', None)
         if hier_raw is not None and isinstance(hier_raw, dict):
             constructor_args['hierarchy_config'] = HierarchicalConfig.from_dict(hier_raw)
@@ -716,32 +727,39 @@ class VAE(nn.Module):
         print(f"Creating {model_info['model_class']} from checkpoint...")
         
         # Handle CVAE reconstruction
-        if model_info['model_class'] in ("CVAE", "HierarchicalCVAE"):
-            # Reconstruct conditioner first
-            conditioner_state = model_info['conditioner_state']
+        if model_info.get('model_class') in ("CVAE", "HierarchicalCVAE", "SetGuideVAE", "OnlineCVAE", "GuideVAE") or 'conditioner_state' in model_info:
+            conditioner = kwargs.get('conditioner', None)
             
-            import importlib
-            from data.conditioner import Conditioner
-            conditioner = Conditioner()
-            
-            print(f"Reconstructing conditioner with {len(conditioner_state['condition_items'])} items...")
-            for tag, item_state in conditioner_state['condition_items'].items():
-                # Import and create condition item
-                item_module = importlib.import_module(item_state['module'])
-                ItemClass = getattr(item_module, item_state['class_name'])
+            if 'conditioner_state' in model_info:
+                conditioner_state = model_info['conditioner_state']
                 
-                constructor_args_item = item_state.get('constructor_args', {})
-                try:
-                    condition_item = ItemClass(**constructor_args_item)
-                    if item_state['state_dict']:
-                        condition_item.load_state_dict(item_state['state_dict'])
-                    conditioner.add_condition_item(tag, condition_item)
-                    print(f"  {tag}: {item_state['class_name']}")
-                except Exception as e:
-                    print(f"  {tag}: {e}")
+                import importlib
+                from data.conditioner import Conditioner
+                if conditioner is None:
+                    conditioner = Conditioner()
+                
+                print(f"Reconstructing conditioner with {len(conditioner_state['condition_items'])} items...")
+                for tag, item_state in conditioner_state['condition_items'].items():
+                    # Import and create condition item
+                    item_module = importlib.import_module(item_state['module'])
+                    ItemClass = getattr(item_module, item_state['class_name'])
+                    
+                    constructor_args_item = item_state.get('constructor_args', {})
+                    try:
+                        condition_item = ItemClass(**constructor_args_item)
+                        if item_state['state_dict']:
+                            condition_item.load_state_dict(item_state['state_dict'])
+                        conditioner.add_condition_item(tag, condition_item)
+                        print(f"  {tag}: {item_state['class_name']}")
+                    except Exception as e:
+                        print(f"  {tag}: {e}")
             
-            # Create CVAE instance
-            constructor_args['conditioner'] = conditioner
+            if conditioner is None:
+                print("Warning: Checkpoint is missing 'conditioner_state'. Must provide it via kwargs if the model requires it.")
+            else:
+                # Create CVAE instance
+                constructor_args['conditioner'] = conditioner
+                
             # CVAE expects latent_dim as a top-level kwarg, but it's also stored
             # inside distribution_dict.  Extract it so the constructor sees it.
             if 'latent_dim' not in constructor_args:

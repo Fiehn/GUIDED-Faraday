@@ -87,7 +87,7 @@ class Visualizer:
             print(f"Error visualizing PCA comparison: {e}")
         try:
             print("Visualizing t-SNE comparison.")
-            self.tsne_compared(test_loader=test_loader)
+            #self.tsne_compared(test_loader=test_loader)
         except Exception as e:
             print(f"Error visualizing t-SNE comparison: {e}")
     
@@ -131,10 +131,17 @@ class Visualizer:
         
         self.model.eval()
         input_data = next(iter(test_loader))
-        x_original, c, meter_id, timestamps = input_data
+        if len(input_data) == 4:
+            x_original, c, meter_id, timestamps = input_data
+        else:
+            x_original, meter_id, timestamps = input_data
         x_original = x_original.to(self.device)
+        
+        # If x_original is [B, F, L] (e.g. 3, 96), transpose it to [B, L, F] so it acts consistently
+        if x_original.dim() == 3 and x_original.shape[1] < x_original.shape[2]:
+            x_original = x_original.transpose(1, 2)
 
-        recon_samples = self.generator.reconstruct(x_original, num_recon_per, meter_id=meter_id, timestamp=timestamps)
+        recon_samples = self.generator.reconstruct(x_original, num_recon_per, meter_id=meter_id, timestamp=timestamps, is_normalized=True)
         
         S, B, D = recon_samples.shape
         L, F = x_original.shape[1], x_original.shape[2]
@@ -359,7 +366,15 @@ class Visualizer:
         self.model.eval()
         with torch.no_grad():
             # Get a batch from test loader
-            x, c, meter_id, timestamps = next(iter(test_loader))
+            input_data = next(iter(test_loader))
+            if len(input_data) == 4:
+                x, c, meter_id, timestamps = input_data
+            else:
+                x, meter_id, timestamps = input_data
+                if hasattr(self.model, "conditioner") and self.model.conditioner is not None:
+                    c = self.model.conditioner.get_conditions(x, meter_id, timestamps)
+                else:
+                    c = None
             x = x.to(self.device)
             c = c.to(self.device)
             timestamps = timestamps.to(self.device)
@@ -378,23 +393,25 @@ class Visualizer:
             )
             c = self.model.move_to_device(c, device=self.device)
             
-            # Generate synthetic samples with the SAME conditions
             synthetic_samples, _ = self.generator.generate(num_samples=num_synthetic_per, conditions=c)
-            
-            # Reshape: [num_synthetic_per, 1, num_originals, D] -> [num_synthetic_per, num_originals, D]
-            synthetic_samples = synthetic_samples.squeeze(1)  # [num_synthetic_per, num_originals, D]
-            
-            # Reshape to [num_synthetic_per, num_originals, L, F]
-            L, F = x_selected.shape[1], x_selected.shape[2]
-            synthetic_reshaped = synthetic_samples.reshape(num_synthetic_per, num_originals, L, F)
+
+            x_selected_tf = x_selected.transpose(1, 2) if x_selected.dim() == 3 and x_selected.shape[1] < x_selected.shape[2] else x_selected
+            L, F = x_selected_tf.shape[1], x_selected_tf.shape[2]
+
+            if synthetic_samples.dim() >= 3:
+                # [N, L, F]
+                synthetic_reshaped = synthetic_samples.reshape(num_synthetic_per, num_originals, L, F)
+            else:
+                synthetic_reshaped = synthetic_samples.reshape(num_synthetic_per, num_originals, L, F)
             
             # Compute mean synthetic sample
             mean_synthetic = synthetic_reshaped.mean(dim=0)  # [num_originals, L, F]
             
             if self.normalizer is not None:
-                x_denorm = self.normalizer.inverse_transform(x_selected.cpu())
+                x_selected_tf = x_selected.transpose(1, 2) if x_selected.dim() == 3 and x_selected.shape[1] < x_selected.shape[2] else x_selected
+                x_denorm = self.normalizer.inverse_transform(x_selected_tf.cpu())
             else:
-                x_denorm = x_selected.cpu()
+                x_denorm = x_selected.transpose(1, 2).cpu() if x_selected.dim() == 3 and x_selected.shape[1] < x_selected.shape[2] else x_selected.cpu()
             synthetic_denorm = synthetic_reshaped.cpu()
             mean_synthetic_denorm = mean_synthetic.cpu()
             
@@ -532,7 +549,15 @@ class Visualizer:
         Generate syntetic samples and compare with real values in PCA space.
         """
         # Get the conditions of real data:
-        x, c, meter_id, timestamps = next(iter(test_loader))
+        input_data = next(iter(test_loader))
+        if len(input_data) == 4:
+            x, c, meter_id, timestamps = input_data
+        else:
+            x, meter_id, timestamps = input_data
+            if hasattr(self.model, "conditioner") and self.model.conditioner is not None:
+                c = self.model.conditioner.get_conditions(x, meter_id, timestamps)
+            else:
+                c = None
         x = x.to(self.device)
         c = c.to(self.device)
         timestamps = timestamps.to(self.device)
@@ -544,9 +569,11 @@ class Visualizer:
         )
 
         if self.normalizer is not None:
-            x_denorm = self.normalizer.inverse_transform(x.cpu())
+            x_tf = x.transpose(1, 2) if x.dim() == 3 and x.shape[1] < x.shape[2] else x
+            x_denorm = self.normalizer.inverse_transform(x_tf.cpu())
         else:
-            x_denorm = x.cpu().numpy()
+            x_tf = x.transpose(1, 2) if x.dim() == 3 and x.shape[1] < x.shape[2] else x
+            x_denorm = x_tf.cpu().numpy()
 
         if isinstance(x_denorm, torch.Tensor):
             x_denorm = x_denorm.numpy()
@@ -590,7 +617,15 @@ class Visualizer:
     def tsne_compared(self,test_loader):
         """Generate t-SNE plots for real vs synthetic data."""
         # Get conditions of real data
-        x, c, meter_id, timestamps = next(iter(test_loader))
+        input_data = next(iter(test_loader))
+        if len(input_data) == 4:
+            x, c, meter_id, timestamps = input_data
+        else:
+            x, meter_id, timestamps = input_data
+            if hasattr(self.model, "conditioner") and self.model.conditioner is not None:
+                c = self.model.conditioner.get_conditions(x, meter_id, timestamps)
+            else:
+                c = None
         x = x.to(self.device)
         c = c.to(self.device)
         timestamps = timestamps.to(self.device)
@@ -600,9 +635,11 @@ class Visualizer:
             conditions=c
         )
         if self.normalizer is not None:
-            x_denorm = self.normalizer.inverse_transform(x.cpu())
+            x_tf = x.transpose(1, 2) if x.dim() == 3 and x.shape[1] < x.shape[2] else x
+            x_denorm = self.normalizer.inverse_transform(x_tf.cpu())
         else:
-            x_denorm = x.cpu().numpy()
+            x_tf = x.transpose(1, 2) if x.dim() == 3 and x.shape[1] < x.shape[2] else x
+            x_denorm = x_tf.cpu().numpy()
 
         if isinstance(x_denorm, torch.Tensor):
             x_denorm = x_denorm.numpy()

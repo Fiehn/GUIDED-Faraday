@@ -144,20 +144,21 @@ def _build_phased_eval_loader(eval_stream, batch_size: int, num_workers: int, ev
     )
 
 
-def _run_evaluation_and_visualization(model, test_loader, normalizer, writer, device, log_path, config, phased_mode: bool):
+def _run_evaluation_and_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, phased_mode: bool):
     """Route evaluation by mode and run shared visualizations."""
     if phased_mode:
         phased_evaluator = PhasedEvaluationSuite(
             model,
             test_loader,
             normalizer=normalizer,
+            conditioner=conditioner,
             device='cpu',
             window_size=config.window.input_len,
             output_dir=log_path,
         )
         phased_evaluator.evaluate()
     else:
-        evaluator = EvalFramework(model, test_loader, normalizer, device='cpu', output_dir=log_path)
+        evaluator = EvalFramework(model, test_loader, normalizer,conditioner=conditioner, device='cpu', output_dir=log_path)
         evaluator.register_all()
         evaluator.evaluate()
         evaluator.save_results(os.path.join(log_path, 'eval_results.json'))
@@ -166,14 +167,14 @@ def _run_evaluation_and_visualization(model, test_loader, normalizer, writer, de
                             plot_style=PlotStyle(),
                             log_dir=log_path,
                             device=device,
-                            normalizer=normalizer)
+                            normalizer=normalizer,
+                            conditioner=conditioner)
     visualizer.visualize(test_loader=test_loader,
                          num_samples=config.visualize.num_samples,
                          num_recon_per=config.visualize.num_recon_per,
                          num_synthetic=config.visualize.num_synthetic,
                          num_originals=config.visualize.num_originals,
                          num_synthetic_per=config.visualize.num_synthetic_per)
-
 
 def train(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -359,6 +360,8 @@ def train(config):
             print("Using phased normalizer: log1p_phase")
         else:
             print(f"Warning: phased_parquet mode currently expects normalization.method='log1p_phase'. Got '{norm_method}'. Continuing without normalization.")
+        if conditioner.condition_items.get("user_profile") is not None:
+            conditioner.condition_items.get("user_profile", None).fit_on_files(parquet_paths)  # Fit user profiler on all data files for phased mode
 
         phase_window = PhaseWindowSpec(input_len=config.window.input_len, stride=config.window.stride)
         train_ds = StreamingParquetBuffer(
@@ -455,6 +458,7 @@ def train(config):
                 log_path=log_path,
                 config=config,
                 phased_mode=True,
+                conditioner=conditioner,
             )
 
         return model
@@ -476,6 +480,25 @@ def train(config):
         train_frac=config.data.splits.train_ratio,
         seed=config.data.splits.random_seed,
     )
+
+    if hasattr(model, "conditioner") and model.conditioner is not None:
+        user_profiler = model.conditioner.condition_items.get("user_profile")
+        if user_profiler is not None:
+            fit_userprofiler_on_files(
+                user_profiler=user_profiler,
+                data_dir=data_dir,
+                filenames=data_files,
+                feature_cols=config.data.columns.value_cols,
+                window=window,
+                meter_col=config.data.columns.meter_id,
+                timestamp_dst_col=config.data.columns.timestamp_dst,
+                timestamp_utc_col=config.data.columns.timestamp_utc,
+                batch_size=config.data.dataloader.batch_size,
+                num_workers=config.data.dataloader.num_workers,
+                seed=config.data.splits.random_seed,
+                train_frac=config.data.splits.train_ratio,
+                normalizer=normalizer
+            )
 
     all_test_tensors = []
     log_path = os.path.join(config.logging.log_dir, model_tag)
@@ -539,12 +562,6 @@ def train(config):
         train_loader = dm.train_dataloader()
         val_loader = dm.val_dataloader()
 
-        if hasattr(model, "conditioner") and model.conditioner is not None:
-            user_profiler = model.conditioner.condition_items.get("user_profile")
-            if i == 1 and user_profiler is not None and getattr(user_profiler, "is_fitted", False) is False:
-                print("Fitting user profile conditioner on first training file...")
-                user_profiler.fit(train_loader)
-
         model_tag, writer = model.fit(
             trainloader = train_loader,
             valloader = val_loader,
@@ -602,6 +619,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default=os.path.join(parent_dir, "config", "config.yaml"))
     parser.add_argument("--skip-validation", action="store_true", default=False)
     parser.add_argument("--quiet", action="store_true", default=False)
+    parser.add_argument("--load_path_model", type=str, default=None, help="Path to a saved model to load and visualize without training")
     args = parser.parse_args()
 
     config = _load_train_config(args.config)

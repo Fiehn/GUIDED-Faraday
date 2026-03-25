@@ -23,7 +23,7 @@ class BasePrior(nn.Module, ABC):
         ...
 
     @abstractmethod
-    def sample(self,batch_size, num_samples=1):
+    def sample(self,batch_size, num_samples=1, **kwargs):
         """Sample from the prior distribution."""
         ...
     
@@ -48,7 +48,7 @@ class StandardGaussianPrior(BasePrior):
     def get_params(self):
         return {"mu": self.mu, "sigma": self.sigma}
     
-    def sample(self, batch_size, num_samples=1):
+    def sample(self, batch_size, num_samples=1, **kwargs):
         return torch.randn((num_samples, batch_size, self.latent_dim), device=self.sigma.device)
     
     def log_prob(self, z):
@@ -74,7 +74,7 @@ class LearnableDictionaryPrior(BasePrior):
 
     def get_params(self):
         return {"mu": self.mu, "sigma": torch.exp(self.log_sigma)}
-    def sample(self, batch_size, num_samples=1):
+    def sample(self, batch_size, num_samples=1, **kwargs):
         sigma = torch.exp(self.log_sigma)
         eps = torch.randn((num_samples, batch_size, self.latent_dim), device=sigma.device)
         return self.mu + eps * sigma
@@ -102,7 +102,7 @@ class StandardDictionaryPrior(BasePrior):
     def get_params(self):
         return {"mu": self.mu, "sigma": self.sigma}
     
-    def sample(self, batch_size, num_samples=1):
+    def sample(self, batch_size, num_samples=1, **kwargs):
         eps = torch.randn(num_samples, batch_size, self.dictionary_size, device=self.sigma.device)
         return eps  # Will be mapped by SigmaMapper in encoder
     
@@ -136,7 +136,7 @@ class LearnableDictionaryPrior(BasePrior):
 
     def get_params(self):
         return {"mu": self.mu, "sigma": torch.exp(self.log_sigma)}
-    def sample(self, batch_size, num_samples=1):
+    def sample(self, batch_size, num_samples=1, **kwargs):
         sigma = torch.exp(self.log_sigma)
         eps = torch.randn((num_samples, batch_size, self.dictionary_size), device=sigma.device)
         # Return samples in dictionary space only (mu in latent space is added after
@@ -202,7 +202,7 @@ class VampPrior(BasePrior):
         # Return the mean across components - this works with existing expand() logic
         return {k: v.mean(dim=0, keepdim=True) for k, v in component_params.items()}
 
-    def sample(self, batch_size, num_samples=1):
+    def sample(self, batch_size, num_samples=1, **kwargs):
         """Sample by randomly selecting components then using encoder's reparameterize."""
         component_params = self.encoder(self.pseudo_inputs)  # [K, ...]
 

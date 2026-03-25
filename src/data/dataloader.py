@@ -383,11 +383,8 @@ class SmartMeterDataModule:
                 def __init__(self, dm):
                     self.dm = dm
                 def __iter__(self):
-                    return self.dm._yield_train_batches()
-                
-            user_profiler.fit(StreamLoader(self))
-
-    def _fit_normalizer(self):
+                    for x, m, t in self.dm._yield_train_batches():
+                        yield x, None, m, t
         """Fit normalizer on training meters only, streamed one meter at a time.
 
         If the normalizer is already fitted (e.g. pre-fitted across multiple
@@ -677,3 +674,64 @@ def fit_normalizer_on_files(
     print(f"[Normalizer] Stats fitted on {len(filenames)} file(s) and saved to {stats_path}")
 
 
+
+def fit_userprofiler_on_files(
+    user_profiler,
+    data_dir: str,
+    filenames: Sequence[str],
+    feature_cols: Sequence[str],
+    *,
+    window: WindowSpec,
+    meter_col: str,
+    timestamp_dst_col: str,
+    timestamp_utc_col: Optional[str] = None,
+    batch_size: int = 1024,
+    num_workers: int = 0,
+    seed: int = 0,
+    train_frac: float = 0.8,
+    normalizer=None,
+    force_refit: bool = False,
+) -> None:
+    
+    if user_profiler is None:
+        return
+        
+    stats_path = getattr(user_profiler, 'path', None)
+    
+    if stats_path is not None and not force_refit and os.path.exists(stats_path):
+        print(f"[UserProfiler] Loaded cached profiler from {stats_path}")
+        user_profiler.load(stats_path)
+        return
+        
+    print(f"[UserProfiler] Fitting across {len(filenames)} file(s) from scratch...")
+
+    class MultiFileLoader:
+        def __init__(self):
+            self.filenames = filenames
+            
+        def __iter__(self):
+            for filename in self.filenames:
+                dm = SmartMeterDataModule(
+                    data_dir=data_dir,
+                    filename=filename,
+                    meter_col=meter_col,
+                    timestamp_dst_col=timestamp_dst_col,
+                    timestamp_utc_col=timestamp_utc_col,
+                    feature_cols=feature_cols,
+                    window=window,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    shuffle_train=False, # Must be false to properly build coherent time series words if sequential matters, actually UserProfiler just needs windows
+                    seed=seed,
+                    train_frac=train_frac,
+                    normalizer=normalizer,
+                    conditioner=None # none to prevent recursive fit!
+                )
+                from tqdm import tqdm
+                print(f"  -> Profiling {filename}...")
+                for x, m, t in dm._yield_train_batches():
+                    # yield 4 items exactly like UserProfiler.fit expects: x, cond, meter, time
+                    yield x, None, m, t
+
+    loader = MultiFileLoader()
+    user_profiler.fit(loader)

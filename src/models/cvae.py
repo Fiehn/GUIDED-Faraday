@@ -197,7 +197,7 @@ class CVAE(VAE):
         return agg
 
     @torch.no_grad()
-    def sample(self, conditions: torch.Tensor, num_prior_samples: int = 1, num_x_samples: int = 1, device: str = "cpu",):
+    def sample(self, conditions: torch.Tensor, num_prior_samples: int = 1, num_x_samples: int = 1, device: str = "cpu", **kwargs):
         self.eval()
 
         original_device = next(self.parameters()).device
@@ -265,7 +265,7 @@ class CVAE(VAE):
         xs_all = []
         for s in range(S):
             params_s = {k: v[s] for k, v in recon_params.items()}         # [B, D]
-            xs = self.decoder.sample(params_s, num_samples=num_x_samples) # [num_x_samples, B, D]
+            xs = self.decoder.sample(params_s, num_samples=num_x_samples, **kwargs) # [num_x_samples, B, D]
             xs_all.append(xs)
 
         return_val = torch.stack(xs_all, dim=0)  # [S, num_x_samples, B, D]

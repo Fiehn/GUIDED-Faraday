@@ -11,6 +11,10 @@ class SyntheticGenerator:
     - Generating new samples for a single day based on specified conditions (meter ID, date, or pre-built conditions).
     - Generating continuous multi-day sequences by sampling multiple candidates for each day and selecting the one that best continues from the previous day, ensuring smoother transitions at day boundaries.
 
+    Includes built-in safeguards for log-space generation:
+    - Temperature scaling: Shrink the variance of the generated noise.
+    - Rejection sampling: Automatically discard and re-roll mathematically explosive samples.
+
     Args:
         model: A trained generative model (e.g., CVAE) that has a .sample() method and optionally: [.conditioner, .encoder, .decoder, .hierarchy].
         conditioner: Optional Conditioner object to build conditions for generation. If None, it will try to use model.conditioner.
@@ -37,7 +41,12 @@ class SyntheticGenerator:
                     num_reconstructions: int = 1,
                     meter_id: int | None = None, 
                     timestamp: datetime | torch.Tensor | None = None,
-                    new_conditions: torch.Tensor | None = None,) -> torch.Tensor | None:
+                    new_conditions: torch.Tensor | None = None,
+                    is_normalized: bool = False,
+                    temperature: float = 1.0,
+                    use_rejection: bool = False,
+                    max_safe_z: float = 5.0,
+                    max_retries: int = 10) -> torch.Tensor | None:
         """
         Reconstruct input data with optional new conditions. If new_conditions is provided,
         it will be used for the decoding and thus providing a way to manipulate the reconstruction by changing the conditions.
@@ -46,21 +55,32 @@ class SyntheticGenerator:
             input_data (torch.Tensor): Tensor of original timeseries data to reconstruct of shape `(batch_size, 24, num_features)`.
             new_conditions (Optional[torch.Tensor]): Tensor of new conditions to use for reconstruction of shape `(batch_size, num_conditions)`.
                             If None, original conditions from the model will be used.
+            is_normalized (bool): Whether the input_data is already normalized. If False, it will be normalized using self.normalizer before reconstruction and inverse-transformed back to original scale at the end.
+            temperature (float): Temperature scaling factor for sampling. Values < 1.0 will produce less variance (safer samples), while values > 1.0 will produce more variance.
+            use_rejection (bool): Whether to use rejection sampling to discard and re-roll samples with extreme latent values that could lead to mathematically explosive reconstructions.
+            max_safe_z (float): The maximum absolute value for latent variables (z) considered safe. Samples with any latent dimension exceeding this value will be discarded and re-sampled if use_rejection is True.
+            max_retries (int): Maximum number of retries for rejection sampling before giving up and returning the best attempt.
         Returns:
             Reconstructed data tensor of shape `(num_reconstructions, batch_size, 24, num_features)` in original scale.
         """
         self.model.eval()
         self.model.to(self.device)
         input_data = input_data.to(self.device)
-        if self.normalizer is not None:
+
+        if self.normalizer is not None and not is_normalized:
             input_data = self.normalizer.transform(input_data.reshape(-1, input_data.shape[-1])).reshape(input_data.shape)
         if self._is_cvae and meter_id is not None and timestamp is not None:
             # Conditions for the encoding are always based on the original meter_id and timestamp, to get the correct latent representation.
             conditions = self.conditioner.get_conditions(input_data, meter_id, timestamp).to(self.device)
             
             # Ensure input_data is flattened appropriately
-            input_data_flat = input_data.reshape(input_data.shape[0], -1).to(self.device)
-            enc_in = torch.cat([input_data_flat, conditions], dim=-1)
+            if hasattr(self.model, '_set_encode'):
+                x_enc = self.model._set_encode(self.model._to_phase_first(input_data))
+                enc_in = torch.cat([x_enc, conditions], dim=-1)
+            else:
+                input_data_flat = input_data.reshape(input_data.shape[0], -1).to(self.device)
+                enc_in = torch.cat([input_data_flat, conditions], dim=-1)
+                
             q_params = self.model.encoder(enc_in) # dict of [B, latent_dim] params
 
             # Sample latent variables using reparameterization trick - sample z: [S, B, latent_dim]
@@ -101,10 +121,56 @@ class SyntheticGenerator:
         xs_all = []
         for s in range(S_dim):
             params_s = {k: v[s] for k, v in recon_params.items()}
-            xs = self.model.decoder.sample(params_s, num_samples=num_reconstructions) # [num_recon, B, D]
-            xs_all.append(xs)
             
-        return torch.cat(xs_all, dim=0)  # [S*num_reconstructions, B, D]
+            # --- Rejection Sampling Loop for Reconstruction ---
+            valid_samples = []
+            needed = num_reconstructions
+            
+            for attempt in range(max_retries):
+                xs = self.model.decoder.sample(params_s, num_samples=needed, temperature=temperature)
+                
+                if not use_rejection:
+                    valid_samples.append(xs)
+                    break
+                    
+                # Check safe maximums across the [needed, B, D] tensor
+                max_vals = xs.abs().amax(dim=-1) # [needed, B]
+                good_mask = (max_vals < max_safe_z).all(dim=-1) # Only keep if entire batch is safe
+                
+                good_xs = xs[good_mask]
+                if len(good_xs) > 0:
+                    valid_samples.append(good_xs)
+                    needed -= len(good_xs)
+                    
+                if needed <= 0:
+                    break
+                    
+            if needed > 0:
+                print(f"Warning: Rejection sampling failed to find safe reconstructions. Injecting {needed} flatline means.")
+                fallback = self.model.decoder.sample(params_s, num_samples=needed, temperature=0.0)
+                valid_samples.append(fallback)
+                
+            xs_all.append(torch.cat(valid_samples, dim=0)[:num_reconstructions])
+        flat_output = torch.cat(xs_all, dim=0)  # [S*num_recon, B, D]
+        N, B, D = flat_output.shape
+        flat_output = flat_output.reshape(N * B, D)
+
+        # 1. Un-flatten properly based on Phase-First vs Time-First
+        L = getattr(self.model, 'sequence_length', 24)
+        F = D // L
+        is_phase_first = getattr(self.model, 'num_features', None) is not None
+
+        if is_phase_first:
+            output = flat_output.reshape(-1, F, L).transpose(1, 2)  # [N*B, L, F]
+        else:
+            output = flat_output.reshape(-1, L, F)
+
+        # 2. Apply inverse transform so it's in actual kWh, not Z-scores
+        if self.normalizer is not None and not is_normalized:
+            output = self.normalizer.inverse_transform(output.reshape(-1, F)).reshape(-1, L, F)
+
+        # Return as 
+        return output.reshape(N, B, -1)
 
     @torch.no_grad()
     def generate(
@@ -112,7 +178,11 @@ class SyntheticGenerator:
         num_samples: int,
         meter_id: int | None = None,
         date: datetime | torch.Tensor | None = None,
-        conditions: torch.Tensor | None = None
+        conditions: torch.Tensor | None = None,
+        temperature: float = 1.0,
+        use_rejection: bool = False,
+        max_safe_z: float = 4.5,
+        max_retries: int = 10
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
         Generate samples from the model for a single day with given conditions.
@@ -123,6 +193,10 @@ class SyntheticGenerator:
             date (datetime | torch.Tensor | None): Date for time-based conditioning.
             conditions (torch.Tensor | None): Pre-built conditioning tensor `(batch_size, num_conditions)`. 
                 If provided, it will be used directly for generation. If None, conditions will be built using meter_id and date.
+            temperature (float): Temperature scaling factor for sampling. Values < 1.0 will produce less variance (safer samples), while values > 1.0 will produce more variance.
+            use_rejection (bool): Whether to use rejection sampling to discard and re-roll samples with extreme latent values that could lead to mathematically explosive generations.
+            max_safe_z (float): The maximum absolute value for latent variables (z) considered safe. Samples with any latent dimension exceeding this value will be discarded and re-sampled if use_rejection is True.
+            max_retries (int): Maximum number of retries for rejection sampling before giving up and returning the best attempt.
 
         Returns:
             (torch.Tensor | None, torch.Tensor | None): Tuple of (generated_samples, used_conditions).
@@ -133,31 +207,77 @@ class SyntheticGenerator:
         self.model.to(self.device)
 
         if self._is_cvae and conditions is None:
-            random = False
-            if date is None:
-                random = True
-            elif isinstance(date, (int, float)):
+            random_cond = (date is None)
+            if isinstance(date, (int, float)):
                 date = datetime.fromtimestamp(date)
-            conditions = self._build_conditions(meter_id=meter_id, timestamp=date, random_condition=random)
+            conditions = self._build_conditions(meter_id=meter_id, timestamp=date, random_condition=random_cond)
         
-        if self._is_cvae:
-            samples = self.model.sample(
-                conditions=conditions,
-                num_prior_samples=num_samples,
-                num_x_samples=1,
-                device=self.device,
-            )  # Usually returns [num_samples, 1, B, D] or [num_samples, B, D]
+        valid_samples = []
+        needed = num_samples
+        
+        # --- Batched Rejection Sampling ---
+        for attempt in range(max_retries):
+            if self._is_cvae:
+                samples = self.model.sample(
+                    conditions=conditions,
+                    num_prior_samples=needed,
+                    num_x_samples=1,
+                    device=self.device,
+                    temperature=temperature
+                ) 
+            else:
+                samples = self.model.sample(num_samples_prior=needed, num_samples_posterior=1, device=self.device, temperature=temperature)
+            
+            if not use_rejection:
+                valid_samples.append(samples)
+                break
+                
+            # Flatten to evaluate maximums
+            flat_samples = samples.reshape(needed, -1)
+            max_vals, _ = flat_samples.abs().max(dim=-1)
+            
+            good_mask = max_vals < max_safe_z
+            good_samples = samples[good_mask]
+            
+            if len(good_samples) > 0:
+                valid_samples.append(good_samples)
+                needed -= len(good_samples)
+                
+            if needed <= 0:
+                break
+                
+        if needed > 0:
+            print(f"Warning: Rejection sampling yielded {needed} flatline means to avoid explosions.")
+            if self._is_cvae:
+                fallback = self.model.sample(conditions=conditions, num_prior_samples=needed, num_x_samples=1, device=self.device, temperature=0.0)
+            else: 
+                fallback = self.model.sample(num_samples_prior=needed, num_samples_posterior=1, device=self.device, temperature=0.0)
+            valid_samples.append(fallback)
+            
+        final_samples = torch.cat(valid_samples, dim=0)[:num_samples] # [S, 1, B, D]
+
+        # Flatten out S, 1, B into a single batch dimension for normalization
+        S, _, B, D = final_samples.shape
+        flat = final_samples.reshape(S * B, D)
+        
+        L = getattr(self.model, 'sequence_length', 24)
+        F = D // L
+
+        is_phase_first = getattr(self.model, 'num_features', None) is not None and getattr(self.model, 'element_dim', None) is not None
+
+        if is_phase_first:
+            output = flat.reshape(S * B, F, L).transpose(1, 2)
         else:
-            samples = self.model.sample(num_samples_prior=num_samples, num_samples_posterior=1, device=self.device)
-        
-        flat = samples.reshape(-1, samples.shape[-1])
-        N = flat.shape[0]
-        F = flat.shape[-1] // 24
-        output = flat.reshape(N, 24, F)  # [N, 24, F]
+            output = flat.reshape(S * B, L, F)
 
         if self.normalizer is not None:
-            output = self.normalizer.inverse_transform(output.reshape(-1, F)).reshape(N, 24, F)
+            output = self.normalizer.inverse_transform(output.reshape(-1, F)).reshape(S * B, L, F)
 
+        # If conditions had a batch size > 1 and S > 1, the returned shape is (S * B, L, F).
+        # To remain compatible with callers expecting (num_samples, L, F), 
+        # if B == 1, we just return (S, L, F). 
+        # If B > 1 and S == 1, it's (B, L, F).
+        # We let the callers handle the S * B size.
         return output, conditions
     
     @torch.no_grad()
@@ -168,7 +288,10 @@ class SyntheticGenerator:
         start_date: datetime,
         num_candidates: int = 32,
         continuity_weight: float = 1.0,
-        conditions = None
+        conditions = None,
+        temperature: float = 1.0,
+        use_rejection: bool = False,
+        max_safe_z: float = 4.5
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Samples continuous multi-day sequences by sampling multiple candidates for each day and selecting the one that best continues from the previous day, ensuring smoother transitions at day boundaries.
 
@@ -178,6 +301,10 @@ class SyntheticGenerator:
             start_date (datetime): Starting date for generation.
             num_candidates (int): Number of candidate windows to sample for each day after the first, to select the best continuation.
             continuity_weight (float): Weighting factor for the continuity score when selecting the best candidate. Higher values prioritize smoother transitions more strongly.
+            conditions (torch.Tensor | None): Optional pre-built conditions tensor to use for all days. If None, conditions will be built for each day using meter_id and date.
+            temperature (float): Temperature scaling factor for sampling. Values < 1.0 will produce less variance (safer samples), while values > 1.0 will produce more variance.
+            use_rejection (bool): Whether to use rejection sampling to discard and re-roll samples with extreme latent values that could lead to mathematically explosive generations.
+            max_safe_z (float): The maximum absolute value for latent variables (z) considered safe. Samples with any latent dimension exceeding this value will be discarded and re-sampled if use_rejection is True.
 
         Returns:
             (torch.Tensor | None, torch.Tensor | None): Tuple of (generated_samples, used_conditions).
@@ -193,20 +320,34 @@ class SyntheticGenerator:
 
         for day_idx in range(num_days):
             day_start = start_date + timedelta(days=day_idx)
-            if conditions is None:
-                conditions = self._build_conditions(meter_id=meter_id, timestamp=day_start)
+            current_conditions = self._build_conditions(meter_id=meter_id, timestamp=day_start) if conditions is None else conditions
             
             if prev_window is None or num_candidates <= 1:
-                # First day or no selection: just sample one window
-                window = self._sample_window(conditions)
+                # Use generate() to get a single safe window
+                window, _ = self.generate(
+                    num_samples=1, 
+                    conditions=current_conditions,
+                    temperature=temperature,
+                    use_rejection=use_rejection,
+                    max_safe_z=max_safe_z
+                )
+                window = window.squeeze(0) # Remove batch dim
+                
+                # Inverse transform is handled inside generate, so we undo it here 
+                # so the continuity tracker scores normalized data.
+                if self.normalizer is not None:
+                    window = self.normalizer.transform(window)
             else:
-                # Sample multiple candidates and pick the best one for continuity
                 window = self._select_best_continuation(
-                    conditions=conditions,
+                    conditions=current_conditions,
                     prev_window=prev_window,
                     continuity_weight=continuity_weight,
                     num_candidates=num_candidates,
+                    temperature=temperature,
+                    use_rejection=use_rejection,
+                    max_safe_z=max_safe_z
                 )
+                
             all_windows.append(window.cpu())
             prev_window = window
         
@@ -217,8 +358,6 @@ class SyntheticGenerator:
         return output, conditions
 
     def _sample_window(self, conditions: torch.Tensor) -> torch.Tensor:
-        """ Sample a single 24-hour window given the conditions. Returns a tensor of shape [24, num_features]."""
-        # TODO: make sure this can be used by VAE as well
         samples = self.model.sample(
             conditions=conditions,
             num_prior_samples=1,
@@ -226,15 +365,26 @@ class SyntheticGenerator:
             device=self.device,
         )
         flat = samples.reshape(-1)
-        F = flat.shape[0] // 24
-        return flat.reshape(24, F)
+        L = getattr(self.model, 'sequence_length', 24)
+        F = flat.shape[0] // L
+        
+        # Safely un-flatten Phase-First data
+        is_phase_first = getattr(self.model, 'num_features', None) is not None and getattr(self.model, 'element_dim', None) is not None
+        
+        if is_phase_first:
+            return flat.reshape(F, L).T  # [F, L] transposed to [L, F]
+        else:
+            return flat.reshape(L, F)
     
     def _select_best_continuation(
             self,
             conditions: torch.Tensor,
             prev_window: torch.Tensor,
             num_candidates: int,
-            continuity_weight: float
+            continuity_weight: float,
+            temperature: float = 1.0,
+            use_rejection: bool = False,
+            max_safe_z: float = 4.5
         ) -> torch.Tensor:
         """ 
         Sample 'num_candidates' windows and return the one that
@@ -249,6 +399,9 @@ class SyntheticGenerator:
             prev_window (torch.Tensor): The previous day's window, shape `(24, num_features)`.
             num_candidates (int): Number of candidate windows to sample.
             continuity_weight (float): Weighting factor for the continuity score. Higher values prioritize smoother transitions more strongly.
+            temperature (float): Temperature scaling factor for sampling. Values < 1.0 will produce less variance (safer samples), while values > 1.0 will produce more variance.
+            use_rejection (bool): Whether to use rejection sampling to discard and re-roll samples with extreme latent values that could lead to mathematically explosive generations.
+            max_safe_z (float): The maximum absolute value for latent variables (z) considered safe. Samples with any latent dimension exceeding this value will be discarded and re-sampled if use_rejection is True.
 
         Returns:
             torch.Tensor: The selected window that best continues from the previous day, shape `(24, num_features)`.
@@ -257,26 +410,45 @@ class SyntheticGenerator:
             conditions = conditions,
             num_prior_samples = num_candidates,
             num_x_samples = 1,
-            device = self.device
+            device = self.device,
+            temperature = temperature
         )
+        
         candidates = samples.reshape(num_candidates, -1)
-        F = candidates.shape[-1] // 24
-        candidates = candidates.reshape(num_candidates, 24, F)  # [num_candidates, 24, F]
+        L = getattr(self.model, 'sequence_length', 24)
+        F = candidates.shape[-1] // L
+        
+        # Pre-filter dangerous candidates before scoring
+        if use_rejection:
+            max_vals, _ = candidates.abs().max(dim=-1)
+            good_mask = max_vals < max_safe_z
+            if good_mask.any():
+                candidates = candidates[good_mask]
+            else:
+                print("Warning: All continuation candidates were explosive. Generating flatline mean.")
+                safe_sample = self.model.sample(conditions=conditions, num_prior_samples=1, num_x_samples=1, device=self.device, temperature=0.0)
+                candidates = safe_sample.reshape(1, -1)
 
-        # === Score each Candidate ===
-        # level: |prev_23 - cand_0|²
-        level_gap = (prev_window[-1] - candidates[:,0]) ** 2  # [num_candidates, F]
-        level_cost = level_gap.sum(dim=-1) # [num_candidates]
+        num_valid = candidates.shape[0]
+        
+        is_phase_first = getattr(self.model, 'num_features', None) is not None and getattr(self.model, 'element_dim', None) is not None
+        if is_phase_first:
+            candidates = candidates.reshape(num_valid, F, L).transpose(1, 2)
+        else:
+            candidates = candidates.reshape(num_valid, L, F) 
 
-        # trend: |(prev_23 - prev_22) - (cand_1 - cand_0)|²
+        # Score in Normalized Space
+        level_gap = (prev_window[-1] - candidates[:,0]) ** 2  
+        level_cost = level_gap.sum(dim=-1) 
+
         prev_slope = prev_window[-1] - prev_window[-2]
-        cand_slope = candidates[:,1] - candidates[:,0]  # [num_candidates, F]
+        cand_slope = candidates[:,1] - candidates[:,0]  
         slope_gap = (prev_slope - cand_slope) ** 2
-        slope_cost = slope_gap.sum(dim=-1)  # [num_candidates]
+        slope_cost = slope_gap.sum(dim=-1)  
 
-        # combined cost
         total_cost = continuity_weight * level_cost + 0.5 * continuity_weight * slope_cost
         best_idx = torch.argmin(total_cost)
+        
         return candidates[best_idx]
     
     def _build_conditions(self, meter_id: int, timestamp: datetime, random_condition: bool = False) -> torch.Tensor:

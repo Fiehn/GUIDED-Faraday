@@ -36,17 +36,22 @@ class GaussianCoder(torch.nn.Module):
     
     def forward(self, inputs):
         param_dict = self.parameterizer(inputs)
-        param_dict["mu"] = param_dict["mu"] # clamp with upper and lower bounds?
+        param_dict["mu"] = torch.clamp(param_dict["mu"], min=0.0, max=12.0)
         if self.learn_sigma:
             param_dict["sigma"] = F.softplus(param_dict["sigma"]) + 1e-6 # Ensure positivity 
         else:
             param_dict["sigma"] = torch.ones_like(param_dict["mu"]) * self.sigma_fixed # Fixed sigma
         return param_dict
     
-    def sample(self, param_dict=None, num_samples=1,**_):
-        """ Sampple from the Gaussian defined by param_dict using reparameterization trick """
+    def sample(self, param_dict=None, num_samples=1, return_mean=False, **_):
+        """Sample from the distribution. If return_mean is True, ignores noise."""
         if param_dict is None:
             raise ValueError("param_dict must be provided for sampling")
+        
+        if return_mean:
+            # Safely return just the predicted mean without log-normal explosions
+            return param_dict["mu"].unsqueeze(0).expand(num_samples, -1, -1)
+            
         return self.reparameterize(param_dict, num_samples=num_samples)
 
     def loglikelihood(self, inputs, param_dict, **_):
@@ -105,10 +110,16 @@ class GaussianCoder(torch.nn.Module):
         # Here in the Gaussian case, we create a diagonal covariance matrix from the sigma parameters
         return torch.eye(param_dict["mu"].shape[1]).to(param_dict["mu"].device) * (param_dict["sigma"] ** 2).unsqueeze(-1)
     
-    def reparameterize(self, param_dict, num_samples=1, **_):
+    def reparameterize(self, param_dict, num_samples=1, temperature: float = 1.0, **_):
         # Reparameterization trick: sample epsilon from N(0,1) and return mu + sigma * epsilon
         mu = param_dict["mu"]
         sigma = param_dict["sigma"]
+
+        if temperature <= 0.0:
+            # If temperature is 0 or negative, return the mean (deterministic output)
+            return mu.unsqueeze(0).expand(num_samples, -1, -1)
+        sigma = sigma * temperature
+
         batch_size, output_dim = mu.shape
         # Sample epsilon
         epsilon = torch.randn((num_samples, batch_size, output_dim)).to(mu.device)
@@ -143,7 +154,8 @@ class DictionaryCoder(torch.nn.Module):
 
         self.marginal_std_lim = marginal_std_lim
         self.average_max_std = average_max_std
-        self.sigma_lower_lim = sigma_lim
+        scale_lim = (output_dim / dictionary_size) ** 0.5 # The variance is additive in the covariance, so we need to scale the sigma_lim by the sqrt of the ratio of output_dim to dictionary_size to get the right scale in the output space. This is because each dictionary element contributes to the variance in the output space, and we want to ensure that the total variance is in a reasonable range.
+        self.sigma_lower_lim = sigma_lim * scale_lim
         self.sigma_upper_lim = (output_dim/self.dictionary_size)**0.5 * (average_max_std - self.marginal_std_lim) # TODO: UNderstand this step
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -171,10 +183,25 @@ class DictionaryCoder(torch.nn.Module):
         # The sigmaMapper is normalized to have unit norm
         return self.SigmaMapper / torch.norm(self.SigmaMapper, dim=0, keepdim=True)
     
-    def forward(self, inputs):
+    def forward(self, inputs, test=True):
+        if test:
+            param_dict = self.parameterizer(inputs)
+            
+            # 1. Smoothly bound the Mean (mu) between -5.0 and +5.0
+            # No dead gradients, no infinite predictions.
+            param_dict["mu"] = torch.tanh(param_dict["mu"]) * 5.0 
+
+            # 2. Smoothly bound the Variance (sigma) 
+            # Sigmoid maps to [0, 1]. This maps sigma smoothly between lower_lim and ~2.0
+            # No softplus exploding into infinity.
+            max_sigma_range = 2.0 - self.sigma_lower_lim
+            param_dict["sigma"] = self.sigma_lower_lim + (torch.sigmoid(param_dict["sigma"]) * max_sigma_range)
+            
+            return param_dict
+        
         param_dict = self.parameterizer(inputs)
         #param_dict["sigma"] = torch.nn.functional.relu(param_dict["sigma"]).clamp(self.sigma_lower_lim, self.sigma_upper_lim)
-        # TODO: They clamp mu as well?? Check later
+        param_dict["mu"] = torch.clamp(param_dict["mu"], min=0.0, max=9.0)
 
         # The actual max allowed out of the clamp is (upper - lower)
         max_allowed_softplus = self.sigma_upper_lim - self.sigma_lower_lim
@@ -183,10 +210,15 @@ class DictionaryCoder(torch.nn.Module):
         param_dict["sigma"] = F.softplus(param_dict["sigma"]).clamp(max=max_allowed_softplus) + self.sigma_lower_lim
         return param_dict
 
-    def reparameterize(self, param_dict, num_samples=1, **_):
+    def reparameterize(self, param_dict, num_samples=1, temperature: float = 1.0, **_):
         """Reparameterization trick for sampling from the multivariate Gaussian defined by param_dict"""
         mu, sigma = param_dict["mu"], param_dict["sigma"]
         batch_size = mu.shape[0]
+
+        if temperature <= 0.0:
+            # If temperature is 0 or negative, return the mean (deterministic output)
+            return mu.unsqueeze(0).expand(num_samples, -1, -1)
+        sigma = sigma * temperature
 
         eps = torch.randn((num_samples, mu.shape[0], self.dictionary_size)).to(mu.device)
 
@@ -205,11 +237,12 @@ class DictionaryCoder(torch.nn.Module):
 
         return z
     
-    def sample(self, param_dict=None, num_samples=1, **_):
-        """Sample from the dictionary-based distribution."""
+    def sample(self, param_dict=None, num_samples=1, temperature: float = 1.0, **_):
+        """Sample from the distribution. If return_mean is True, ignores noise."""
         if param_dict is None:
             raise ValueError("param_dict must be provided for sampling")
-        return self.reparameterize(param_dict, num_samples=num_samples)
+            
+        return self.reparameterize(param_dict, num_samples=num_samples, temperature=temperature)
     
     def loglikelihood(self, inputs, param_dict,**_):
         """Compute log likelihood under multivariate Gaussian with PDCC covariance."""

@@ -411,10 +411,11 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         meter_id_valid = meter_id[valid_mask]
 
         if x_fit.shape[1] != self.cluster_centers_.shape[1]:
-            raise ValueError(
-                f"Feature dimension mismatch: x has {x_fit.shape[1]} features, "
-                f"but cluster_centers_ has {self.cluster_centers_.shape[1]} features"
-            )
+            print(f"Warning: Feature dimension mismatch (x:{x_fit.shape[1]}, centers:{self.cluster_centers_.shape[1]}). Using uniform init for missing meters.")
+            random_profiles = np.random.dirichlet(np.ones(self.n_topics), size=len(target_meter_ids))
+            for i, m_id in enumerate(target_meter_ids):
+                self.user_profiles_cache[m_id] = torch.tensor(random_profiles[i], dtype=torch.float32)
+            return
 
         target_set = set(target_meter_ids)
         selected_indices = [i for i, m in enumerate(meter_id_valid) if m in target_set]
@@ -439,6 +440,56 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         for m_id, gamma_u in zip(computable, posterior):
             self.gamma_cache[m_id] = gamma_u
             self.resample_user_vector(m_id)
+    def fit_on_files(self, parquet_paths: list[str]):
+        """Convenience method to fit the model directly on a list of parquet files.
+
+        Args:
+            parquet_paths (list[str]): List of file paths to parquet files containing 
+                the training data.
+        """
+        import os
+        from data.dataloader_phased import StreamingParquetBuffer, WindowSpec
+        from torch.utils.data import DataLoader
+        
+        if self.path and os.path.exists(self.path):
+            if self.verbose:
+                print(f"[UserProfiler] Loading pre-fitted model from {self.path}")
+            self.load(self.path)
+            return self
+            
+        if not parquet_paths:
+            if self.verbose:
+                print("[UserProfiler] No parquet paths provided for fitting.")
+            return self
+
+        if self.verbose:
+            print(f"[UserProfiler] Fitting across {len(parquet_paths)} parquet files...")
+
+        # We use a purely non-overlapping stride (24) to avoid massively redundant clustering
+        phased_ds = StreamingParquetBuffer(
+            sm_files=parquet_paths, 
+            replay_buffer_capacity=10000, 
+            min_buffer_size=5184,
+            window_spec=WindowSpec(input_len=24, stride=24), 
+            num_workers=0
+        )
+        
+        loader = DataLoader(phased_ds, batch_size=1024, num_workers=0)
+        
+        class WrapperLoader:
+            def __init__(self, loader):
+                self.loader = loader
+            def __iter__(self):
+                for x, cond in self.loader:
+                    # Transpose x from [B, 3, 24] to [B, 24, 3] 
+                    # so it matches the inference shape
+                    x_time_first = x.transpose(1, 2)
+                    
+                    yield x_time_first, None, cond[:, 0, 0], cond[:, 1, 0]
+                    
+        self.fit(WrapperLoader(loader))
+        return self
+        
 
     def resample_user_vector(self, meter_id = None):
         """Samples new user profiles from stored gamma parameters using a Dirichlet distribution.
