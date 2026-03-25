@@ -57,7 +57,6 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         random_state (int, optional): Random seed. Defaults to None.
         path (str): Path to save/load the model. Defaults to 'models/UserProfiles/user_profiles.pkl'.
         decay (float): Exponential forgetting factor for inactive users (0 < decay <= 1). Defaults to 0.9.
-        update_frequency (int): Trigger incremental update every N `get_conditions` calls. Defaults to 10.
         **kwargs: Additional keyword arguments. Accepts 'verbose' (bool).
 
     Attributes:
@@ -70,14 +69,13 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
     def __init__(self, n_topics = 10, num_clusters = 100, 
                  random_state=None, 
                  path='models/UserProfiles/user_profiles.pkl', 
-                 decay=0.9, update_frequency=10,
+                 decay=0.9,
                  **kwargs):
         super(UserProfiler, self).__init__(n_components=n_topics, random_state=random_state)
         self.n_topics = n_topics
         self.num_clusters = num_clusters
         self.condition_dim = n_topics
         self.decay = decay
-        self.update_frequency = update_frequency
 
         self.lambda_matrix = None  # To hold the learned topic-word distributions
         self.cluster_centers_ = None  # To hold KMeans cluster centers
@@ -217,7 +215,6 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         """Gets topic distributions for a batch during inference.
         
         Looks up cached profiles by `meter_id`. If not found, computes on-the-fly.
-        Triggers incremental model updates based on `update_frequency`.
 
         Args:
             data (torch.Tensor | np.ndarray | None): Time series data of shape 
@@ -254,23 +251,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         for m_id in meter_id:
             self.user_last_seen[m_id] = self.batch_counter
 
-        if data is not None:
-            self._maybe_update_model(data, meter_id)
-
         return self._get_cached_profiles(data, meter_id)
-    
-    def _maybe_update_model(self, data, meter_ids):
-        """Triggers an incremental model update if enough batches have passed.
-        
-        Args:
-            data (torch.Tensor | np.ndarray): Time series data batch.
-            meter_ids (np.ndarray): Array of meter IDs for the batch.
-        """
-        if self.update_frequency <= 0:
-            return
-        if (self.batch_counter - self.last_update_batch) >= self.update_frequency:
-            self.update_model_incremental(data, meter_ids)
-            self.last_update_batch = self.batch_counter
 
     def update_model_incremental(self, x_batch, meter_ids):
         """Incrementally updates the KMeans clustering and LDA topic model.

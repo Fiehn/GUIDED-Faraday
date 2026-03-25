@@ -236,17 +236,15 @@ def train(config):
             elif condition_tag == "user_profile":
                 if config.conditioning.user_profile.online:
                     decay = config.conditioning.online_user_profile.decay
-                    update_frequency = config.conditioning.online_user_profile.update_frequency
                 else:
                     decay = 1.0
-                    update_frequency = -1
 
                 profiler = UserProfiler(n_topics=config.conditioning.user_profile.n_topics,
                     num_clusters=config.conditioning.user_profile.num_clusters, 
                     path=config.conditioning.user_profile.cache_path, 
                     verbose=config.conditioning.user_profile.verbose, 
                     decay=decay, 
-                    update_frequency=update_frequency)
+                    )
                 
                 conditioner.add_condition_item("user_profile", profiler)
                     
