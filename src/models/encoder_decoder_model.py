@@ -1,10 +1,23 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Any
 from models.priors import *
 
 # === Gaussian encoder and decoder Model ===
 class GaussianCoder(torch.nn.Module):
+    """Gaussian parameterization module used for encoder/decoder heads.
+
+    Produces mean and standard deviation tensors and provides helper methods for
+    sampling, log-likelihood, KL divergence, and covariance construction.
+
+    Attributes:
+        input_dim: Input feature dimensionality.
+        output_dim: Output feature dimensionality.
+        learn_sigma: Whether sigma is learned or fixed.
+        sigma_fixed: Fixed sigma value when `learn_sigma=False`.
+        parameterizer: Shared MLP/NN block mapping inputs to distribution params.
+    """
     def __init__(self, input_dim, output_dim,  
                  learn_sigma=False, 
                  sigma_fixed=1.0,
@@ -13,7 +26,21 @@ class GaussianCoder(torch.nn.Module):
                  dropout = True,
                  dropout_rate = 0.2,
                  batch_norm = False,
-                 **_):
+                 **_) -> None:
+        """Initialize Gaussian coder module.
+
+        Args:
+            input_dim: Input dimensionality.
+            output_dim: Output dimensionality.
+            learn_sigma: Whether sigma is predicted by the network.
+            sigma_fixed: Fixed sigma value when not learning sigma.
+            num_hidden_layers: Number of hidden layers in parameterizer.
+            num_neurons: Hidden width.
+            dropout: Whether to use dropout.
+            dropout_rate: Dropout probability.
+            batch_norm: Whether to use normalization layers.
+            **_: Unused compatibility kwargs.
+        """
         super(GaussianCoder, self).__init__()
         
         self.input_dim = input_dim
@@ -31,10 +58,23 @@ class GaussianCoder(torch.nn.Module):
             dropout_rate=dropout_rate,
             batch_norm=batch_norm)
 
-    def _num_parameters(self):
+    def _num_parameters(self) -> int:
+        """Count trainable parameters.
+
+        Returns:
+            Number of trainable parameters.
+        """
         return self.parameterizer._num_parameters()
     
-    def forward(self, inputs):
+    def forward(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Compute Gaussian distribution parameters.
+
+        Args:
+            inputs: Input tensor `[B, input_dim]`.
+
+        Returns:
+            Dictionary with keys `mu` and `sigma`.
+        """
         param_dict = self.parameterizer(inputs)
         param_dict["mu"] = param_dict["mu"] # clamp with upper and lower bounds?
         if self.learn_sigma:
@@ -43,21 +83,48 @@ class GaussianCoder(torch.nn.Module):
             param_dict["sigma"] = torch.ones_like(param_dict["mu"]) * self.sigma_fixed # Fixed sigma
         return param_dict
     
-    def sample(self, param_dict=None, num_samples=1,**_):
-        """ Sampple from the Gaussian defined by param_dict using reparameterization trick """
+    def sample(self,
+               param_dict: dict[str, torch.Tensor] | None = None,
+               num_samples: int = 1,
+               **_) -> torch.Tensor:
+        """Sample from Gaussian distribution via reparameterization.
+
+        Args:
+            param_dict: Dictionary with `mu` and `sigma`.
+            num_samples: Number of samples per batch element.
+            **_: Unused compatibility kwargs.
+
+        Returns:
+            Samples shaped `[S, B, D]`.
+        """
         if param_dict is None:
             raise ValueError("param_dict must be provided for sampling")
         return self.reparameterize(param_dict, num_samples=num_samples)
 
-    def loglikelihood(self, inputs, param_dict, **_):
-        """ Compute log likelihood of inputs under the Gaussian defined by param_dict """
+    def loglikelihood(self,
+                      inputs: torch.Tensor,
+                      param_dict: dict[str, torch.Tensor],
+                      **_) -> torch.Tensor:
+        """Compute Gaussian log-likelihood.
+
+        Args:
+            inputs: Observations `[B, D]`.
+            param_dict: Dictionary with `mu` and `sigma`.
+            **_: Unused compatibility kwargs.
+
+        Returns:
+            Log-likelihood tensor `[B]`.
+        """
         mu = param_dict["mu"]
         sigma = param_dict["sigma"]
         var = sigma ** 2
         log_likelihood = -0.5 * torch.sum(((inputs - mu) ** 2) / var + torch.log(2 * torch.pi * var), dim=1)
         return log_likelihood
 
-    def kl_divergence(self, param_dict_q, prior=None, **_):
+    def kl_divergence(self,
+                      param_dict_q: dict[str, torch.Tensor],
+                      prior: BasePrior | None = None,
+                      **_) -> torch.Tensor:
         """
         Compute KL divergence KL(q||p).
 
@@ -101,11 +168,32 @@ class GaussianCoder(torch.nn.Module):
         )
         return kl
     
-    def create_covariance_matrix(self, param_dict):
+    def create_covariance_matrix(self, param_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Create diagonal covariance matrices from sigma values.
+
+        Args:
+            param_dict: Dictionary with `mu` and `sigma`.
+
+        Returns:
+            Covariance tensor shaped `[B, D, D]`.
+        """
         # Here in the Gaussian case, we create a diagonal covariance matrix from the sigma parameters
         return torch.eye(param_dict["mu"].shape[1]).to(param_dict["mu"].device) * (param_dict["sigma"] ** 2).unsqueeze(-1)
     
-    def reparameterize(self, param_dict, num_samples=1, **_):
+    def reparameterize(self,
+                       param_dict: dict[str, torch.Tensor],
+                       num_samples: int = 1,
+                       **_) -> torch.Tensor:
+        """Sample with reparameterization trick.
+
+        Args:
+            param_dict: Dictionary with `mu` and `sigma`.
+            num_samples: Number of samples per batch element.
+            **_: Unused compatibility kwargs.
+
+        Returns:
+            Sample tensor `[S, B, D]`.
+        """
         # Reparameterization trick: sample epsilon from N(0,1) and return mu + sigma * epsilon
         mu = param_dict["mu"]
         sigma = param_dict["sigma"]
@@ -115,7 +203,12 @@ class GaussianCoder(torch.nn.Module):
         samples = mu.unsqueeze(0) + sigma.unsqueeze(0) * epsilon
         return samples
     
-    def get_SigmaMapper(self):
+    def get_SigmaMapper(self) -> None:
+        """Return sigma mapper for API compatibility.
+
+        Returns:
+            Always `None` for Gaussian coder.
+        """
         # In Gaussian case, there is no SigmaMapper
         return None
 
@@ -123,6 +216,19 @@ class GaussianCoder(torch.nn.Module):
 # Dictionary approach with PDCC matrix as the covariance (Guide VAE)
 # =================
 class DictionaryCoder(torch.nn.Module):
+    """Dictionary-based coder with PDCC covariance parameterization.
+
+    Uses a learned dictionary (`SigmaMapper`) and per-sample dictionary-space
+    scales to form full covariance matrices in output space.
+
+    Attributes:
+        dictionary_size: Dictionary code dimensionality.
+        sigma_lower_lim: Lower bound for dictionary sigma values.
+        sigma_upper_lim: Upper bound for dictionary sigma values.
+        marginal_std_lim: Marginal diagonal jitter term for covariance stability.
+        SigmaMapper: Learnable dictionary mapping matrix.
+        parameterizer: Network producing `mu` and dictionary-space `sigma`.
+    """
     def __init__(self,
                  input_dim,
                  output_dim,
@@ -135,7 +241,23 @@ class DictionaryCoder(torch.nn.Module):
                  dropout=True,
                  dropout_rate=0.2,
                  batch_norm=False,
-                 **_):
+                 **_) -> None:
+        """Initialize dictionary coder.
+
+        Args:
+            input_dim: Input dimensionality.
+            output_dim: Output dimensionality.
+            dictionary_size: Dictionary latent dimensionality.
+            sigma_lim: Lower sigma floor in dictionary space.
+            marginal_std_lim: Marginal std floor in output space.
+            average_max_std: Target upper scale control.
+            num_hidden_layers: Number of hidden layers in parameterizer.
+            num_neurons: Hidden width.
+            dropout: Whether to use dropout.
+            dropout_rate: Dropout probability.
+            batch_norm: Whether to use normalization layers.
+            **_: Unused compatibility kwargs.
+        """
         super(DictionaryCoder, self).__init__()
         if dictionary_size <= output_dim:
             raise ValueError("Dictionary size must be greater than output dimension")
@@ -164,14 +286,32 @@ class DictionaryCoder(torch.nn.Module):
         # Setting this to be a learnable parameter is equivalent to the dictionary being learned in training through the data
         self.SigmaMapper = torch.nn.Parameter(torch.randn(output_dim, dictionary_size), requires_grad=True)
 
-    def _num_parameters(self):
+    def _num_parameters(self) -> int:
+        """Count trainable parameters in parameterizer.
+
+        Returns:
+            Number of trainable parameters.
+        """
         return self.parameterizer._num_parameters()
     
-    def get_SigmaMapper(self):
+    def get_SigmaMapper(self) -> torch.Tensor:
+        """Return column-normalized dictionary mapper.
+
+        Returns:
+            Normalized mapper tensor `[output_dim, dictionary_size]`.
+        """
         # The sigmaMapper is normalized to have unit norm
         return self.SigmaMapper / torch.norm(self.SigmaMapper, dim=0, keepdim=True)
     
-    def forward(self, inputs):
+    def forward(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Compute dictionary Gaussian parameters.
+
+        Args:
+            inputs: Input tensor `[B, input_dim]`.
+
+        Returns:
+            Dictionary with keys `mu` and bounded positive `sigma`.
+        """
         param_dict = self.parameterizer(inputs)
         #param_dict["sigma"] = torch.nn.functional.relu(param_dict["sigma"]).clamp(self.sigma_lower_lim, self.sigma_upper_lim)
         # TODO: They clamp mu as well?? Check later
@@ -183,7 +323,10 @@ class DictionaryCoder(torch.nn.Module):
         param_dict["sigma"] = F.softplus(param_dict["sigma"]).clamp(max=max_allowed_softplus) + self.sigma_lower_lim
         return param_dict
 
-    def reparameterize(self, param_dict, num_samples=1, **_):
+    def reparameterize(self,
+                       param_dict: dict[str, torch.Tensor],
+                       num_samples: int = 1,
+                       **_) -> torch.Tensor:
         """Reparameterization trick for sampling from the multivariate Gaussian defined by param_dict"""
         mu, sigma = param_dict["mu"], param_dict["sigma"]
         batch_size = mu.shape[0]
@@ -205,13 +348,19 @@ class DictionaryCoder(torch.nn.Module):
 
         return z
     
-    def sample(self, param_dict=None, num_samples=1, **_):
+    def sample(self,
+               param_dict: dict[str, torch.Tensor] | None = None,
+               num_samples: int = 1,
+               **_) -> torch.Tensor:
         """Sample from the dictionary-based distribution."""
         if param_dict is None:
             raise ValueError("param_dict must be provided for sampling")
         return self.reparameterize(param_dict, num_samples=num_samples)
     
-    def loglikelihood(self, inputs, param_dict,**_):
+    def loglikelihood(self,
+                      inputs: torch.Tensor,
+                      param_dict: dict[str, torch.Tensor],
+                      **_) -> torch.Tensor:
         """Compute log likelihood under multivariate Gaussian with PDCC covariance."""
         mu = param_dict['mu']
         Sigma = self.create_covariance_matrix(param_dict)  # [B, D, D]
@@ -229,7 +378,10 @@ class DictionaryCoder(torch.nn.Module):
         dist = torch.distributions.MultivariateNormal(loc=mu, scale_tril=L)
         return dist.log_prob(inputs)
     
-    def kl_divergence(self, param_dict_q, prior=None, **_):
+    def kl_divergence(self,
+                      param_dict_q: dict[str, torch.Tensor],
+                      prior: BasePrior | None = None,
+                      **_) -> torch.Tensor:
         """
         Compute KL divergence KL(q||p).
 
@@ -283,7 +435,15 @@ class DictionaryCoder(torch.nn.Module):
 
 
 
-    def create_covariance_matrix(self, param_dict):
+    def create_covariance_matrix(self, param_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Create PDCC covariance matrix for each sample.
+
+        Args:
+            param_dict: Dictionary containing at least `mu` and dictionary-space `sigma`.
+
+        Returns:
+            Covariance tensor shaped `[B, output_dim, output_dim]`.
+        """
         # THis is the spot that is interesting 
         # First get the U (sigma mapper)
         U = self.get_SigmaMapper()  # Output_dim x Dictionary_size
@@ -296,11 +456,30 @@ class DictionaryCoder(torch.nn.Module):
         # This ensures positive definiteness and adds marginal noise
         return (S.mT @ S) + torch.eye(self.output_dim, device=param_dict["mu"].device) * (self.marginal_std_lim ** 2)  # Batch_size x Output_dim x Output_dim
 
-    def get_marginal_sigmas(self,param_dict):
+    def get_marginal_sigmas(self, param_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Extract marginal standard deviations from covariance matrices.
+
+        Args:
+            param_dict: Distribution parameters.
+
+        Returns:
+            Marginal sigma tensor `[B, output_dim]`.
+        """
         return torch.sqrt(torch.diagonal(self.create_covariance_matrix(param_dict), dim1=-2, dim2=-1))
     
 # === This is the actual network structure ===
 class Parameterizer(nn.Module):
+    """Shared-then-headed parameter network for distribution parameters.
+
+    Builds one shared representation block and per-parameter heads (e.g. `mu`,
+    `sigma`) producing outputs for each requested distribution parameter.
+
+    Attributes:
+        dist_parameters: Ordered names of predicted distribution parameters.
+        num_neurons: Width of shared hidden representation.
+        shared_block: Shared feature extractor block.
+        param_heads: Per-parameter prediction heads.
+    """
     def __init__(self,
                  input_dim,
                  output_dim,
@@ -312,7 +491,22 @@ class Parameterizer(nn.Module):
                  batch_norm=False,
                  resnets=True,
                  block_type='MLP',
-                 **_):
+                 **_) -> None:
+        """Initialize parameterizer network.
+
+        Args:
+            input_dim: Input dimensionality.
+            output_dim: Output size or per-parameter output mapping.
+            dist_parameters: Names of output distribution parameters.
+            num_hidden_layers: Number of hidden layers in blocks.
+            num_neurons: Hidden width.
+            dropout: Whether to use dropout.
+            dropout_rate: Dropout probability.
+            batch_norm: Whether to use normalization.
+            resnets: Whether to enable residual connections in blocks.
+            block_type: Block backend type (`MLP`, `Conv1D`, etc.).
+            **_: Unused compatibility kwargs.
+        """
         super(Parameterizer, self).__init__()
         self.dist_parameters = dist_parameters
         self.num_neurons = num_neurons
@@ -361,20 +555,59 @@ class Parameterizer(nn.Module):
                         type=block_type
                     )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Predict all requested distribution parameters.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Dictionary mapping each parameter name to predicted tensor.
+        """
         h = self.shared_block(x)
         param_dict = {}
         for param in self.dist_parameters:
             param_dict[param] = self.param_heads[param](h)
         return param_dict
         
-    def _num_parameters(self):
+    def _num_parameters(self) -> int:
+        """Count trainable parameters.
+
+        Returns:
+            Number of trainable parameters.
+        """
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 class NNBlock(nn.Module):
+    """Configurable neural network block with optional residual connection.
+
+    Supports several layer backends (`MLP`, `Conv1D`, `LSTM`, `Transformer`) and
+    composes input, hidden, and output sub-blocks.
+
+    Attributes:
+        input_dim: Input dimensionality.
+        output_dim: Output dimensionality.
+        num_neurons: Hidden width.
+        resnet: Whether to add residual connection.
+        layer_type: Backend layer family.
+    """
     def __init__(self, input_dim, output_dim, num_neurons=128, dropout=False, 
                  dropout_rate=0.2, batch_norm=False,num_hidden_layers=2, 
                  resnet=True, type='MLP', **_):
+        """Initialize NN block.
+
+        Args:
+            input_dim: Input dimensionality.
+            output_dim: Output dimensionality.
+            num_neurons: Hidden layer width.
+            dropout: Whether to use dropout.
+            dropout_rate: Dropout probability.
+            batch_norm: Whether to include normalization layers.
+            num_hidden_layers: Number of hidden layers.
+            resnet: Whether to use residual connection.
+            type: Backend type (`MLP`, `Conv1D`, `LSTM`, `Transformer`).
+            **_: Unused compatibility kwargs.
+        """
         super(NNBlock, self).__init__()
         self.resnet = resnet
         self.input_dim = input_dim
@@ -396,7 +629,15 @@ class NNBlock(nn.Module):
         else:
             self.residual_proj = None
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run block forward pass with optional residual connection.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Output tensor.
+        """
         h = self.input_layer(x)
         h = self.hidden_layer(h)
         out = self.output_layer(h)
@@ -416,10 +657,20 @@ class NNBlock(nn.Module):
         else:
             return out
     
-    def _num_parameters(self):
+    def _num_parameters(self) -> int:
+        """Count trainable parameters.
+
+        Returns:
+            Number of trainable parameters.
+        """
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
-    def _build_input_layer(self):
+    def _build_input_layer(self) -> nn.Sequential:
+        """Build input sub-layer stack.
+
+        Returns:
+            Sequential module for input projection.
+        """
         if self.layer_type == 'MLP':
             layers = [nn.Linear(self.input_dim, self.num_neurons), nn.ReLU()]
         elif self.layer_type == 'Conv1D':
@@ -436,7 +687,13 @@ class NNBlock(nn.Module):
         if self.dropout:
             layers.append(nn.Dropout(self.dropout_rate * 0.5))  # Less dropout in the first layer
         return nn.Sequential(*layers)
-    def _build_hidden_layer(self):
+
+    def _build_hidden_layer(self) -> nn.Sequential:
+        """Build hidden sub-layer stack.
+
+        Returns:
+            Sequential module for hidden processing.
+        """
         layers = []
         for _ in range(self.num_hidden_layers):
             if self.layer_type == 'MLP':
@@ -459,7 +716,13 @@ class NNBlock(nn.Module):
             if self.dropout:
                 layers.append(nn.Dropout(self.dropout_rate))
         return nn.Sequential(*layers)
-    def _build_output_layer(self):
+
+    def _build_output_layer(self) -> nn.Sequential:
+        """Build output sub-layer stack.
+
+        Returns:
+            Sequential module mapping hidden state to final output.
+        """
         if self.layer_type == 'MLP':
             layers = [nn.Linear(self.num_neurons, self.output_dim)] 
         elif self.layer_type == 'Conv1D':
@@ -473,7 +736,18 @@ class NNBlock(nn.Module):
         return nn.Sequential(*layers)
     
     
-def get_encoder_model(input_dim, latent_dim, type, **kwargs):
+def get_encoder_model(input_dim: int, latent_dim: int, type: str, **kwargs) -> torch.nn.Module:
+    """Factory for encoder coder module.
+
+    Args:
+        input_dim: Input dimensionality.
+        latent_dim: Latent dimensionality.
+        type: Encoder family (`dictionary` or gaussian fallback).
+        **kwargs: Extra kwargs forwarded to coder constructor.
+
+    Returns:
+        Instantiated encoder module.
+    """
     if type == "dictionary":
         return DictionaryCoder(
             input_dim=input_dim,
@@ -487,7 +761,20 @@ def get_encoder_model(input_dim, latent_dim, type, **kwargs):
             learn_sigma=True,
             **kwargs
         )
-def get_decoder_model(latent_dim, output_dim, type, **kwargs):
+
+
+def get_decoder_model(latent_dim: int, output_dim: int, type: str, **kwargs) -> torch.nn.Module:
+    """Factory for decoder coder module.
+
+    Args:
+        latent_dim: Latent input dimensionality.
+        output_dim: Output dimensionality.
+        type: Decoder family (`dictionary` or gaussian fallback).
+        **kwargs: Extra kwargs forwarded to coder constructor.
+
+    Returns:
+        Instantiated decoder module.
+    """
     if type == "dictionary":
         return DictionaryCoder(
             input_dim=latent_dim,

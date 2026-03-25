@@ -4,6 +4,7 @@ import json
 import torch
 import torch.nn as nn
 from datetime import datetime
+from typing import Any
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -11,27 +12,58 @@ sys.path.append(parent_dir)
 
 from data.conditioner import Conditioner
 from visualization.writer import Writer
+
+
 class GAN(nn.Module):
     """
     A WGAN-GP implementation for time series data.
     The generator takes noise and optional conditions to produce synthetic time series data.
     The discriminator evaluates the authenticity of the generated data, optionally conditioned on the same information.
     
-    Based on Gulrajani et al., "Improved Training of Wasserstein GANs" (https://arxiv.org/abs/1704.00028)"""
+    Based on Gulrajani et al., "Improved Training of Wasserstein GANs" (https://arxiv.org/abs/1704.00028)
+    
+    Attributes: 
+        input_dim: Dimensionality of the input time series (e.g., flattened window size)
+        noise_dim: Dimensionality of the noise vector fed to the generator
+        conditioner: Optional Conditioner instance for providing conditioning information
+        generator_hidden: List of hidden layer sizes for the generator MLP
+        discriminator_hidden: List of hidden layer sizes for the discriminator MLP
+        n_critic: Number of discriminator updates per generator update
+        gp_lambda: Gradient penalty coefficient for WGAN-GP
+        dropout: Dropout rate for both networks
+        use_spectral_norm: Whether to apply spectral normalization to discriminator layers
+        device: Target device for model parameters and computations
+    """
     def __init__(self,
                  input_dim: int = 24,
                  *,
                  noise_dim: int = 32,
-                 conditioner: Conditioner = None,
-                 generator_hidden: list = None,
-                 discriminator_hidden: list = None,
+                 conditioner: Conditioner | None = None,
+                 generator_hidden: list[int] | None = None,
+                 discriminator_hidden: list[int] | None = None,
                  n_critic: int = 5,
                  gp_lambda: float = 10.0,
                  dropout: float = 0.1,
                  use_spectral_norm: bool = True,
                  device: str = "cpu",
                  **_,
-    ):
+    ) -> None:
+        """
+        Initialize a WGAN-GP model for (optionally conditioned) time-series generation.
+
+        Args:
+            input_dim: Flattened dimensionality of a single input sample.
+            noise_dim: Dimensionality of latent noise sampled for the generator.
+            conditioner: Optional condition manager that returns side-information tensors.
+            generator_hidden: Hidden layer sizes for the generator MLP.
+            discriminator_hidden: Hidden layer sizes for the discriminator MLP.
+            n_critic: Number of discriminator updates per generator update.
+            gp_lambda: Gradient penalty coefficient.
+            dropout: Dropout probability used in both networks.
+            use_spectral_norm: Whether to apply spectral normalization in discriminator.
+            device: Initial device string.
+            **_: Extra unused kwargs for API compatibility.
+        """
         super().__init__()
         self.input_dim = input_dim
         self.noise_dim = noise_dim
@@ -73,13 +105,34 @@ class GAN(nn.Module):
             "use_spectral_norm": use_spectral_norm,
         }
 
-    def _prep_inpiuts(self, x: torch.Tensor) -> torch.Tensor:
-        """ Flatten [B, L, F] -> [B, D]"""
+    def _prep_inpiuts(self, 
+                      x: torch.Tensor) -> torch.Tensor:
+        """
+        Flatten [B, L, F] -> [B, D]
+
+        Args: 
+            x: Input tensor of shape [B, L, F] or [B, D]
+        
+        Returns:
+            Flattened tensor of shape [B, D]
+        """
         if x.ndim == 3:
             return x.reshape(x.shape[0], -1)
         return x
     
-    def move_to_device(self,batch, device = None):
+    def move_to_device(self,
+                       batch: torch.Tensor | list | tuple | dict,
+                       device: str | torch.device | None = None) -> torch.Tensor | list | tuple | dict:
+        """
+        Move batch tensors to the specified device while preserving container structure.
+
+        Args:
+            batch: Tensor, list/tuple of items, or dict of items.
+            device: Target device. Defaults to `self.device`.
+
+        Returns:
+            Batch object with any tensor values moved to the target device.
+        """
         device = device or self.device
         if torch.is_tensor(batch):
             return batch.to(device)
@@ -89,19 +142,56 @@ class GAN(nn.Module):
             return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
         return batch
     
-    def _sample_noise(self, bathc_size: int, device = None) -> torch.Tensor:
-        """ Sample noise from a standard normal distribution."""
+    def _sample_noise(self, 
+                      batch_size: int, 
+                      device: str | torch.device | None = None) -> torch.Tensor:
+        """
+        Sample noise from a standard normal distribution.
+
+        Args: 
+            batch_size: Number of noise samples to generate
+            device: Target device for the noise tensor
+
+        Returns:
+            Noise tensor of shape [batch_size, noise_dim]
+        """
         device = device or self.device
-        return torch.randn(bathc_size, self.noise_dim, device=device)
+        return torch.randn(batch_size, self.noise_dim, device=device)
     
-    def _get_conditions(self, x, meter_id, timestamps):
+    def _get_conditions(self, 
+                        x: torch.Tensor,
+                        meter_id: torch.Tensor | None = None,
+                        timestamps: torch.Tensor | None = None) -> torch.Tensor | None:
+        """
+        Get condition tensor from the conditioner module, if available. Returns None if no conditioner is used.
+        
+        Args:
+            x: Input tensor of shape [B, L, F] or [B, D] (used for any conditioning based on input features)
+            meter_id: Tensor of shape [B] containing meter IDs for each instance (used for meter-based conditioning)
+            timestamps: Tensor of shape [B] containing timestamps for each instance (used for time-based conditioning)
+
+        Returns:
+            Condition tensor of shape [B, condition_dim] or None if no conditioner is used
+        """
         if self.conditioner is None:
             return None
         return self.move_to_device(self.conditioner.get_conditions(meter_id, timestamps))
     
-    def _gradient_penalty(self, x_real: torch.Tensor, x_fake: torch.Tensor,
-                          conditions: torch.Tensor = None) -> torch.Tensor:
-        """ Compute the gradient penalty for WGAN-GP."""
+    def _gradient_penalty(self, 
+                          x_real: torch.Tensor, 
+                          x_fake: torch.Tensor,
+                          conditions: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Compute the gradient penalty for WGAN-GP.
+        
+        Args: 
+            x_real: [B, D] real samples
+            x_fake: [B, D] generated samples
+            conditions: [B, condition_dim] conditioning tensor (or None)
+
+        Returns:
+            Scalar tensor representing the gradient penalty
+        """
         B = x_real.size(0)
         alpha = torch.rand(B, 1, device=x_real.device)
         x_interp = (alpha * x_real + (1 - alpha) * x_fake).requires_grad_(True)
@@ -119,7 +209,25 @@ class GAN(nn.Module):
         gp = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
         return gp
     
-    def train_core(self, batch, optim_g, optim_d, step: int = 0, **_):
+    def train_core(self,
+                   batch: torch.Tensor | list | tuple | dict,
+                   optim_g: torch.optim.Optimizer,
+                   optim_d: torch.optim.Optimizer,
+                   step: int = 0,
+                   **_) -> dict[str, float]:
+        """
+        Run one GAN training step (with multiple critic updates).
+
+        Args:
+            batch: Training batch in tensor/list/tuple/dict format.
+            optim_g: Optimizer for generator parameters.
+            optim_d: Optimizer for discriminator parameters.
+            step: Global step counter.
+            **_: Extra unused kwargs for API compatibility.
+
+        Returns:
+            Dictionary of scalar training metrics.
+        """
         
         self.train()
 
@@ -179,8 +287,23 @@ class GAN(nn.Module):
         }
     
     @torch.no_grad()
-    def validate(self, valloader, num_samples: int = 1, beta: float = 1.0, device: str = "cpu"):
-        """ Wasserstein distance between real and generated distributions on the validation set."""
+    def validate(self,
+                 valloader: torch.utils.data.DataLoader,
+                 num_samples: int = 1,
+                 beta: float = 1.0,
+                 device: str = "cpu") -> dict[str, float]:
+        """
+        Compute validation metrics using Wasserstein distance on held-out data.
+
+        Args:
+            valloader: Validation dataloader.
+            num_samples: Unused; kept for API compatibility.
+            beta: Unused; kept for API compatibility.
+            device: Target device for inference.
+
+        Returns:
+            Dictionary containing validation loss-style metrics.
+        """
         self.eval()
         total_wd = 0.0
         total_loss_d = 0.0
@@ -256,11 +379,23 @@ class GAN(nn.Module):
         return samples.unsqueeze(1) # [S, 1, B, D]
     
     @torch.no_grad()
-    def reconstruct(self, x: torch.Tensor, meter_ids: torch.Tensor = None, timestamps: torch.Tensor = None,
-                    num_samples: int = 1):
-        """ GANs don't reconstruct approximate by finding closest generation.
-        For evaluation compatibility, we encode via the discriminator features
-        and regenerate. This is a rough proxy. Mostly for full comparisons to work
+    def reconstruct(self,
+                    x: torch.Tensor,
+                    meter_ids: torch.Tensor | None = None,
+                    timestamps: torch.Tensor | None = None,
+                    num_samples: int = 1) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        """
+        Approximate reconstruction by selecting nearest generated samples.
+
+        Args:
+            x: Input tensor to approximate reconstruction for.
+            meter_ids: Optional meter IDs used by conditioner.
+            timestamps: Optional timestamps used by conditioner.
+            num_samples: Number of reconstruction samples requested (used to set search budget).
+
+        Returns:
+            Tuple of `(recon_params, aux)` where `recon_params` includes `mu` and
+            `aux` is an empty compatibility dictionary.
         """
         self.eval()
         x_flat = self._prep_inputs(x)
@@ -291,37 +426,78 @@ class GAN(nn.Module):
         recon_params = {"mu": best_recon.unsqueeze(0)}  # [1, B, D]
         return recon_params, {}
     
-    def get_optimizers(self, lr_g: float = 1e-4, lr_d: float = 1e-4,
-                       weight_decay: float = 1e-4, betas: tuple = (0.0, 0.9)):
-        """ Return separate optimizers for generator and discriminator.
-        WGAN-GP typically use ADAM"""
+    def get_optimizers(self,
+                       lr_g: float = 1e-4,
+                       lr_d: float = 1e-4,
+                       weight_decay: float = 1e-4,
+                       betas: tuple[float, float] = (0.0, 0.9)) -> tuple[torch.optim.Optimizer, torch.optim.Optimizer]:
+        """
+        Create separate Adam optimizers for generator and discriminator.
+
+        Args:
+            lr_g: Generator learning rate.
+            lr_d: Discriminator learning rate.
+            weight_decay: Weight decay for both optimizers.
+            betas: Adam beta coefficients.
+
+        Returns:
+            Tuple of `(optim_g, optim_d)`.
+        """
         optim_g = torch.optim.Adam(self.generator.parameters(), lr=lr_g, betas=betas, weight_decay=weight_decay)
         optim_d = torch.optim.Adam(self.discriminator.parameters(), lr=lr_d, betas=betas, weight_decay=weight_decay)    
         return optim_g, optim_d
     
     def fit(
             self,
-            trainloader,
-            valloader = None,
-            lr=1e-4,
+            trainloader: torch.utils.data.DataLoader,
+            valloader: torch.utils.data.DataLoader | None = None,
+            lr: float = 1e-4,
             lr_g: float = None,
             lr_d: float = None,
             weight_decay: float = 1e-4,
-            gradient_clip=None,
-            gradient_clip_kwargs=None,
-            lr_scheduler=False,
-            lr_scheduler_kwargs=None,
+            gradient_clip: Any = None,
+            gradient_clip_kwargs: dict[str, Any] | None = None,
+            lr_scheduler: bool = False,
+            lr_scheduler_kwargs: dict[str, Any] | None = None,
             num_epochs: int = 100,
-            validation_freq=1,
+            validation_freq: int = 1,
             device: str = "cpu",
-            early_stopping = True,
-            early_stopping_kwargs = None,
-            save_epoch_freq = 10,
-            writer=None,
-            log_dir='./models/',
-            n_critic=None,
+            early_stopping: bool = True,
+            early_stopping_kwargs: dict[str, Any] | None = None,
+            save_epoch_freq: int = 10,
+            writer: Writer | None = None,
+            log_dir: str = './models/',
+            n_critic: int | None = None,
             **_,
-    ):
+    ) -> tuple[str, Writer | None]:
+        """
+        Train GAN model with logging, validation, checkpointing, and early stopping.
+
+        Args:
+            trainloader: Training dataloader.
+            valloader: Optional validation dataloader.
+            lr: Default learning rate fallback for both optimizers.
+            lr_g: Generator learning rate override.
+            lr_d: Discriminator learning rate override.
+            weight_decay: Optimizer weight decay.
+            gradient_clip: Unused; kept for API compatibility.
+            gradient_clip_kwargs: Unused; kept for API compatibility.
+            lr_scheduler: Whether to enable step LR schedulers.
+            lr_scheduler_kwargs: Parameters for step LR scheduler.
+            num_epochs: Number of training epochs.
+            validation_freq: Validation frequency in epochs.
+            device: Target training device.
+            early_stopping: Whether to enable early stopping.
+            early_stopping_kwargs: Early stopping parameters.
+            save_epoch_freq: Checkpoint save frequency.
+            writer: Optional experiment writer.
+            log_dir: Base log directory.
+            n_critic: Optional override for discriminator update ratio.
+            **_: Extra unused kwargs for API compatibility.
+
+        Returns:
+            Tuple of `(model_tag, writer)`.
+        """
         from src.models.model_utils import EarlyStopping
 
         if n_critic is not None:
@@ -481,7 +657,18 @@ class GAN(nn.Module):
 
         return model_tag, writer
 
-    def save_model(self, save_path="./models/", model_name="gan_model", device="cpu"):
+    def save_model(self,
+                   save_path: str = "./models/",
+                   model_name: str = "gan_model",
+                   device: str = "cpu") -> None:
+        """
+        Save model checkpoint including architecture metadata and conditioner state.
+
+        Args:
+            save_path: Directory where checkpoint is stored.
+            model_name: File stem for checkpoint.
+            device: Unused in save path; kept for API compatibility.
+        """
         os.makedirs(save_path, exist_ok=True)
         model_path = os.path.join(save_path, f"{model_name}.pt")
 
@@ -519,7 +706,14 @@ class GAN(nn.Module):
         torch.save(checkpoint, model_path)
         self.to(original_device)
 
-    def load_model(self, load_path, device="cpu"):
+    def load_model(self, load_path: str, device: str = "cpu") -> None:
+        """
+        Load model weights from a checkpoint file.
+
+        Args:
+            load_path: Path to checkpoint `.pt` file.
+            device: Device used for loading state dict.
+        """
         checkpoint = torch.load(load_path, map_location=device, weights_only=False)
         self.load_state_dict(checkpoint['model_state_dict'])
         self.to(device)
@@ -527,11 +721,26 @@ class GAN(nn.Module):
 
 class Generator(nn.Module):
     """
-    Maps [z, c] -> x_fake.
-    Architecture mirrors the VAE decoder: MLP with residual connections.
+    MLP generator that maps noise and optional conditions to synthetic samples.
+
+    Attributes:
+        noise_dim: Dimensionality of latent noise vector.
+        condition_dim: Dimensionality of optional condition vector.
+        output_dim: Output dimensionality of generated flattened sample.
+        net: Sequential MLP network producing generated samples.
     """
     def __init__(self, noise_dim: int, condition_dim: int, output_dim: int,
-                 hidden_dims: list = None, dropout: float = 0.1):
+                 hidden_dims: list[int] | None = None, dropout: float = 0.1) -> None:
+        """
+        Initialize generator network.
+
+        Args:
+            noise_dim: Size of latent input vector.
+            condition_dim: Size of condition vector concatenated to noise.
+            output_dim: Flattened output sample size.
+            hidden_dims: Hidden layer sizes.
+            dropout: Dropout probability.
+        """
         super().__init__()
         self.noise_dim = noise_dim
         self.condition_dim = condition_dim
@@ -557,23 +766,50 @@ class Generator(nn.Module):
         self.net = nn.Sequential(*layers)
     
     def forward(self, z: torch.Tensor, conditions: torch.Tensor = None) -> torch.Tensor:
-        """ Args:
-            z: [B, noise_dim]
-            conditions: [B, condition_dim] or None
-            """
+        """
+        Generate synthetic samples from noise and optional conditions.
+
+        Args:
+            z: Noise tensor of shape `[B, noise_dim]`.
+            conditions: Optional condition tensor of shape `[B, condition_dim]`.
+
+        Returns:
+            Generated samples of shape `[B, output_dim]`.
+        """
         inp = torch.cat([z, conditions], dim=-1) if conditions is not None else z
         return self.net(inp)
     
-    def _num_parameters(self):
+    def _num_parameters(self) -> int:
+        """
+        Count trainable parameters in generator.
+
+        Returns:
+            Number of trainable parameters.
+        """
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
 class Discriminator(nn.Module):
     """
-    Maps [x, c] -> real/fake score.
+    MLP critic that maps samples and optional conditions to Wasserstein scores.
+
+    Attributes:
+        input_dim: Dimensionality of flattened input sample.
+        condition_dim: Dimensionality of optional condition vector.
+        net: Sequential network outputting a scalar score per sample.
     """
     def __init__(self, input_dim: int, condition_dim: int, 
-                 hidden_dims: list = None, dropout: float = 0.1,
-                 use_spectral_norm: bool = True):
+                 hidden_dims: list[int] | None = None, dropout: float = 0.1,
+                 use_spectral_norm: bool = True) -> None:
+        """
+        Initialize discriminator network.
+
+        Args:
+            input_dim: Flattened input sample size.
+            condition_dim: Condition vector size.
+            hidden_dims: Hidden layer sizes.
+            dropout: Dropout probability.
+            use_spectral_norm: Whether to apply spectral norm to linear layers.
+        """
         super().__init__()
         self.input_dim = input_dim
         self.condition_dim = condition_dim
@@ -597,13 +833,24 @@ class Discriminator(nn.Module):
         layers.append(_maybe_sn(nn.Linear(prev_dim, 1)))  # Output a single score
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor, conditions: torch.Tensor = None) -> torch.Tensor:
-        """ Args:
-            x: [B, input_dim]
-            conditions: [B, condition_dim] or None
-            """
+    def forward(self, x: torch.Tensor, conditions: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Compute critic score for real or generated samples.
+
+        Args:
+            x: Input tensor of shape `[B, input_dim]`.
+            conditions: Optional conditions of shape `[B, condition_dim]`.
+
+        Returns:
+            Critic score tensor of shape `[B, 1]`.
+        """
         inp = torch.cat([x, conditions], dim=-1) if conditions is not None else x
         return self.net(inp)
     
-    def _num_parameters(self):
+    def _num_parameters(self) -> int:
+        """Count trainable parameters in discriminator.
+
+        Returns:
+            Number of trainable parameters.
+        """
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

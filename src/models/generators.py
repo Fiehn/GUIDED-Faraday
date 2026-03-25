@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from datetime import datetime, timedelta
+from typing import Any
 
 class SyntheticGenerator:
     """Called to generate synthetic samples from a trained model.
@@ -25,7 +26,19 @@ class SyntheticGenerator:
         _is_cvae: Boolean flag indicating if the model is a CVAE (i.e., has a conditioner).
     """
 
-    def __init__(self, model, conditioner=None, normalizer = None, device = 'cpu'):
+    def __init__(self,
+                 model: Any,
+                 conditioner: Any | None = None,
+                 normalizer: Any | None = None,
+                 device: str = 'cpu') -> None:
+        """Initialize synthetic sample generator.
+
+        Args:
+            model: Trained generative model exposing `sample` and optionally conditioner hooks.
+            conditioner: Optional explicit conditioner. Falls back to `model.conditioner`.
+            normalizer: Optional normalizer used for inverse scaling.
+            device: Device string for generation (`cpu` or `cuda`).
+        """
         self.model = model
         self.conditioner = conditioner if conditioner is not None else getattr(model, 'conditioner', None)
         self.normalizer = normalizer
@@ -47,7 +60,7 @@ class SyntheticGenerator:
             new_conditions (Optional[torch.Tensor]): Tensor of new conditions to use for reconstruction of shape `(batch_size, num_conditions)`.
                             If None, original conditions from the model will be used.
         Returns:
-            Reconstructed data tensor of shape `(num_reconstructions, batch_size, 24, num_features)` in original scale.
+            Reconstructed data tensor shaped `(num_reconstructions, batch_size, 24, num_features)`.
         """
         self.model.eval()
         self.model.to(self.device)
@@ -168,7 +181,7 @@ class SyntheticGenerator:
         start_date: datetime,
         num_candidates: int = 32,
         continuity_weight: float = 1.0,
-        conditions = None
+        conditions: torch.Tensor | None = None
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Samples continuous multi-day sequences by sampling multiple candidates for each day and selecting the one that best continues from the previous day, ensuring smoother transitions at day boundaries.
 
@@ -217,7 +230,14 @@ class SyntheticGenerator:
         return output, conditions
 
     def _sample_window(self, conditions: torch.Tensor) -> torch.Tensor:
-        """ Sample a single 24-hour window given the conditions. Returns a tensor of shape [24, num_features]."""
+        """Sample one 24-hour window for the provided conditions.
+
+        Args:
+            conditions: Condition tensor of shape `(1, num_conditions)`.
+
+        Returns:
+            Tensor shaped `(24, num_features)`.
+        """
         # TODO: make sure this can be used by VAE as well
         samples = self.model.sample(
             conditions=conditions,
@@ -279,14 +299,19 @@ class SyntheticGenerator:
         best_idx = torch.argmin(total_cost)
         return candidates[best_idx]
     
-    def _build_conditions(self, meter_id: int, timestamp: datetime, random_condition: bool = False) -> torch.Tensor:
-        """Build conditions tensor for generation based on meter_id and timestamp. If random_condition is True, it will ignore meter_id and timestamp and return random conditions.
+    def _build_conditions(self, meter_id: int | None, timestamp: datetime | None, random_condition: bool = False) -> torch.Tensor:
+        """Build condition tensor for a single generation request.
+
+        If `random_condition` is True, meter and timestamp are ignored and random
+        condition vectors are produced from the conditioner.
+
         Args:
-            meter_id (int): Meter ID for user-profile conditioning.
-            timestamp (datetime): Timestamp for time-based conditioning.
-            random_condition (bool): If True, ignore meter_id and timestamp and return random conditions.
+            meter_id: Meter ID for user-profile conditioning.
+            timestamp: Timestamp for time-based conditioning.
+            random_condition: Whether to sample random conditions instead.
+
         Returns:
-            torch.Tensor: Conditions tensor of shape `(1, num_conditions)`.
+            Condition tensor of shape `(1, num_conditions)`.
         """
         if random_condition:
             return self.conditioner.get_random_conditions(batch_size=1).to(self.device)
@@ -299,7 +324,10 @@ class SyntheticGenerator:
         )  # [B, C]
         return conditions.to(self.device)
 
-    def _estimate_candidates_needed(test_loader, normalizer = None, target_gap_kwh: float = 0.5):
+    @staticmethod
+    def _estimate_candidates_needed(test_loader: torch.utils.data.DataLoader,
+                                    normalizer: Any | None = None,
+                                    target_gap_kwh: float = 0.5) -> int:
         """
         Estimate how many candidate samples are needed to find a smooth
         midnight transition, based on the empirical variance at hour 23 and 0.

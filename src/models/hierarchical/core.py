@@ -7,26 +7,26 @@ from .levels import StrategyRegistry
 from .aggregation import ConcatAggregation, SumAggregation, GatedAggregation, AttentionAggregation, _AGGREGATION_STRATEGIES
 
 class HierarchicalLatentModule(nn.Module):
-    """
-    Modular hierarchical latent variable module that can be flexibly configured with different strategies at each level,
-    optional top-down context, and various aggregation methods to combine the levels into a single representation.
+    """Hierarchical latent block with configurable level strategies.
 
-    usage:
-        # In VAE model __init__:
-        if hierarchy_config is not None:
-            self.hierarchical_latent = HierarchicalLatentModule(hierarchy_config, encoder_latent_dim)
-        
-        # In VAE model forward:
-        z = self.encoder.reparameterize(q_params, num_samples).sqeeze(1)  # [B, encoder_latent_dim]
-        if self.hierarchical_latent is not None:
-            hier_results = self.hierarchical_latent(z)
-            z = hier_results["z"]  # [B, output_dim]
-            hierachy_loss = hier_results["loss"]  # scalar
-        else:
-            hier_results = None
-            hierachy_loss = torch.tensor(0.0, device=z.device)
+    The module builds multiple latent-processing levels from
+    ``HierarchicalConfig``, optionally applies top-down context and residual
+    links, and aggregates active levels into a single latent representation.
     """
+
     def __init__(self, config: HierarchicalConfig, encoder_latent_dim: int):
+        """Initialize hierarchical latent module.
+
+        Args:
+            config: Hierarchical model configuration describing all levels and
+                global aggregation/training options.
+            encoder_latent_dim: Dimension of encoder latent input passed to each
+                level.
+
+        Raises:
+            ValueError: If no levels are provided or aggregation strategy is
+                unknown.
+        """
         super().__init__()
         self.config = config
         self.encoder_latent_dim = encoder_latent_dim
@@ -79,18 +79,21 @@ class HierarchicalLatentModule(nn.Module):
         self.aggregator = agg_cls(level_dims, out_dim)
 
     def forward(self, z_enc: torch.Tensor, active_levels: Optional[list] = None,) -> dict:
-        """
+        """Run hierarchical processing and aggregate active levels.
+
         Args:
-            z_enc: [B, encoder_latent_dim] Latent representation from the encoder
-            active_levels: Optional list of level indices to activate (for ablation). If None, use all levels.
+            z_enc: Latent tensor from encoder with shape
+                ``[batch_size, encoder_latent_dim]``.
+            active_levels: Optional list of level indices to execute (e.g., for
+                ablations). If ``None``, all levels are used.
+
         Returns:
-            dict with keys:
-            - "z": [B, output_dim] Aggregated latent representation from all levels
-            - "loss": Total Heirarchical latent loss (scalar)
-            - "level_outputs": List of dicts for each level with keys:
-                - "z": [B, latent_dim] This level's latent representation
-                - "loss": This level's regularization loss (scalar)
-                - "params": Any distributional parameters for this level (for logging/analysis)
+            Dictionary with keys:
+            - ``"z"``: Aggregated latent tensor of shape
+              ``[batch_size, output_dim]``.
+            - ``"loss"``: Weighted scalar hierarchical loss.
+            - ``"level_outputs"``: Per-level dictionaries for active levels,
+              each containing ``"z"``, ``"loss"``, and ``"params"``.
         """
         if active_levels is None:
             active_levels = list(range(self.num_levels))
@@ -138,8 +141,11 @@ class HierarchicalLatentModule(nn.Module):
         }
     
     def get_level_info(self):
-        """
-        Utility for logging/debugging: returns a list of dicts with info about each level's configuration.
+        """Return per-level configuration and parameter-count summary.
+
+        Returns:
+            List of dictionaries with level index, strategy metadata, and
+            parameter counts for logging/debugging.
         """
         return [
             {

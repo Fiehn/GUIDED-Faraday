@@ -18,10 +18,19 @@ from data.normalizer import Normalizer
 
 
 def map_meter_ids_to_feeder_ids(
-    meter_ids: Sequence,
-    meter_to_feeder: dict[str, Optional[str]],
-) -> np.ndarray:
-    """Map a sequence of meter ids to feeder ids using a pre-loaded mapping."""
+                                meter_ids: Sequence,
+                                meter_to_feeder: dict[str, Optional[str]],
+                                ) -> np.ndarray:
+    """
+    Map a sequence of meter ids to feeder ids using a pre-loaded mapping.
+    
+    Args: 
+        meter_ids: A sequence of meter identifiers to be mapped.
+        meter_to_feeder: A dictionary mapping meter identifiers (as strings) to feeder identifiers.
+    
+    Returns:
+        A numpy array of feeder identifiers corresponding to the input meter_ids. If a meter_id does not have a mapping, None is used.
+    """
     feeder_ids = []
     for meter in meter_ids:
         if isinstance(meter, np.generic):
@@ -33,9 +42,10 @@ def map_meter_ids_to_feeder_ids(
 class SmartMeterCSV:
     """
     Loads and preprocesses SM data from CSV into a MultiIndex DataFrame:
-
-    index: (meter_number, timestamp_utc). 
-    columns include consumption/production. 
+    
+    Attributes: 
+        index: (meter_number, timestamp_utc). 
+        columns include consumption/production. 
     """
 
     def __init__(
@@ -57,8 +67,11 @@ class SmartMeterCSV:
 
         self.df: Optional[pd.DataFrame] = None
 
-    def load(self, filename: str) -> pd.DataFrame:
-        """Load CSV (or a Parquet cache thereof) into a MultiIndex DataFrame.
+    def load(self, 
+             filename: str
+             ) -> pd.DataFrame:
+        """
+        Load CSV (or a Parquet cache thereof) into a MultiIndex DataFrame.
 
         On the first call the 3 GB CSV is chunk-read and written to a
         _parquet_cache/<stem>.parquet file (zstd-compressed
@@ -66,6 +79,12 @@ class SmartMeterCSV:
         call simply reads the Parquet file, skipping the expensive CSV
         parse entirely.  The cache is invalidated automatically whenever
         the source CSV is newer than the cached file.
+
+        Args: 
+            filename: The name of the CSV file to load (should be located in data_dir).
+       
+         Returns:
+            A pandas DataFrame with a MultiIndex of (meter_id, timestamp_dst) and columns for the specified value_cols.
         """
         path = os.path.join(self.data_dir, filename)
         if not os.path.exists(path):
@@ -123,16 +142,36 @@ class SmartMeterCSV:
 
     # returns all unique meter IDs in the index
     def meter_ids(self) -> List[int]:
+        """
+        Get a list of all unique meter IDs present in the loaded DataFrame.
+        
+        Returns:
+            A list of unique meter identifiers extracted from the DataFrame index.
+        """
         self._require_loaded()
         return self.df.index.get_level_values(self.meter_col).unique().tolist()
 
     # returns DataFrame for a single meter ID
-    def meter_frame(self, meter_id: int) -> pd.DataFrame:
+    def meter_frame(self,
+                     meter_id: int) -> pd.DataFrame:
+        """
+        Get a DataFrame containing all rows for a specific meter ID, sorted by timestamp.
+        
+        Args: 
+            meter_id: The identifier of the meter for which to retrieve the data.
+        
+        Returns:
+            A pandas DataFrame containing all rows for the specified meter ID, indexed by timestamp and sorted in ascending order.
+        """
         self._require_loaded()
         return self.df.xs(meter_id, level=self.meter_col).sort_index()
 
     # prints basic stats
     def examine(self) -> None:
+        """
+        Print basic information about the loaded DataFrame, including data types, summary statistics, and missing value counts.
+        This method requires that the data has been loaded into the DataFrame. If the data is not loaded, it will raise a ValueError.
+        """
         self._require_loaded()
         print("Data Info:")
         print(self.df.info())
@@ -142,6 +181,12 @@ class SmartMeterCSV:
         print(self.df.isnull().sum())
 
     def _require_loaded(self) -> None:
+        """
+        Utility method to check if the DataFrame has been loaded before performing operations that require data access.
+        
+        Raises:
+            ValueError: If the DataFrame is not loaded (i.e., self.df is None).
+        """
         if self.df is None:
             raise ValueError("Data not loaded. Call .load(filename) first.")
 
@@ -150,6 +195,9 @@ class SmartMeterCSV:
 # Dataset: sliding windows per meter
 @dataclass(frozen=True)
 class WindowSpec:
+    """
+    Specification for how to window the time series data for model input.
+    """
     input_len: int # length of input window - how many past hours go into the model as x
     stride: int = 1 # how many hours to move the window each step
 
@@ -158,7 +206,12 @@ class SmartMeterWindowDataset(Dataset):
     """
     Convert a single meter's time series into x. 
     Assumes regular hourly sampling, so if timestamps are missing, it still windows by row order.
-    x: [input_len, num_features]
+    
+    Attributes:
+        feature_cols: which columns to include in the x tensor (e.g. consumption, production)
+        window: how to slice the time series into windows (input_len, stride)
+        drop_nan_windows: whether to drop windows that contain any NaN values (default: True)
+        dtype: the torch dtype for the x tensor (default: torch.float32)
     """
 
     def __init__(
@@ -195,7 +248,18 @@ class SmartMeterWindowDataset(Dataset):
         self.starts = self._compute_starts(drop_nan_windows)
         
     # determines which window start positions are allowed
-    def _compute_starts(self, drop_nan: bool) -> np.ndarray:
+    def _compute_starts(self, 
+                        drop_nan: bool) -> np.ndarray:
+        """
+        Compute the valid starting indices for sliding windows based on the window specification and NaN handling.
+        The method calculates the total number of time steps (T) in the meter's data and determines the maximum valid starting index for a window of the specified input length (L). It then generates potential starting indices based on the stride. If drop_nan is True, it filters out any starting indices where the corresponding window contains NaN values.
+
+        Args:
+            drop_nan: A boolean flag indicating whether to exclude windows that contain any NaN values.
+
+        Returns:
+            A numpy array of valid starting indices for the sliding windows. If drop_nan is True, only indices corresponding to windows without NaN values are included.
+        """
         T = self.values.shape[0]
         L = self.window.input_len
         stride = self.window.stride
@@ -218,7 +282,20 @@ class SmartMeterWindowDataset(Dataset):
         return len(self.starts)
 
     # get x at index idx so x: [B, input_len, F]
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(self, 
+                    idx: int) -> torch.Tensor:
+        """
+        Retrieve the input window (x), meter_id, and timestamp for a given index. The method calculates the starting index for the window based on the pre-computed valid starting positions. It then slices the values tensor to extract the window of data corresponding to the input length specified in the WindowSpec. The method also retrieves the meter_id and the timestamp corresponding to the start of the window.
+        
+        Args:
+            idx: The index of the window to retrieve. This index corresponds to the position in the list of valid starting indices for the sliding windows.
+        
+        Returns:
+            A tuple containing:
+                - x: A tensor of shape [input_len, F] representing the input window of features for the specified index.
+                - meter_id: A tensor containing the meter identifier associated with the window.
+                - timestamp_unix: A tensor containing the Unix timestamp corresponding to the start of the window.
+        """
         s = int(self.starts[idx])
         L = self.window.input_len
         x = self.values[s : s + L]
@@ -232,6 +309,21 @@ class SmartMeterDataModule:
     """
     Loads/preprocesses data, then splits meters into train/val/test and creates window datasets + dataloaders. 
     Split is done by meter_id.
+    
+    Attributes: 
+        loader: SmartMeterCSV instance for loading/parsing CSV data into DataFrames
+        filename: which CSV file to load (should be located in loader's data_dir)
+        feature_cols: which columns to include in the x tensor (e.g. consumption, production)
+        window: how to slice the time series into windows (input_len, stride)
+        batch_size: how many windows per batch in the DataLoader
+        num_workers: how many subprocesses to use for data loading in the DataLoader
+        shuffle_train: whether to shuffle the training data in the DataLoader
+        seed: random seed for reproducibility of train/val/test split
+        train_frac: fraction of meters to use for training (default: 0.8)
+        val_frac: fraction of meters to use for validation (default: 0.1)
+        max_meters: optional limit on number of meters to load (for quick testing/debugging)
+        normalizer: optional Normalizer instance to fit on training data and apply to all splits
+        conditioner: optional Conditioner instance to fit on training data and apply to all splits
     """
 
     def __init__(
@@ -280,6 +372,9 @@ class SmartMeterDataModule:
         self._test_ds = None
 
     def setup(self) -> None:
+        """
+        Load and preprocess the data, then split meters into train/val/test and create window datasets for each split.
+        """
         self.loader.load(self.filename)
         meter_ids = self.loader.meter_ids()
 
@@ -323,7 +418,9 @@ class SmartMeterDataModule:
         gc.collect()
 
     def _yield_train_batches(self):
-        """Yields batches of preprocessed (x, meter_id, timestamps) for training data."""
+        """
+        Yields batches of preprocessed (x, meter_id, timestamps) for training data.
+        """
         L = self.window.input_len
         for mid in self.train_ids:
             meter_df = self.loader.meter_frame(mid)
@@ -362,11 +459,10 @@ class SmartMeterDataModule:
                 yield x_windows[i:i+self.batch_size], meter_t[i:i+self.batch_size], times_t[i:i+self.batch_size]
 
     def _fit_conditioner(self):
-        """Fit conditioner on training meters only, streamed one meter at a time.
-
+        """
+        Fit conditioner on training meters only, streamed one meter at a time.
         If the conditioner is already fitted (e.g. pre-fitted across multiple
         files) this method is a no-op, so the existing state is preserved.
-
         """
         if self.conditioner is None or "user_profile" not in self.conditioner.get_condition_tags():
             return  # nothing to fit
@@ -388,7 +484,8 @@ class SmartMeterDataModule:
             user_profiler.fit(StreamLoader(self))
 
     def _fit_normalizer(self):
-        """Fit normalizer on training meters only, streamed one meter at a time.
+        """
+        Fit normalizer on training meters only, streamed one meter at a time.
 
         If the normalizer is already fitted (e.g. pre-fitted across multiple
         files via fit_normalizer_on_files()) this method is a no-op, so the
@@ -427,13 +524,25 @@ class SmartMeterDataModule:
                 raise ValueError("No training data available to fit normalizer.")
             self.normalizer.fit(np.concatenate(all_values, axis=0))
 
-    def _make_dataset(self, meter_ids) -> TensorDataset:
-        """Pre-compute all windows for the given meters into a single TensorDataset.
+    def _make_dataset(self, 
+                      meter_ids: Sequence[int]) -> TensorDataset:
+        """
+        Pre-compute all windows for the given meters into a single TensorDataset.
 
         Pre-flattening means __getitem__ is an O(1) tensor index rather than
         an O(log N_meters) binary search through a ConcatDataset offset list.
         All windows are held in RAM, but their total size is small compared
         to the raw CSV (float32 windows only; no duplicate timestamp storage).
+
+        Args: 
+            meter_ids: A sequence of meter identifiers for which to create the dataset.
+        
+        Returns:
+            A TensorDataset containing all valid windows for the specified meters, along with their corresponding meter IDs and timestamps. The dataset will have the following structure:
+                - x: A tensor of shape [N, input_len, F] containing the input windows for all meters.
+                - meter_id: A tensor of shape [N] containing the meter identifiers corresponding to each window.
+                - timestamp_unix: A tensor of shape [N] containing the Unix timestamps corresponding to the start of each window.
+                - conditions (optional): If a conditioner is provided, an additional tensor of shape [N, condition_dim] containing the conditions for each window.
         """
         L = self.window.input_len
         F = len(self.feature_cols)
@@ -521,9 +630,21 @@ class SmartMeterDataModule:
         return TensorDataset(*tensors)
 
     def get_normalizer(self):
+        """
+        Get the fitted normalizer instance, if available. This can be used to access the normalizer's parameters or apply the same normalization to new data outside of the DataModule.
+        
+        Returns:
+            The normalizer instance that was fitted on the training data, or None if no normalizer was provided or fitted. The normalizer should have a transform() method that can be applied to new data using the same parameters as were used for the training data.
+        """
         return self.normalizer
 
     def train_dataloader(self) -> DataLoader:
+        """
+        Create a DataLoader for the training dataset with the specified batch size, shuffling, and number of workers. The DataLoader will yield batches of (x, meter_id, timestamp) for the training data.
+        
+        Returns:
+            A DataLoader instance for the training dataset, configured with the specified batch size, shuffling, and number of workers. The DataLoader will yield batches of (x, meter_id, timestamp) for the training data.
+        """
         return DataLoader(
             self._train_ds,
             batch_size         = self.batch_size,
@@ -534,6 +655,13 @@ class SmartMeterDataModule:
         )
 
     def val_dataloader(self) -> DataLoader:
+        """
+        Create a DataLoader for the validation dataset with the specified batch size and number of workers. 
+        Shuffling is disabled for validation data to ensure consistent evaluation.
+        
+        Return: 
+            A DataLoader instance for the validation dataset, configured with the specified batch size and number of workers. 
+        """
         return DataLoader(
             self._val_ds,
             batch_size         = self.batch_size,
@@ -544,6 +672,13 @@ class SmartMeterDataModule:
         )
 
     def test_dataloader(self) -> DataLoader:
+        """
+        Create a DataLoader for the test dataset with the specified batch size and number of workers.
+        Shuffling is disabled for test data to ensure consistent evaluation.
+        
+        Returns: 
+            A DataLoader instance for the test dataset, configured with the specified batch size and number of workers.
+        """
         return DataLoader(
             self._test_ds,
             batch_size         = self.batch_size,
@@ -555,7 +690,7 @@ class SmartMeterDataModule:
 
 
 def fit_normalizer_on_files(
-    normalizer,
+    normalizer: Normalizer,
     data_dir: str,
     filenames: Sequence[str],
     feature_cols: Sequence[str],
@@ -566,30 +701,26 @@ def fit_normalizer_on_files(
     seed: int = 0,
     stats_path: Optional[str] = None,
     force_refit: bool = False,
-) -> None:
-    """Fit a Normalizer across all data files using one streaming Welford pass.
+    ) -> None:
+    """
+    Fit a Normalizer across all data files using one streaming Welford pass.
 
     Reads from the Parquet cache when available (so the 3 GB CSV is only
     parsed once ever).  The fitted stats are saved next to the cache and
     reloaded automatically on subsequent calls, so training-run startup is
     O(seconds) after the first fit.
 
-    Parameters
-    ----------
-    normalizer       : Normalizer instance to fit (modified in-place and saved).
-    data_dir         : directory that contains the CSV/Parquet files.
-    filenames        : CSV filenames to fit across (all passed to the same
-                       loader so they should share the same column schema).
-    feature_cols     : value columns to include in the fit.
-    meter_col        : meter identifier column name.
-    timestamp_dst_col: DST timestamp column name.
-    train_frac       : fraction of meters per file used for fitting
-                       (mirrors the DataModule split for consistency).
-    seed             : RNG seed for the per-file meter shuffle.
-    stats_path       : explicit path for the cached stats file.
-                       If None, defaults to
-                       <data_dir>/_parquet_cache/normalizer_<method>.pt
-    force_refit      : if True, ignore any cached stats and refit from scratch.
+    Args: 
+        normalizer: Normalizer instance to fit (modified in-place and saved).
+        data_dir: directory that contains the CSV/Parquet files.
+        filenames: CSV filenames to fit across (all passed to the same loader so they should share the same column schema).
+        feature_cols: value columns to include in the fit.
+        meter_col: meter identifier column name.
+        timestamp_dst_col: DST timestamp column name.
+        train_frac: fraction of meters per file used for fitting (mirrors the DataModule split for consistency).
+        seed: RNG seed for the per-file meter shuffle.
+        stats_path: explicit path for the cached stats file. If None, defaults to <data_dir>/_parquet_cache/normalizer_<method>.pt
+        force_refit: if True, ignore any cached stats and refit from scratch.
     """
     if stats_path is None:
         stats_path = os.path.join(
