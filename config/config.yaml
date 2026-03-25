@@ -206,12 +206,6 @@ training:
   
   compile_model: false
 
-  # Tiny phased smoke-run settings for quick SetGuideVAE wiring checks
-  smoke:
-    max_files: 2
-    max_steps: 20
-    batch_size: 8
-
 # ============================================================================
 # LOGGING AND MONITORING CONFIGURATION
 # ============================================================================

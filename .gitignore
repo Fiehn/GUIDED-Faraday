@@ -22,3 +22,8 @@ topology/
 !src/models/*.py
 
 output/
+
+!src/data/
+!src/data/*.py
+!src/models/
+!src/models/*.py
