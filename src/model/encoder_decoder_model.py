@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.priors import *
+from model.priors import *
 
 # === Gaussian encoder and decoder Model ===
 class GaussianCoder(torch.nn.Module):

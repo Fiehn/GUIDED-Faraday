@@ -1,7 +1,7 @@
 import torch
 import sys
 import os
-from src.models.cvae import CVAE
+from src.model.cvae import CVAE
 from src.visualization.plot_styling import PlotStyle
 from src.visualization.visualizer import Visualizer
 import traceback

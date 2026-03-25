@@ -349,7 +349,7 @@ if __name__ == "__main__":
     sys.path.append(root_dir)
 
     # Test the candidate generator
-    from src.models.cvae import CVAE
+    from src.model.cvae import CVAE
     from src.data.conditioner import Conditioner
     from src.data.normalizer import Normalizer
     

@@ -8,7 +8,7 @@ import numpy as np
 from sklearn.decomposition import PCA 
 from sklearn.manifold import TSNE
 
-from src.models.generators import SyntheticGenerator
+from src.model.generators import SyntheticGenerator
 from src.data.conditioner import UserProfiler
  
 class Visualizer:
