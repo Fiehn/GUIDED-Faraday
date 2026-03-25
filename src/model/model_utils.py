@@ -1,5 +1,6 @@
 
- 
+from typing import Any
+
 # ==============
 # Cyclical Beta Annealing Scheduler
 # Reference: "Cyclical Annealing Schedule: A Simple Approach to Mitigating KL Vanishing"
@@ -53,23 +54,60 @@ class CyclicalBetaScheduler:
             # Constant phase
             return self.beta_max
 
-    def state_dict(self):
+    def state_dict(self) -> dict[str, int | float]:
+        """Return serializable scheduler state.
+
+        Returns:
+            Dictionary containing step counter and schedule hyperparameters.
+        """
         return {"step": self._step, "total_steps": self.total_steps,
                 "n_cycles": self.n_cycles, "ratio": self.ratio, "beta_max": self.beta_max}
 
     @classmethod
-    def from_state_dict(cls, d):
+    def from_state_dict(cls, d: dict[str, int | float]) -> "CyclicalBetaScheduler":
+        """Create scheduler from serialized state.
+
+        Args:
+            d: State dictionary as produced by `state_dict()`.
+
+        Returns:
+            Restored `CyclicalBetaScheduler` instance.
+        """
         obj = cls(d["total_steps"], d["n_cycles"], d["ratio"], d["beta_max"])
         obj._step = d["step"]
         return obj
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Return concise string representation of scheduler state."""
         return (f"CyclicalBetaScheduler(total_steps={self.total_steps}, n_cycles={self.n_cycles}, "
                 f"ratio={self.ratio}, beta_max={self.beta_max}, current_step={self._step})")
 
 
 class EarlyStopping:
-    def __init__(self, patience=10, min_delta=0.001, mode='min'):
+    """Early stopping helper with optional overfitting guard.
+
+    Training stops when validation improvement stagnates for `patience` checks,
+    or when train/validation metrics become too close under a simple overfitting
+    heuristic.
+
+    Attributes:
+        patience: Maximum non-improving checks before stopping.
+        min_delta: Minimum required metric improvement.
+        counter: Number of consecutive non-improving checks.
+        best_score: Best transformed validation score observed so far.
+        early_stop: Stop flag indicating training should terminate.
+        best_epoch: Epoch index where best score was observed.
+        mode: Optimization direction (`min` or `max`).
+    """
+
+    def __init__(self, patience: int = 10, min_delta: float = 0.001, mode: str = 'min') -> None:
+        """Initialize early stopping state.
+
+        Args:
+            patience: Number of non-improving checks allowed.
+            min_delta: Minimum improvement threshold.
+            mode: Whether lower (`min`) or higher (`max`) val metric is better.
+        """
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
@@ -78,7 +116,20 @@ class EarlyStopping:
         self.best_epoch = 0
         self.mode = mode
 
-    def __call__(self, train_metric, val_metric, epoch=None):
+    def __call__(self,
+                 train_metric: float | None,
+                 val_metric: float | None,
+                 epoch: int | None = None) -> bool:
+        """Update stopper with latest metrics.
+
+        Args:
+            train_metric: Current training metric.
+            val_metric: Current validation metric.
+            epoch: Optional epoch index.
+
+        Returns:
+            `True` if current point is considered an improvement, else `False`.
+        """
         score = -val_metric if self.mode == 'min' else val_metric
 
         if train_metric is not None and val_metric is not None:
@@ -104,7 +155,9 @@ class EarlyStopping:
             if epoch is not None:
                 self.best_epoch = epoch
             return True
-    def reset(self):
+
+    def reset(self) -> None:
+        """Reset internal state for a fresh training run."""
         self.counter = 0
         self.best_score = None
         self.early_stop = False

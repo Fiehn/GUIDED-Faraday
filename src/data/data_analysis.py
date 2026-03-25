@@ -32,7 +32,9 @@ print(f"Current directory: {current_dir}")
 
 
 def _to_namespace(obj):
-    """Convert nested dicts to SimpleNamespace recursively."""
+    """
+    Convert nested dicts to SimpleNamespace recursively.
+    """
     if isinstance(obj, dict):
         return SimpleNamespace(**{k: _to_namespace(v) for k, v in obj.items()})
     if isinstance(obj, list):
@@ -41,7 +43,12 @@ def _to_namespace(obj):
 
 
 def _load_config(config_path: str = None):
-    """Load YAML config and convert to SimpleNamespace."""
+    """
+    Load YAML config and convert to SimpleNamespace.
+
+    Args: 
+        config_path: Optional path to YAML config file. If None, defaults to "config/config.yaml" in project root.
+    """
     if config_path is None:
         config_path = os.path.join(current_dir, "config", "config.yaml")
     
@@ -75,13 +82,35 @@ window_spec = WindowSpec(input_len=96, stride=96)  # used for phased loader only
 plot_style = PlotStyle()
 
 
-def save_df(df: pd.DataFrame, filename: str) -> str:
+def save_df(df: pd.DataFrame, 
+            filename: str) -> str:
+    """
+    Save a DataFrame to CSV in the output directory.
+
+    Args:
+        df: DataFrame to save
+        filename: Name of the CSV file (e.g., "meter_123_analysis.csv")
+
+    Returns:
+        The full path to the saved CSV file.
+    """
     path = os.path.join(output_dir_data_analysis, filename)
     df.to_csv(path, index=False)
     return path
 
 
-def save_json(payload: dict, filename: str) -> str:
+def save_json(payload: dict, 
+              filename: str) -> str:
+    """
+    Save a dictionary as a JSON file in the output directory.
+    
+    Args:
+        payload: Dictionary to save
+        filename: Name of the JSON file (e.g., "meter_123_metrics.json")
+
+    Returns:
+        The full path to the saved JSON file.
+    """
     path = os.path.join(output_dir_data_analysis, filename)
     with open(path, "w", encoding="utf-8") as f:
         import json
@@ -181,6 +210,17 @@ if preview_train_loader_sample and sm_phase_data is not None:
 # Plotting: `selected_meter` and `selected_day` to plot a specific smart meter and exact day.
 
 class SmartMeterDayPlotter:
+    """
+    Utility class to load data for a specific smart meter, select a day, and plot the time series and distribution.
+
+    Attributes: 
+        data_dir_parquet: Directory containing parquet files (used if data_mode is "phased_parquet")
+        verbose: Whether to print detailed logs during loading and plotting
+        data_mode: "phased_parquet" or "hourly_csv" to determine data loading method
+        hourly_csv_path: Path to hourly CSV file (used if data_mode is "hourly_csv")
+        interval_freq: Frequency for reindexing time series (e.g., "15min" or "1h")
+        hourly_energy_col: Column name in hourly CSV that contains energy consumption values
+    """
     def __init__(
         self,
         data_dir_parquet: str,
@@ -199,11 +239,28 @@ class SmartMeterDayPlotter:
         self.hourly_df = None
         self.meter_to_file = self._build_meter_file_map()
 
-    def _log(self, msg: str):
+    def _log(self, 
+             msg: str):
+        """
+        Log a message if verbose mode is enabled.
+
+        Args: 
+            msg: The message to log 
+        """
         if self.verbose:
             print(msg)
 
     def _build_meter_file_map(self):
+        """
+        Build a mapping from meter ID to data source (parquet file or hourly CSV).
+        
+        Returns:
+            A dictionary mapping meter IDs to their corresponding data source (file path or CSV).
+        
+        Raises:
+            FileNotFoundError: If the hourly CSV file is not found when using "hourly_csv" mode.
+        """
+
         if self.data_mode == "hourly_csv":
             if self.hourly_csv_path is None or (not os.path.exists(self.hourly_csv_path)):
                 raise FileNotFoundError(f"Hourly CSV not found: {self.hourly_csv_path}")
@@ -227,11 +284,33 @@ class SmartMeterDayPlotter:
         return sorted(self.meter_to_file.keys())
 
     @staticmethod
-    def _pick_col(cols, base):
+    def _pick_col(cols: list, 
+                  base: str) -> str:
+        """
+        Pick a column from a list of columns that starts with the given base string.
+
+        Args:
+            cols: List of column names to search through
+            base: Base string to match at the start of column names (e.g., "active_power_p14_l1")
+
+        Returns:
+            The first column name that starts with the base string, or None if no match is found.
+        """
         matches = [c for c in cols if c.startswith(base)]
         return matches[0] if matches else None
 
-    def _pick_time_column(self, df):
+    def _pick_time_column(self, 
+                          df: pd.DataFrame) -> str: 
+        """
+        Heuristic to pick the best timestamp column from a DataFrame. 
+        Checks common timestamp column names first, then falls back to parsing all columns.
+        
+        Args:
+            df: The DataFrame to analyze for timestamp columns
+        
+        Returns:
+            The name of the best timestamp column, or "__index__" if the index is the best candidate, or None if no suitable column is found.
+        """
         cols = list(df.columns)
 
         for c in ["timestamp_utc", "timestamp_dst", "timestamp"]:
@@ -271,7 +350,19 @@ class SmartMeterDayPlotter:
 
         return None
 
-    def _load_meter_dataframe(self, selected_meter: int):
+    def _load_meter_dataframe(self,
+                              selected_meter: int) -> pd.DataFrame:
+        """
+        Load the data for a specific meter into a DataFrame with a datetime index and columns for each phase and aggregated energy.
+        
+        Args:
+            selected_meter: The meter ID to load data for
+        
+        Returns:
+            A DataFrame indexed by timestamp with columns "L1", "L2", "L3", and "Aggregated"
+        """
+
+
         available_meters = self.available_meters()
         self._log(f"Found {len(available_meters)} meters in parquet files")
         self._log(f"Available meters: {available_meters}")
@@ -340,7 +431,21 @@ class SmartMeterDayPlotter:
         self._log(f"Non-zero rows (aggregated): {(df['Aggregated'] > 0).sum()} / {len(df)}")
         return df
 
-    def _resolve_day(self, df, selected_day="auto", top_n_days=10):
+    def _resolve_day(self, 
+                     df: pd.DataFrame, 
+                     selected_day: str = "auto", 
+                     top_n_days: int = 10) -> str:
+        """
+        Resolve the selected day for plotting. If "auto", selects the day with the highest aggregated energy.
+        
+        Args:
+            df: DataFrame containing the data for the selected meter
+            selected_day: The day to select (e.g., "2023-10-15") or "auto" to select the day with highest energy
+            top_n_days: Number of top days to log when showing the most active days
+        
+        Returns:
+            The selected day as a string in "YYYY-MM-DD" format
+        """
         daily = df["Aggregated"].groupby(df.index.floor("D")).sum().sort_values(ascending=False)
         non_zero_daily = daily[daily > 0]
 
@@ -357,7 +462,23 @@ class SmartMeterDayPlotter:
 
         return selected_day
 
-    def plot_day(self, selected_meter: int, selected_day="auto", show_distribution=True, top_n_days=10):
+    def plot_day(self, 
+                 selected_meter: int, 
+                 selected_day: str = "auto", 
+                 show_distribution: bool = True, 
+                 top_n_days: int = 10) -> pd.DataFrame:
+        """
+        Load data for the selected meter, select the specified day, and plot the time series and distribution.
+        
+        Args:
+            selected_meter: The meter ID to plot
+            selected_day: The day to plot (e.g., "2023-10-15") or "auto" to select the day with highest energy
+            show_distribution: Whether to also plot the distribution of energy values for the selected day
+            top_n_days: Number of top days to log when showing the most active days
+        
+        Returns:
+            A DataFrame containing the data for the selected day, indexed by timestamp with columns "L1", "L2", "L3", and "Aggregated"
+        """
         df = self._load_meter_dataframe(selected_meter)
         selected_day = self._resolve_day(df, selected_day=selected_day, top_n_days=top_n_days)
 
@@ -465,18 +586,57 @@ class SmartMeterDayPlotter:
 # - gap statistics in the 15-minute timeline
 
 class CoverageAnalyzer:
-    def __init__(self, plotter: SmartMeterDayPlotter, freq: str = '15min'):
+    """
+    Utility class to compute coverage and completeness metrics for each smart meter based on the loaded data.
+
+    Attributes: 
+        plotter: An instance of SmartMeterDayPlotter used to load meter data
+        freq: The frequency for defining intervals (e.g., "15min" or "1h")
+    """
+    def __init__(self, 
+                 plotter: SmartMeterDayPlotter, 
+                 freq: str = '15min'):
         self.plotter = plotter
         self.freq = freq
 
     def _interval_label(self) -> str:
+        """
+        Generate a label for the interval frequency by removing spaces (e.g., "15min" -> "15min", "1h" -> "1h").
+        """
         return str(self.freq).replace(" ", "")
 
     def _intervals_per_day(self) -> int:
+        """
+        Calculate the number of intervals per day based on the specified frequency (e.g., 96 for 15-minute intervals, 24 for hourly intervals).
+        """
         delta = pd.to_timedelta(self.freq)
         return int(pd.Timedelta(days=1) / delta)
 
-    def compute_meter_coverage_metrics(self, meter_id: int):
+    def compute_meter_coverage_metrics(self, 
+                                       meter_id: int):
+        """
+        Compute coverage and completeness metrics for a specific meter.
+        
+        Args:
+            meter_id: The ID of the meter to analyze
+        
+        Returns:
+            A dictionary containing coverage metrics for the specified meter, including:
+            - meter_id: The ID of the meter
+            - file: The source file associated with the meter
+            - start_utc: The earliest timestamp in the data
+            - end_utc: The latest timestamp in the data
+            - expected_intervals_{interval_label}: The total number of expected intervals based on the date range and frequency
+            - observed_intervals_{interval_label}: The number of intervals with observed data
+            - missing_intervals_{interval_label}: The number of intervals with missing data
+            - missing_rate: The proportion of missing intervals (missing / expected)
+            - coverage_rate: The proportion of observed intervals (observed / expected)
+            - num_gap_runs_{interval_label}: The number of contiguous runs of missing intervals
+            - max_gap_intervals_{interval_label}: The maximum number of consecutive missing intervals in a single gap
+            - avg_gap_intervals_{interval_label}: The average number of consecutive missing intervals across all gaps
+            - full_days_{intervals_per_day}_of_{intervals_per_day}: The number of full days with complete data (all intervals observed)
+            - days_with_{intervals_per_day}_expected: The number of days that have the full expected number of intervals (regardless of whether they are observed or missing)
+        """
         source_path = self.plotter.meter_to_file[meter_id]
         df = self.plotter._load_meter_dataframe(meter_id)
         ts = pd.DatetimeIndex(df.index)
@@ -538,7 +698,19 @@ class CoverageAnalyzer:
         }
         return metrics
 
-    def report_all_meters(self, sort_by='missing_rate', ascending=False):
+    def report_all_meters(self, 
+                          sort_by: str = 'missing_rate', 
+                          ascending: bool = False) -> pd.DataFrame:
+        """
+        Compute coverage metrics for all available meters and return a summary DataFrame sorted by the specified metric.
+        
+        Args:
+            sort_by: The column name to sort the report by (e.g., 'missing_rate', 'coverage_rate', 'observed_intervals_15min')
+            ascending: Whether to sort in ascending order (default: False, meaning higher missing_rate will be at the top)
+       
+        Returns:
+            A DataFrame containing coverage metrics for all meters, sorted by the specified column.
+        """
         rows = []
         for meter in self.plotter.available_meters():
             rows.append(self.compute_meter_coverage_metrics(meter_id=meter))
@@ -559,11 +731,34 @@ class CoverageAnalyzer:
 # - load factor (mean / peak)
 
 class DailyProfileAnalyzer:
-    def __init__(self, plotter: SmartMeterDayPlotter, freq: str = '15min'):
+    """
+    Compute daily profile statistics for each smart meter based on the loaded data.
+
+    Attributes: 
+        plotter: An instance of SmartMeterDayPlotter used to load meter data
+        freq: The frequency for defining intervals (e.g., "15min" or "1h") used for computing daily metrics
+    """
+
+    def __init__(self, 
+                 plotter: SmartMeterDayPlotter, 
+                 freq: str = '15min'):
         self.plotter = plotter
         self.freq = freq
 
-    def compute_daily_profile_stats(self, meter_id: int):
+    def compute_daily_profile_stats(self, 
+                                    meter_id: int) -> pd.DataFrame:
+        """
+        Compute daily profile statistics for a specific meter, including:
+        - daily total energy in Wh and kWh
+        - peak load in Wh per interval and time of peak (UTC)
+        - load factor (mean load / peak load)
+        
+        Args:
+            meter_id: The ID of the meter to analyze
+        
+        Returns:
+            A DataFrame containing daily profile statistics for the specified meter, with columns:
+        """
         df = self.plotter._load_meter_dataframe(meter_id)
         df = df.sort_index()
 
@@ -596,6 +791,26 @@ class DailyProfileAnalyzer:
         return daily_stats.sort_values('date_utc').reset_index(drop=True)
 
     def report_all_meters(self):
+        """
+        Compute daily profile statistics for all meters and return a combined DataFrame and summary.
+        
+        Returns:
+            all_daily_df: A DataFrame containing daily profile statistics for all meters, with columns:
+                - meter_id: The ID of the meter
+                - date_utc: The date of the profile (UTC)
+                - daily_total_wh: Total energy for the day in Wh
+                - daily_total_kwh: Total energy for the day in kWh
+                - peak_load_wh_15min: Peak load for the day in Wh per 15-minute interval
+                - time_of_peak_utc: Time of peak load in UTC (HH:MM)
+                - load_factor_mean_over_peak: Load factor calculated as mean load divided by peak load
+            summary: A DataFrame summarizing daily profile statistics by meter, with columns:
+                - meter_id: The ID of the meter
+                - days: The number of days with data for the meter
+                - avg_daily_total_kwh: The average daily total energy in kWh for the meter
+                - median_daily_total_kwh: The median daily total energy in kWh for the meter
+                - avg_peak_load_wh_15min: The average peak load in Wh per 15-minute interval for the meter
+                - avg_load_factor: The average load factor for the meter
+        """
         all_daily = []
         for meter_id in self.plotter.available_meters():
             meter_daily = self.compute_daily_profile_stats(meter_id=meter_id)
@@ -627,11 +842,34 @@ class DailyProfileAnalyzer:
 # - imbalance index: measure of phase imbalance (0=perfect balance, 1=completely unbalanced)
 
 class PhaseBalanceAnalyzer:
-    def __init__(self, plotter: SmartMeterDayPlotter):
+    """
+    Compute phase balance metrics for each smart meter based on the loaded data.
+    """
+    def __init__(self, 
+                 plotter: SmartMeterDayPlotter):
         self.plotter = plotter
 
-    def compute_meter_phase_balance_stats(self, meter_id: int):
-        """Compute phase balance metrics for all timesteps in a meter's data."""
+    def compute_meter_phase_balance_stats(self, 
+                                          meter_id: int) -> dict:
+        """
+        Compute phase balance metrics for all timesteps in a meter's data.
+        
+        Args: 
+            meter_id: The ID of the meter to analyze
+        
+        Returns:
+            A dictionary containing phase balance metrics for the specified meter, including:
+            - meter_id: The ID of the meter
+            - avg_l1_wh_15min: The average energy in Wh per 15-minute interval for phase L1
+            - avg_l2_wh_15min: The average energy in Wh per 15-minute interval for phase L2
+            - avg_l3_wh_15min: The average energy in Wh per 15-minute interval for phase L3
+            - avg_agg_wh_15min: The average total energy in Wh per 15-minute interval across all phases
+            - avg_l1_share_pct: The average percentage contribution of phase L1 to the total energy across all intervals
+            - avg_l2_share_pct: The average percentage contribution of phase L2 to the total energy across all intervals
+            - avg_l3_share_pct: The average percentage contribution of phase L3 to the total energy across all intervals
+            - dominant_phase: The phase (L1, L2, or L3) that has the highest average percentage contribution across all intervals
+            - imbalance_index: A measure of phase imbalance calculated as the standard deviation of the phase contribution shares divided by the maximum possible standard deviation for three phases (100% imbalance), where 0 indicates perfect balance and 1 indicates complete imbalance (all load on one phase).
+        """
         df = self.plotter._load_meter_dataframe(meter_id)
 
         # Extract L1, L2, L3 data
@@ -690,7 +928,22 @@ class PhaseBalanceAnalyzer:
         }
 
     def report_all_meters(self):
-        """Compute phase balance metrics for all meters."""
+        """
+        Compute phase balance metrics for all meters.
+
+        Returns: 
+            A DataFrame containing phase balance metrics for all meters, with columns:
+            - meter_id: The ID of the meter
+            - avg_l1_wh_15min: The average energy in Wh per 15-minute interval for phase L1
+            - avg_l2_wh_15min: The average energy in Wh per 15-minute interval for phase L2
+            - avg_l3_wh_15min: The average energy in Wh per 15-minute interval for phase L3
+            - avg_agg_wh_15min: The average total energy in Wh per 15-minute interval across all phases
+            - avg_l1_share_pct: The average percentage contribution of phase L1 to the total energy across all intervals
+            - avg_l2_share_pct: The average percentage contribution of phase L2 to the total energy across all intervals
+            - avg_l3_share_pct: The average percentage contribution of phase L3 to the total energy across all intervals
+            - dominant_phase: The phase (L1, L2, or L3) that has the highest average percentage contribution across all intervals
+            - imbalance_index: A measure of phase imbalance calculated as the standard deviation of the phase contribution shares divided by the maximum possible standard deviation for three phases (100% imbalance), where 0 indicates perfect balance and 1 indicates complete imbalance (all load on one phase).
+        """
         rows = []
         for meter_id in self.plotter.available_meters():
             stats = self.compute_meter_phase_balance_stats(meter_id)
@@ -706,16 +959,42 @@ class PhaseBalanceAnalyzer:
 # This plots the distributions using all available timesteps from all parquet files (L1, L2, L3, and Aggregated).
 
 class DistributionAnalyzer:
-    def __init__(self, plotter: SmartMeterDayPlotter, exclude_zeros: bool = True, verbose: bool = False):
+    """
+    Compute and plot the distributions of energy values across all available data for each phase (L1, L2, L3) and the aggregated total. 
+    This can be done with or without excluding zero values to analyze the distribution of active load.
+    
+    Attributes:
+        plotter: An instance of SmartMeterDayPlotter used to load meter data
+        exclude_zeros: Whether to exclude zero values from the distribution analysis (default: True)
+        verbose: Whether to print detailed logs during processing (default: False)
+    """
+    def __init__(self, 
+                 plotter: SmartMeterDayPlotter, 
+                 exclude_zeros: bool = True, 
+                 verbose: bool = False):
         self.plotter = plotter
         self.exclude_zeros = exclude_zeros
         self.verbose = verbose
 
-    def _log(self, msg: str):
+    def _log(self, 
+             msg: str):
+        """
+        Utility method for logging messages when verbose mode is enabled.
+        
+        Args:
+            msg: The message to log
+        """
         if self.verbose:
             print(msg)
 
     def compute_and_save(self):
+        """
+        Compute the distributions of energy values for L1, L2, L3, and Aggregated across all available data, and save the distribution plots and summary statistics.
+        
+        Returns:
+            full_dist_plot_path: The file path to the saved distribution plot image
+            distribution_summary_path: The file path to the saved distribution summary JSON file
+        """
         all_l1, all_l2, all_l3 = [], [], []
         processed = 0
 
@@ -816,11 +1095,41 @@ class DistributionAnalyzer:
 # - Statistical comparison of calendar effects (weekday load vs weekend load)
 
 class SeasonalityAnalyzer:
-    def __init__(self, plotter: SmartMeterDayPlotter):
+    """
+    Compute seasonality and calendar effect statistics for the aggregated load data across all meters.
+
+    Attributes:
+        plotter: An instance of SmartMeterDayPlotter used to load meter data
+    """
+    def __init__(self, 
+                 plotter: SmartMeterDayPlotter):
         self.plotter = plotter
 
     def compute_stats(self):
-        """Analyze calendar effects across aggregated load data."""
+        """
+        Analyze calendar effects across aggregated load data.
+
+        Returns: 
+            month_stats: A DataFrame containing monthly statistics for the aggregated load, with columns:
+                - month: The month number (1-12)
+                - mean_wh: The average energy in Wh per interval for the month
+                - median_wh: The median energy in Wh per interval for the month
+                - std_wh: The standard deviation of energy in Wh per interval for the month
+                - count_intervals: The total number of intervals observed for the month
+                - month_name: The name of the month (e.g., "Jan", "Feb", etc.)
+            wd_we_stats: A DataFrame comparing weekday vs weekend patterns, with columns:
+                - day_type: "Weekday" or "Weekend"
+                - mean_wh: The average energy in Wh per interval for the day type
+                - median_wh: The median energy in Wh per interval for the day type
+                - std_wh: The standard deviation of energy in Wh per interval for the day type
+                - count_intervals: The total number of intervals observed for the day type
+            weekday_stats: A DataFrame containing statistics for each weekday, with columns:
+                - weekday_name: The name of the weekday (e.g., "Mon", "Tue", etc.)
+                - mean_wh: The average energy in Wh per interval for the weekday
+                - median_wh: The median energy in Wh per interval for the weekday
+                - std_wh: The standard deviation of energy in Wh per interval for the weekday
+                - count_intervals: The total number of intervals observed for the weekday
+        """
         all_data = []
         for meter_id in self.plotter.available_meters():
             df_meter = self.plotter._load_meter_dataframe(meter_id)
@@ -879,6 +1188,15 @@ class SeasonalityAnalyzer:
 
 
 def make_plotter(verbose: bool = False) -> SmartMeterDayPlotter:
+    """
+    Utility function to create a SmartMeterDayPlotter instance with the appropriate configuration for analysis.
+    
+    Args:
+        verbose: Whether to enable verbose logging in the plotter (default: False)
+    
+    Returns:
+        An instance of SmartMeterDayPlotter configured for analysis with the specified data source and frequency settings.
+    """
     return SmartMeterDayPlotter(
         data_dir_parquet=data_dir_parquet,
         verbose=verbose,

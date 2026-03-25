@@ -1,20 +1,28 @@
 from typing import Callable, Type
 
+
 class StrategyRegistry:
+    """Registry for hierarchical latent-level strategy classes.
+
+    This registry maps string keys to strategy class objects and is used by
+    hierarchical modules to instantiate levels from configuration names.
     """
-    Registry for latent-level strategies. Allows plg-in of custom
-    encoding/decoding strategies for each level in the hierarchical model.
-     
-    usage:
-        @StrategyRegistry.register("my_strategy")
-        class MyStrategy(LatentLevel):
-            ...
-    """
+
     _registry: dict[str, Type] = {}
 
     @classmethod
     def register(cls, name: str) -> Callable:
-        """Decorator to register a new strategy."""
+        """Create a decorator that registers a new strategy class.
+
+        Args:
+            name: Registry key for the strategy implementation.
+
+        Returns:
+            Decorator that stores the decorated class under ``name``.
+
+        Raises:
+            ValueError: If ``name`` is already registered.
+        """
         def decorator(strategy_cls: Type) -> Type:
             if name in cls._registry:
                 raise ValueError(
@@ -28,7 +36,14 @@ class StrategyRegistry:
     
     @classmethod
     def force_register(cls, name: str) -> Callable:
-        """Decorator to force register a new strategy, overriding any existing one."""
+        """Create a decorator that registers and overwrites existing entries.
+
+        Args:
+            name: Registry key for the strategy implementation.
+
+        Returns:
+            Decorator that stores the decorated class under ``name``.
+        """
         def decorator(strategy_cls: Type) -> Type:
             cls._registry[name] = strategy_cls
             return strategy_cls
@@ -36,6 +51,17 @@ class StrategyRegistry:
     
     @classmethod
     def get(cls, name: str) -> Type:
+        """Retrieve a registered strategy class by name.
+
+        Args:
+            name: Registry key to resolve.
+
+        Returns:
+            Strategy class associated with ``name``.
+
+        Raises:
+            KeyError: If ``name`` is not present in the registry.
+        """
         if name not in cls._registry:
             available = ", ".join(cls._registry.keys())
             raise KeyError(
@@ -45,11 +71,19 @@ class StrategyRegistry:
     
     @classmethod
     def available(cls) -> list[str]:
-        """Return a list of available strategy names."""
+        """Return all currently registered strategy names.
+
+        Returns:
+            List of registry keys.
+        """
         return list(cls._registry.keys())
     
     @classmethod
     def clear(cls):
-        """Clear all registered strategies (useful for testing)."""
+        """Remove all registered strategy mappings.
+
+        Returns:
+            None.
+        """
         cls._registry.clear()
 

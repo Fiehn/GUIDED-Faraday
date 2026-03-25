@@ -17,6 +17,7 @@ from scipy.spatial.distance import cdist
 import pickle
 from tqdm import tqdm
 
+
 class BaseConditioner(ABC):
     """Abstract base class for all conditioners.
 
@@ -66,6 +67,13 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         gamma_cache (dict): Cache for concentration parameters `{meter_id: gamma_u}`.
         is_fitted (bool): Indicates if the LDA model has been fitted.
     """
+    def __init__(self, 
+                 n_topics: int = 10, 
+                 num_clusters: int = 100, 
+                 random_state: int | None = None, 
+                 path: str ='models/UserProfiles/user_profiles.pkl', 
+                 decay: float = 0.9, 
+                 update_frequency: int = 10,
     def __init__(self, n_topics = 10, num_clusters = 100, 
                  random_state=None, 
                  path='models/UserProfiles/user_profiles.pkl', 
@@ -106,7 +114,8 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
             if self.verbose:
                 print(f"Could not load existing UserProfiler model from {self.path}. Will fit a new model. Error: {e}")
 
-    def fit(self, train_loader):
+    def fit(self, 
+            train_loader: torch.utils.data.DataLoader):
         """
         Fits the UserProfiler using batches from a PyTorch DataLoader.
         
@@ -211,8 +220,12 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
                 print(f"UserProfiler model saved to {self.path}.")
         return self
 
-    def get_conditions(self, data, meter_id=None, timestamps=None):
-        """Gets topic distributions for a batch during inference.
+    def get_conditions(self, 
+                       data: torch.Tensor | np.ndarray | None, 
+                       meter_id: torch.Tensor | np.ndarray | None = None, 
+                       timestamps: torch.Tensor | list | None = None) -> torch.Tensor:
+        """
+        Gets topic distributions for a batch during inference.
         
         Looks up cached profiles by `meter_id`. If not found, computes on-the-fly.
 
@@ -334,8 +347,11 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
                 self.gamma_cache[m_id] = gamma_u
                 self.resample_user_vector(m_id)
     
-    def _get_cached_profiles(self, data, meter_ids):
-        """Assembles profile vectors from cache. 
+    def _get_cached_profiles(self, 
+                             data: torch.Tensor | np.ndarray | None, 
+                             meter_ids: torch.Tensor | np.ndarray) -> torch.Tensor:
+        """
+        Assembles profile vectors from cache. 
         
         Computes on-the-fly for unknown meters. Falls back to a uniform distribution 
         for meters with no data available.
@@ -363,8 +379,12 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
 
         return torch.tensor(profiles, dtype=torch.float32)
 
-    def _compute_profiles_for_batch(self, data, meter_id, target_meter_ids):
-        """Computes and caches gamma and profile vectors for specific meters.
+    def _compute_profiles_for_batch(self, 
+                                    data: torch.Tensor | np.ndarray, 
+                                    meter_id: torch.Tensor | np.ndarray, 
+                                    target_meter_ids: list):
+        """
+        Computes and caches gamma and profile vectors for specific meters.
 
         Args:
             data (torch.Tensor | np.ndarray): Time series data batch.
@@ -472,8 +492,10 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         return self
         
 
-    def resample_user_vector(self, meter_id = None):
-        """Samples new user profiles from stored gamma parameters using a Dirichlet distribution.
+    def resample_user_vector(self, 
+                             meter_id: str | int | None = None):
+        """
+        Samples new user profiles from stored gamma parameters using a Dirichlet distribution.
 
         Args:
             meter_id (str | int, optional): Specific meter ID to resample. If None, 
@@ -492,8 +514,10 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
                 raise ValueError(f"Meter ID {meter_id} not found in gamma cache.")
             self.user_profiles_cache[meter_id] = np.random.dirichlet(self.gamma_cache[meter_id])
 
-    def get_random_conditions(self, batch_size):
-        """Generates random user profiles for testing and random synthetic profiles.
+    def get_random_conditions(self, 
+                              batch_size: int) -> torch.Tensor:
+        """
+        Generates random user profiles for testing and random synthetic profiles.
 
         Args:
             batch_size (int): Number of profiles to generate.
@@ -504,8 +528,10 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         random_profiles = np.random.dirichlet(alpha=np.ones(self.n_topics), size=batch_size)
         return torch.tensor(random_profiles, dtype=torch.float32)
 
-    def save(self, path):
-        """Saves the UserProfiler model state to a pickle file.
+    def save(self, 
+             path: str):
+        """
+        Saves the UserProfiler model state to a pickle file.
 
         Args:
             path (str): Filepath to save the model.
@@ -517,8 +543,10 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         if self.verbose:
             print(f"Saved model with {len(self.user_profiles_cache)} cached profiles")
 
-    def load(self, path):
-        """Loads model state from a pickle file and updates the instance state.
+    def load(self,
+            path: str):
+        """
+        Loads model state from a pickle file and updates the instance state.
 
         Args:
             path (str): Filepath to load the model from.
@@ -529,10 +557,10 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         if self.verbose:
             print(f"Loaded model with {len(self.user_profiles_cache)} cached profiles")
 
-            
-# === Day of week conditioning ===
+
 class DayOfWeekConditioner(BaseConditioner):
-    """Generates a one-hot encoded representation of the day of the week.
+    """
+    Generates a one-hot encoded representation of the day of the week.
     
     Attributes:
         condition_dim (int): The dimension of the generated condition (7).
@@ -546,7 +574,8 @@ class DayOfWeekConditioner(BaseConditioner):
         meter_id: torch.Tensor | np.ndarray | None, 
         timestamps: torch.Tensor | list | None
     ) -> torch.Tensor | None:
-        """Extracts day of the week from timestamps and returns a one-hot encoding.
+        """
+        Extracts day of the week from timestamps and returns a one-hot encoding.
 
         Args:
             x (Any): Unused input data.
@@ -575,8 +604,10 @@ class DayOfWeekConditioner(BaseConditioner):
         dow_onehot = F.one_hot(days_of_week, num_classes=7).float().to(device)
         return dow_onehot
     
-    def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
-        """Generates random day of week conditions for testing.
+    def get_random_conditions(self, 
+                              batch_size: int) -> torch.Tensor | None:
+        """
+        Generates random day of week conditions for testing.
 
         Args:
             batch_size (int): Number of conditions to generate.
@@ -588,8 +619,10 @@ class DayOfWeekConditioner(BaseConditioner):
         dow_onehot = F.one_hot(random_days, num_classes=7).float()
         return dow_onehot
 
+
 class MonthOfYearConditioner(BaseConditioner):
-    """Generates a one-hot encoded representation of the month of the year.
+    """
+    Generates a one-hot encoded representation of the month of the year.
     
     Attributes:
         condition_dim (int): The dimension of the generated condition (12).
@@ -603,7 +636,8 @@ class MonthOfYearConditioner(BaseConditioner):
         meter_id: torch.Tensor | np.ndarray | None, 
         timestamps: torch.Tensor | list | None
     ) -> torch.Tensor | None:
-        """Extracts month from timestamps and returns a one-hot encoding.
+        """
+        Extracts month from timestamps and returns a one-hot encoding.
 
         Args:
             x (Any): Unused input data.
@@ -629,8 +663,10 @@ class MonthOfYearConditioner(BaseConditioner):
         moy_onehot = F.one_hot(months, num_classes=12).float().to(device)
         return moy_onehot
     
-    def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
-        """Generates random month conditions for testing.
+    def get_random_conditions(self, 
+                              batch_size: int) -> torch.Tensor | None:
+        """
+        Generates random month conditions for testing.
 
         Args:
             batch_size (int): Number of conditions to generate.
@@ -642,8 +678,10 @@ class MonthOfYearConditioner(BaseConditioner):
         moy_onehot = F.one_hot(random_months, num_classes=12).float()
         return moy_onehot
 
+
 class HolidayConditioner(BaseConditioner):
-    """Flags whether a given timestamp falls on a known holiday.
+    """
+    Flags whether a given timestamp falls on a known holiday.
     As defined by: https://helligdage-dk.dk/helligdage-2024/
     
     Args:
@@ -654,18 +692,21 @@ class HolidayConditioner(BaseConditioner):
         condition_dim (int): The dimension of the generated condition (1).
         holiday_dates (set): Set of loaded holiday dates.
     """
-    def __init__(self, holiday_path='data/holidays/denmark_holidays.json'):
+    def __init__(self, 
+                 holiday_path: str = 'data/holidays/denmark_holidays.json'):
         self.condition_dim = 1
         with open(holiday_path, 'r') as f:
             holidays = json.load(f)
         self.holiday_dates = set(pd.to_datetime(holidays['dates']).date)
+
     def get_conditions(
         self, 
         x: torch.Tensor | np.ndarray | None, 
         meter_id: torch.Tensor | np.ndarray | None, 
         timestamps: torch.Tensor | list | None
     ) -> torch.Tensor | None:
-        """Checks if timestamps are holidays.
+        """
+        Checks if timestamps are holidays.
 
         Args:
             x (Any): Unused input data.
@@ -688,20 +729,24 @@ class HolidayConditioner(BaseConditioner):
             is_holiday = torch.tensor(is_holiday, dtype=torch.float32).unsqueeze(1)
         return is_holiday
     
-    def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
-        """Generates random holiday conditions for testing.
+    def get_random_conditions(self, 
+                              batch_size: int) -> torch.Tensor | None:
+        """
+        Generates random holiday conditions for testing.
 
-            Args:
-                batch_size (int): Number of conditions to generate.
+        Args:
+            batch_size (int): Number of conditions to generate.
 
-            Returns:
-                torch.Tensor: Binary tensor of shape `(batch_size, 1)`.
+        Returns:
+            torch.Tensor: Binary tensor of shape `(batch_size, 1)`.
         """
         random_holiday = torch.randint(0,2,(batch_size,1)).float()
         return random_holiday
-    
+
+
 class HeatpumpConditioner(BaseConditioner):
-    """Flags whether a specific meter is associated with a heat pump.
+    """
+    Flags whether a specific meter is associated with a heat pump.
 
     Args:
         topology_path (str): Path to CSV file mapping meters to heat pump status.
@@ -710,7 +755,8 @@ class HeatpumpConditioner(BaseConditioner):
         condition_dim (int): The dimension of the generated condition (1).
         topology_df (pd.DataFrame): Loaded topology data.
     """
-    def __init__(self, topology_path = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
+    def __init__(self, 
+                 topology_path: str = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
         self.condition_dim = 1
         self.topology_df = pd.read_csv(topology_path)
     
@@ -720,7 +766,8 @@ class HeatpumpConditioner(BaseConditioner):
         meter_id: torch.Tensor | np.ndarray | None, 
         timestamps: torch.Tensor | list | None
     ) -> torch.Tensor | None:
-        """Retrieves heat pump status for given meter IDs.
+        """
+        Retrieves heat pump status for given meter IDs.
 
         Args:
             x (Any): Unused input data.
@@ -748,8 +795,10 @@ class HeatpumpConditioner(BaseConditioner):
 
         return torch.tensor(heatpump_status, dtype=torch.float32).unsqueeze(1)
     
-    def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
-        """Generates random holiday conditions for testing.
+    def get_random_conditions(self, 
+                              batch_size: int) -> torch.Tensor | None:
+        """
+        Generates random holiday conditions for testing.
 
         Args:
             batch_size (int): Number of conditions to generate.
@@ -759,9 +808,11 @@ class HeatpumpConditioner(BaseConditioner):
         """
         random_status = torch.randint(0,2,(batch_size,1)).float()
         return random_status
-    
+
+
 class SolarPanelConditioner(BaseConditioner):
-    """Flags whether a specific meter is associated with solar panels.
+    """
+    Flags whether a specific meter is associated with solar panels.
 
     Args:
         topology_path (str): Path to CSV file mapping meters to solar panel status.
@@ -770,7 +821,9 @@ class SolarPanelConditioner(BaseConditioner):
         condition_dim (int): The dimension of the generated condition (1).
         topology_df (pd.DataFrame): Loaded topology data.
     """
-    def __init__(self, topology_path = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
+    
+    def __init__(self, 
+                 topology_path: str = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
         self.condition_dim = 1
         self.topology_df = pd.read_csv(topology_path)
     
@@ -780,7 +833,8 @@ class SolarPanelConditioner(BaseConditioner):
         meter_id: torch.Tensor | np.ndarray | None, 
         timestamps: torch.Tensor | list | None
     ) -> torch.Tensor | None:
-        """Retrieves solar panel status for given meter IDs.
+        """
+        Retrieves solar panel status for given meter IDs.
 
         Args:
             x (Any): Unused input data.
@@ -808,8 +862,10 @@ class SolarPanelConditioner(BaseConditioner):
 
         return torch.tensor(solar_status, dtype=torch.float32).unsqueeze(1)
     
-    def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
-        """Generates random solar panel conditions for testing.
+    def get_random_conditions(self, 
+                              batch_size: int) -> torch.Tensor | None:
+        """
+        Generates random solar panel conditions for testing.
         
         Args:
             batch_size (int): Number of conditions to generate.
@@ -819,19 +875,27 @@ class SolarPanelConditioner(BaseConditioner):
         """
         random_status = torch.randint(0,2,(batch_size,1)).float()
         return random_status
-    
+
+
 class ElectricVehicleConditioner():
     # TODO: WAIT FOR EV data to arrive
-    def __init__(self, topology_path = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
+    def __init__(self, 
+                 topology_path: str = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
         self.condition_dim = 0
 
-    def get_conditions(self, x, meter_id, timestamps):
+    def get_conditions(self, 
+                       x, 
+                       meter_id, 
+                       timestamps):
         return None
     
-    def get_random_conditions(self, batch_size):
+    def get_random_conditions(self, 
+                              batch_size):
         return None
     
-    def get_conditions_no_data(self, meter_id, timestamps):
+    def get_conditions_no_data(self,
+                                meter_id, 
+                                timestamps):
         return None
 
 # =============
@@ -839,7 +903,8 @@ class ElectricVehicleConditioner():
 # ============
 
 class Conditioner():
-    """Central manager that aggregates multiple condition modules.
+    """
+    Central manager that aggregates multiple condition modules.
 
     Holds objects that create and determine the type of conditioning used in models.
     Concatenates individual conditions into a single tensor.
@@ -853,20 +918,28 @@ class Conditioner():
         condition_dim (int): Total concatenated dimension of all active conditions.
         condition_items (dict): Mapping of tags to their respective conditioner instances.
     """
-    def __init__(self, tags: list[str] | None = None, **kwargs):
+
+    def __init__(self, 
+                 tags: list[str] | None = None, 
+                 **kwargs):
         self.tags = tags if tags is not None else []
         self.condition_dim = 0
         self.condition_items = {}
     
+
     def get_condition_tags(self) -> list[str]:
-        """Retrieves list of active condition tags.
+        """
+        Retrieves list of active condition tags.
 
         Returns:
             list[str]: Tags registered in the Conditioner.
         """
         return self.tags
 
-    def add_condition_item(self, tag: str, item):
+
+    def add_condition_item(self, 
+                           tag: str, 
+                           item: Any):
         """Registers a new conditioner item to the Conditioner.
 
         Args:
@@ -881,10 +954,13 @@ class Conditioner():
         # Add the condition dimension to the total condition dimension
         self.condition_dim += item.condition_dim
 
-    def get_conditions(self, x: torch.Tensor | np.ndarray | None = None, 
+
+    def get_conditions(self, 
+                       x: torch.Tensor | np.ndarray | None = None, 
                        meter_id: torch.Tensor | np.ndarray | None = None, 
                        timestamps: torch.Tensor | np.ndarray | None = None): 
-        """Gets and concatenates conditions from all registered conditioners.
+        """
+        Gets and concatenates conditions from all registered conditioners.
 
         Args:
             x (torch.Tensor | np.ndarray): Input data. Used to infer target device.
@@ -917,8 +993,11 @@ class Conditioner():
         # Concatenate all conditions along feature dimension
         return torch.cat(conditions, dim=-1)            
     
-    def get_random_conditions(self, batch_size: int):
-        """Generates random conditions concatenated from all active items for testing.
+
+    def get_random_conditions(self, 
+                              batch_size: int):
+        """
+        Generates random conditions concatenated from all active items for testing.
 
         Args:
             batch_size (int): Number of conditions to generate.
@@ -933,16 +1012,21 @@ class Conditioner():
             conditions.append(item.get_random_conditions(batch_size))
         return torch.cat(conditions, dim=-1)
 
+
     def get_condition_dim(self):
-        """Returns the total aggregated condition dimension.
+        """
+        Returns the total aggregated condition dimension.
         
         Returns:
             int: Size of condition vector
         """
         return int(self.condition_dim)
 
-    def get_condition_indexes(self, tag: str):
-        """Calculates the feature indices for a specific condition in the concatenated tensor.
+
+    def get_condition_indexes(self, 
+                              tag: str):
+        """
+        Calculates the feature indices for a specific condition in the concatenated tensor.
 
         Args:
             tag (str): The condition tag to locate.
@@ -962,8 +1046,11 @@ class Conditioner():
             idx += self.condition_items[t].condition_dim
         raise ValueError(f"Condition tag '{tag}' not found in Conditioner.")
 
-    def save(self, path: str):
-        """Saves the entire Conditioner state to a pickle file.
+
+    def save(self, 
+             path: str):
+        """
+        Saves the entire Conditioner state to a pickle file.
 
         Args:
             path (str): Filepath to save the model.
@@ -972,9 +1059,11 @@ class Conditioner():
         with open(path, "wb") as f:
             pickle.dump(self, f)
     
+    
     @staticmethod
     def load(path: str):
-        """Loads a Conditioner instance from a pickle file.
+        """
+        Loads a Conditioner instance from a pickle file.
 
         Args:
             path (str): Filepath to load the model from.

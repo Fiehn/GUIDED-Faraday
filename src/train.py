@@ -3,6 +3,7 @@ import sys
 import argparse
 import yaml
 from types import SimpleNamespace
+from typing import Any
 from xml.parsers.expat import model
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -25,7 +26,15 @@ from src.visualization.plot_styling import PlotStyle
 import gc
 
 
-def _to_namespace(obj):
+def _to_namespace(obj: Any) -> Any:
+    """Recursively convert nested dictionaries/lists into `SimpleNamespace` objects.
+
+    Args:
+        obj: Arbitrary Python object (dict, list, or scalar-like value).
+
+    Returns:
+        Namespace-converted object preserving original nested structure.
+    """
     if isinstance(obj, dict):
         return SimpleNamespace(**{k: _to_namespace(v) for k, v in obj.items()})
     if isinstance(obj, list):
@@ -33,7 +42,7 @@ def _to_namespace(obj):
     return obj
 
 
-def _load_train_config(config_path: str = None):
+def _load_train_config(config_path: str | None = None) -> SimpleNamespace:
     """Load YAML config and add aliases expected by train()."""
     if config_path is None:
         config_path = os.path.join(parent_dir, "config", "config.yaml")
@@ -69,7 +78,7 @@ def _load_train_config(config_path: str = None):
     return cfg
 
 
-def _cfg_get(config, path, default=None):
+def _cfg_get(config: Any, path: str, default: Any = None) -> Any:
     """Safe getter for dict/namespace-like configs using dot paths."""
     if config is None:
         return default
@@ -85,8 +94,26 @@ def _cfg_get(config, path, default=None):
     return default if cur is None else cur
 
 
-def _build_phased_eval_loader(eval_stream, batch_size: int, num_workers: int, eval_batches: int, normalizer=None):
-    """Build finite eval loader from phased stream, preferring non-zero windows."""
+def _build_phased_eval_loader(eval_stream: DataLoader,
+                              batch_size: int,
+                              num_workers: int,
+                              eval_batches: int,
+                              normalizer: Any | None = None) -> DataLoader | None:
+    """Build a finite evaluation loader from phased streaming batches.
+
+    The function prioritizes non-zero windows in raw space (if inverse transform
+    is available), and falls back to first streamed batches when none are found.
+
+    Args:
+        eval_stream: Streaming phased evaluation dataloader yielding `(x, cond)`.
+        batch_size: Output loader batch size.
+        num_workers: Number of dataloader workers.
+        eval_batches: Target number of eval batches to collect.
+        normalizer: Optional normalizer used for raw-space non-zero filtering.
+
+    Returns:
+        Finite `DataLoader` with `(x, meter_id, timestamps)`, or `None` if empty.
+    """
     xs, ms, ts = [], [], []
     max_scan_batches = max(20, max(1, eval_batches) * 20)
     collected_samples = 0
@@ -144,8 +171,26 @@ def _build_phased_eval_loader(eval_stream, batch_size: int, num_workers: int, ev
     )
 
 
-def _run_evaluation_and_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, phased_mode: bool):
-    """Route evaluation by mode and run shared visualizations."""
+def _run_evaluation_and_visualization(model: Any,
+                                      test_loader: DataLoader,
+                                      normalizer: Any,
+                                      writer: Writer | None,
+                                      device: str | torch.device,
+                                      log_path: str,
+                                      config: Any,
+                                      phased_mode: bool) -> None:
+    """Run evaluation and visualization for phased or non-phased training modes.
+
+    Args:
+        model: Trained model instance.
+        test_loader: Evaluation dataloader.
+        normalizer: Optional normalizer for inverse transformations.
+        writer: Optional writer used by visualizer.
+        device: Target compute device.
+        log_path: Output path for metrics/plots/checkpoints.
+        config: Runtime training configuration.
+        phased_mode: Whether phased evaluation suite should be used.
+    """
     if phased_mode:
         phased_evaluator = PhasedEvaluationSuite(
             model,
@@ -176,7 +221,19 @@ def _run_evaluation_and_visualization(model, test_loader, normalizer, conditione
                          num_originals=config.visualize.num_originals,
                          num_synthetic_per=config.visualize.num_synthetic_per)
 
-def train(config):
+
+def train(config: Any) -> Any:
+    """Main training entry point.
+
+    Supports both CSV and phased parquet data modes, model construction,
+    training loops, checkpointing, and evaluation/visualization.
+
+    Args:
+        config: Runtime config namespace loaded from YAML.
+
+    Returns:
+        Trained model instance for phased mode, otherwise final trained model.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device: ", device)
     # Up the recursion limit for deep models

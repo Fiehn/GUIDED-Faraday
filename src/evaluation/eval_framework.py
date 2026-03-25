@@ -31,7 +31,15 @@ except ImportError:
 
 
 def _to_json_serializable(obj: Any) -> Any:
-    """Recursively convert numpy/torch-like objects into JSON-serializable values."""
+    """
+    Recursively convert numpy/torch-like objects into JSON-serializable values.
+    
+    Args: 
+        obj: The object to convert
+
+    Return: 
+        obj: A JSON-serializable version of the input object
+    """
     if isinstance(obj, dict):
         return {k: _to_json_serializable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -43,7 +51,8 @@ def _to_json_serializable(obj: Any) -> Any:
     return obj
 
 
-def _save_standalone_metric_result(metric_key: str, payload: Dict[str, Any],
+def _save_standalone_metric_result(metric_key: str, 
+                                   payload: Dict[str, Any],
                                    output_file: str = 'models/eval_results.json') -> None:
     """Save/update standalone metric results in the shared per-condition JSON file.
     Args:
@@ -75,6 +84,15 @@ def _save_standalone_metric_result(metric_key: str, payload: Dict[str, Any],
 
 
 def _flatten_windows(data: np.ndarray) -> np.ndarray:
+    """
+    Flatten windowed data back to [N, L] by summing across features if needed.
+    
+    Args: 
+        data: Input data, either [N, L] or [N, F, L]
+    
+    Returns:
+        Flattened data of shape [N, L]
+    """
     arr = np.asarray(data)
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D array [N, L], got {arr.shape}")
@@ -82,13 +100,34 @@ def _flatten_windows(data: np.ndarray) -> np.ndarray:
 
 
 def _flatten_phase_first(data: np.ndarray) -> np.ndarray:
+    """
+    Flatten phase-first data [N, F, L] -> [N, F*L] by concatenating features for each sample.
+    
+    Args: 
+        data: Input data of shape [N, F, L]
+    
+    Returns:
+        Flattened data of shape [N, F*L]
+    """
     arr = np.asarray(data)
     if arr.ndim != 3:
         raise ValueError(f"Expected 3D array [N, F, L], got {arr.shape}")
     return arr.reshape(arr.shape[0], -1)
 
 
-def _inverse_transform_phase_first(data: np.ndarray, normalizer) -> np.ndarray:
+def _inverse_transform_phase_first(data: np.ndarray, 
+                                   normalizer: Any) -> np.ndarray:
+    """
+    Apply inverse transformation to phase-first data [N, F, L] using the provided normalizer.
+    This function handles the case where the normalizer expects feature-last input by transposing before and after.
+    
+    Args: 
+        data: Input data of shape [N, F, L]
+        normalizer: Normalizer object with an inverse_transform method that can handle feature-last input
+    
+    Returns:
+        Inverse-transformed data of shape [N, F, L]
+    """
     arr = np.asarray(data, dtype=np.float32)
     if arr.ndim != 3:
         raise ValueError(f"Expected 3D array [N, F, L], got {arr.shape}")
@@ -102,6 +141,15 @@ def _inverse_transform_phase_first(data: np.ndarray, normalizer) -> np.ndarray:
 
 
 def _rank_phases_by_total_consumption(data: np.ndarray) -> np.ndarray:
+    """
+    Rank phases by total consumption across the window, so that phase 0 is the highest-consuming one.
+    
+    Args: 
+        data: Input data of shape [N, F, L]
+    
+    Returns: 
+        Reordered data of shape [N, F, L] with phases ranked by total consumption
+    """
     arr = np.asarray(data)
     if arr.ndim != 3:
         raise ValueError(f"Expected 3D array [N, F, L], got {arr.shape}")
@@ -112,8 +160,9 @@ def _rank_phases_by_total_consumption(data: np.ndarray) -> np.ndarray:
 
 
 class EvaluationMetric(ABC):
-    """Base class for evaluation metrics."""
-    
+    """
+    Base class for evaluation metrics.
+    """
     @property
     @abstractmethod
     def name(self) -> str:
@@ -127,7 +176,13 @@ class EvaluationMetric(ABC):
 
 
 class ReconstructionMetric(EvaluationMetric):
-    """Base class for reconstruction evaluation metrics."""
+    """
+    Base class for reconstruction evaluation metrics.
+    
+    These metrics evaluate how well the model reconstructs real data:
+    - Input: real data from dataloader
+    - Output: compare original vs reconstructed
+    """
     
     @abstractmethod
     def compute(self) -> float:
@@ -136,7 +191,13 @@ class ReconstructionMetric(EvaluationMetric):
 
 
 class SyntheticMetric(EvaluationMetric):
-    """Base class for synthetic data evaluation metrics."""
+    """
+    Base class for synthetic data evaluation metrics.
+    
+    These metrics evaluate properties of generated synthetic data:
+    - Input: model samples from prior (or with conditions)
+    - Output: compare synthetic vs real distributions
+    """
     
     @abstractmethod
     def compute(self) -> float:
@@ -189,8 +250,8 @@ class EvalFramework:
         self, 
         model: nn.Module, 
         dataloader: torch.utils.data.DataLoader,
-        normalizer = None,
-        conditioner = None, 
+        normalizer: Any = None,
+        conditioner: Any = None, 
         device: str = 'cpu',
         window_size: int = 24,
         n_synthetic_samples: int = 1000,
@@ -232,8 +293,10 @@ class EvalFramework:
 
         self.output_path = output_path
 
-    def register_all(self) -> None:
-        """Convenience method to register all default metrics."""
+    def register_all(self):
+        """
+        Register all default evaluation metrics.
+        """
         self.register_metrics([
             ReconstructionRMSE(),
             ReconstructionLogLikelihood(),
@@ -247,11 +310,15 @@ class EvalFramework:
         ])
 
     def _is_cvae(self) -> bool:
-        """Check if model is a CVAE based on presence of conditioner on the model."""
+        """
+        Check if model is a CVAE based on presence of conditioner on the model.
+        """
         return hasattr(self.model, 'conditioner') and self.model.conditioner is not None
     
     def _prepare_data(self) -> None:
-        """Extract real data, reconstructed data, and synthetic data for metrics that need it."""
+        """
+        Extract real data, reconstructed data, and synthetic data for metrics that need it.
+        """
         if self.prepared_data is not None:
             self._real_data = np.asarray(self.prepared_data.get('real_data'))
             self._reconstructed_data = np.asarray(self.prepared_data.get('reconstructed_data'))
@@ -405,7 +472,9 @@ class EvalFramework:
         return synthetic_flat.cpu().numpy()
 
     def _inject_data_into_metrics(self) -> None:
-        """Inject prepared data into metrics that need it."""
+        """
+        Inject prepared data into metrics that need it.
+        """
         for metric in self.reconstruction_metrics.values():
             metric.real_data = self._real_data
             metric.reconstructed_data = self._reconstructed_data
@@ -454,8 +523,11 @@ class EvalFramework:
                 metric.timestamps = (np.asarray(self._timestamps)[:n] if self._timestamps is not None else None)
                 metric.meter_ids = (np.asarray(self._meter_ids)[:n] if self._meter_ids is not None else None)
 
-    def register_metric(self, metric: EvaluationMetric) -> None:
-        """Register an evaluation metric. 
+    def register_metric(self, 
+                        metric: EvaluationMetric) -> None:
+        """
+        Register an evaluation metric.
+        
         Args:
             metric: An instance of ReconstructionMetric or SyntheticMetric
         """
@@ -474,8 +546,11 @@ class EvalFramework:
             metric_label = getattr(metric, 'name', metric.__class__.__name__)
             raise ValueError(f"Metric {metric_label} must inherit from ReconstructionMetric or SyntheticMetric")
     
-    def register_metrics(self, metrics: List[EvaluationMetric]) -> None:
-        """Register multiple metrics at once.
+    def register_metrics(self, 
+                         metrics: List[EvaluationMetric]) -> None:
+        """
+        Register multiple metrics at once.
+        
         Args:
             metrics: List of ReconstructionMetric or SyntheticMetric instances
         """
@@ -581,7 +656,9 @@ class EvalFramework:
         return self.results
 
     def _print_results_table(self) -> None:
-        """Print results in a formatted table."""
+        """
+        Print results in a formatted table.
+        """
         print("\n" + "="*70)
         print("EVALUATION RESULTS")
         print("="*70 + "\n")
@@ -601,7 +678,9 @@ class EvalFramework:
         print()
 
     def get_results(self) -> Dict[str, float]:
-        """Get cached results from last evaluation."""
+        """
+        Get cached results from last evaluation.
+        """
         return self.results.copy()
 
     def save_results(self, output_path: str) -> None:
@@ -621,7 +700,19 @@ class EvalFramework:
 
 
 class PhasedEvaluationSuite:
-    """Run separate evaluation views for multi-phase data while preserving the original one-phase evaluator."""
+    """
+    Run separate evaluation views for multi-phase data while preserving the original one-phase evaluator.
+    
+    Attributes: 
+        model: The trained model to evaluate
+        dataloader: DataLoader for evaluation data
+        normalizer: Data normalizer (if used during training)
+        conditioner: Conditioner object (for CVAE, if applicable)
+        device: Device to run on ('cpu' or 'cuda')
+        window_size: Window size used for phase separation (e.g., 96 for 15-min data with 24h windows)
+        n_synthetic_samples: Number of synthetic samples to generate for evaluation
+        output_dir: Directory to save evaluation results and outputs
+    """
 
     def __init__(
         self,
@@ -644,6 +735,12 @@ class PhasedEvaluationSuite:
         self.output_dir = output_dir
 
     def _prepare_base_framework(self) -> EvalFramework:
+        """
+        Prepare the base evaluation framework to extract real, reconstructed, and synthetic data in phase-first format.
+        
+        Returns:
+            EvalFramework instance with prepared data ready for phased evaluation
+        """
         framework = EvalFramework(
             self.model,
             self.dataloader,
@@ -658,7 +755,20 @@ class PhasedEvaluationSuite:
         framework._prepare_data()
         return framework
 
-    def _extract_phase_first(self, flat_data: np.ndarray, label: str) -> np.ndarray:
+    def _extract_phase_first(self, 
+                             flat_data: np.ndarray, 
+                             label: str) -> np.ndarray:
+        """
+        Extract phase-first data [N, F, L] from flattened input [N, F*L], where F is the number of phases (features) and L is the window size.
+        This function assumes that the input data is already in the correct order (phase 1 features followed by phase 2 features, etc.) and that the total number of features is divisible by the window size.
+        
+        Args:
+            flat_data: Input data of shape [N, F*L]
+            label: Label for error messages (e.g., "real data", "reconstructed data", "synthetic data")
+        
+        Returns:
+            Phase-first data of shape [N, F, L]
+        """
         arr = np.asarray(flat_data)
         if arr.ndim != 2:
             raise ValueError(f"Expected 2D flattened array for {label}, got {arr.shape}")
@@ -669,7 +779,24 @@ class PhasedEvaluationSuite:
         n_features = arr.shape[1] // self.window_size
         return arr.reshape(arr.shape[0], n_features, self.window_size)
 
-    def _run_prepared_eval(self, prepared_data: Dict[str, Any], output_dir: str, title: str, output_path: str) -> Dict[str, float]:
+    def _run_prepared_eval(self, 
+                           prepared_data: Dict[str, Any], 
+                           output_dir: str, 
+                           title: str, 
+                           output_path: str) -> Dict[str, float]:
+        """
+        Run evaluation on already prepared data (real, reconstructed, synthetic) in phase-first format.
+        This function creates a new EvalFramework instance with the prepared data injected, runs all registered metrics, and saves results to the specified output path.
+        
+        Args:
+            prepared_data: Dictionary containing 'real_data', 'reconstructed_data', 'synthetic_data', 'timestamps', and 'meter_ids' in phase-first format
+            output_dir: Directory to save any outputs (e.g., plots) generated by the evaluation metrics
+            title: Title for the evaluation (used in print statements and logs)
+            output_path: Path to save the evaluation results JSON file
+        
+        Returns: 
+            Dictionary mapping metric names to computed values
+        """
         evaluator = EvalFramework(
             self.model,
             self.dataloader,
@@ -688,6 +815,9 @@ class PhasedEvaluationSuite:
         return results
 
     def evaluate(self) -> Dict[str, Any]:
+        """
+        Run phased evaluation by extracting phase-first data, running evaluations on aggregated and ranked phases, and saving results.
+        """
         os.makedirs(self.output_dir, exist_ok=True)
         base = self._prepare_base_framework()
 
@@ -756,8 +886,13 @@ class PhasedEvaluationSuite:
 # ============================================================================
 
 class ReconstructionMSE(ReconstructionMetric):
-    """Mean squared error on reconstruction.
-        mean((real - recon)^2) over all elements. Lower is better.
+    """
+    Mean squared error on reconstruction.
+
+    Attributes: 
+        real_data: Real data from dataloader (injected before compute)
+        reconstructed_data: Reconstructed data from model (injected before compute)
+        output_path: Path to save metric result JSON file (injected before compute)
     """
     
     real_data: np.ndarray = None
@@ -769,7 +904,12 @@ class ReconstructionMSE(ReconstructionMetric):
         return "Reconstruction MSE"
     
     def compute(self) -> float:
-        """Compute reconstruction MSE on test data."""
+        """
+        Compute reconstruction MSE on test data.
+        
+        Returns: 
+            MSE value (lower is better)
+        """
         if self.real_data is None or self.reconstructed_data is None:
             raise ValueError("ReconstructionMSE requires injected real_data and reconstructed_data before compute().")
 
@@ -806,8 +946,13 @@ class ReconstructionMSE(ReconstructionMetric):
 
 
 class ReconstructionRMSE(ReconstructionMetric):
-    """Root mean squared error on reconstruction.
-        sqrt(mean((real - recon)^2)) over all elements. Lower is better.
+    """
+    Mean absolute error on reconstruction.
+
+    Attributes: 
+        real_data: Real data from dataloader (injected before compute)
+        reconstructed_data: Reconstructed data from model (injected before compute)
+        output_path: Path to save metric result JSON file (injected before compute)
     """
     
     real_data: np.ndarray = None
@@ -819,7 +964,12 @@ class ReconstructionRMSE(ReconstructionMetric):
         return "Reconstruction RMSE"
     
     def compute(self) -> float:
-        """Compute reconstruction RMSE on test data."""
+        """
+        Compute reconstruction RMSE on test data.
+
+        Returns: 
+            RMSE value (lower is better)
+        """
         if self.real_data is None or self.reconstructed_data is None:
             raise ValueError("ReconstructionRMSE requires injected real_data and reconstructed_data before compute().")
 
@@ -869,11 +1019,13 @@ class ReconstructionLogLikelihood(ReconstructionMetric):
         return "Reconstruction Log-Likelihood"
     
     def compute(self) -> float:
-        """Compute reconstruction log-likelihood.
-
+        """
+        Compute reconstruction log-likelihood.
         Uses a simple isotropic Gaussian likelihood approximation:
         x | x_hat ~ N(x_hat, sigma^2 I), where sigma^2 is estimated from residuals.
-        Returns mean log-likelihood per element (higher is better).
+        
+        Returns: 
+            mean log-likelihood per element (higher is better).
         """
         if self.real_data is None or self.reconstructed_data is None:
             raise ValueError(
@@ -927,7 +1079,8 @@ class ReconstructionLogLikelihood(ReconstructionMetric):
     
 
 class FlexibilityDistance(ReconstructionMetric):
-    """Flexibility Distance (FD) between real and reconstructed time-series.
+    """
+    Flexibility Distance (FD) between real and reconstructed time-series.
     
     Implements the assignment-based FD from FlexibilityDistance2023:
     given two equal-length series, build a cost matrix combining amplitude
@@ -993,7 +1146,8 @@ class FlexibilityDistance(ReconstructionMetric):
         return total_cost
     
     def compute(self) -> float:
-        """Compute flexibility distance metric.
+        """
+        Compute flexibility distance metric.
         
         Process:
         2. For each window, build cost matrix and solve linear assignment
@@ -1039,7 +1193,8 @@ class FlexibilityDistance(ReconstructionMetric):
 
 
 class MaximumMeanDiscrepancy(SyntheticMetric):
-    """Maximum Mean Discrepancy (MMD) between real and synthetic data.
+    """
+    Maximum Mean Discrepancy (MMD) between real and synthetic data.
     
     MMD measures the distance between two distributions using a kernel-based approach.
     Uses RBF (Gaussian) kernel with automatic bandwidth selection via median heuristic.
@@ -1059,6 +1214,11 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
         sigma (float): RBF kernel bandwidth. If None, uses median heuristic.
         seed (int): Random seed for reproducibility
         max_samples (int): Maximum number of samples to use for median heuristic (for efficiency)
+
+    Attributes: 
+        real_data: Real data from dataloader (injected before compute)
+        synthetic_data: Generated synthetic data (injected before compute)
+        output_path: Path to save metric result JSON file (injected before compute)
     """
     
     real_data: np.ndarray = None
@@ -1145,7 +1305,8 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
         return float(mmd2)
     
     def compute(self) -> float:
-        """Compute MMD metric.
+        """
+        Compute MMD metric.
         
         Returns:
             float: MMD value (lower is better, 0 = identical distributions)
@@ -1218,7 +1379,16 @@ class ACFDistribution(SyntheticMetric):
     synthetic_data: np.ndarray = None
     output_path: str = None
     
-    def __init__(self, window_size=24, max_lag=10):
+    def __init__(self, 
+                 window_size: int = 24, 
+                 max_lag: int =10):
+        """
+        Args:
+            real_data: numpy array [N, D] where D = window_size * n_features
+            synthetic_data: numpy array [M, D] where D = window_size * n_features
+            window_size: Length of each time series window (e.g., 24 hours)
+            max_lag: Maximum lag to compute ACF for (default: 10)
+        """
         self.window_size = window_size
         self.max_lag = max_lag
     
@@ -1226,7 +1396,9 @@ class ACFDistribution(SyntheticMetric):
     def name(self) -> str:
         return "ACF Distribution Match (KS)"
     
-    def _compute_acf(self, time_series, max_lag):
+    def _compute_acf(self, 
+                     time_series: np.ndarray, 
+                     max_lag: int) -> np.ndarray:
         """
         Compute autocorrelation function for a single time series.
         
@@ -1316,7 +1488,13 @@ class ACFDistribution(SyntheticMetric):
 
 
 class VisualEvaluation(SyntheticMetric):
-    """Visual evaluation of synthetic data"""
+    """
+    Visual evaluation of synthetic data
+
+    Attributes: 
+        real_data: Real data from dataloader (injected before compute)
+        synthetic_data: Generated synthetic data (injected before compute)
+    """
     
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None   
@@ -1336,7 +1514,9 @@ class VisualEvaluation(SyntheticMetric):
         return "Visual Evaluations"
     
     def pca(self) -> None:
-        """Generate PCA plots for real vs synthetic data."""
+        """
+        Generate PCA plots for real vs synthetic data.
+        """
         real_data = self.real_data[:500] if len(self.real_data) > 500 else self.real_data
         synthetic_data = self.synthetic_data[:500] if len(self.synthetic_data) > 500 else self.synthetic_data
         
@@ -1377,7 +1557,9 @@ class VisualEvaluation(SyntheticMetric):
         plt.close()
     
     def tsne(self) -> None:
-        """Generate t-SNE plots for real vs synthetic data."""
+        """
+        Generate t-SNE plots for real vs synthetic data.
+        """
         # Use smaller subset for t-SNE
         real_data = self.real_data[:500] if len(self.real_data) > 500 else self.real_data
         synthetic_data = self.synthetic_data[:500] if len(self.synthetic_data) > 500 else self.synthetic_data
@@ -1423,7 +1605,9 @@ class VisualEvaluation(SyntheticMetric):
         plt.close()
     
     def compute(self) -> float:
-        """Generate visual evaluation plots and return success indicator."""
+        """
+        Generate visual evaluation plots and return success indicator.
+        """
         try:
             self.pca()
             self.tsne()
@@ -1435,10 +1619,16 @@ class VisualEvaluation(SyntheticMetric):
 
 
 class ClassicalStatistics(SyntheticMetric):
-    """Classical statistics comparison between real and synthetic data.
-    
+    """
+    Classical statistics comparison between real and synthetic data.
+
     Computes and compares basic statistical properties including mean, variance,
     min/max, quantiles, and standard deviation across time for both datasets.
+
+    Attributes: 
+        real_data: Real data from dataloader (injected before compute)
+        synthetic_data: Generated synthetic data (injected before compute) (injected before compute)
+        output_path: Path to save metric result JSON file (injected before compute)
         Provides a comprehensive overview of how well the synthetic data captures the 
         central tendencies and variability of the real data, both overall and at each time step.
     """
@@ -1510,7 +1700,8 @@ class ClassicalStatistics(SyntheticMetric):
         return stats
     
     def compute(self) -> Dict[str, Any]:
-        """Compute and compare classical statistics between real and synthetic data.
+        """
+        Compute and compare classical statistics between real and synthetic data.
         
         Returns: TODO: THIS IS NOT TRUE IT IS CURRENTLY A FLOAT VALUE (MAE OF MEAN PROFILES)
             Dict[str, Any]: Dictionary containing both real and synthetic statistics
@@ -1553,7 +1744,9 @@ class ClassicalStatistics(SyntheticMetric):
         return mean_profile_diff
     
     def print_comparison(self):
-        """Print formatted comparison of statistics."""
+        """
+        Print formatted comparison of statistics.
+        """
         stats = self.compute()
         real = stats['real']
         synth = stats['synthetic']
@@ -1856,7 +2049,12 @@ class AggregatedProfiles(SyntheticMetric):
         return "Aggregated Profiles (Flexibility Distance)"
     
     def compute(self) -> float:
-        """Aggregate real and synthetic data, then compute Flexibility Distance."""
+        """
+        Aggregate real and synthetic data, then compute Flexibility Distance.
+
+        Returns: 
+            Flexibility Distance score (lower is better, 0 = perfect match)
+        """
         real_data = np.asarray(self.real_data)
         synthetic_data = np.asarray(self.synthetic_data)
 
@@ -1951,7 +2149,8 @@ class AggregatedProfiles(SyntheticMetric):
         
 
 class PerConditionEval(SyntheticMetric):
-    """Compute per-condition evaluation for MMD, ACFDistribution, TSTR, ClassicalStatistics, and AggregatedProfiles.
+    """
+    Compute per-condition evaluation for MMD, ACFDistribution, TSTR, ClassicalStatistics, and AggregatedProfiles.
 
     Includes:
     - MMD per day-of-week and month (using full 24-hour windows)
@@ -2042,8 +2241,18 @@ class PerConditionEval(SyntheticMetric):
     def name(self) -> str:
         return "Per-Condition Evaluation"
 
-    def _print_input_debug(self, real_data: np.ndarray, synthetic_data: np.ndarray, timestamps: np.ndarray) -> None:
-        """Print information about input formats."""
+    def _print_input_debug(self, 
+                           real_data: np.ndarray, 
+                           synthetic_data: np.ndarray, 
+                           timestamps: np.ndarray) -> None:
+        """
+        Print information about input formats.
+
+        Args: 
+            real_data: Real data array
+            synthetic_data: Synthetic data array
+            timestamps: Timestamps array
+        """
         print("\n" + "=" * 70)
         print("PER-CONDITION DATA INPUT")
         print("=" * 70)
@@ -2063,17 +2272,37 @@ class PerConditionEval(SyntheticMetric):
             dt0 = datetime.utcfromtimestamp(int(timestamps[0]))
             print(f"timestamps[0]: {int(timestamps[0])} -> {dt0.strftime('%Y-%m-%d %A %H:%M:%S')} UTC")
 
-    def _compute_subset_acf(self, real_subset: np.ndarray, synthetic_subset: np.ndarray):
-        """Compute ACF score for one subset; return None if too few samples."""
+    def _compute_subset_acf(self, 
+                            real_subset: np.ndarray, 
+                            synthetic_subset: np.ndarray):
+        """
+        Compute ACF score for one subset; return None if too few samples.
+        
+        Args: 
+            real_subset: Subset of real data (shape [N_subset, D])
+            synthetic_subset: Subset of synthetic data (shape [N_subset, D])
+        """
         if len(real_subset) < self.min_samples_per_group or len(synthetic_subset) < self.min_samples_per_group:
             return None
         self.acf_calculator.real_data = real_subset
         self.acf_calculator.synthetic_data = synthetic_subset
         return float(self.acf_calculator.compute())
 
-    def _compute_subset_tstr(self, real_subset: np.ndarray, synthetic_subset: np.ndarray,
+    def _compute_subset_tstr(self, 
+                             real_subset: np.ndarray, 
+                             synthetic_subset: np.ndarray,
                              group_label: str = None) -> float:
-        """Compute TSTR ratio for one subset using the TSTR metric; return None if too few samples."""
+        """
+        Compute TSTR ratio for one subset using the TSTR metric; return None if too few samples.
+        
+        Args: 
+            real_subset: Subset of real data (shape [N_subset, D])
+            synthetic_subset: Subset of synthetic data (shape [N_subset, D])
+            group_label: Optional label for the group (e.g., "Monday" or "January") for logging purposes
+        
+        Returns: 
+            TSTR/TRTR MSE ratio (lower is better, 1.0 means synthetic is as good as real)
+        """
         if len(real_subset) < 4 or len(synthetic_subset) < 2:
             if self.verbose and group_label is not None:
                 print(f"\n  [TSTR] {group_label} -> insufficient samples (real={len(real_subset)}, synthetic={len(synthetic_subset)})")
@@ -2092,8 +2321,16 @@ class PerConditionEval(SyntheticMetric):
                 print(f"Warning: TSTR computation failed{label_suffix}: {e}")
             return None
 
-    def _compute_subset_aggregated_profiles(self, real_subset: np.ndarray, synthetic_subset: np.ndarray):
-        """Compute AggregatedProfiles score for one subset; return None if too few samples."""
+    def _compute_subset_aggregated_profiles(self, 
+                                            real_subset: np.ndarray, 
+                                            synthetic_subset: np.ndarray):
+        """
+        Compute AggregatedProfiles score for one subset; return None if too few samples.
+
+        Args: 
+            real_subset: Subset of real data (shape [N_subset, D])
+            synthetic_subset: Subset of synthetic data (shape [N_subset, D])
+        """
         if len(real_subset) < self.min_samples_per_group or len(synthetic_subset) < self.min_samples_per_group:
             return None
 
@@ -2108,7 +2345,9 @@ class PerConditionEval(SyntheticMetric):
             return None
 
     def _load_meter_to_feeder_mapping(self) -> Dict[str, str]:
-        """Load meter->feeder mapping from Cleaned_SM_Topology_mapping.json."""
+        """
+        Load meter->feeder mapping from Cleaned_SM_Topology_mapping.json.
+        """
         if self._meter_to_feeder is not None:
             return self._meter_to_feeder
 
@@ -2130,8 +2369,14 @@ class PerConditionEval(SyntheticMetric):
         self._meter_to_feeder = meter_to_feeder
         return meter_to_feeder
 
-    def _resolve_feeder_ids(self, n_expected: int) -> np.ndarray:
-        """Resolve feeder IDs either from injected feeder_ids or from injected meter_ids + mapping file."""
+    def _resolve_feeder_ids(self, 
+                            n_expected: int) -> np.ndarray:
+        """
+        Resolve feeder IDs either from injected feeder_ids or from injected meter_ids + mapping file.
+
+        Args: 
+            n_expected: Expected number of samples (must match length of real/synthetic data)
+        """
         if self.feeder_ids is not None:
             feeder_ids = np.asarray(self.feeder_ids)
         elif self.meter_ids is not None:
@@ -2160,7 +2405,17 @@ class PerConditionEval(SyntheticMetric):
         synthetic_data: np.ndarray,
         feeder_ids: np.ndarray,
     ) -> Dict[str, Dict[str, Any]]:
-        """Compute AggregatedProfiles FD per feeder."""
+        """
+        Compute AggregatedProfiles FD per feeder.
+
+        Args: 
+            real_data: Real data array (shape [N, D])
+            synthetic_data: Synthetic data array (shape [N, D])
+            feeder_ids: Array of feeder IDs corresponding to each sample (shape [N])
+
+        Returns: 
+            Dictionary mapping feeder ID to {'fd': float, 'n_samples': int}
+        """
         feeder_scores = {}
         unique_feeders = [f for f in np.unique(feeder_ids) if f is not None and str(f).lower() != 'nan']
 
@@ -2189,8 +2444,17 @@ class PerConditionEval(SyntheticMetric):
 
         return feeder_scores
 
-    def _compute_classical_stats_for_data(self, data: np.ndarray) -> Dict[str, Any]:
-        """Compute classical stats for [N, window_size] consumption windows."""
+    def _compute_classical_stats_for_data(self,
+                                           data: np.ndarray) -> Dict[str, Any]:
+        """
+        Compute classical stats for [N, window_size] consumption windows.
+
+        Args: 
+            data: Array of shape [N, window_size] containing consumption values for each sample
+        
+        Returns: 
+            Dictionary containing mean_profile, std_profile, overall_mean, overall_std, overall_min, overall_max, and quantiles
+        """
         data = np.asarray(data)
         if data.ndim != 2 or data.shape[1] != self.window_size:
             raise ValueError(
@@ -2214,8 +2478,19 @@ class PerConditionEval(SyntheticMetric):
             }
         }
 
-    def _compute_subset_classical_stats(self, real_subset: np.ndarray, synthetic_subset: np.ndarray):
-        """Compute full classical stats for one subset; return None if too few samples."""
+    def _compute_subset_classical_stats(self, 
+                                        real_subset: np.ndarray, 
+                                        synthetic_subset: np.ndarray):
+        """
+        Compute full classical stats for one subset; return None if too few samples.
+
+        Args: 
+            real_subset: Subset of real data (shape [N_subset, D])
+            synthetic_subset: Subset of synthetic data (shape [N_subset, D])
+        
+        Returns: 
+            Dictionary containing real stats, synthetic stats, and differences between them
+        """
         if len(real_subset) < self.min_samples_per_group or len(synthetic_subset) < self.min_samples_per_group:
             return None
 
@@ -2251,7 +2526,19 @@ class PerConditionEval(SyntheticMetric):
         months_of_year: np.ndarray,
         feeder_ids: np.ndarray = None,
     ) -> Dict[str, str]:
-        """Create bar charts of aggregated real vs synthetic consumption by day and month."""
+        """
+        Create bar charts of aggregated real vs synthetic consumption by day and month.
+
+        Args: 
+            real_data: Real data array (shape [N, D])
+            synthetic_data: Synthetic data array (shape [N, D])
+            days_of_week: Array of day-of-week values for each sample (shape [N], values 0-6)
+            months_of_year: Array of month-of-year values for each sample (shape [N], values 1-12)
+            feeder_ids: Optional array of feeder IDs for each sample (shape [N])
+        
+        Returns:
+            Dictionary containing paths to saved plots
+        """
         base_dir = os.path.dirname(self.output_path) if self.output_path and self.output_path.endswith('.json') else self.output_path
         plots_dir = os.path.join(base_dir, 'Plots') if base_dir else 'Plots'
         os.makedirs(plots_dir, exist_ok=True)
@@ -2375,7 +2662,12 @@ class PerConditionEval(SyntheticMetric):
         }
 
     def compute(self) -> float:
-        """Run per-condition MMD, ACFDistribution, and TSTR and save results."""
+        """
+        Run per-condition MMD, ACFDistribution, and TSTR and save results.
+
+        Returns: 
+            Overall TSTR/TRTR ratio across all data (lower is better, 1.0 means synthetic is as good as real)
+        """
         if self.real_data is None or self.synthetic_data is None:
             raise ValueError("PerConditionEval requires injected real_data and synthetic_data.")
         if self.timestamps is None:

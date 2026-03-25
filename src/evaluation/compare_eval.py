@@ -16,6 +16,13 @@ except ImportError:
         return str(data)
 
 class ModelComparator:
+    """
+    Class to compare evaluation results across multiple models.
+    
+    Attributes: 
+        output_dir: Directory to save comparison plots and tables
+        models_data: Dictionary to hold evaluation data for each model (model_name -> eval_data)
+    """
     """Class to compare evaluation results across multiple models.
     Usage:
         comparator = ModelComparator(output_dir="comparison_results")
@@ -32,7 +39,8 @@ class ModelComparator:
         output_dir (str): Directory to save comparison results (plots and table).
     """
 
-    def __init__(self, output_dir: str = "evaluation_comparison"):
+    def __init__(self, 
+                 output_dir: str = "evaluation_comparison"):
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         self.models_data = {}
@@ -74,7 +82,9 @@ class ModelComparator:
         self.models_data[model_name] = data
 
     def compare(self):
-        """Generate comparison table and plots."""
+        """
+        Generate comparison table and plots.
+        """
         if not self.models_data:
             print("No models added. Exiting.")
             return
@@ -83,7 +93,10 @@ class ModelComparator:
         self._generate_plots()
 
     def _generate_table(self):
-        """Generate and print a comparison table of scalar metrics."""
+        """
+        Generate and print a comparison table of scalar metrics.
+        The table will include all scalar metrics found in the eval results, with one column per model. 
+        """
         headers = ["Metric"] + list(self.models_data.keys())
         
         # Collect all unique metric names
@@ -113,7 +126,10 @@ class ModelComparator:
         print(f"\nTable saved to {table_path}")
 
     def _generate_plots(self):
-        """Generate bar charts for scalar metrics."""
+        """
+        Generate bar charts for scalar metrics.
+        Each metric will have its own subplot, and bars will be colored by model. The best value for each metric will be highlighted with a star.
+        """
         all_metrics = set()
         for data in self.models_data.values():
             if 'standalone_metrics' in data:

@@ -9,6 +9,19 @@ import torch
 from torch.utils.data import Dataset, DataLoader, TensorDataset
 
 def map_meter_ids_to_feeder_ids(
+                                meter_ids: Sequence,
+                                meter_to_feeder: dict[str, Optional[str]],
+                                ) -> np.ndarray:
+    """
+    Map a sequence of meter ids to feeder ids using a pre-loaded mapping.
+    
+    Args: 
+        meter_ids: A sequence of meter identifiers to be mapped.
+        meter_to_feeder: A dictionary mapping meter identifiers (as strings) to feeder identifiers.
+    
+    Returns:
+        A numpy array of feeder identifiers corresponding to the input meter_ids. If a meter_id does not have a mapping, None is used.
+    """
     meter_ids: Sequence,
     meter_to_feeder: dict[str, str | None],
 ) -> np.ndarray:
@@ -71,8 +84,11 @@ class SmartMeterCSV:
 
         self.df: pd.DataFrame | None = None
 
-    def load(self, filename: str) -> pd.DataFrame:
-        """Load CSV (or a Parquet cache thereof) into a MultiIndex DataFrame.
+    def load(self, 
+             filename: str
+             ) -> pd.DataFrame:
+        """
+        Load CSV (or a Parquet cache thereof) into a MultiIndex DataFrame.
 
         On the first call the 3 GB CSV is chunk-read and written to a
         _parquet_cache/<stem>.parquet file (zstd-compressed
@@ -166,6 +182,10 @@ class SmartMeterCSV:
 
     # prints basic stats
     def examine(self) -> None:
+        """
+        Print basic information about the loaded DataFrame, including data types, summary statistics, and missing value counts.
+        This method requires that the data has been loaded into the DataFrame. If the data is not loaded, it will raise a ValueError.
+        """
         self._require_loaded()
         print("Data Info:")
         print(self.df.info())
@@ -175,6 +195,12 @@ class SmartMeterCSV:
         print(self.df.isnull().sum())
 
     def _require_loaded(self) -> None:
+        """
+        Utility method to check if the DataFrame has been loaded before performing operations that require data access.
+        
+        Raises:
+            ValueError: If the DataFrame is not loaded (i.e., self.df is None).
+        """
         if self.df is None:
             raise ValueError("Data not loaded. Call .load(filename) first.")
 
@@ -183,6 +209,9 @@ class SmartMeterCSV:
 # Dataset: sliding windows per meter
 @dataclass(frozen=True)
 class WindowSpec:
+    """
+    Specification for how to window the time series data for model input.
+    """
     input_len: int # length of input window - how many past hours go into the model as x
     stride: int = 1 # how many hours to move the window each step
 
@@ -644,9 +673,21 @@ class SmartMeterDataModule:
         return TensorDataset(*tensors)
 
     def get_normalizer(self):
+        """
+        Get the fitted normalizer instance, if available. This can be used to access the normalizer's parameters or apply the same normalization to new data outside of the DataModule.
+        
+        Returns:
+            The normalizer instance that was fitted on the training data, or None if no normalizer was provided or fitted. The normalizer should have a transform() method that can be applied to new data using the same parameters as were used for the training data.
+        """
         return self.normalizer
 
     def train_dataloader(self) -> DataLoader:
+        """
+        Create a DataLoader for the training dataset with the specified batch size, shuffling, and number of workers. The DataLoader will yield batches of (x, meter_id, timestamp) for the training data.
+        
+        Returns:
+            A DataLoader instance for the training dataset, configured with the specified batch size, shuffling, and number of workers. The DataLoader will yield batches of (x, meter_id, timestamp) for the training data.
+        """
         return DataLoader(
             self._train_ds,
             batch_size         = self.batch_size,
@@ -657,6 +698,13 @@ class SmartMeterDataModule:
         )
 
     def val_dataloader(self) -> DataLoader:
+        """
+        Create a DataLoader for the validation dataset with the specified batch size and number of workers. 
+        Shuffling is disabled for validation data to ensure consistent evaluation.
+        
+        Return: 
+            A DataLoader instance for the validation dataset, configured with the specified batch size and number of workers. 
+        """
         return DataLoader(
             self._val_ds,
             batch_size         = self.batch_size,
@@ -667,6 +715,13 @@ class SmartMeterDataModule:
         )
 
     def test_dataloader(self) -> DataLoader:
+        """
+        Create a DataLoader for the test dataset with the specified batch size and number of workers.
+        Shuffling is disabled for test data to ensure consistent evaluation.
+        
+        Returns: 
+            A DataLoader instance for the test dataset, configured with the specified batch size and number of workers.
+        """
         return DataLoader(
             self._test_ds,
             batch_size         = self.batch_size,
@@ -678,7 +733,7 @@ class SmartMeterDataModule:
 
 
 def fit_normalizer_on_files(
-    normalizer,
+    normalizer: Normalizer,
     data_dir: str,
     filenames: Sequence[str],
     feature_cols: Sequence[str],
@@ -689,8 +744,9 @@ def fit_normalizer_on_files(
     seed: int = 0,
     stats_path: str | None = None,
     force_refit: bool = False,
-) -> None:
-    """Fit a Normalizer across all data files using one streaming Welford pass.
+    ) -> None:
+    """
+    Fit a Normalizer across all data files using one streaming Welford pass.
 
     Reads from the Parquet cache when available (so the 3 GB CSV is only
     parsed once ever).  The fitted stats are saved next to the cache and

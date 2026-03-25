@@ -23,7 +23,9 @@ class WindowSpec:
 
 
 class StreamingParquetBuffer(IterableDataset):
-    """An IterableDataset that reads data from a Parquet file in a streaming manner and uses a replay buffer to store and sample data for training."""
+    """
+    An IterableDataset that reads data from a Parquet file in a streaming manner and uses a replay buffer to store and sample data for training.
+    """
     def __init__(self, 
                  sm_files, 
                  replay_buffer_capacity: int = 10000, 
@@ -54,22 +56,58 @@ class StreamingParquetBuffer(IterableDataset):
         else:
             self.base_frequency = '15min'
     
-    def _push_to_buffer(self, item):
+    def _push_to_buffer(self, 
+                        item: tuple):
+        """
+        Push a new item into the replay buffer, overwriting old items in a circular manner.
+        """
         self.buffer[self.ptr] = item
         self.ptr = (self.ptr + 1) % self.replay_buffer_capacity
         self.current_size = min(self.current_size + 1, self.replay_buffer_capacity)
 
     def _sample_from_buffer(self):
+        """
+        Sample a random item from the replay buffer.
+
+        Returns: 
+            A randomly sampled item from the buffer
+
+        Raises:
+            ValueError: If the buffer does not have enough items to sample from (i.e., current_size < min_buffer_size)
+        """
         if self.current_size < self.min_buffer_size:
             raise ValueError(f"Buffer size {self.current_size} is less than the minimum required {self.min_buffer_size} for sampling.")
         idx = random.randrange(self.current_size)
         return self.buffer[idx]
 
-    def _extract_meter_id(self, file_path: str) -> int:
+    def _extract_meter_id(self, 
+                          file_path: str) -> int:
+        """
+        Extract the meter ID from the file name. Assumes file names are in the format 'sm_{meter_id}.parquet'.
+        
+        Args:
+            file_path: The full path to the Parquet file
+        
+        Returns:
+            The extracted meter ID as an integer
+        """
         basename = os.path.basename(file_path)
         return int(basename.replace('sm_', '').replace('.parquet', ''))
 
-    def _select_columns(self, file_cols):
+    def _select_columns(self, 
+                        file_cols: list) -> tuple:
+        """
+        Select the columns to load from the Parquet file based on the expected feature columns and time column candidates.
+        
+        Args:
+            file_cols: The list of column names available in the Parquet file
+        
+        Returns:            
+            A tuple containing:
+                - cols_to_load: The list of column names to load from the Parquet file
+                - rename_map: A dictionary mapping the actual column names in the file to the expected feature column names
+                - time_col_name: The name of the time column found in the file (or None if not found)
+        """
         cols_to_load = []
         rename_map = {}
 
@@ -85,7 +123,19 @@ class StreamingParquetBuffer(IterableDataset):
 
         return cols_to_load, rename_map, time_col_name
 
-    def _prepare_time_index(self, df: pd.DataFrame, time_col_name: Optional[str]) -> pd.DataFrame:
+    def _prepare_time_index(self, 
+                            df: pd.DataFrame, 
+                            time_col_name: Optional[str]) -> pd.DataFrame:
+        """
+        Prepare the DataFrame by setting a proper datetime index based on the time column. If no time column is found, use the existing index.
+        
+        Args: 
+            df: The input DataFrame loaded from the Parquet file
+            time_col_name: The name of the time column in the DataFrame (or None if not found)
+        
+        Returns:
+            A DataFrame with a datetime index prepared for time series processing
+        """
         if time_col_name and time_col_name in df.columns:
             time_values = df[time_col_name]
             df = df.drop(columns=[time_col_name])
@@ -100,7 +150,17 @@ class StreamingParquetBuffer(IterableDataset):
         prepared = prepared.sort_index()
         return prepared
 
-    def _impute_to_base_frequency(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _impute_to_base_frequency(self, 
+                                  df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Impute missing timestamps in the DataFrame to ensure a continuous time index at the base frequency
+        
+        Args:
+            df: The input DataFrame with a datetime index
+        
+        Returns:
+            A DataFrame with missing timestamps imputed to create a continuous time index at the base frequency
+        """
         if df.empty:
             return df
 
@@ -111,7 +171,19 @@ class StreamingParquetBuffer(IterableDataset):
 
         return df.reindex(full_index)
 
-    def _load_file_dataframe(self, file_path: str):
+    def _load_file_dataframe(self, 
+                             file_path: str):
+        """
+        Load a Parquet file into a DataFrame, selecting and renaming columns as needed, and prepare the time index.
+        
+        Args:
+            file_path: The path to the Parquet file to load
+        
+        Returns:
+            A tuple containing:
+                - A DataFrame with the selected features and a prepared time index, or None if loading failed
+                - The extracted meter ID from the file name, or None if loading failed
+        """
         parquet_file = pq.ParquetFile(file_path)
         file_cols = parquet_file.schema.names
         cols_to_load, rename_map, time_col_name = self._select_columns(file_cols)
@@ -125,6 +197,13 @@ class StreamingParquetBuffer(IterableDataset):
         return self._prepare_time_index(df, time_col_name), meter_id
     
     def __iter__(self):
+        """
+        The main loop for the IterableDataset. 
+        It controls the multiprocessing behavior, streams Parquet files, extracts sequences, and manages the replay buffer.
+        
+        Yields:
+            (seq, cond) pairs where seq is the input sequence tensor and cond is the condition tensor containing meter ID and timestamps.
+        """
         # === Multiprocessing traffic control ===
         worker_info = get_worker_info()
 
@@ -162,7 +241,21 @@ class StreamingParquetBuffer(IterableDataset):
                     # The yield pauses the loop right here until PyTorch needs more data
                     yield self._sample_from_buffer()
     
-    def _extract_sequences(self, df, meter_id):
+    def _extract_sequences(self, 
+                           df: pd.DataFrame, 
+                           meter_id: int) -> list:
+        """
+        Extract sequences of the specified input length and stride from the DataFrame for a given meter ID, and create corresponding condition tensors.
+        
+        Args:
+            df: The input DataFrame containing the time series data for a single meter, with a datetime index and feature columns
+            meter_id: The ID of the meter corresponding to the data in the DataFrame
+        
+        Returns:
+            A list of tuples, where each tuple contains:
+                - A tensor of shape [seq_len, num_features] representing the input sequence for the model
+                - A tensor of shape [2, seq_len] representing the condition for the sequence, where the first row contains the meter ID and the second row contains the timestamps
+        """
         sequences = []
 
         if self.window_spec is None:
@@ -197,6 +290,26 @@ class StreamingParquetBuffer(IterableDataset):
 
 
 class SMPhaseData:
+    """
+    A data module for loading and preparing smart meter data in a phased manner using a streaming Parquet buffer. 
+    This class is designed to work with PyTorch Lightning and provides DataLoaders for training, validation, and testing.
+    
+    Attributes:
+        data_dir: The directory containing the Parquet files with smart meter data
+        filename: Optional specific Parquet file to load (if not provided, all Parquet files in the data_dir will be used)
+        window_spec: A WindowSpec object defining the input sequence length and stride for extracting sequences from the time series data
+        batch_size: The batch size to use for the DataLoaders
+        replay_buffer_capacity: The capacity of the replay buffer used in the StreamingParquetBuffer
+        seed: An optional random seed for reproducibility of data shuffling and sampling
+        train_frac: The fraction of the data to use for training (default: 0.8)
+        val_frac: The fraction of the data to use for validation (default: 0.1)
+        test_frac: The fraction of the data to use for testing (default: 0.1)
+        normalizer: An optional Normalizer object to apply normalization to the input sequences
+        num_workers: The number of worker processes to use for data loading (default: 0, meaning data loading will happen in the main process)
+        train_loader: The DataLoader for the training set, initialized in the setup method
+        val_loader: The DataLoader for the validation set, initialized in the setup method
+        test_loader: The DataLoader for the test set, initialized in the setup method
+    """
     def __init__(
             self,
             data_dir: str,
@@ -237,6 +350,10 @@ class SMPhaseData:
         self.aggregation = hourly_aggregation
 
     def setup(self) -> None:
+        """
+        Set up the DataLoaders for training, validation, and testing by creating a StreamingParquetBuffer dataset and splitting it according to the specified fractions.
+        This method should be called before accessing the DataLoaders.
+        """
         # Create the streaming dataset
         dataset = StreamingParquetBuffer(
             sm_files=self.data_files,
@@ -250,7 +367,19 @@ class SMPhaseData:
         # Create the DataLoaders with the streaming dataset
         self.train_loader = DataLoader(dataset, batch_size=self.batch_size, num_workers=self.num_workers)
 
-    def _get_all_files(self, data_dir, time_series_info_json=None):
+    def _get_all_files(self, 
+                       data_dir: str, 
+                       time_series_info_json: Optional[str] = None) -> list:
+        """
+        Get a list of all Parquet files in the specified data directory. If a time_series_info_json file is provided, use it to determine which files to include based on the information in the JSON.
+        
+        Args: 
+            data_dir: The directory to search for Parquet files
+            time_series_info_json: An optional JSON file containing information about the time series data, which can be used to determine which files to include
+        
+        Returns:
+            A list of file paths to the Parquet files to be used for loading data
+        """
         if time_series_info_json is not None:
             with open(time_series_info_json, 'r') as f:
                 info = json.load(f)

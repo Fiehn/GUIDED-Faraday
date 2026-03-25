@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from datetime import datetime
 import json
+from typing import Any
 
 import os
 import sys
@@ -32,7 +33,20 @@ from src.model.model_utils import CyclicalBetaScheduler, EarlyStopping
 #   - encoder and decoder are modular and can be swapped out
 # ==============
 class VAE(nn.Module):
-    """Base VAE class with modular encoder, decoder, prior and hierarchical latent space.
+    """Base variational autoencoder with modular components.
+
+    This class provides a backbone for VAE-like models with pluggable encoder,
+    decoder, prior, and optional hierarchical latent module.
+
+    Attributes:
+        input_dim: Flattened input dimensionality.
+        latent_dim: Latent dimensionality.
+        encoder: Encoder module producing posterior parameters.
+        decoder: Decoder module producing reconstruction parameters.
+        prior: Prior distribution module.
+        hierarchy: Optional hierarchical latent module.
+        num_parameters: Number of trainable encoder+decoder parameters.
+        model_kwargs: Persisted constructor/training metadata.
     """
     def __init__(self,
                  input_dim=24,
@@ -45,6 +59,20 @@ class VAE(nn.Module):
                  device="cpu",
                  hierarchy_config: HierarchicalConfig = None,
                  **_):
+        """Initialize VAE model and its components.
+
+        Args:
+            input_dim: Flattened input dimensionality.
+            latent_dim: Latent dimensionality.
+            dictionary_size: Dictionary size for dictionary coders/priors.
+            vamp_num_components: Number of components for VampPrior.
+            encoder_type: Encoder family name.
+            decoder_type: Decoder family name.
+            prior_type: Prior type name. If None, inferred from encoder type.
+            device: Target device.
+            hierarchy_config: Optional hierarchy configuration.
+            **_: Unused compatibility kwargs.
+        """
         super(VAE, self).__init__()
 
         # === Argument Handling ===
@@ -102,7 +130,16 @@ class VAE(nn.Module):
         # Calculate and store the number of parameters
         self.num_parameters = self.encoder._num_parameters() + self.decoder._num_parameters()
     
-    def forward(self, inputs, num_samples=1):
+    def forward(self, inputs: torch.Tensor, num_samples: int = 1) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Run VAE forward pass.
+
+        Args:
+            inputs: Flattened input tensor `[B, D]`.
+            num_samples: Number of posterior samples.
+
+        Returns:
+            Tuple `(recon_params_dict, posterior_params_dict)`.
+        """
         # Encode inputs to get posterior parameters
         posterior_params_dict = self.encoder(inputs)
         # Sample latent variables using reparameterization trick 
@@ -127,8 +164,16 @@ class VAE(nn.Module):
         return recon_params_dict, posterior_params_dict
     
     @torch.no_grad()
-    def sample(self, num_samples_prior = 1, num_samples_posterior = 1, **kwargs):
-        """Sample from prior and decode."""
+    def sample(self, num_samples_prior: int = 1, num_samples_posterior: int = 1) -> dict[str, torch.Tensor]:
+        """Sample from prior and decode.
+
+        Args:
+            num_samples_prior: Number of prior draws.
+            num_samples_posterior: Number of decoder samples per prior draw.
+
+        Returns:
+            Dictionary containing sampled tensors and reconstruction parameters.
+        """
         self.eval()
 
         # Get prior parameters and move to device
@@ -166,17 +211,37 @@ class VAE(nn.Module):
         return {"samples": samples_stacked, "recon_params_dict": recon_params_dict}
     
     @torch.no_grad()
-    def reconstruct(self, inputs, num_samples=1):
+    def reconstruct(self, inputs: torch.Tensor, num_samples: int = 1) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Reconstruct inputs through encoder-decoder path.
+
+        Args:
+            inputs: Input tensor.
+            num_samples: Number of posterior samples.
+
+        Returns:
+            Tuple `(recon_params_dict, posterior_params_dict)`.
+        """
         # Run a single forward pass to get reconstruction parameters
         recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=num_samples)
         return recon_params_dict, posterior_params_dict
     
-    def reconstruction_loglikelihood(self, inputs, recon_params_dict):
+    def reconstruction_loglikelihood(self,
+                                     inputs: torch.Tensor,
+                                     recon_params_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Compute reconstruction log-likelihood.
+
+        Args:
+            inputs: Ground-truth inputs.
+            recon_params_dict: Decoder distribution parameters.
+
+        Returns:
+            Reconstruction log-likelihood tensor.
+        """
         # Compute reconstruction log-likelihood
         return self.decoder.loglikelihood(inputs, recon_params_dict)
     
     @torch.no_grad()
-    def loglikelihood(self, inputs, num_mc_samples=1):
+    def loglikelihood(self, inputs: torch.Tensor, num_mc_samples: int = 1) -> torch.Tensor:
         """Compute log-likelihood"""
         recon_params_dict, posterior_params_dict = self.forward(inputs, num_samples=num_mc_samples)
 
@@ -187,7 +252,26 @@ class VAE(nn.Module):
         
         return (recon_loglikelihood.sum(-1) + prior_loglikelihood.sum(-1) - posterior_loglikelihood.sum(-1)).mean(dim=0)
     
-    def loss(self, inputs, recon_params_dict, posterior_params_dict, beta: float = 1.0, weighted_loss: float = 0.0, **_):
+    def loss(self,
+             inputs: torch.Tensor,
+             recon_params_dict: dict[str, torch.Tensor],
+             posterior_params_dict: dict[str, torch.Tensor],
+             beta: float = 1.0,
+             weighted_loss: float = 0.0,
+             **_) -> dict[str, torch.Tensor]:
+        """Compute ELBO objective.
+
+        Args:
+            inputs: Ground-truth input tensor.
+            recon_params_dict: Decoder output parameters.
+            posterior_params_dict: Posterior parameters from encoder.
+            beta: KL weighting factor.
+            weighted_loss: Optional sample weighting strength.
+            **_: Unused compatibility kwargs.
+
+        Returns:
+            Dictionary with total loss and ELBO components.
+        """
         # Compute reconstruction log-likelihood
         recon_loglikelihood = self.reconstruction_loglikelihood(inputs, recon_params_dict)
 
@@ -209,7 +293,28 @@ class VAE(nn.Module):
         # TODO: MMD (mean maximum discrepancy) has been shown to be useful for smart meter data by one of the papers
         return {"loss": loss, "recon_loglikelihood": recon_loglikelihood, "kl_divergence": kl_div}
 
-    def train_core(self, x, optim, gradient_clip=None, gradient_clip_kwargs=None, beta=1.0, weighted_loss =0.0, **_):
+    def train_core(self,
+                   x: torch.Tensor | tuple[Any, ...] | list[Any],
+                   optim: torch.optim.Optimizer,
+                   gradient_clip: Any | None = None,
+                   gradient_clip_kwargs: dict[str, Any] | None = None,
+                   beta: float = 1.0,
+                   weighted_loss: float = 0.0,
+                   **_) -> dict[str, torch.Tensor]:
+        """Run one training step.
+
+        Args:
+            x: Batch tensor or packed batch tuple/list.
+            optim: Optimizer.
+            gradient_clip: Enables gradient clipping when not None.
+            gradient_clip_kwargs: Clip kwargs (e.g. `max_norm`).
+            beta: KL weighting factor.
+            weighted_loss: Optional reconstruction weighting term.
+            **_: Unused compatibility kwargs.
+
+        Returns:
+            Loss dictionary.
+        """
         # batch can be x OR (x, meter_id, timeStamp)
         self.train()  # Set model to training mode
 
@@ -246,11 +351,28 @@ class VAE(nn.Module):
         loss_dict = self.loss(x_flat, recon_params_dict, posterior_params_dict, beta=beta, weighted_loss=weighted_loss)
         loss_dict["loss"].backward() # Backpropagate
         if gradient_clip is not None:
+            if gradient_clip_kwargs is None:
+                gradient_clip_kwargs = {"max_norm": 1.0}
             torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_kwargs.get("max_norm", 1.0))
         optim.step() # Update parameters
         return loss_dict
     
-    def validate(self, valloader, num_samples = 1, beta=1, device = "cpu"):
+    def validate(self,
+                 valloader: torch.utils.data.DataLoader,
+                 num_samples: int = 1,
+                 beta: float = 1,
+                 device: str = "cpu") -> dict[str, float]:
+        """Evaluate model on validation data.
+
+        Args:
+            valloader: Validation dataloader.
+            num_samples: Number of latent samples in forward pass.
+            beta: KL weighting factor.
+            device: Device for evaluation.
+
+        Returns:
+            Averaged validation metrics dictionary.
+        """
         self.eval() # Set model to evaluation mode
         # Validation loop
         val_loss = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
@@ -287,12 +409,32 @@ class VAE(nn.Module):
 
         return val_loss
     
-    def get_optimizer(self, lr=1e-3, weight_decay=1e-4):
+    def get_optimizer(self, lr: float = 1e-3, weight_decay: float = 1e-4) -> torch.optim.Optimizer:
+        """Create optimizer for model parameters.
+
+        Args:
+            lr: Learning rate.
+            weight_decay: Weight decay.
+
+        Returns:
+            Adam optimizer instance.
+        """
         # Return Adam optimizer for model parameters
         # TODO: Allow for different optimizers and parameter settings
         return torch.optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay) # TODO: Parameters should be inputted
 
-    def move_to_device(self, batch, device):
+    def move_to_device(self,
+                       batch: torch.Tensor | list[Any] | tuple[Any, ...] | dict[str, Any],
+                       device: str | torch.device):
+        """Move tensor-containing batch structures to a device.
+
+        Args:
+            batch: Tensor/list/tuple/dict batch.
+            device: Target device.
+
+        Returns:
+            Batch with tensors moved to target device.
+        """
         if torch.is_tensor(batch):
             return batch.to(device)
         if isinstance(batch, (list, tuple)):
@@ -308,7 +450,11 @@ class VAE(nn.Module):
         return batch
 
 
-    def save_model(self, save_path=None, model_name="trained_model", device="cpu", normalizer=None):
+    def save_model(self,
+                   save_path: str | None = None,
+                   model_name: str = "trained_model",
+                   device: str = "cpu",
+                   normalizer: Any | None = None) -> None:
         """
         Save model with complete reconstruction information and validation.
         Stores all parameters needed to recreate the model from scratch.
@@ -412,7 +558,7 @@ class VAE(nn.Module):
             if hasattr(self, 'prior'):
                 self.prior.to(device)
 
-    def _extract_constructor_args(self):
+    def _extract_constructor_args(self) -> dict[str, Any]:
         """Safely extract and validate constructor arguments."""
         args =  {
             'input_dim': self.input_dim,
@@ -428,14 +574,14 @@ class VAE(nn.Module):
         return args
         
 
-    def _infer_prior_type(self):
+    def _infer_prior_type(self) -> str:
         """Safely infer prior type from class name."""
         if not hasattr(self, 'prior'):
             return 'standard_gaussian'
         prior_class = self.prior.__class__.__name__
         return prior_class.lower().replace('prior', '').replace('standard_', '')
 
-    def _extract_distribution_dict(self):
+    def _extract_distribution_dict(self) -> dict[str, Any]:
         """Extract distribution parameters with validation."""
         distribution_dict = {
             'latent_dim': getattr(self, 'latent_dim', 
@@ -466,7 +612,7 @@ class VAE(nn.Module):
         
         return distribution_dict
 
-    def _serialize_prior(self):
+    def _serialize_prior(self) -> dict[str, Any]:
         """Serialize prior with fallback error handling."""
         if not hasattr(self, 'prior'):
             return {'prior_type': 'StandardGaussianPrior', 'init_args': {}, 'state_dict': {}}
@@ -511,7 +657,7 @@ class VAE(nn.Module):
         
         return prior_state
 
-    def _serialize_cvae_info(self, model_info):
+    def _serialize_cvae_info(self, model_info: dict[str, Any]) -> dict[str, Any]:
         """Serialize CVAE-specific info with error handling."""
         model_info['condition_dim'] = self.condition_dim
         
@@ -543,7 +689,7 @@ class VAE(nn.Module):
         model_info['conditioner_state'] = conditioner_state
         return model_info
 
-    def _extract_conditioner_args(self, condition_item):
+    def _extract_conditioner_args(self, condition_item: Any) -> dict[str, Any]:
         """Extract constructor args for a condition item."""
         item_args = {}
         class_name = condition_item.__class__.__name__
@@ -569,7 +715,7 @@ class VAE(nn.Module):
         
         return item_args
 
-    def _validate_checkpoint(self, checkpoint):
+    def _validate_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         """Validate checkpoint structure and content."""
         required_keys = ['model_state_dict', 'model_info', 'constructor_args', 'prior_state']
         for key in required_keys:
@@ -587,7 +733,7 @@ class VAE(nn.Module):
         
         print(f"✓ Checkpoint validation passed")
 
-    def load_model(self, load_path, device="cpu"):
+    def load_model(self, load_path: str, device: str = "cpu") -> Any:
         """
         Load model with complete reconstruction from saved information.
         Works with both old and new save formats.
@@ -674,7 +820,7 @@ class VAE(nn.Module):
         return normalizer
     
     @staticmethod
-    def _load_normalizer_from_checkpoint(checkpoint, device="cpu"):
+    def _load_normalizer_from_checkpoint(checkpoint: dict[str, Any], device: str = "cpu") -> Any | None:
         """Load normalizer state from checkpoint if available."""
         normalizer_state = checkpoint.get('normalizer_state', None)
         if normalizer_state is not None:
@@ -696,7 +842,7 @@ class VAE(nn.Module):
         return None
 
     @classmethod
-    def load_from_checkpoint(cls, load_path, device="cpu", **kwargs):
+    def load_from_checkpoint(cls, load_path: str, device: str = "cpu") -> tuple["VAE", Any | None]:
         """
         Load a model instance completely from a saved checkpoint.
         """
@@ -811,36 +957,73 @@ class VAE(nn.Module):
         normalizer = cls._load_normalizer_from_checkpoint(checkpoint=checkpoint, device=device)
         return model, normalizer
     
-    def get_tag(self):
+    def get_tag(self) -> str:
+        """Create timestamped model tag string.
+
+        Returns:
+            Unique model tag.
+        """
         time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"{self.__class__.__name__}_{self.decoder.__class__.__name__}_{time_stamp}"
 
     def fit(self,
-            trainloader,
-            valloader = None,
-            lr = 1e-3,
-            weight_decay = 1e-4,
-            gradient_clip = None,
-            gradient_clip_kwargs = {"max_norm": 1.0},
-            lr_scheduler = False,
-            lr_scheduler_kwargs = {"step_size": 10, "gamma": 0.9},
-            beta = 1.0,
-            beta_annealing = False,  # Enable cyclical beta annealing to avoid posterior collapse
-            beta_annealing_kwargs = {"n_cycles": 4, "ratio": 0.5},  # kwargs for CyclicalBetaScheduler
-            epochs = 1000,
-            validation_freq = 1,
-            validation_num_samples = 10,
-            device = "cpu", 
-            early_stopping = True,
-            early_stopping_kwargs = {"patience": 10, "min_delta": 0.001},
-            save_epoch_freq = 10,
-            writer = None,
-            log_dir = './models/',
-            model_name = None, # Optionally specify model name for saving
-            normalizer = None,
-            compile_model = False, # Whether to use torch.compile for faster training (PyTorch 2.0+)
-            weighted_loss = 0.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
-            **_):
+            trainloader: torch.utils.data.DataLoader,
+            valloader: torch.utils.data.DataLoader | None = None,
+            lr: float = 1e-3,
+            weight_decay: float = 1e-4,
+            gradient_clip: Any | None = None,
+            gradient_clip_kwargs: dict[str, Any] = {"max_norm": 1.0},
+            lr_scheduler: bool = False,
+            lr_scheduler_kwargs: dict[str, Any] = {"step_size": 10, "gamma": 0.9},
+            beta: float = 1.0,
+            beta_annealing: bool = False,
+            beta_annealing_kwargs: dict[str, Any] = {"n_cycles": 4, "ratio": 0.5},
+            epochs: int = 1000,
+            validation_freq: int = 1,
+            validation_num_samples: int = 10,
+            device: str = "cpu",
+            early_stopping: bool = True,
+            early_stopping_kwargs: dict[str, Any] = {"patience": 10, "min_delta": 0.001},
+            save_epoch_freq: int = 10,
+            writer: Writer | None = None,
+            log_dir: str = './models/',
+            model_name: str | None = None,
+            normalizer: Any | None = None,
+            compile_model: bool = False,
+            weighted_loss: float = 0.0,
+            **_) -> tuple[str, Writer | None]:
+        """Train VAE model with optional validation, checkpointing, and annealing.
+
+        Args:
+            trainloader: Training dataloader.
+            valloader: Optional validation dataloader.
+            lr: Learning rate.
+            weight_decay: Weight decay.
+            gradient_clip: Enables gradient clipping when not None.
+            gradient_clip_kwargs: Gradient clipping configuration.
+            lr_scheduler: Whether to use learning rate scheduler.
+            lr_scheduler_kwargs: Scheduler configuration.
+            beta: KL weighting coefficient.
+            beta_annealing: Whether to use cyclical beta schedule.
+            beta_annealing_kwargs: Annealing scheduler configuration.
+            epochs: Number of epochs.
+            validation_freq: Validate every N epochs.
+            validation_num_samples: Number of validation latent samples.
+            device: Training device.
+            early_stopping: Whether to enable early stopping.
+            early_stopping_kwargs: Early stopping settings.
+            save_epoch_freq: Checkpoint save frequency.
+            writer: Optional writer instance.
+            log_dir: Output directory for logs/checkpoints.
+            model_name: Optional explicit model name.
+            normalizer: Optional fitted normalizer to serialize with model.
+            compile_model: Whether to attempt torch.compile.
+            weighted_loss: Reconstruction weighting strength.
+            **_: Unused compatibility kwargs.
+
+        Returns:
+            Tuple `(model_tag, writer)`.
+        """
 
         # === Generate a model tag ===
         if model_name is None:
@@ -1089,7 +1272,12 @@ class VAE(nn.Module):
             print(f"Writter logs saved to: {log_dir_tagged}")
         return model_tag, writer
     
-    def get_SigmaMapper(self):
+    def get_SigmaMapper(self) -> torch.Tensor | None:
+        """Get decoder sigma mapper when available.
+
+        Returns:
+            Sigma mapper tensor or `None`.
+        """
         return self.decoder.get_SigmaMapper()
 
 
