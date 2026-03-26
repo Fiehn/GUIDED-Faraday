@@ -154,11 +154,11 @@ def _run_evaluation_and_visualization(model, test_loader, normalizer, conditione
             conditioner=conditioner,
             device='cpu',
             window_size=config.window.input_len,
-            output_dir=log_path,
+            output_path=log_path,
         )
         phased_evaluator.evaluate()
     else:
-        evaluator = EvalFramework(model, test_loader, normalizer,conditioner=conditioner, device='cpu', output_dir=log_path)
+        evaluator = EvalFramework(model, test_loader, normalizer,conditioner=conditioner, device='cpu', output_path=log_path)
         evaluator.register_all()
         evaluator.evaluate()
         evaluator.save_results(os.path.join(log_path, 'eval_results.json'))

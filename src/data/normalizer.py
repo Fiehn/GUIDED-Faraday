@@ -204,7 +204,10 @@ class Normalizer:
             return torch.from_numpy(X.astype(np.float32)).to(self.device)
         return X.float().to(self.device)
 
-    def fit(self, X: np.ndarray | torch.Tensor, sm_files=None, stats_path=None) -> 'Normalizer':
+    def fit(self, 
+            X: np.ndarray | torch.Tensor, 
+            sm_files=None, 
+            stats_path='normalization_stats.json') -> 'Normalizer':
         """
         Fit the normalizer on a full dataset at once.
 

@@ -195,7 +195,6 @@ class EvalFramework:
         window_size: int = 24,
         n_synthetic_samples: int = 1000,
         output_path: str = 'models/eval_results.json',
-        output_dir: str = 'models',
         prepared_data: Dict[str, Any] = None,
         evaluation_title: str = 'EVALUATION RESULTS',
     ):
@@ -216,7 +215,7 @@ class EvalFramework:
 
         self.window_size = window_size
         self.n_synthetic_samples = n_synthetic_samples
-        self.output_dir = output_dir
+        self.output_path = output_path
         self.prepared_data = prepared_data
         self.evaluation_title = evaluation_title
         
@@ -229,8 +228,6 @@ class EvalFramework:
         self._reconstructed_data: np.ndarray = None  # Cache reconstructed data for metrics that need it
         self._synthetic_data: np.ndarray = None  # Cache synthetic data for metrics that need it
         self._timestamps: np.ndarray = None  # Cache timestamps for metrics that need it
-
-        self.output_path = output_path
 
     def register_all(self) -> None:
         """Convenience method to register all default metrics."""
@@ -301,9 +298,11 @@ class EvalFramework:
                 real_batches.append(x_flat.cpu().numpy())
 
                 if timestamps is not None:
-                    timestamp_batches.append(timestamps.cpu().numpy())
+                    # timestamp_batches.append(timestamps.cpu().numpy())
+                    timestamp_batches.append(np.asarray(timestamps.cpu().numpy()).reshape(-1))
                 if meter_ids is not None:
-                    meter_id_batches.append(meter_ids.cpu().numpy())
+                    # meter_id_batches.append(meter_ids.cpu().numpy())
+                    meter_id_batches.append(np.asarray(meter_ids.cpu().numpy()).reshape(-1))
 
                 recon = self._reconstruct(data, meter_id=meter_ids, timestamps=timestamps)
                 recon_batches.append(recon.cpu().numpy())
@@ -632,7 +631,7 @@ class PhasedEvaluationSuite:
         device: str = 'cpu',
         window_size: int = 96,
         n_synthetic_samples: int = 1000,
-        output_dir: str = 'output',
+        output_path: str = 'output',
     ):
         self.model = model
         self.dataloader = dataloader
@@ -641,7 +640,7 @@ class PhasedEvaluationSuite:
         self.device = device
         self.window_size = int(window_size)
         self.n_synthetic_samples = int(n_synthetic_samples)
-        self.output_dir = output_dir
+        self.output_path = output_path
 
     def _prepare_base_framework(self) -> EvalFramework:
         framework = EvalFramework(
@@ -652,7 +651,7 @@ class PhasedEvaluationSuite:
             device=self.device,
             window_size=self.window_size,
             n_synthetic_samples=self.n_synthetic_samples,
-            output_dir=self.output_dir,
+            output_path=self.output_path,
             evaluation_title='PHASED DATA PREPARATION',
         )
         framework._prepare_data()
@@ -669,7 +668,7 @@ class PhasedEvaluationSuite:
         n_features = arr.shape[1] // self.window_size
         return arr.reshape(arr.shape[0], n_features, self.window_size)
 
-    def _run_prepared_eval(self, prepared_data: Dict[str, Any], output_dir: str, title: str, output_path: str) -> Dict[str, float]:
+    def _run_prepared_eval(self, prepared_data: Dict[str, Any], output_path: str, title: str) -> Dict[str, float]:
         evaluator = EvalFramework(
             self.model,
             self.dataloader,
@@ -678,7 +677,7 @@ class PhasedEvaluationSuite:
             device='cpu',
             window_size=self.window_size,
             n_synthetic_samples=self.n_synthetic_samples,
-            output_dir=output_dir,
+            output_path=output_path,
             prepared_data=prepared_data,
             evaluation_title=title,
         )
@@ -688,7 +687,7 @@ class PhasedEvaluationSuite:
         return results
 
     def evaluate(self) -> Dict[str, Any]:
-        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.output_path, exist_ok=True)
         base = self._prepare_base_framework()
 
         real_phase = self._extract_phase_first(base._real_data, 'real data')
@@ -699,7 +698,7 @@ class PhasedEvaluationSuite:
         recon_denorm = _inverse_transform_phase_first(recon_phase, self.normalizer)
         synthetic_denorm = _inverse_transform_phase_first(synthetic_phase, self.normalizer)
 
-        aggregated_dir = os.path.join(self.output_dir, 'aggregated_phase_eval')
+        aggregated_dir = os.path.join(self.output_path, 'aggregated_phase_eval')
         os.makedirs(aggregated_dir, exist_ok=True)
         aggregated_prepared = {
             'real_data': _flatten_windows(real_denorm.sum(axis=1)),
@@ -710,7 +709,6 @@ class PhasedEvaluationSuite:
         }
         aggregate_results = self._run_prepared_eval(
             prepared_data=aggregated_prepared,
-            output_dir=aggregated_dir,
             title='AGGREGATED 3-PHASE EVALUATION',
             output_path=os.path.join(aggregated_dir, 'eval_results.json'),
         )
@@ -723,7 +721,7 @@ class PhasedEvaluationSuite:
         num_phases = ranked_real.shape[1]
         for phase_idx in range(num_phases):
             phase_number = phase_idx + 1
-            phase_dir = os.path.join(self.output_dir, f'ranked_phase_{phase_number}_eval')
+            phase_dir = os.path.join(self.output_path, f'ranked_phase_{phase_number}_eval')
             os.makedirs(phase_dir, exist_ok=True)
             prepared = {
                 'real_data': _flatten_windows(ranked_real[:, phase_idx, :]),
@@ -734,7 +732,6 @@ class PhasedEvaluationSuite:
             }
             ranked_results[f'phase_{phase_number}'] = self._run_prepared_eval(
                 prepared_data=prepared,
-                output_dir=phase_dir,
                 title=f'RANKED PHASE {phase_number} EVALUATION',
                 output_path=os.path.join(phase_dir, 'eval_results.json'),
             )
@@ -744,7 +741,7 @@ class PhasedEvaluationSuite:
             'ranked_phases': ranked_results,
         }
 
-        summary_path = os.path.join(self.output_dir, 'phased_eval_summary.json')
+        summary_path = os.path.join(self.output_path, 'phased_eval_summary.json')
         with open(summary_path, 'w') as f:
             json.dump(_to_json_serializable(summary), f, indent=2)
         print(f"Phased evaluation summary saved to {summary_path}")
@@ -1321,15 +1318,15 @@ class VisualEvaluation(SyntheticMetric):
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None   
 
-    def __init__(self, output_dir='output/Plots'):
+    def __init__(self, output_path='output'):
         """
         Args:
             real_data: numpy array of real data [N, D]
             synthetic_data: numpy array of synthetic data [M, D]
-            output_dir: Directory to save plots
+            output_path: Directory to save plots
         """
-        self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
+        self.output_path = output_path
+        os.makedirs(output_path, exist_ok=True)
     
     @property
     def name(self) -> str:
@@ -1373,7 +1370,7 @@ class VisualEvaluation(SyntheticMetric):
         ax2.set_ylabel('PC2')
         ax2.set_zlabel('PC3')
         plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, 'pca_comparison.pdf'), format='pdf')
+        plt.savefig(os.path.join(self.output_path, 'pca_comparison.pdf'), format='pdf')
         plt.close()
     
     def tsne(self) -> None:
@@ -1419,7 +1416,7 @@ class VisualEvaluation(SyntheticMetric):
         ax.set_ylabel('t-SNE 2')
         ax.legend()
         plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, 'tsne_comparison.pdf'), format='pdf')
+        plt.savefig(os.path.join(self.output_path, 'tsne_comparison.pdf'), format='pdf')
         plt.close()
     
     def compute(self) -> float:
@@ -1427,7 +1424,7 @@ class VisualEvaluation(SyntheticMetric):
         try:
             self.pca()
             self.tsne()
-            print(f"  Visual evaluation plots saved to {self.output_dir}")
+            print(f"  Visual evaluation plots saved to {self.output_path}")
             return 1.0  # Success
         except Exception as e:
             print(f"  Error generating visualizations: {e}")
@@ -1843,7 +1840,7 @@ class AggregatedProfiles(SyntheticMetric):
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
     normalizer = None
-    output_dir: str = None
+    output_path: str = None
     
     def __init__(self, n_samples: int = 100, window_size: int = 24, tau: str = 'auto', normalize: bool = True):
         self.n_samples = n_samples
@@ -1980,7 +1977,7 @@ class PerConditionEval(SyntheticMetric):
     timestamps: np.ndarray = None
     meter_ids: np.ndarray = None
     feeder_ids: np.ndarray = None
-    output_dir: str = None
+    output_path: str = None
 
     def __init__(self, window_size: int = 24, max_lag: int = 10, min_samples_per_group: int = 2,
                  verbose: bool = False, predictor_type: str = 'linear', tstr_epochs: int = 50,
@@ -2253,7 +2250,8 @@ class PerConditionEval(SyntheticMetric):
     ) -> Dict[str, str]:
         """Create bar charts of aggregated real vs synthetic consumption by day and month."""
         base_dir = os.path.dirname(self.output_path) if self.output_path and self.output_path.endswith('.json') else self.output_path
-        plots_dir = os.path.join(base_dir, 'Plots') if base_dir else 'Plots'
+        # plots_dir = os.path.join(base_dir, 'Plots') if base_dir else 'Plots'
+        plots_dir = self.output_path
         os.makedirs(plots_dir, exist_ok=True)
         
         # Plot style
@@ -2669,7 +2667,7 @@ class PerConditionEval(SyntheticMetric):
                 print(f"{month_names[month]:10s} (month {month:2d})  ->  TSTR Ratio = {value_str}")
 
         # Save file
-        combined_output_file = os.path.join(self.output_dir, 'eval_results.json')
+        combined_output_file = os.path.join(self.output_path, 'eval_results.json')
         existing_payload = {}
         if os.path.exists(combined_output_file):
             try:
