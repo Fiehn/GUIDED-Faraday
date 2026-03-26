@@ -204,7 +204,7 @@ class Normalizer:
             return torch.from_numpy(X.astype(np.float32)).to(self.device)
         return X.float().to(self.device)
 
-    def fit(self, X: np.ndarray | torch.Tensor) -> 'Normalizer':
+    def fit(self, X: np.ndarray | torch.Tensor, sm_files=None, stats_path=None) -> 'Normalizer':
         """
         Fit the normalizer on a full dataset at once.
 
@@ -218,7 +218,22 @@ class Normalizer:
         Returns:
             Normalizer: The fitted normalizer instance.
         """
-        Xt = self._to_tensor(X)
+        
+        if X is None:
+            # For log1p_phase, we can compute the stats from the entire dataset using the compute_normalization_stats function
+            if self.method == 'log1p_phase':
+                self.mean, self.std = compute_normalization_stats(
+                    sm_files=sm_files,
+                    feature_cols=['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3'],
+                    save_path=stats_path,
+                    valid_ids_json_path=None,
+                    use_cache=True,
+                )
+                self.fitted = True
+                return
+            else:
+                raise ValueError("X cannot be None for methods other than 'log1p_phase'.")
+        Xt = self._to_tensor(X) # (N,F)
 
         if self.method == 'zero_preserved_log':
             nz = Xt[Xt != 0]
@@ -230,14 +245,19 @@ class Normalizer:
             self.std  = Xt.std(dim=0,  keepdim=True)
             self.std[self.std == 0] = 1.0
         elif self.method == 'log1p':
-            Xl = torch.log1p(Xt.clamp(min=0.0))
-            self.mean = Xl.mean(dim=0, keepdim=True)
-            self.std  = Xl.std(dim=0,  keepdim=True)
-            self.std[self.std == 0] = 1.0
+            log1p_values = torch.log1p(Xt)
+            self.mean = log1p_values.mean(dim=0, keepdim=True)
+            self.std = log1p_values.std(dim=0, keepdim=True)
+            self.std[self.std == 0] = 1.0 # Avoid division by zero
+            self.fitted = True
         else:
-            raise ValueError(f"Unknown normalisation method: '{self.method}'")
+            raise ValueError(f"finalise_fit() not implemented for method '{self.method}'")
 
         self.fitted = True
+
+        # Release temporary Welford state
+        for attr in ('_wf_n', '_wf_mean', '_wf_M2'):
+            self.__dict__.pop(attr, None)
         return self
     
     # ------------------------------------------------------------------

@@ -17,8 +17,8 @@ data:
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
   # data_dir: "./data/raw_profiles"
-  #data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
-  data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
+  data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+  #data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   
   # CSV filename to load
   data_files: [] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
@@ -44,9 +44,9 @@ data:
   
   # Windowing configuration
   window:
-    aggregated: false # whether to aggregate 15-min data to hourly (for phased parquet mode) change the following to 24 hours
-    input_len: 96  # 24-hour windows (24 hours * 4 readings per hour)
-    stride: 96     # Non-overlapping windows (one per day)
+    aggregated: true # whether to aggregate 15-min data to hourly (for phased parquet mode) change the following to 24 hours
+    input_len: 24  # 24-hour windows (24 hours * 4 readings per hour)
+    stride: 24     # Non-overlapping windows (one per day)
   
   # DataLoader settings
   dataloader:

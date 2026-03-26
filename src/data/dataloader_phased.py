@@ -50,7 +50,7 @@ class StreamingParquetBuffer(IterableDataset):
         self.feature_cols = ['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3']
         self.time_col_candidates = ['timestamp_dst', 'timestamp', 'timestamp_utc']
         if self.aggregation:
-            self.base_frequency = '1H'
+            self.base_frequency = '1h'
         else:
             self.base_frequency = '15min'
     
