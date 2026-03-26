@@ -65,13 +65,16 @@ class SyntheticGenerator:
         """
         self.model.eval()
         self.model.to(self.device)
-        input_data = input_data.to(self.device)
+        model_dtype = next(self.model.parameters()).dtype
+        input_data = input_data.to(self.device, dtype=model_dtype)
 
         if self.normalizer is not None and not is_normalized:
             input_data = self.normalizer.transform(input_data.reshape(-1, input_data.shape[-1])).reshape(input_data.shape)
+            # Normalizers may return float64 tensors; align with model dtype for linear layers.
+            input_data = input_data.to(self.device, dtype=model_dtype)
         if self._is_cvae and meter_id is not None and timestamp is not None:
             # Conditions for the encoding are always based on the original meter_id and timestamp, to get the correct latent representation.
-            conditions = self.conditioner.get_conditions(input_data, meter_id, timestamp).to(self.device)
+            conditions = self.conditioner.get_conditions(input_data, meter_id, timestamp).to(self.device, dtype=model_dtype)
             
             # Ensure input_data is flattened appropriately
             if hasattr(self.model, '_set_encode'):
@@ -98,7 +101,7 @@ class SyntheticGenerator:
 
             # Add new conditions in the decoder!
             if new_conditions is not None:
-                conditions = new_conditions.to(self.device)
+                conditions = new_conditions.to(self.device, dtype=model_dtype)
 
             c_expanded = conditions.unsqueeze(0).expand(1, -1, -1)
             

@@ -257,7 +257,7 @@ class DictionaryCoder(torch.nn.Module):
         Sigma_jittered = Sigma + jitter
         
         # Using scale_tril with Cholesky decomposition for better numerical stability (should be equivalent to covariance_matrix but more stable)
-        L = torch.linalg.cholesky(Sigma)
+        L = torch.linalg.cholesky(Sigma_jittered)
         
         dist = torch.distributions.MultivariateNormal(loc=mu, scale_tril=L)
         return dist.log_prob(inputs)
@@ -311,7 +311,15 @@ class DictionaryCoder(torch.nn.Module):
             if prior is None:
                 log_p = -0.5 * torch.sum(z ** 2 + torch.log(torch.tensor(2 * torch.pi)), dim=-1)
             else:
-                log_p = prior.log_prob(z)
+                # Dictionary priors can parameterize sigma in dictionary space.
+                # For MC fallback we evaluate p(z) in latent/output space using the
+                # already-constructed Gaussian prior covariance.
+                Sigma_p_sym = 0.5 * (Sigma_p + Sigma_p.transpose(-1, -2))
+                D = Sigma_p_sym.shape[-1]
+                jitter = 1e-5 * torch.eye(D, device=Sigma_p_sym.device, dtype=Sigma_p_sym.dtype).unsqueeze(0)
+                L_p = torch.linalg.cholesky(Sigma_p_sym + jitter)
+                dist_p = torch.distributions.MultivariateNormal(loc=mu_p, scale_tril=L_p)
+                log_p = dist_p.log_prob(z)
             return log_q - log_p
 
 

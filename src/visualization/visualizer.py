@@ -127,7 +127,7 @@ class Visualizer:
 
             # Simple non-zero mask in raw space
             x_tf = self._to_time_feature(x)
-            x_raw = self._safe_inverse_transform(x_tf) if self.normalizer is not None else x_tf
+            x_raw = x_tf
             mask = x_raw.reshape(x_raw.shape[0], -1).abs().sum(dim=1) > 1e-8
 
             if mask.any():
@@ -193,11 +193,8 @@ class Visualizer:
 
         self.visualize_reconstructions(num_samples=num_samples, num_recon_per=num_recon_per, test_loader=test_loader)
 
-        try:
-            print("Visualizing synthetic samples.")
-            self.visualize_synthetic(num_samples=num_synthetic)
-        except Exception as e:
-            print(f"Error visualizing synthetic samples: {e}")
+        self.visualize_synthetic(num_samples=num_synthetic)
+
         try:
             print("Visualizing sigma mapper.")
             self.visualize_sigma_mapper()
@@ -208,11 +205,9 @@ class Visualizer:
             self.visualize_latent_space(test_loader=test_loader)
         except Exception as e:
             print(f"Error visualizing latent space: {e}")
-        try:
-            print("Visualizing synthetic recreations.")
-            self.visualize_synthetic_recreations(test_loader=test_loader, num_originals=num_originals, num_synthetic_per=num_synthetic_per)
-        except Exception as e:
-            print(f"Error visualizing synthetic recreations: {e}")
+        
+        self.visualize_synthetic_recreations(test_loader=test_loader, num_originals=num_originals, num_synthetic_per=num_synthetic_per)
+        
         try:
             print("Visualizing user profiles.")
             self.visualize_user_dict()
@@ -257,20 +252,45 @@ class Visualizer:
             print("Model and normalizer are required for reconstruction visualization.")
             return
         x_original, m_ids, t_ids = self._collect_nonzero_samples(test_loader, min_samples=num_samples)
+        x_original_tf = self._to_time_feature(x_original)
 
-        recon_samples = self.generator.reconstruct(x_original, num_reconstructions=num_recon_per, is_normalized=False, meter_id=m_ids, timestamp=t_ids)
-        
+        recon_samples = self.generator.reconstruct(
+            x_original_tf,
+            num_reconstructions=num_recon_per,
+            is_normalized=False,
+            meter_id=m_ids,
+            timestamp=t_ids,
+        )
+
+        if recon_samples is None or recon_samples.dim() != 3:
+            print("Unexpected reconstruction output; expected tensor with shape [S, B, D].")
+            return
+
+        if x_original_tf.dim() != 3:
+            print(f"Unexpected original sample shape: {tuple(x_original_tf.shape)}")
+            return
+
         S, B, D = recon_samples.shape
-        x_original_tf = x_original
         L, F = x_original_tf.shape[1], x_original_tf.shape[2]
-        recon_reshaped = recon_samples.reshape(S, B, F, L)  # phase-first flattened layout
+        expected_D = L * F
+        if D != expected_D:
+            print(
+                f"Shape mismatch: reconstruction last dim D={D} does not match original L*F={expected_D} "
+                f"(L={L}, F={F})."
+            )
+            return
 
-        if self.normalizer is not None:
-            x_original_denorm = x_original_tf.cpu()
-            recon_denorm = recon_reshaped.cpu()
-        else:
-            x_original_denorm = x_original_tf.cpu()
-            recon_denorm = recon_reshaped.cpu()
+        # SyntheticGenerator.reconstruct flattens [L, F] before returning [S, B, L*F].
+        recon_reshaped = recon_samples.reshape(S, B, L, F)
+
+        if B != x_original_tf.shape[0]:
+            b_common = min(B, x_original_tf.shape[0])
+            x_original_tf = x_original_tf[:b_common]
+            recon_reshaped = recon_reshaped[:, :b_common]
+            B = b_common
+
+        x_original_denorm = x_original_tf.cpu()
+        recon_denorm = recon_reshaped.cpu()
 
         num_to_plot = min(num_samples, B)
 
@@ -311,7 +331,8 @@ class Visualizer:
                     linestyle=self.plot_style.linestyle,
                     markersize=4
                 )
-                for s in range(num_recon_per):
+                num_recon_available = recon_view.shape[0]
+                for s in range(min(num_recon_per, num_recon_available)):
                     recon_series = self._feature_series(recon_view[s, i], 0)
                     ax.plot(
                         recon_series,
@@ -361,59 +382,21 @@ class Visualizer:
             print("Model and normalizer are required for synthetic sample visualization.")
             return
         
-        self.model.eval()
-        with torch.no_grad():
-            if self._is_cvae():
-                fake_conditions = self.model.conditioner.get_random_conditions(batch_size=num_samples).to(self.device)
-                # Extract day of week from one-hot encoded conditions
-                if fake_conditions.shape[1] == 7:  # day-of-week only
-                    day_indices = fake_conditions.argmax(dim=1).cpu().numpy()
-                    day_labels = [self.plot_style.get_day_names(short=False)[idx] for idx in day_indices]
-                else:
-                    # If multiple conditions concatenated, extract first 7 dims
-                    dow_part = fake_conditions[:, :7]
-                    day_indices = dow_part.argmax(dim=1).cpu().numpy()
-                    day_labels = [self.plot_style.get_day_names(short=False)[idx] for idx in day_indices]
-                # Sample from model with conditions
-                samples = self.model.sample(fake_conditions, num_prior_samples=1, num_x_samples=1, device=self.device)
-                synthetic_flat = samples[0, 0]  # [num_samples, input_dim]
-                
-                total_samples = num_samples
-                window_len = getattr(self.model, 'sequence_length', 24)
-                num_features = synthetic_flat.shape[1] // window_len
-                synthetic_data = synthetic_flat.reshape(total_samples, num_features, window_len)
-                synthetic_data = self._to_time_feature(synthetic_data)
-            else:
-                # VAE: sample from prior
-                samples_dict = self.model.sample(num_samples_prior=num_samples, num_samples_posterior=1, device=self.device)
-                synthetic_flat = samples_dict["samples"][:, 0, 0, :]  # [num_samples, input_dim]
-                
-                # Reshape
-                window_len = 24
-                num_features = synthetic_flat.shape[1] // window_len
-                synthetic_data = synthetic_flat.reshape(num_samples, num_features, window_len)
-                synthetic_data = self._to_time_feature(synthetic_data)
-                day_labels = [None] * num_samples
-            # Denormalize
-            if self.normalizer is not None:
-                synthetic_data_denorm = self.normalizer.inverse_transform(synthetic_data.cpu())
-            else:
-                synthetic_data_denorm = synthetic_data.cpu()
+        synthetic_data, conditions = self.generator.generate(num_samples=num_samples)
     
         num_to_plot = synthetic_data.shape[0]
+        num_features = synthetic_data.shape[2] if synthetic_data.dim() == 3 else 1
         feature_labels = self._feature_labels(num_features)
-        hours = np.arange(window_len)
+        hours = np.arange(synthetic_data.shape[1])
         fig, axes = plt.subplots(num_features, 1, figsize=(8, 3.2 * num_features), squeeze=False, sharex=True)
 
         for feature_idx in range(num_features):
             ax = axes[feature_idx][0]
             for i in range(num_to_plot):
                 label = f"Sample {i+1}"
-                if day_labels[i] is not None:
-                    label += f" ({day_labels[i]})"
                 ax.plot(
                     hours,
-                    self._feature_series(synthetic_data_denorm[i], feature_idx),
+                    self._feature_series(synthetic_data[i], feature_idx),
                     label=label,
                     marker=self.plot_style.marker,
                     color=self.plot_style.get_color(i),
@@ -560,119 +543,53 @@ class Visualizer:
         if "day_of_week" not in self.model.conditioner.get_condition_tags():
             print("Model conditioner does not include 'day_of_week', skipping synthetic recreation visualization.")
             return
-        if "user_profile" not in self.model.conditioner.get_condition_tags():
-            print("Model conditioner does not include 'user_profile', skipping synthetic recreation visualization.")
-            return
         
-        self.model.eval()
-        with torch.no_grad():
-            recreation_sampling_mode = "posterior"  # "posterior" (default) or "prior"
-
-            # Get non-zero originals from test loader
-            x, meter_id, timestamps = self._collect_nonzero_samples(
+        x, meter_id, timestamps = self._collect_nonzero_samples(
                 test_loader,
                 min_samples=max(1, int(num_originals)),
                 max_batches=100,
-            )       
-            x = x.to(self.device)
-            timestamps = timestamps.to(self.device)
-            
-            # Select a few samples
-            num_originals = min(num_originals, x.shape[0])
-            x_selected = x[:num_originals]
-            meter_id_selected = meter_id[:num_originals]
-            timestamps_selected = timestamps[:num_originals]
-
-            # Precompute shape metadata for reshaping
-            x_selected_tf = self._to_time_feature(x_selected)
-            L, F = x_selected_tf.shape[1], x_selected_tf.shape[2]
-            
-            # Get conditions for selected samples
-            c = self.model.conditioner.get_conditions(
-                x_selected_tf,
-                meter_id=meter_id_selected, 
-                timestamps=timestamps_selected
             )
-            c = self.model.move_to_device(c, device=self.device)
-
-            # Try posterior-based decoder sampling for stable recreations; fallback to prior if unavailable.
-            x_selected_flat = x_selected.reshape(x_selected.shape[0], -1)
-            recon_params = None
-            try:
-                recon_params, _ = self.model.reconstruct(
-                    x_selected_flat,
-                    meter_ids=meter_id_selected,
-                    timestamps=timestamps_selected,
-                    num_samples=1,
-                )
-            except Exception:
-                pass
-            
-            # Generate synthetic recreations with SAME conditions.
-            # Prefer posterior-conditioned decoder sampling; fallback to prior.
-            if isinstance(recon_params, dict):
-                recon_params_single = {}
-                for key, value in recon_params.items():
-                    if torch.is_tensor(value) and value.dim() == 3 and value.shape[0] == 1:
-                        recon_params_single[key] = value.squeeze(0)
-                    else:
-                        recon_params_single[key] = value
-                synthetic_samples = self.model.decoder.sample(recon_params_single, num_samples=num_synthetic_per)
-            else:
-                synthetic_samples = self.model.sample(
-                    conditions=c,
-                    num_prior_samples=num_synthetic_per,
-                    num_x_samples=1,
-                    device=self.device
-                )
-            
-            # Normalize sample shape to [num_synthetic_per, num_originals, D]
-            if synthetic_samples.dim() == 4 and synthetic_samples.shape[1] == 1:
-                synthetic_samples = synthetic_samples.squeeze(1)
-            elif synthetic_samples.dim() == 3:
-                pass
-            else:
-                raise ValueError(f"Unexpected synthetic_samples shape: {tuple(synthetic_samples.shape)}")
-            
-            # Model flattens in phase-first order [F, L], so reshape to [S, B, F, L], then convert to [S, B, L, F]
-            synthetic_reshaped = synthetic_samples.reshape(num_synthetic_per, num_originals, F, L)
-            synthetic_reshaped = self._to_time_feature(synthetic_reshaped)
-            
-            # Denormalize
-            if self.normalizer is not None:
-                x_denorm = self._safe_inverse_transform(x_selected_tf)
-                synthetic_denorm = self._safe_inverse_transform(self._to_time_feature(synthetic_reshaped))
-                mean_synthetic_denorm = synthetic_denorm.mean(dim=0)
-            else:
-                x_denorm = x_selected_tf.cpu()
-                synthetic_denorm = self._to_time_feature(synthetic_reshaped).cpu()
-                mean_synthetic = synthetic_reshaped.mean(dim=0)
-                mean_synthetic_denorm = self._to_time_feature(mean_synthetic).cpu()
-            
-            # Get condition labels
-            condition_labels = []
-            for i in range(num_originals):
-                ts = timestamps_selected[i].cpu().item()
-                dt = pd.Timestamp(ts, unit='s')
-                day_name = self.plot_style.get_day_names(short=False)[dt.dayofweek]
-                date_str = dt.strftime("%Y-%m-%d")
-                m_id = meter_id_selected[i].item()
-                condition_labels.append(f"Meter {m_id} | {day_name} ({date_str})")
         
-        hours = np.arange(L)
-        synthetic_alpha_values = np.linspace(0.3, 0.7, num_synthetic_per)
+        x_tf = self._to_time_feature(x)
+        num_originals = min(int(num_originals), x_tf.shape[0])
+        x_selected_tf = x_tf[:num_originals]
+        meter_id_selected = meter_id[:num_originals]
+        timestamps_selected = timestamps[:num_originals]
+        
+        # Build labels and generate synthetic recreations for each original condition.
+        # Collect as [S, B, L, F] where B=num_originals.
+        condition_labels = []
+        synthetic_per_original = []
+        for i in range(num_originals):
+            ts = timestamps_selected[i].cpu().item()
+            dt = pd.Timestamp(ts, unit='s')
+            day_name = self.plot_style.get_day_names(short=False)[dt.dayofweek]
+            date_str = dt.strftime("%Y-%m-%d")
+            m_id = meter_id_selected[i].item()
+            synthetic_samples_i, _ = self.generator.generate(num_synthetic_per, meter_id=m_id, date=dt)
+            synthetic_samples_i = self._to_time_feature(synthetic_samples_i)
+            synthetic_per_original.append(synthetic_samples_i)
+            condition_labels.append(f"Meter {m_id} | {day_name} ({date_str})")
 
+        synthetic_samples = torch.stack(synthetic_per_original, dim=1)  # [S, B, L, F]
+        num_synth_available = synthetic_samples.shape[0]
+        L = x_selected_tf.shape[1]
+        F = x_selected_tf.shape[2] if x_selected_tf.dim() == 3 else 1
+    
+        hours = np.arange(L)
+        synthetic_alpha_values = np.linspace(0.3, 0.7, max(1, num_synth_available))
+        mean_synthetic = synthetic_samples.mean(dim=0)
         view_specs = []
         if F > 1:
-            ranked_orig = self._rank_features_by_total(x_denorm)
-            ranked_synth = self._rank_features_by_total(synthetic_denorm)
-            ranked_mean = self._rank_features_by_total(mean_synthetic_denorm)
+            ranked_orig = self._rank_features_by_total(x_selected_tf)
+            ranked_synth = self._rank_features_by_total(synthetic_samples)
+            ranked_mean = self._rank_features_by_total(mean_synthetic)
 
             view_specs.append((
                 "aggregated",
-                x_denorm.sum(dim=-1, keepdim=True),
-                synthetic_denorm.sum(dim=-1, keepdim=True),
-                mean_synthetic_denorm.sum(dim=-1, keepdim=True),
+                x_selected_tf.sum(dim=-1, keepdim=True),
+                synthetic_samples.sum(dim=-1, keepdim=True),
+                mean_synthetic.sum(dim=-1, keepdim=True),
                 "Aggregated 3-Phase",
             ))
             for phase_idx in range(F):
@@ -685,14 +602,15 @@ class Visualizer:
                     f"Ranked Phase {phase_no}",
                 ))
         else:
-            view_specs.append(("single_phase", x_denorm, synthetic_denorm, mean_synthetic_denorm, "Single Phase"))
+            view_specs.append(("single_phase", x_selected_tf, synthetic_samples, mean_synthetic, "Single Phase"))
 
         for view_name, orig_view, synth_view, mean_view, view_label in view_specs:
             fig, axes = plt.subplots(num_originals, 1, figsize=(8, 3.2 * num_originals), squeeze=False, sharex=True)
 
             for i in range(num_originals):
                 ax = axes[i][0]
-                for s in range(num_synthetic_per):
+                num_plot_synth = min(num_synthetic_per, synth_view.shape[0])
+                for s in range(num_plot_synth):
                     synth_data = self._feature_series(synth_view[s, i], 0)
                     ax.plot(
                         hours, synth_data,
@@ -732,6 +650,7 @@ class Visualizer:
                     fontsize=12,
                     fontweight='bold'
                 )
+                L = orig_view.shape[1]
                 ax.set_xlabel("Hour", fontsize=10)
                 ax.set_ylabel("Energy Consumption (kWh)", fontsize=10)
                 ax.legend(loc='upper right', fontsize=9)
