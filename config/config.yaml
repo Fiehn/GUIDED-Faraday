@@ -17,9 +17,12 @@ data:
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
   # data_dir: "./data/raw_profiles"
-  data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
-  #data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
-  
+  # data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+  # data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
+  # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
+  data_dir: "data/raw_profiles"
+
+
   # CSV filename to load
   data_files: [] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
   
@@ -44,9 +47,9 @@ data:
   
   # Windowing configuration
   window:
-    aggregated: true # whether to aggregate 15-min data to hourly (for phased parquet mode) change the following to 24 hours
-    input_len: 24  # 24-hour windows (24 hours * 4 readings per hour)
-    stride: 24     # Non-overlapping windows (one per day)
+    aggregated: false # whether to aggregate 15-min data to hourly (for phased parquet mode) change the following to 24 hours
+    input_len: 96  # 24-hour windows (24 hours * 4 readings per hour)
+    stride: 96     # Non-overlapping windows (one per day)
   
   # DataLoader settings
   dataloader:
@@ -56,9 +59,9 @@ data:
 
   # Phased parquet streaming settings (used by SetGuideVAE phased training)
   phased:
-    replay_buffer_capacity: 8192
-    min_buffer_size: 2048
-    num_workers: 6
+    replay_buffer_capacity: 513 #8192
+    min_buffer_size: 8 #48
+    num_workers: 0 #6
     steps_per_epoch: 100
     eval_batches: 5
 
@@ -177,7 +180,7 @@ training:
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 30
+  num_epochs: 3
   
   # Beta (KL weight) settings
   beta: 1.0

@@ -287,14 +287,27 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
 
         if len(x_valid) == 0:
             return
+        
 
-        self.kmeans.partial_fit(x_valid)
+        # MiniBatchKMeans requires n_samples >= n_clusters on each partial_fit call.
+        # For small batches, upsample with replacement to avoid runtime failure.
+        if x_valid.shape[0] < self.num_clusters:
+            repeat_factor = int(math.ceil(self.num_clusters / max(1, x_valid.shape[0])))
+            idx = np.tile(np.arange(x_valid.shape[0]), repeat_factor)[:self.num_clusters]
+            x_kmeans = x_valid[idx]
+            meter_ids_kmeans = meter_ids_valid[idx]
+        else:
+            x_kmeans = x_valid
+            meter_ids_kmeans = meter_ids_valid
+
+        self.kmeans.partial_fit(x_kmeans)
+        # self.kmeans.partial_fit(x_valid)
         self.cluster_centers_ = self.kmeans.cluster_centers_
         self.kmeans_initialized = True
 
-        labels = cdist(x_valid, self.cluster_centers_).argmin(axis=1)
+        labels = cdist(x_kmeans, self.cluster_centers_).argmin(axis=1)
         meter_corpus = {}
-        for m_id, label in zip(meter_ids_valid, labels):
+        for m_id, label in zip(meter_ids_kmeans, labels):
             if m_id not in meter_corpus:
                 meter_corpus[m_id] = np.zeros(self.num_clusters, dtype=np.int32)
             meter_corpus[m_id][label] += 1
@@ -421,6 +434,8 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         for m_id, gamma_u in zip(computable, posterior):
             self.gamma_cache[m_id] = gamma_u
             self.resample_user_vector(m_id)
+
+    
     def fit_on_files(self, parquet_paths: list[str]):
         """Convenience method to fit the model directly on a list of parquet files.
 
