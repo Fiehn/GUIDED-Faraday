@@ -819,7 +819,7 @@ class SolarPanelConditioner(BaseConditioner):
         """
         random_status = torch.randint(0,2,(batch_size,1)).float()
         return random_status
-    
+
 class ElectricVehicleConditioner():
     # TODO: WAIT FOR EV data to arrive
     def __init__(self, topology_path = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
@@ -833,6 +833,63 @@ class ElectricVehicleConditioner():
     
     def get_conditions_no_data(self, meter_id, timestamps):
         return None
+
+
+class ActivePhaseCountConditioner(BaseConditioner):
+    """
+    Conditions the model on HOW MANY phases are active in the current window.
+    Outputs a one-hot vector of length 4 (representing 0, 1, 2, or 3 active phases).
+    """
+    def __init__(self, activity_threshold=1e-5):
+        super().__init__()
+        self.condition_dim = 4
+        # Anything with an absolute sum below this threshold is considered "dead"
+        self.activity_threshold = activity_threshold
+
+    def get_conditions(
+        self, 
+        x: torch.Tensor | np.ndarray | None, 
+        meter_id: torch.Tensor | np.ndarray | None, 
+        timestamps: torch.Tensor | list | None
+    ) -> torch.Tensor | None:
+        
+        if x is None:
+            raise ValueError("ActivePhaseCountConditioner requires input data 'x' to calculate phase activity.")
+            
+        if isinstance(x, np.ndarray):
+            x = torch.tensor(x, dtype=torch.float32)
+            
+        # x arrives from SetGuideVAE._build_condition_input as [B, L, F] (Time-First)
+        # 1. Sum the absolute values over the time dimension (L) to get total activity per phase
+        # Shape: [B, F]
+        phase_activity = x.abs().sum(dim=1)
+        
+        # 2. Check which phases cross the active threshold
+        # Shape: [B, F] (Boolean)
+        is_active = phase_activity > self.activity_threshold
+        
+        # 3. Count how many phases are active per batch
+        # Shape: [B] (Values 0, 1, 2, or 3)
+        active_count = is_active.sum(dim=1).long()
+        
+        # 4. Convert to One-Hot encoding [B, 4]
+        count_onehot = F.one_hot(active_count, num_classes=self.condition_dim).float()
+        
+        return count_onehot.to(x.device)
+    
+    def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
+        """
+        For random synthetic generation, we probabilistically sample the number of active phases.
+        (You can adjust these weights based on your real dataset distribution!)
+        """
+        # Example probabilities: 
+        # 0 active: 0%, 1 active: 20%, 2 active: 30%, 3 active: 50%
+        probs = torch.tensor([0.0, 0.2, 0.3, 0.5])
+        random_counts = torch.multinomial(probs, batch_size, replacement=True)
+        
+        return F.one_hot(random_counts, num_classes=self.condition_dim).float()
+
+    
 
 # =============
 # Conditioner Module - Holds an object that creates and determines type of conditioning to be used in Models

@@ -252,6 +252,8 @@ def train(config):
                 conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json'))
             elif condition_tag == "month_of_year":
                 conditioner.add_condition_item("month_of_year", MonthOfYearConditioner())
+            elif condition_tag == "nr_phases_active":
+                conditioner.add_condition_item("nr_phases_active", ActivePhasesConditioner())
             else:
                 print(f"Warning: Unknown condition tag '{condition_tag}' in config. Skipping this conditioner.")
         
@@ -337,7 +339,7 @@ def train(config):
             raise ValueError(f"No parquet files found for phased mode in: {data_dir}")
         
         # TODO: REMOVE THIS:
-        parquet_paths = parquet_paths[:2000]  # temporary limit for testing
+        parquet_paths = parquet_paths[:20]  # temporary limit for testing
 
         print(f"Phased mode enabled. Using {len(parquet_paths)} parquet file(s).")
 
