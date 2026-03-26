@@ -80,27 +80,6 @@ def _flatten_windows(data: np.ndarray) -> np.ndarray:
         raise ValueError(f"Expected 2D array [N, L], got {arr.shape}")
     return arr.reshape(arr.shape[0], -1)
 
-
-def _flatten_phase_first(data: np.ndarray) -> np.ndarray:
-    arr = np.asarray(data)
-    if arr.ndim != 3:
-        raise ValueError(f"Expected 3D array [N, F, L], got {arr.shape}")
-    return arr.reshape(arr.shape[0], -1)
-
-
-def _inverse_transform_phase_first(data: np.ndarray, normalizer) -> np.ndarray:
-    arr = np.asarray(data, dtype=np.float32)
-    if arr.ndim != 3:
-        raise ValueError(f"Expected 3D array [N, F, L], got {arr.shape}")
-    if normalizer is None or not hasattr(normalizer, 'inverse_transform'):
-        return arr
-
-    tensor = torch.tensor(arr, dtype=torch.float32)
-    tensor = tensor.transpose(1, 2)  # [N, L, F] for feature-last normalizers
-    restored = normalizer.inverse_transform(tensor).detach().cpu().numpy()
-    return np.transpose(restored, (0, 2, 1))
-
-
 def _rank_phases_by_total_consumption(data: np.ndarray) -> np.ndarray:
     arr = np.asarray(data)
     if arr.ndim != 3:
@@ -694,16 +673,12 @@ class PhasedEvaluationSuite:
         recon_phase = self._extract_phase_first(base._reconstructed_data, 'reconstructed data')
         synthetic_phase = self._extract_phase_first(base._synthetic_data, 'synthetic data')
 
-        real_denorm = _inverse_transform_phase_first(real_phase, self.normalizer)
-        recon_denorm = _inverse_transform_phase_first(recon_phase, self.normalizer)
-        synthetic_denorm = _inverse_transform_phase_first(synthetic_phase, self.normalizer)
-
         aggregated_dir = os.path.join(self.output_path, 'aggregated_phase_eval')
         os.makedirs(aggregated_dir, exist_ok=True)
         aggregated_prepared = {
-            'real_data': _flatten_windows(real_denorm.sum(axis=1)),
-            'reconstructed_data': _flatten_windows(recon_denorm.sum(axis=1)),
-            'synthetic_data': _flatten_windows(synthetic_denorm.sum(axis=1)),
+            'real_data': _flatten_windows(real_phase.sum(axis=1)),
+            'reconstructed_data': _flatten_windows(recon_phase.sum(axis=1)),
+            'synthetic_data': _flatten_windows(synthetic_phase.sum(axis=1)),
             'timestamps': base._timestamps,
             'meter_ids': base._meter_ids,
         }
@@ -713,9 +688,9 @@ class PhasedEvaluationSuite:
             output_path=os.path.join(aggregated_dir, 'eval_results.json'),
         )
 
-        ranked_real = _rank_phases_by_total_consumption(real_denorm)
-        ranked_recon = _rank_phases_by_total_consumption(recon_denorm)
-        ranked_synth = _rank_phases_by_total_consumption(synthetic_denorm)
+        ranked_real = _rank_phases_by_total_consumption(real_phase)
+        ranked_recon = _rank_phases_by_total_consumption(recon_phase)
+        ranked_synth = _rank_phases_by_total_consumption(synthetic_phase)
 
         ranked_results = {}
         num_phases = ranked_real.shape[1]
