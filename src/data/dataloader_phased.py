@@ -104,10 +104,18 @@ class StreamingParquetBuffer(IterableDataset):
         if df.empty:
             return df
 
-        full_index = pd.date_range(start=df.index.min(), end=df.index.max(), freq=self.base_frequency, tz=df.index.tz)
-        # Aggregate to base frequency if needed
+        # Aggregate first so index labels align with the target base frequency.
+        # Building full_index before resampling can misalign (e.g., :45 vs :00)
+        # and reindex would then wipe out all values as NaN.
         if self.aggregation:
-            df = df.resample(self.base_frequency).sum()
+            df = df.resample(self.base_frequency).sum(min_count=1)
+
+        if df.empty:
+            return df
+
+        start = df.index.min()
+        end = df.index.max()
+        full_index = pd.date_range(start=start, end=end, freq=self.base_frequency, tz=df.index.tz)
 
         return df.reindex(full_index)
 

@@ -134,6 +134,7 @@ class SyntheticGenerator:
                 
                 if not use_rejection:
                     valid_samples.append(xs)
+                    needed = 0
                     break
                     
                 # Check safe maximums across the [needed, B, D] tensor
@@ -233,6 +234,7 @@ class SyntheticGenerator:
             
             if not use_rejection:
                 valid_samples.append(samples)
+                needed = 0
                 break
                 
             # Flatten to evaluate maximums
