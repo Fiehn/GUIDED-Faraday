@@ -208,19 +208,22 @@ class EvalFramework:
         self._synthetic_data: np.ndarray = None  # Cache synthetic data for metrics that need it
         self._timestamps: np.ndarray = None  # Cache timestamps for metrics that need it
 
-    def register_all(self) -> None:
+    def register_all(self, phased: bool = False) -> None:
         """Convenience method to register all default metrics."""
         self.register_metrics([
             ReconstructionRMSE(),
             ReconstructionLogLikelihood(),
             FlexibilityDistance(),
-            MaximumMeanDiscrepancy(),
             ACFDistribution(),
             ClassicalStatistics(),
             TSTR(),
             AggregatedProfiles(),
             PerConditionEval()
         ])
+        if phased:
+            self.register_metric(SetMaximumMeanDiscrepancy())
+        else:
+            self.register_metric(MaximumMeanDiscrepancy())
 
     def _is_cvae(self) -> bool:
         """Check if model is a CVAE based on presence of conditioner on the model."""
@@ -235,10 +238,6 @@ class EvalFramework:
             self._timestamps = self.prepared_data.get('timestamps')
             self._meter_ids = self.prepared_data.get('meter_ids')
 
-            print("Preparing data for evaluation metrics...")
-            print(f"  Real: {self._real_data.shape} | "
-                  f"Reconstructed: {self._reconstructed_data.shape} | "
-                  f"Synthetic: {self._synthetic_data.shape}")
             return
 
         print("Preparing data for evaluation metrics...")
@@ -305,9 +304,6 @@ class EvalFramework:
 
         self._synthetic_data = self._generate_synthetic(self.n_synthetic_samples)
 
-        print(f"  Real: {self._real_data.shape} | "
-              f"Reconstructed: {self._reconstructed_data.shape} | "
-              f"Synthetic: {self._synthetic_data.shape}")
     
     def _reconstruct(self, x: torch.Tensor, 
                      meter_id: torch.Tensor | int | None = None, 
@@ -517,9 +513,6 @@ class EvalFramework:
         Returns:
             Dict[str, float]: Dictionary mapping reconstruction metric names to their computed values
         """
-        print("\n" + "="*70)
-        print("RECONSTRUCTION EVALUATION")
-        print("="*70 + "\n")
 
         self.results = {}
         for name, metric in self.reconstruction_metrics.items():
@@ -540,9 +533,6 @@ class EvalFramework:
         Returns:
             Dict[str, float]: Dictionary mapping synthetic metric names to their computed values
         """
-        print("\n" + "="*70)
-        print("SYNTHETIC DATA EVALUATION")
-        print("="*70 + "\n")
 
         self.results = {}
         for name, metric in self.synthetic_metrics.items():
@@ -651,7 +641,7 @@ class PhasedEvaluationSuite:
         evaluator = EvalFramework(
             self.model,
             self.dataloader,
-            normalizer=None,
+            normalizer=self.normalizer,
             conditioner=self.conditioner,
             device='cpu',
             window_size=self.window_size,
@@ -660,7 +650,7 @@ class PhasedEvaluationSuite:
             prepared_data=prepared_data,
             evaluation_title=title,
         )
-        evaluator.register_all()
+        evaluator.register_all(phased=True)
         results = evaluator.evaluate()
         evaluator.save_results(output_path)
         return results
@@ -719,7 +709,6 @@ class PhasedEvaluationSuite:
         summary_path = os.path.join(self.output_path, 'phased_eval_summary.json')
         with open(summary_path, 'w') as f:
             json.dump(_to_json_serializable(summary), f, indent=2)
-        print(f"Phased evaluation summary saved to {summary_path}")
         return summary
 
 
@@ -1322,8 +1311,6 @@ class VisualEvaluation(SyntheticMetric):
         pca = PCA(n_components=min(3, real_data.shape[1], synthetic_data.shape[1]))
         pca_real = pca.fit_transform(real_data)
         pca_synthetic = pca.transform(synthetic_data)
-        print(f'  PCA Explained Variance: {pca.explained_variance_ratio_}')
-        
         # Plot
         fig = plt.figure(figsize=(16, 6))
         
@@ -1490,13 +1477,6 @@ class ClassicalStatistics(SyntheticMetric):
         real_stats = self._compute_stats(self.real_data)
         synthetic_stats = self._compute_stats(self.synthetic_data)
         
-        print(f"  Computed classical statistics for real and synthetic data.")
-        print(f"  Overall Mean - Real: {real_stats['overall_mean']:.4f}, Synthetic: {synthetic_stats['overall_mean']:.4f}")
-        print(f"  Overall Std - Real: {real_stats['overall_std']:.4f}, Synthetic: {synthetic_stats['overall_std']:.4f}")
-        print(f"  Overall Min - Real: {real_stats['overall_min']:.4f}, Synthetic: {synthetic_stats['overall_min']:.4f}")
-        print(f"  Overall Max - Real: {real_stats['overall_max']:.4f}, Synthetic: {synthetic_stats['overall_max']:.4f}")
-        print(f"  Quantiles (25%, 50%, 75%) - Real: {real_stats['quantiles']}, Synthetic: {synthetic_stats['quantiles']}")
-
         # Scalar summary: mean absolute difference of mean profiles
         mean_profile_diff = float(np.mean(np.abs(
             real_stats['mean_profile'] - synthetic_stats['mean_profile']
@@ -1755,23 +1735,18 @@ class TSTR(SyntheticMetric):
         input_dim = X_real_train.shape[1]
         
         # Train model on real data (TRTR - Train Real, Test Real)
-        print(f"\n  Training predictor on REAL data ({len(X_real_train)} samples)...")
         model_real = self._create_predictor(input_dim)
         model_real = self._train_predictor(X_real_train, y_real_train, model_real)
         trtr_mse = self._evaluate_predictor(X_real_test, y_real_test, model_real)
         
         # Train model on synthetic data (TSTR - Train Synthetic, Test Real)
-        print(f"  Training predictor on SYNTHETIC data ({len(X_synth_train)} samples)...")
         model_synth = self._create_predictor(input_dim)
         model_synth = self._train_predictor(X_synth_train, y_synth_train, model_synth)
         tstr_mse = self._evaluate_predictor(X_real_test, y_real_test, model_synth)
         
         # Compute ratio (ideal: 1.0, higher = synthetic is worse)
         tstr_ratio = tstr_mse / trtr_mse if trtr_mse > 0 else float('inf')
-        print(f"  TRTR MSE: {trtr_mse:.6f}")
-        print(f"  TSTR MSE: {tstr_mse:.6f}")
-        print(f"  TSTR/TRTR Ratio: {tstr_ratio:.6f}")
-
+        
         _save_standalone_metric_result(
             metric_key='TSTR',
             payload={
@@ -1814,14 +1789,12 @@ class AggregatedProfiles(SyntheticMetric):
     
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
-    normalizer = None
     output_path: str = None
     
-    def __init__(self, n_samples: int = 100, window_size: int = 24, tau: str = 'auto', normalize: bool = True):
+    def __init__(self, n_samples: int = 100, window_size: int = 24, tau: str = 'auto'):
         self.n_samples = n_samples
         self.window_size = window_size
         self.tau = tau
-        self.normalize = normalize
     
     @property
     def name(self) -> str:
@@ -1831,24 +1804,6 @@ class AggregatedProfiles(SyntheticMetric):
         """Aggregate real and synthetic data, then compute Flexibility Distance."""
         real_data = np.asarray(self.real_data)
         synthetic_data = np.asarray(self.synthetic_data)
-
-        def _inverse_if_possible(arr: np.ndarray) -> np.ndarray:
-            if self.normalizer is None or not hasattr(self.normalizer, 'inverse_transform'):
-                return arr
-
-            t = torch.tensor(arr, dtype=torch.float32)
-            if t.ndim == 2 and t.shape[1] % self.window_size == 0:
-                n_features = t.shape[1] // self.window_size
-                t = t.reshape(-1, self.window_size, n_features)
-                t = self.normalizer.inverse_transform(t)
-                t = t.reshape(t.shape[0], -1)
-            else:
-                t = self.normalizer.inverse_transform(t)
-            return t.detach().cpu().numpy()
-        
-        # Denormalize both real and synthetic consistently when possible
-        real_data = _inverse_if_possible(real_data)
-        synthetic_data = _inverse_if_possible(synthetic_data)
 
         # Extract consumption only (feature 0)
         real_n_features = real_data.shape[1] // self.window_size
@@ -1861,8 +1816,6 @@ class AggregatedProfiles(SyntheticMetric):
         n_agg = min(self.n_samples, len(real_data), len(synthetic_data))
         real_samples = real_data[:n_agg]
         synth_samples = synthetic_data[:n_agg]
-        
-        print(f"  Aggregating {n_agg} samples (real: {len(real_data)} available, synth: {len(synthetic_data)} available)")
         
         # Aggregate by summing
         real_aggregated = np.sum(real_samples, axis=0)
@@ -1915,10 +1868,8 @@ class AggregatedProfiles(SyntheticMetric):
         
         # Ensure output_path doesn't contain a filename
         base_dir = os.path.dirname(self.output_path) if self.output_path and self.output_path.endswith('.json') else self.output_path
-        plot_dir = os.path.join(base_dir, 'Plots') if base_dir else 'Plots'
-        os.makedirs(plot_dir, exist_ok=True)
         
-        plt.savefig(os.path.join(plot_dir, 'aggregated_profiles_comparison.png'), dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(base_dir, 'aggregated_profiles_comparison.pdf'), dpi=150, bbox_inches='tight')
         plt.close()
         
 
@@ -2007,33 +1958,11 @@ class PerConditionEval(SyntheticMetric):
             n_samples=100,
             window_size=window_size,
             tau='auto',
-            normalize=True,
         )
 
     @property
     def name(self) -> str:
         return "Per-Condition Evaluation"
-
-    def _print_input_debug(self, real_data: np.ndarray, synthetic_data: np.ndarray, timestamps: np.ndarray) -> None:
-        """Print information about input formats."""
-        print("\n" + "=" * 70)
-        print("PER-CONDITION DATA INPUT")
-        print("=" * 70)
-        print(f"real_data:      shape={real_data.shape}, dtype={real_data.dtype}")
-        print(f"synthetic_data: shape={synthetic_data.shape}, dtype={synthetic_data.dtype}")
-        print(f"timestamps:     shape={timestamps.shape}, dtype={timestamps.dtype}")
-
-        if len(real_data) > 0:
-            print(f"real_data[0] (first window, len={len(real_data[0])}):")
-            print(np.array2string(real_data[0], precision=4, separator=", "))
-
-        if len(synthetic_data) > 0:
-            print(f"synthetic_data[0] (first window, len={len(synthetic_data[0])}):")
-            print(np.array2string(synthetic_data[0], precision=4, separator=", "))
-
-        if len(timestamps) > 0:
-            dt0 = datetime.utcfromtimestamp(int(timestamps[0]))
-            print(f"timestamps[0]: {int(timestamps[0])} -> {dt0.strftime('%Y-%m-%d %A %H:%M:%S')} UTC")
 
     def _compute_subset_acf(self, real_subset: np.ndarray, synthetic_subset: np.ndarray):
         """Compute ACF score for one subset; return None if too few samples."""
@@ -2136,22 +2065,14 @@ class PerConditionEval(SyntheticMetric):
         feeder_scores = {}
         unique_feeders = [f for f in np.unique(feeder_ids) if f is not None and str(f).lower() != 'nan']
 
-        if self.verbose:
-            print(f"  Found {len(unique_feeders)} unique feeders")
-            print(f"  Min samples threshold per feeder: {self.min_samples_per_feeder}")
-
         for feeder in unique_feeders:
             n_group = int(np.sum(feeder_ids == feeder))
             if n_group < self.min_samples_per_feeder:
-                if self.verbose:
-                    print(f"    Skipping {feeder}: only {n_group} samples (need {self.min_samples_per_feeder})")
                 continue
 
             score = self._compute_subset_aggregated_profiles(real_data[feeder_ids == feeder], 
                                                              synthetic_data[feeder_ids == feeder])
             if score is None:
-                if self.verbose:
-                    print(f"    {feeder}: insufficient samples for FD computation")
                 continue
 
             feeder_scores[str(feeder)] = {
@@ -2211,8 +2132,7 @@ class PerConditionEval(SyntheticMetric):
                 }
             }
         except Exception as e:
-            if self.verbose:
-                print(f"Warning: ClassicalStatistics computation failed: {e}")
+            print(f"Warning: ClassicalStatistics computation failed: {e}")
             return None
 
     def _plot_aggregated_profiles_bars(
@@ -2398,13 +2318,6 @@ class PerConditionEval(SyntheticMetric):
         days_of_week = np.array(days_of_week)
         months_of_year = np.array(months_of_year)
 
-        if self.verbose:
-            unique_days, day_counts = np.unique(days_of_week, return_counts=True)
-            unique_months, month_counts = np.unique(months_of_year, return_counts=True)
-            print("\nCondition counts:")
-            print("  day_of_week:", {int(k): int(v) for k, v in zip(unique_days, day_counts)})
-            print("  month_of_year:", {int(k): int(v) for k, v in zip(unique_months, month_counts)})
-
         # Resolve feeder IDs if available
         feeder_ids = self._resolve_feeder_ids(len(real_data))
 
@@ -2540,107 +2453,6 @@ class PerConditionEval(SyntheticMetric):
         self.results_by_condition['tstr']['day_of_week'] = tstr_per_day
         self.results_by_condition['tstr']['month_of_year'] = tstr_per_month
 
-        if self.verbose:
-            print("\n" + "="*70)
-            print("MMD PER DAY OF WEEK (24-HOUR WINDOWS)")
-            print("="*70)
-            for day in sorted(mmd_per_day.keys()):
-                print(f"{day_names[day]:10s} (day {day})  ->  MMD = {mmd_per_day[day]:.6f}")
-
-            print("\n" + "="*70)
-            print("MMD PER MONTH OF YEAR (24-HOUR WINDOWS)")
-            print("="*70)
-            for month in sorted(mmd_per_month.keys()):
-                print(f"{month_names[month]:10s} (month {month:2d})  ->  MMD = {mmd_per_month[month]:.6f}")
-
-            print("\n" + "="*70)
-            print("ACF DISTRIBUTION PER DAY OF WEEK (KS, lower is better)")
-            print("="*70)
-            for day in sorted(acf_per_day.keys()):
-                value = acf_per_day[day]
-                value_str = f"{value:.6f}" if value is not None else "insufficient samples"
-                print(f"{day_names[day]:10s} (day {day})  ->  ACF KS = {value_str}")
-
-            print("\n" + "="*70)
-            print("ACF DISTRIBUTION PER MONTH") # (KS, lower is better)
-            print("="*70)
-            for month in sorted(acf_per_month.keys()):
-                value = acf_per_month[month]
-                value_str = f"{value:.6f}" if value is not None else "insufficient samples"
-                print(f"{month_names[month]:10s} (month {month:2d})  ->  ACF KS = {value_str}")
-
-            print("\n" + "="*70)
-            print("CLASSICAL STATISTICS PER DAY OF WEEK")
-            print("="*70)
-            for day in sorted(classical_stats_per_day.keys()):
-                value = classical_stats_per_day[day]
-                if value is None:
-                    print(f"{day_names[day]:10s} (day {day})  ->  insufficient samples")
-                else:
-                    mae = value['differences']['mean_profile_mae']
-                    omd = value['differences']['overall_mean_abs_diff']
-                    print(f"{day_names[day]:10s} (day {day})  ->  mean_profile_mae = {mae:.6f}, overall_mean_abs_diff = {omd:.6f}")
-
-            print("\n" + "="*70)
-            print("CLASSICAL STATISTICS PER MONTH")
-            print("="*70)
-            for month in sorted(classical_stats_per_month.keys()):
-                value = classical_stats_per_month[month]
-                if value is None:
-                    print(f"{month_names[month]:10s} (month {month:2d})  ->  insufficient samples")
-                else:
-                    mae = value['differences']['mean_profile_mae']
-                    omd = value['differences']['overall_mean_abs_diff']
-                    print(f"{month_names[month]:10s} (month {month:2d})  ->  mean_profile_mae = {mae:.6f}, overall_mean_abs_diff = {omd:.6f}")
-
-            print("\n" + "="*70)
-            print("AGGREGATED PROFILES PER DAY OF WEEK") # (FD, lower is better)
-            print("="*70)
-            for day in sorted(aggregated_profiles_per_day.keys()):
-                value = aggregated_profiles_per_day[day]
-                value_str = f"{value:.6f}" if value is not None else "insufficient samples"
-                print(f"{day_names[day]:10s} (day {day})  ->  Aggregated FD = {value_str}")
-
-            print("\n" + "="*70)
-            print("AGGREGATED PROFILES PER MONTH") # (FD, lower is better)
-            print("="*70)
-            for month in sorted(aggregated_profiles_per_month.keys()):
-                value = aggregated_profiles_per_month[month]
-                value_str = f"{value:.6f}" if value is not None else "insufficient samples"
-                print(f"{month_names[month]:10s} (month {month:2d})  ->  Aggregated FD = {value_str}")
-
-            print("\n" + "="*70)
-            print("AGGREGATED PROFILES PER FEEDER")
-            print("="*70)
-            if not aggregated_profiles_per_feeder:
-                print("  No feeders met minimum sample threshold")
-            else:
-                sorted_feeders = sorted(
-                    aggregated_profiles_per_feeder.items(),
-                    key=lambda kv: kv[1]['fd']
-                )
-                for feeder, details in sorted_feeders[:20]:
-                    print(
-                        f"{feeder:20s} -> Aggregated FD = {details['fd']:.6f} "
-                        f"(n={details['n_samples']})"
-                    )
-
-            print("\n" + "="*70)
-            print("TSTR PER DAY OF WEEK") # (Ratio, 1.0 = perfect, lower is better)
-            print("="*70)
-            for day in sorted(tstr_per_day.keys()):
-                value = tstr_per_day[day]
-                value_str = f"{value:.6f}" if value is not None else "insufficient samples"
-                print(f"{day_names[day]:10s} (day {day})  ->  TSTR Ratio = {value_str}")
-
-            print("\n" + "="*70)
-            print("TSTR PER MONTH") # (Ratio, 1.0 = perfect, lower is better)
-            print("="*70)
-            for month in sorted(tstr_per_month.keys()):
-                value = tstr_per_month[month]
-                value_str = f"{value:.6f}" if value is not None else "insufficient samples"
-                print(f"{month_names[month]:10s} (month {month:2d})  ->  TSTR Ratio = {value_str}")
-
         # Save file
         combined_output_file = os.path.join(self.output_path, 'eval_results.json')
         existing_payload = {}
@@ -2673,10 +2485,111 @@ class PerConditionEval(SyntheticMetric):
         with open(combined_output_file, 'w') as f:
             json.dump(_to_json_serializable(output_payload), f, indent=2)
 
-        if self.verbose:
-            print(f"Results saved to: {combined_output_file}")
-            print(f"Aggregated profile bar plots saved to: {aggregated_profile_plot_paths['day_of_week']} and {aggregated_profile_plot_paths['month_of_year']}")
-
         all_mmd_scores = list(mmd_per_day.values()) + list(mmd_per_month.values())
         avg_mmd = np.mean(all_mmd_scores) if all_mmd_scores else 0.0
         return float(avg_mmd)
+
+
+class SetMaximumMeanDiscrepancy(SyntheticMetric):
+    """Permutation-Invariant MMD for 3-Phase Set Data."""
+    
+    real_data: np.ndarray = None
+    synthetic_data: np.ndarray = None
+    output_path: str = None
+
+    def __init__(self, sigma: float | None = None, seed: int = 42, max_samples: int = 1000, n_features: int = 3):
+        self.sigma = sigma
+        self.seed = seed
+        self.max_samples = max_samples
+        self.n_features = n_features
+        # The 6 possible permutations for 3 phases
+        self.perms = [
+            [0, 1, 2], [0, 2, 1], 
+            [1, 0, 2], [1, 2, 0], 
+            [2, 0, 1], [2, 1, 0]
+        ]
+
+    @property
+    def name(self) -> str:
+        return "Set-MMD (Permutation Invariant)"
+
+    def _set_sqeuclidean_cdist(self, X: np.ndarray, Y: np.ndarray) -> np.ndarray:
+        """
+        Computes the minimum squared euclidean distance across all 6 permutations.
+        X: [N, 3, 24]
+        Y: [M, 3, 24]
+        Returns: [N, M] distance matrix
+        """
+        N, F, L = X.shape
+        M = Y.shape[0]
+        
+        # Flatten the temporal dimension for distance calculation -> [N, 3*24]
+        X_flat = X.reshape(N, -1)
+        
+        # We will track the minimum distance across all permutations
+        min_dists = np.full((N, M), np.inf)
+        
+        for p in self.perms:
+            # Permute the features of Y
+            Y_perm = Y[:, p, :]
+            # Flatten -> [M, 3*24]
+            Y_perm_flat = Y_perm.reshape(M, -1)
+            
+            # Compute pairwise squared euclidean distance for this permutation
+            dists_p = cdist(X_flat, Y_perm_flat, metric="sqeuclidean")
+            
+            # Update minimum distances
+            min_dists = np.minimum(min_dists, dists_p)
+            
+        return min_dists
+
+    def _rbf_kernel_set(self, X: np.ndarray, Y: np.ndarray, sigma: float) -> np.ndarray:
+        sq_dists = self._set_sqeuclidean_cdist(X, Y)
+        return np.exp(-sq_dists / (2 * sigma ** 2))
+
+    def _median_heuristic_sigma_set(self, Z: np.ndarray, max_points: int = 1000) -> float:
+        rng = np.random.default_rng(self.seed)
+        if Z.shape[0] > max_points:
+            Z = Z[rng.choice(Z.shape[0], size=max_points, replace=False)]
+            
+        dists = self._set_sqeuclidean_cdist(Z, Z)
+        med = np.median(dists[dists > 0])
+        return float(med) if med > 0 else 1.0
+
+    def compute(self) -> float:
+        # 1. Ensure data is correctly shaped as [N, F, L]
+        N_real = self.real_data.shape[0]
+        N_synth = self.synthetic_data.shape[0]
+        L = self.real_data.shape[1] // self.n_features
+        
+        real_3d = self.real_data.reshape(N_real, self.n_features, L)
+        synth_3d = self.synthetic_data.reshape(N_synth, self.n_features, L)
+
+        # 2. Subsample for memory efficiency
+        rng = np.random.default_rng(self.seed)
+        if len(real_3d) > self.max_samples:
+            real_3d = real_3d[rng.choice(len(real_3d), size=self.max_samples, replace=False)]
+        if len(synth_3d) > self.max_samples:
+            synth_3d = synth_3d[rng.choice(len(synth_3d), size=self.max_samples, replace=False)]
+
+        # 3. Compute Auto-Sigma on the combined Set Data
+        sigma = self.sigma
+        if sigma is None:
+            combined = np.vstack([real_3d, synth_3d])
+            sigma = self._median_heuristic_sigma_set(combined)
+
+        # 4. Compute Kernel Matrices
+        n, m = real_3d.shape[0], synth_3d.shape[0]
+        Kxx = self._rbf_kernel_set(real_3d, real_3d, sigma)
+        Kyy = self._rbf_kernel_set(synth_3d, synth_3d, sigma)
+        Kxy = self._rbf_kernel_set(real_3d, synth_3d, sigma)
+
+        np.fill_diagonal(Kxx, 0.0)
+        np.fill_diagonal(Kyy, 0.0)
+
+        mmd2 = (Kxx.sum() / (n * (n - 1))
+              + Kyy.sum() / (m * (m - 1))
+              - 2.0 * Kxy.sum() / (n * m))
+
+        mmd_value = float(np.sqrt(np.maximum(mmd2, 0.0)))
+        return mmd_value

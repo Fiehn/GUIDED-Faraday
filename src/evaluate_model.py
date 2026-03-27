@@ -7,7 +7,7 @@ import torch
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
-from src.models.set_guide_vae import SetGuideVAE
+from src.model.set_guide_vae import SetGuideVAE
 from src.train import _load_train_config, _build_phased_eval_loader, _run_evaluation_and_visualization
 from src.data.dataloader_phased import StreamingParquetBuffer, WindowSpec
 from src.visualization.writer import Writer
