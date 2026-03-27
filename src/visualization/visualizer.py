@@ -257,7 +257,7 @@ class Visualizer:
         recon_samples = self.generator.reconstruct(
             x_original_tf,
             num_reconstructions=num_recon_per,
-            is_normalized=False,
+            is_denormalized=False,
             meter_id=m_ids,
             timestamp=t_ids,
         )

@@ -42,7 +42,7 @@ class SyntheticGenerator:
                     meter_id: int | None = None, 
                     timestamp: datetime | torch.Tensor | None = None,
                     new_conditions: torch.Tensor | None = None,
-                    is_normalized: bool = False,
+                    is_denormalized: bool = False,
                     temperature: float = 1.0,
                     use_rejection: bool = False,
                     max_safe_z: float = 5.0,
@@ -55,7 +55,7 @@ class SyntheticGenerator:
             input_data (torch.Tensor): Tensor of original timeseries data to reconstruct of shape `(batch_size, 24, num_features)`.
             new_conditions (Optional[torch.Tensor]): Tensor of new conditions to use for reconstruction of shape `(batch_size, num_conditions)`.
                             If None, original conditions from the model will be used.
-            is_normalized (bool): Whether the input_data is already normalized. If False, it will be normalized using self.normalizer before reconstruction and inverse-transformed back to original scale at the end.
+            is_denormalized (bool): Whether the input_data is already normalized. If False, it will be normalized using self.normalizer before reconstruction and inverse-transformed back to original scale at the end.
             temperature (float): Temperature scaling factor for sampling. Values < 1.0 will produce less variance (safer samples), while values > 1.0 will produce more variance.
             use_rejection (bool): Whether to use rejection sampling to discard and re-roll samples with extreme latent values that could lead to mathematically explosive reconstructions.
             max_safe_z (float): The maximum absolute value for latent variables (z) considered safe. Samples with any latent dimension exceeding this value will be discarded and re-sampled if use_rejection is True.
@@ -68,7 +68,7 @@ class SyntheticGenerator:
         model_dtype = next(self.model.parameters()).dtype
         input_data = input_data.to(self.device, dtype=model_dtype)
 
-        if self.normalizer is not None and not is_normalized:
+        if self.normalizer is not None and not is_denormalized:
             input_data = self.normalizer.transform(input_data.reshape(-1, input_data.shape[-1])).reshape(input_data.shape)
             # Normalizers may return float64 tensors; align with model dtype for linear layers.
             input_data = input_data.to(self.device, dtype=model_dtype)
@@ -169,7 +169,7 @@ class SyntheticGenerator:
             output = flat_output.reshape(-1, L, F)
 
         # 2. Apply inverse transform so it's in actual kWh, not Z-scores
-        if self.normalizer is not None and not is_normalized:
+        if self.normalizer is not None and not is_denormalized:
             output = self.normalizer.inverse_transform(output.reshape(-1, F)).reshape(-1, L, F)
 
         # Return as 
