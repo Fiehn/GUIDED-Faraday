@@ -110,6 +110,10 @@ def _build_eval_loader(
     seq_len = int(getattr(model, "sequence_length", config.window.input_len))
     phased_cfg = config.data.phased
     hourly_aggregation = bool(getattr(config.window, "aggregated", False))
+    aggregation_energy_unit = str(getattr(phased_cfg, "aggregation_energy_unit", "wh")).lower()
+    if aggregation_energy_unit not in {"wh", "kwh"}:
+        print(f"Warning: unknown data.phased.aggregation_energy_unit='{aggregation_energy_unit}'. Falling back to 'wh'.")
+        aggregation_energy_unit = "wh"
 
     if seq_len == 24 and not hourly_aggregation:
         hourly_aggregation = True
@@ -121,6 +125,9 @@ def _build_eval_loader(
     config.window.input_len = seq_len
     config.window.stride = seq_len
     config.window.aggregated = hourly_aggregation
+    aggregation_divisor = 1000.0 if hourly_aggregation and aggregation_energy_unit == "kwh" else 1.0
+    if hourly_aggregation:
+        print(f"Hourly aggregation unit: {aggregation_energy_unit} (divisor={aggregation_divisor:g})")
 
     window = WindowSpec(input_len=seq_len, stride=seq_len)
     phased_workers = int(getattr(phased_cfg, "num_workers", config.dataloader.num_workers))
@@ -132,6 +139,7 @@ def _build_eval_loader(
         normalizer=normalizer,
         num_workers=phased_workers,
         hourly_aggregation=hourly_aggregation,
+        aggregation_divisor=aggregation_divisor,
     )
 
     batch_size = int(config.dataloader.batch_size)

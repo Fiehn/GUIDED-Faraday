@@ -18,7 +18,7 @@ data:
   # data_dir: "./data/cleaned_profiles"
   # data_dir: "./data/raw_profiles"
   #data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
-  data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
+  data_dir: "data/3p/"
   
   # CSV filename to load
   data_files: [] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
@@ -61,6 +61,7 @@ data:
     num_workers: 0
     steps_per_epoch: 10
     eval_batches: 5
+    aggregation_energy_unit: "kwh" # set to "kwh" to divide hourly aggregated sums by 1000
 
 # ============================================================================
 # NORMALIZATION CONFIGURATION

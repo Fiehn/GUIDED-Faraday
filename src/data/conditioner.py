@@ -529,8 +529,6 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump(self, f)
-        if self.verbose:
-            print(f"Saved model with {len(self.user_profiles_cache)} cached profiles")
 
     def load(self, path):
         """Loads model state from a pickle file and updates the instance state.

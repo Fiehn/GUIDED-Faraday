@@ -113,12 +113,22 @@ def evaluate_model(model_path, num_test_files=2, config_path="config/config.yaml
     window = WindowSpec(input_len=config.window.input_len, stride=config.window.stride)
     
     if phased_mode:
+        phased_cfg = getattr(config.data, "phased", None)
+        aggregation_energy_unit = str(getattr(phased_cfg, "aggregation_energy_unit", "wh")).lower()
+        if aggregation_energy_unit not in {"wh", "kwh"}:
+            print(f"Warning: unknown data.phased.aggregation_energy_unit='{aggregation_energy_unit}'. Falling back to 'wh'.")
+            aggregation_energy_unit = "wh"
+        hourly_aggregation = bool(getattr(config.window, "aggregated", False))
+        aggregation_divisor = 1000.0 if hourly_aggregation and aggregation_energy_unit == "kwh" else 1.0
+
         eval_ds = StreamingParquetBuffer(
             sm_files=sampled_file_paths,
             window_spec=window,
             normalizer=normalizer,
             replay_buffer_capacity=max(1000, config.data.phased.replay_buffer_capacity),
-            num_workers=getattr(config.advanced, "num_workers", 0) if hasattr(config, "advanced") else 0
+            num_workers=getattr(config.advanced, "num_workers", 0) if hasattr(config, "advanced") else 0,
+            hourly_aggregation=hourly_aggregation,
+            aggregation_divisor=aggregation_divisor,
         )
         
         batch_size = getattr(config.dataloader, "batch_size", 2048)

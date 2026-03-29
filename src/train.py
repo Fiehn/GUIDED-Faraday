@@ -344,6 +344,14 @@ def train(config):
         print(f"Phased mode enabled. Using {len(parquet_paths)} parquet file(s).")
 
         phased_cfg = getattr(config.data, "phased", SimpleNamespace())
+        aggregation_energy_unit = str(getattr(phased_cfg, "aggregation_energy_unit", "wh")).lower()
+        if aggregation_energy_unit not in {"wh", "kwh"}:
+            print(f"Warning: unknown data.phased.aggregation_energy_unit='{aggregation_energy_unit}'. Falling back to 'wh'.")
+            aggregation_energy_unit = "wh"
+        aggregation_divisor = 1000.0 if bool(config.window.aggregated) and aggregation_energy_unit == "kwh" else 1.0
+        if bool(config.window.aggregated):
+            print(f"Hourly aggregation unit: {aggregation_energy_unit} (divisor={aggregation_divisor:g})")
+
         replay_capacity = int(getattr(phased_cfg, "replay_buffer_capacity", 10000))
         min_buffer_size = int(getattr(phased_cfg, "min_buffer_size", 2000))
         phased_workers = int(getattr(phased_cfg, "num_workers", config.dataloader.num_workers))
@@ -354,9 +362,19 @@ def train(config):
         norm_method = str(getattr(config.normalizer, "method", "log1p")).lower()
         if norm_method == "log1p_phase":
             normalizer = Normalizer(method="log1p_phase")
-            stats_name = f"normalization_stats_{os.path.basename(os.path.normpath(data_dir))}.json"
+            agg_tag = "hourly" if bool(config.window.aggregated) else "raw"
+            stats_name = (
+                f"normalization_stats_{os.path.basename(os.path.normpath(data_dir))}_"
+                f"{agg_tag}_{aggregation_energy_unit}.json"
+            )
             stats_path = os.path.join(config.logging.log_dir, stats_name)
-            normalizer.fit(X=None, sm_files=parquet_paths, stats_path=stats_path)
+            normalizer.fit(
+                X=None,
+                sm_files=parquet_paths,
+                stats_path=stats_path,
+                hourly_aggregation=bool(config.window.aggregated),
+                aggregation_divisor=aggregation_divisor,
+            )
             print("Using phased normalizer: log1p_phase")
         else:
             print(f"Warning: phased_parquet mode currently expects normalization.method='log1p_phase'. Got '{norm_method}'. Continuing without normalization.")
@@ -374,7 +392,8 @@ def train(config):
             window_spec=phase_window,
             normalizer=normalizer,
             num_workers=phased_workers,
-            hourly_aggregation=config.window.aggregated
+            hourly_aggregation=config.window.aggregated,
+            aggregation_divisor=aggregation_divisor,
         )
         train_loader = DataLoader(
             train_ds,
@@ -442,6 +461,8 @@ def train(config):
             window_spec=phase_window,
             normalizer=normalizer,
             num_workers=phased_workers,
+            hourly_aggregation=config.window.aggregated,
+            aggregation_divisor=aggregation_divisor,
         )
         eval_stream = DataLoader(eval_ds, batch_size=config.dataloader.batch_size, num_workers=phased_workers)
         combined_test_loader = _build_phased_eval_loader(

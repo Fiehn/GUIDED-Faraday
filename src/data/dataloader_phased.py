@@ -31,7 +31,8 @@ class StreamingParquetBuffer(IterableDataset):
                  window_spec: Optional[WindowSpec] = None,
                  normalizer: Optional[Normalizer] = None,
                  num_workers: int = 0,
-                 hourly_aggregation: bool = False
+                 hourly_aggregation: bool = False,
+                 aggregation_divisor: float = 1.0,
                  ):
         self.sm_files = sm_files
         self.replay_buffer_capacity = replay_buffer_capacity
@@ -47,6 +48,7 @@ class StreamingParquetBuffer(IterableDataset):
         self.normalizer = normalizer
         self.num_workers = num_workers
         self.aggregation = hourly_aggregation
+        self.aggregation_divisor = float(aggregation_divisor) if float(aggregation_divisor) > 0 else 1.0
         self.feature_cols = ['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3']
         self.time_col_candidates = ['timestamp_dst', 'timestamp', 'timestamp_utc']
         if self.aggregation:
@@ -109,6 +111,8 @@ class StreamingParquetBuffer(IterableDataset):
         # and reindex would then wipe out all values as NaN.
         if self.aggregation:
             df = df.resample(self.base_frequency).sum(min_count=1)
+            if self.aggregation_divisor != 1.0:
+                df = df / self.aggregation_divisor
 
         if df.empty:
             return df
@@ -220,6 +224,7 @@ class SMPhaseData:
             num_workers: int = 0,
             time_series_info_json: Optional[str] = None,
             hourly_aggregation: bool = False,
+                aggregation_divisor: float = 1.0,
             **kwargs
     ):
         if filename is not None:
@@ -243,6 +248,7 @@ class SMPhaseData:
         self.val_loader = None
         self.test_loader = None
         self.aggregation = hourly_aggregation
+        self.aggregation_divisor = float(aggregation_divisor) if float(aggregation_divisor) > 0 else 1.0
 
     def setup(self) -> None:
         # Create the streaming dataset
@@ -252,7 +258,8 @@ class SMPhaseData:
             window_spec=self.window_spec,
             normalizer=self.normalizer,
             num_workers=self.num_workers,
-            hourly_aggregation=self.aggregation
+            hourly_aggregation=self.aggregation,
+            aggregation_divisor=self.aggregation_divisor,
         )
 
         # Create the DataLoaders with the streaming dataset

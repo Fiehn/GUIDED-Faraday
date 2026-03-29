@@ -1,6 +1,7 @@
 import os
 from typing import Optional
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import json
@@ -12,7 +13,9 @@ def compute_normalization_stats(sm_files,
                                 feature_cols,
                                 save_path="normalization_stats.json",
                                 valid_ids_json_path=None,
-                                use_cache=True):
+                                use_cache=True,
+                                hourly_aggregation: bool = False,
+                                aggregation_divisor: float = 1.0):
     """Compute the mean and standard deviation for normalization across all Parquet files."""
     if use_cache and os.path.exists(save_path):
         with open(save_path, 'r') as f:
@@ -86,6 +89,10 @@ def compute_normalization_stats(sm_files,
                     rename_map[actual_col] = base_feat
                     found_features.append(base_feat)
                     break
+
+        time_col_name = next((col for col in file_cols if col.lower() in ('timestamp_dst', 'timestamp', 'timestamp_utc')), None)
+        if hourly_aggregation and time_col_name is not None and time_col_name not in cols_to_load:
+            cols_to_load.append(time_col_name)
         
         # Track how many users are missing at least one column
         if len(cols_to_load) != len(feature_cols):
@@ -95,21 +102,52 @@ def compute_normalization_stats(sm_files,
         if not cols_to_load:
             continue
 
-        for batch in dataset.iter_batches(columns=cols_to_load, batch_size=10000):
-            df = batch.to_pandas()
+        if hourly_aggregation:
+            # Compute stats on the same hourly scale used by phased aggregated training.
+            df = pq.read_table(file, columns=cols_to_load).to_pandas()
             df = df.rename(columns=rename_map)
+            if time_col_name is not None and time_col_name in df.columns:
+                time_values = df[time_col_name]
+                df = df.drop(columns=[time_col_name])
+            else:
+                time_values = df.index
 
-            # Apply log only to the features we actually found
-            log_df = np.log1p(df[found_features])  
-            
-            # Add to the sums independently based on what exists
+            time_index = pd.to_datetime(time_values, errors='coerce', utc=True)
+            for feat in feature_cols:
+                if feat not in df.columns:
+                    df[feat] = np.nan
+            phase_df = df[feature_cols].apply(pd.to_numeric, errors='coerce')
+            phase_df.index = time_index
+            phase_df = phase_df[~phase_df.index.isna()]
+            phase_df = phase_df[~phase_df.index.duplicated(keep='last')]
+            phase_df = phase_df.sort_index()
+            phase_df = phase_df.resample('1h').sum(min_count=1)
+            if float(aggregation_divisor) > 0 and float(aggregation_divisor) != 1.0:
+                phase_df = phase_df / float(aggregation_divisor)
+
+            log_df = np.log1p(phase_df[found_features])
             for i, feat in enumerate(feature_cols):
                 if feat in found_features:
-                    # Drop NaNs just in case there are internal empty rows
                     valid_data = log_df[feat].dropna()
                     total_sum[i] += valid_data.sum()
                     total_sq_sum[i] += (valid_data ** 2).sum()
                     total_count[i] += len(valid_data)
+        else:
+            for batch in dataset.iter_batches(columns=cols_to_load, batch_size=10000):
+                df = batch.to_pandas()
+                df = df.rename(columns=rename_map)
+
+                # Apply log only to the features we actually found
+                log_df = np.log1p(df[found_features])
+
+                # Add to the sums independently based on what exists
+                for i, feat in enumerate(feature_cols):
+                    if feat in found_features:
+                        # Drop NaNs just in case there are internal empty rows
+                        valid_data = log_df[feat].dropna()
+                        total_sum[i] += valid_data.sum()
+                        total_sq_sum[i] += (valid_data ** 2).sum()
+                        total_count[i] += len(valid_data)
 
 
     print(f"\n--- DATA QUALITY REPORT ---")
@@ -207,7 +245,9 @@ class Normalizer:
     def fit(self, 
             X: np.ndarray | torch.Tensor, 
             sm_files=None, 
-            stats_path='normalization_stats.json') -> 'Normalizer':
+            stats_path='normalization_stats.json',
+            hourly_aggregation: bool = False,
+            aggregation_divisor: float = 1.0) -> 'Normalizer':
         """
         Fit the normalizer on a full dataset at once.
 
@@ -231,6 +271,8 @@ class Normalizer:
                     save_path=stats_path,
                     valid_ids_json_path=None,
                     use_cache=True,
+                    hourly_aggregation=hourly_aggregation,
+                    aggregation_divisor=aggregation_divisor,
                 )
                 self.fitted = True
                 return

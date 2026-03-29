@@ -64,6 +64,7 @@ data:
     num_workers: 0 #6
     steps_per_epoch: 100
     eval_batches: 5
+    aggregation_energy_unit: "kwh" # "wh" keeps raw hourly sum scale, "kwh" divides hourly sums by 1000
 
 # ============================================================================
 # NORMALIZATION CONFIGURATION
