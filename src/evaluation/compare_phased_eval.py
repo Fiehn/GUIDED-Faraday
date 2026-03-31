@@ -290,14 +290,14 @@ class PhasedModelComparator:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compare evaluations between different phased models.")
-    parser.add_argument("--eval_dirs", nargs='+', required=True, help="List of paths to directories containing phased eval results.")
-    parser.add_argument("--names", nargs='+', required=True, help="List of model names corresponding to the eval dirs.")
+    parser.add_argument("--eval_dirs", nargs='+', required=False, help="List of paths to directories containing phased eval results.")
+    parser.add_argument("--names", nargs='+', required=False, help="List of model names corresponding to the eval dirs.")
     parser.add_argument("--output_dir", type=str, default="evaluation_comparison_phased", help="Directory to save the comparison plots and table.")
     
     args = parser.parse_args()
     
-    args.eval_dirs = ["models/SetGuideVAE_DictionaryCoder_20260320_141714_clamping", "models/SetGuideVAE_DictionaryCoder_20260320_165707_phase_tags", "models/SetGuideVAE_DictionaryCoder_20260321_103830_lossfunction_change"]
-    args.names = ["Clamping", "Phase Tags", "Loss Function Change"]
+    args.eval_dirs = ["models\SetGuideVAE_DictionaryCoder_20260331_090912", "models\SetGuideVAE_DictionaryCoder_20260330_230804", "models\SetGuideVAE_DictionaryCoder_20260330_164117"]
+    args.names = ["Agg. Loss", "New DataLoader", "Old DataLoader"]
 
     if len(args.eval_dirs) != len(args.names):
         print("Error: The number of evaluation directories must match the number of model names.")

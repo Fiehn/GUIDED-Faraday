@@ -159,6 +159,66 @@ def _build_phased_eval_loader(eval_stream, batch_size: int, num_workers: int, ev
     )
 
 
+def _init_vamp_prior_from_batch(model, batch, device, noise_scale: float = 0.01) -> bool:
+    if not isinstance(getattr(model, "prior", None), VampPrior):
+        return False
+
+    if batch is None:
+        return False
+
+    model.eval()
+    with torch.no_grad():
+        if isinstance(model, SetGuideVAE):
+            x, meter_id, timestamps = model._unpack_batch(batch)
+            x_phase_first = model._to_phase_first(x).float()
+            x_for_conditions = model._build_condition_input(x_phase_first)
+            c = model.conditioner.get_conditions(x_for_conditions, meter_id=meter_id, timestamps=timestamps)
+            c = model.move_to_device(c, device=device)
+            x_phase_first = model.move_to_device(x_phase_first, device=device)
+            set_repr = model._set_encode(x_phase_first)
+            enc_in = torch.cat([set_repr, c], dim=-1)
+        elif isinstance(model, CVAE):
+            if len(batch) == 4:
+                x, c, meter_id, timestamps = batch
+                if c.numel() == 0 or c.shape[-1] != model.condition_dim:
+                    c = model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
+            elif len(batch) == 3:
+                x, meter_id, timestamps = batch
+                c = model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
+            elif len(batch) == 2:
+                x, meter_id = batch
+                c = model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=None)
+            else:
+                x = batch[0] if isinstance(batch, (list, tuple)) else batch
+                c = model.conditioner.get_conditions(x)
+
+            c = model.move_to_device(c, device=device)
+            x_flat = model._prep_inputs(x).float()
+            x_flat = model.move_to_device(x_flat, device=device)
+            enc_in = torch.cat([x_flat, c], dim=-1)
+        else:
+            x = batch[0] if isinstance(batch, (list, tuple)) else batch
+            x_flat = x.reshape(x.shape[0], -1) if x.dim() == 3 else x
+            enc_in = model.move_to_device(x_flat.float(), device=device)
+
+        if enc_in.numel() == 0:
+            return False
+
+        K = int(model.prior.num_components)
+        n = int(enc_in.shape[0])
+        if n >= K:
+            idx = torch.randperm(n, device=enc_in.device)[:K]
+        else:
+            idx = torch.randint(0, n, (K,), device=enc_in.device)
+        init = enc_in[idx]
+        if noise_scale and noise_scale > 0:
+            init = init + (float(noise_scale) * torch.randn_like(init))
+
+        model.prior.pseudo_inputs.data.copy_(init)
+
+    return True
+
+
 def _run_evaluation_and_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, phased_mode: bool):
     """Route evaluation by mode and run shared visualizations."""
     if phased_mode:
@@ -196,6 +256,8 @@ def train(config):
     print("Using device: ", device)
     # Up the recursion limit for deep models
     sys.setrecursionlimit(5000) # default seems to be 999
+
+    vamp_initialized = False
 
     data_mode = str(getattr(config.data, "mode", "csv")).lower()
     phased_mode = data_mode in {"phased", "phase", "parquet", "phased_parquet"}
@@ -324,6 +386,7 @@ def train(config):
         raise ValueError(f"Unknown model type '{config.model.type}' specified in config.")
 
     model_tag = model.get_tag()
+    _save_training_config_snapshot(config=config, log_path=os.path.join(config.logging.log_dir, model_tag))
 
     # === Load Data === 
     window = WindowSpec(input_len=config.window.input_len, stride=config.window.stride)
@@ -438,6 +501,20 @@ def train(config):
         model = model.to(device)
         model.prior.to(device)
 
+        if not vamp_initialized and isinstance(model.prior, VampPrior):
+            init_from_data = bool(getattr(config.model.prior, "init_from_data", True))
+            if init_from_data:
+                init_loader, _ = phased_replay.get_epoch_loaders(
+                    steps_per_epoch=1,
+                    eval_batches=0,
+                    refresh_eval=False,
+                )
+                init_batch = next(iter(init_loader)) if init_loader is not None else None
+                noise_scale = float(getattr(config.model.prior, "init_noise_scale", 0.01))
+                if _init_vamp_prior_from_batch(model, init_batch, device=device, noise_scale=noise_scale):
+                    vamp_initialized = True
+                    print("Initialized VampPrior pseudo-inputs from data batch.")
+
         print(f"Starting phased training for {config.training.num_epochs} epoch(s), {steps_per_epoch} step(s)/epoch")
         for epoch in range(config.training.num_epochs):
             should_eval_epoch = eval_batches > 0 and ((epoch + 1) % max(1, eval_every_n_epochs) == 0)
@@ -531,7 +608,6 @@ def train(config):
         log_path = os.path.join(config.logging.log_dir, model_tag)
         os.makedirs(log_path, exist_ok=True)
         model.save_model(save_path=log_path, model_name=f"{model_tag}_final", device=device, normalizer=normalizer)
-        _save_training_config_snapshot(config=config, log_path=log_path)
 
         # Use cached eval loader (kept separate from training cache)
         combined_test_loader = phased_replay.get_eval_loader()
@@ -648,6 +724,15 @@ def train(config):
 
         train_loader = dm.train_dataloader()
         val_loader = dm.val_dataloader()
+
+        if not vamp_initialized and isinstance(model.prior, VampPrior):
+            init_from_data = bool(getattr(config.model.prior, "init_from_data", True))
+            if init_from_data:
+                init_batch = next(iter(train_loader), None)
+                noise_scale = float(getattr(config.model.prior, "init_noise_scale", 0.01))
+                if _init_vamp_prior_from_batch(model, init_batch, device=device, noise_scale=noise_scale):
+                    vamp_initialized = True
+                    print("Initialized VampPrior pseudo-inputs from data batch.")
 
         model_tag, writer = model.fit(
             trainloader = train_loader,

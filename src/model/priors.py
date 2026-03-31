@@ -227,25 +227,63 @@ class VampPrior(BasePrior):
         K = self.num_components
         B, D = z.shape
 
-        # Expand z to [B*K, D] — repeat each z for every component
-        z_expanded = z.unsqueeze(1).expand(B, K, D).reshape(B * K, D)
+        # Compute mixture log-prob in chunks to cap memory for large B*K.
+        max_pairs = int(getattr(self, "max_logprob_pairs", 2048))
+        max_pairs = max(1, max_pairs)
 
-        # Expand component params to [B*K, ...]
-        params_expanded = {}
-        for key, val in component_params.items():
-            rest = val.shape[1:]
-            params_expanded[key] = (
-                val.unsqueeze(0)               # [1, K, *rest]
-                  .expand(B, *val.shape)        # [B, K, *rest]
-                  .reshape(B * K, *rest)         # [B*K, *rest]
-            )
+        batch_chunk_size = int(getattr(self, "log_prob_batch_chunk", 0))
+        if batch_chunk_size <= 0:
+            batch_chunk_size = min(B, max_pairs)
+        batch_chunk_size = max(1, batch_chunk_size)
 
-        # log q(z | u_k) for every (batch, component) pair: [B*K]
-        log_probs = self.encoder.loglikelihood(z_expanded, params_expanded)
-        log_probs = log_probs.reshape(B, K)  # [B, K]
+        component_chunk_size = int(getattr(self, "log_prob_component_chunk", 0))
+        if component_chunk_size <= 0:
+            component_chunk_size = max(1, min(K, max_pairs // batch_chunk_size))
+        component_chunk_size = max(1, min(K, component_chunk_size))
 
+        logsumexp_batches = []
+        for b_start in range(0, B, batch_chunk_size):
+            b_end = min(B, b_start + batch_chunk_size)
+            z_chunk = z[b_start:b_end]
+            Bc = z_chunk.shape[0]
+
+            logsumexp_chunk = None
+            for k_start in range(0, K, component_chunk_size):
+                k_end = min(K, k_start + component_chunk_size)
+                params_chunk = {key: val[k_start:k_end] for key, val in component_params.items()}
+
+                # Expand z to [Bc*Kc, D] — repeat each z for every component in the chunk.
+                Kc = k_end - k_start
+                z_expanded = z_chunk.unsqueeze(1).expand(Bc, Kc, D).reshape(Bc * Kc, D)
+
+                # Expand component params to [Bc*Kc, ...]
+                params_expanded = {}
+                for key, val in params_chunk.items():
+                    rest = val.shape[1:]
+                    params_expanded[key] = (
+                        val.unsqueeze(0)          # [1, Kc, *rest]
+                          .expand(Bc, *val.shape)  # [Bc, Kc, *rest]
+                          .reshape(Bc * Kc, *rest)  # [Bc*Kc, *rest]
+                    )
+
+                # log q(z | u_k) for every (batch, component) pair in this chunk: [Bc*Kc]
+                log_probs = self.encoder.loglikelihood(z_expanded, params_expanded)
+                log_probs = log_probs.reshape(Bc, Kc)  # [Bc, Kc]
+                chunk_logsumexp = torch.logsumexp(log_probs, dim=1)
+
+                if logsumexp_chunk is None:
+                    logsumexp_chunk = chunk_logsumexp
+                else:
+                    logsumexp_chunk = torch.logsumexp(
+                        torch.stack([logsumexp_chunk, chunk_logsumexp], dim=0),
+                        dim=0,
+                    )
+
+            logsumexp_batches.append(logsumexp_chunk)
+
+        logsumexp_all = torch.cat(logsumexp_batches, dim=0)
         # Mixture: log (1/K) sum_k exp(log_prob_k) = logsumexp - log(K)
-        return torch.logsumexp(log_probs, dim=1) - np.log(K)
+        return logsumexp_all - np.log(K)
     
     def forward(self, batch_size):
         """Return mean parameters expanded to batch_size for compatibility."""

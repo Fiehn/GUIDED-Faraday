@@ -252,6 +252,8 @@ class SetGuideVAE(CVAE):
         Permutation-Invariant ELBO Loss (Memory Optimized).
         Finds the best permutation without tracking gradients, then calculates 
         the differentiable loss exactly once.
+
+        Aggregation consistency
         """
         # 1. Get KL Divergence
         kl_divergences = self.encoder.kl_divergence(posterior_params, prior=self.prior) # [B]
@@ -273,7 +275,7 @@ class SetGuideVAE(CVAE):
             [2, 0, 1], [2, 1, 0]
         ]
 
-        # --- STEP 1: Find the best permutation WITHOUT saving gradients ---
+        # --- STEP 1: Find the best permutation ---
         with torch.no_grad():
             ll_scores = []
             for perm in permutations:
@@ -294,8 +296,26 @@ class SetGuideVAE(CVAE):
         # --- STEP 3: Do the heavy math exactly ONCE with gradients ON ---
         best_ll = self.decoder.loglikelihood(x_optimal, recon_params_squeezed)
 
-        # 4. Calculate Final ELBO
-        elbo = best_ll - (beta * kl_divergences)
+        if False:
+            # --- STEP 4: Aggregate Total Phases --- (THIS IS A TEST, WILL MAYBE BE USED IN FUTURE)
+            # Get the predicted means and reshape to [B, F, L]
+            mu_predicted = recon_params_squeezed["mu"].reshape(B, F, L)
+            
+            # Sum across the phases (F dimension) -> [B, L]
+            mu_sum = mu_predicted.sum(dim=1)
+            x_sum = x_phases.sum(dim=1)
+            
+            # Calculate MSE of the Aggregated Total
+            # Summing over L (24 hours) to get the error per sample [B]
+            agg_mse = torch.nn.functional.mse_loss(mu_sum, x_sum, reduction='none').sum(dim=-1)
+
+            # --- STEP 3: Final Combined ELBO ---
+            # Maximize LL, Minimize KL, Minimize Agg_MSE
+            agg_weight = 0.25 # The total counts slightly less than an individual phase to encourage learning both individual and aggregate patterns
+            elbo = best_ll - (beta * kl_divergences) - (agg_weight * agg_mse)
+        else:
+            elbo = best_ll - (beta * kl_divergences)
+
         loss = -elbo.mean()
 
         return {

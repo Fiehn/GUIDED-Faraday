@@ -53,7 +53,7 @@ data:
   
   # DataLoader settings
   dataloader:
-    batch_size: 2048
+    batch_size: 1024
     num_workers: 6
     shuffle: false
 
@@ -110,10 +110,12 @@ model:
   
   # Prior configuration
   prior:
-    type: "learnable_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
-                                 # "learnable_gaussian", "learnable_dictionary", "vamp"
+    type: "vampprior"  # Options: "standard_gaussian", "standard_dictionary", 
+                                 # "learnable_gaussian", "learnable_dictionary", "vampprior"
     dictionary_size: 512         # Must be > input_dim (96 timesteps × 3 phases = 288)
-    vamp_num_components: 20
+    vamp_num_components: 40
+    init_from_data: true
+    init_noise_scale: 0.01
 
   # SetGuideVAE set-encoder architecture configuration
   set:
@@ -184,7 +186,7 @@ training:
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 100
+  num_epochs: 50
   
   # Beta (KL weight) settings
   beta: 1.0
