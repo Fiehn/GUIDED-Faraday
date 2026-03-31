@@ -119,7 +119,7 @@ def evaluate_model(model_path, num_test_files=2, config_path="config/config.yaml
             print(f"Warning: unknown data.phased.aggregation_energy_unit='{aggregation_energy_unit}'. Falling back to 'wh'.")
             aggregation_energy_unit = "wh"
         hourly_aggregation = bool(getattr(config.window, "aggregated", False))
-        aggregation_divisor = 1000.0 if hourly_aggregation and aggregation_energy_unit == "kwh" else 1.0
+        aggregation_divisor = 1000.0 if aggregation_energy_unit == "kwh" else 1.0
 
         eval_ds = StreamingParquetBuffer(
             sm_files=sampled_file_paths,

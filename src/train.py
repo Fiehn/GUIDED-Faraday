@@ -577,6 +577,10 @@ def train(config):
                     writer.add_scalar('eval_loss_epoch', eval_metrics['loss'], epoch)
                     writer.add_scalar('eval_recon_loglikelihood_epoch', eval_metrics['recon_loglikelihood'], epoch)
                     writer.add_scalar('eval_kl_divergence_epoch', eval_metrics['kl_divergence'], epoch)
+                    # Alias eval metrics to val_* tags for shared visualization.
+                    writer.add_scalar('val_loss_epoch', eval_metrics['loss'], epoch)
+                    writer.add_scalar('val_recon_loglikelihood_epoch', eval_metrics['recon_loglikelihood'], epoch)
+                    writer.add_scalar('val_kl_divergence_epoch', eval_metrics['kl_divergence'], epoch)
 
                     if eval_metrics['loss'] < best_eval_loss:
                         best_eval_loss = eval_metrics['loss']
@@ -627,6 +631,10 @@ def train(config):
                 phased_mode=True,
                 conditioner=conditioner,
             )
+
+        if writer is not None:
+            writer.close()
+            print(f"Writer logs saved to: {log_path}")
 
         return model
 

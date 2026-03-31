@@ -780,11 +780,24 @@ class VAE(nn.Module):
             
             import importlib
             from model.priors import VampPrior
-            
-            # Create VampPrior with encoder reference 
+
+            encoder_input_dim = getattr(model.encoder, 'input_dim', None)
+            if encoder_input_dim is not None:
+                input_shape = int(encoder_input_dim)
+            else:
+                input_shape = init_args.get('input_shape', None)
+                if input_shape is None:
+                    if hasattr(model, 'set_hidden_dim') and hasattr(model, 'condition_dim'):
+                        input_shape = int(model.set_hidden_dim) + int(model.condition_dim)
+                    elif hasattr(model, 'condition_dim'):
+                        input_shape = int(model.input_dim) + int(model.condition_dim)
+                    else:
+                        input_shape = int(model.input_dim)
+
+            # Create VampPrior with encoder reference
             model.prior = VampPrior(
                 latent_dim=init_args.get('latent_dim', model.latent_dim),
-                input_shape=init_args.get('input_shape', model.input_dim + getattr(model, 'condition_dim', 0)),
+                input_shape=input_shape,
                 encoder=model.encoder,
                 num_components=init_args.get('num_components', 20),
                 device=device

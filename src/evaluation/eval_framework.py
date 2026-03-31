@@ -90,6 +90,50 @@ def _rank_phases_by_total_consumption(data: np.ndarray) -> np.ndarray:
     return np.take_along_axis(arr, order[:, :, None], axis=1)
 
 
+def _align_phases_by_mse(reference: np.ndarray, candidate: np.ndarray) -> np.ndarray:
+    ref = np.asarray(reference)
+    cand = np.asarray(candidate)
+    if ref.ndim != 3 or cand.ndim != 3:
+        raise ValueError(f"Expected 3D arrays [N, F, L], got {ref.shape} and {cand.shape}")
+    if ref.shape != cand.shape:
+        raise ValueError(f"Reference and candidate shapes must match, got {ref.shape} vs {cand.shape}")
+
+    n, f, _ = ref.shape
+    if f <= 1:
+        return cand
+
+    aligned = np.empty_like(cand)
+    for i in range(n):
+        # Cost[j, k] = MSE between reference phase j and candidate phase k.
+        diff = ref[i][:, None, :] - cand[i][None, :, :]
+        cost = np.mean(diff * diff, axis=2)
+        row_ind, col_ind = linear_sum_assignment(cost)
+        aligned[i, row_ind, :] = cand[i, col_ind, :]
+    return aligned
+
+
+def _align_phases_to_reference_mean(reference: np.ndarray, candidate: np.ndarray) -> np.ndarray:
+    ref = np.asarray(reference)
+    cand = np.asarray(candidate)
+    if ref.ndim != 3 or cand.ndim != 3:
+        raise ValueError(f"Expected 3D arrays [N, F, L], got {ref.shape} and {cand.shape}")
+    if ref.shape[1:] != cand.shape[1:]:
+        raise ValueError(f"Reference and candidate feature shapes must match, got {ref.shape} vs {cand.shape}")
+
+    _, f, _ = ref.shape
+    if f <= 1:
+        return cand
+
+    ref_mean = ref.mean(axis=0)
+    cand_mean = cand.mean(axis=0)
+    diff = ref_mean[:, None, :] - cand_mean[None, :, :]
+    cost = np.mean(diff * diff, axis=2)
+    row_ind, col_ind = linear_sum_assignment(cost)
+    aligned = np.empty_like(cand)
+    aligned[:, row_ind, :] = cand[:, col_ind, :]
+    return aligned
+
+
 class EvaluationMetric(ABC):
     """Base class for evaluation metrics."""
     
@@ -702,9 +746,9 @@ class PhasedEvaluationSuite:
             output_path=os.path.join(aggregated_dir, 'eval_results.json'),
         )
 
-        ranked_real = _rank_phases_by_total_consumption(real_phase)
-        ranked_recon = _rank_phases_by_total_consumption(recon_phase)
-        ranked_synth = _rank_phases_by_total_consumption(synthetic_phase)
+        ranked_real = real_phase
+        ranked_recon = _align_phases_by_mse(real_phase, recon_phase)
+        ranked_synth = _align_phases_to_reference_mean(real_phase, synthetic_phase)
 
         ranked_results = {}
         num_phases = ranked_real.shape[1]
@@ -721,7 +765,7 @@ class PhasedEvaluationSuite:
             }
             ranked_results[f'phase_{phase_number}'] = self._run_prepared_eval(
                 prepared_data=prepared,
-                title=f'RANKED PHASE {phase_number} EVALUATION',
+                title=f'ALIGNED PHASE {phase_number} EVALUATION',
                 output_path=os.path.join(phase_dir, 'eval_results.json'),
             )
 

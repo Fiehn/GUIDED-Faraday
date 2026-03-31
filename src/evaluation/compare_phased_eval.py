@@ -296,8 +296,8 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    args.eval_dirs = ["models\SetGuideVAE_DictionaryCoder_20260331_090912", "models\SetGuideVAE_DictionaryCoder_20260330_230804", "models\SetGuideVAE_DictionaryCoder_20260330_164117"]
-    args.names = ["Agg. Loss", "New DataLoader", "Old DataLoader"]
+    args.eval_dirs = ["models\SetGuideVAE_DictionaryCoder_20260331_090912_aggloss", "models\SetGuideVAE_DictionaryCoder_20260330_230804", "models\SetGuideVAE_DictionaryCoder_20260331_113400_vamp"]
+    args.names = ["Agg. Loss", "New DataLoader", "VAMP Prior"]
 
     if len(args.eval_dirs) != len(args.names):
         print("Error: The number of evaluation directories must match the number of model names.")

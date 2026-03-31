@@ -110,7 +110,7 @@ class StreamingParquetBuffer(IterableDataset):
         # Building full_index before resampling can misalign (e.g., :45 vs :00)
         # and reindex would then wipe out all values as NaN.
         if self.aggregation:
-            df = df.resample(self.base_frequency).sum(min_count=1)
+            df = df.resample(self.base_frequency).mean(min_count=1) # TODO: REMEMBER THIS MOTHERFUCKER! we are using kw not kwh on the 15 min scale
             if self.aggregation_divisor != 1.0:
                 df = df / self.aggregation_divisor
 
@@ -191,7 +191,8 @@ class StreamingParquetBuffer(IterableDataset):
             return sequences
 
         timestamps = (phase_df.index.view('int64') // 10**9).astype(np.int64)
-        values = phase_df.fillna(0.0).astype(np.float32).to_numpy()
+        #values = phase_df.fillna(0.0).astype(np.float32).to_numpy()
+        values = phase_df.dropna().astype(np.float32).to_numpy() # TODO: FUck sommerhuse! 
 
         for start in range(0, len(values) - self.window_spec.input_len + 1, self.window_spec.stride):
             end = start + self.window_spec.input_len
