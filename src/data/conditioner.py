@@ -867,15 +867,54 @@ class ActivePhaseCountConditioner(BaseConditioner):
     ) -> torch.Tensor | None:
         
         if x is None:
-            raise ValueError("ActivePhaseCountConditioner requires input data 'x' to calculate phase activity.")
+            if isinstance(meter_id, torch.Tensor):
+                batch_size = int(meter_id.shape[0])
+                device = meter_id.device
+            elif isinstance(meter_id, np.ndarray):
+                batch_size = int(meter_id.shape[0])
+                device = torch.device("cpu")
+            elif isinstance(timestamps, torch.Tensor):
+                batch_size = int(timestamps.shape[0])
+                device = timestamps.device
+            elif isinstance(timestamps, np.ndarray):
+                batch_size = int(timestamps.shape[0])
+                device = torch.device("cpu")
+            else:
+                batch_size = 1
+                device = torch.device("cpu")
+
+            active_count = torch.full((batch_size,), 3, dtype=torch.long, device=device)
+            count_onehot = F.one_hot(active_count, num_classes=self.condition_dim).float()
+            return count_onehot
             
         if isinstance(x, np.ndarray):
             x = torch.tensor(x, dtype=torch.float32)
-            
-        # x arrives from SetGuideVAE._build_condition_input as [B, L, F] (Time-First)
-        # 1. Sum the absolute values over the time dimension (L) to get total activity per phase
-        # Shape: [B, F]
-        phase_activity = x.abs().sum(dim=1)
+
+        if not torch.is_tensor(x):
+            raise ValueError("ActivePhaseCountConditioner expects a tensor or ndarray input.")
+
+        feature_dim = self.condition_dim - 1
+        used_transpose = False
+
+        if x.dim() == 2:
+            if x.shape[1] % feature_dim != 0:
+                raise ValueError(
+                    f"Expected flattened input with feature_dim={feature_dim}, got shape {tuple(x.shape)}"
+                )
+            x_time_first = x.reshape(x.shape[0], -1, feature_dim)
+        elif x.dim() == 3:
+            if x.shape[2] == feature_dim:
+                x_time_first = x
+            elif x.shape[1] == feature_dim:
+                x_time_first = x.transpose(1, 2)
+                used_transpose = True
+            else:
+                x_time_first = x
+        else:
+            raise ValueError(f"Expected 2D/3D input, got shape {tuple(x.shape)}")
+
+        # x_time_first is expected as [B, L, F]
+        phase_activity = x_time_first.abs().sum(dim=1)
         
         # 2. Check which phases cross the active threshold
         # Shape: [B, F] (Boolean)
@@ -884,11 +923,25 @@ class ActivePhaseCountConditioner(BaseConditioner):
         # 3. Count how many phases are active per batch
         # Shape: [B] (Values 0, 1, 2, or 3)
         active_count = is_active.sum(dim=1).long()
+
+        if active_count.numel() > 0 and int(active_count.max().item()) >= self.condition_dim:
+            if x.dim() == 3 and not used_transpose and x.shape[1] != x.shape[2]:
+                x_time_first = x.transpose(1, 2)
+                phase_activity = x_time_first.abs().sum(dim=1)
+                is_active = phase_activity > self.activity_threshold
+                active_count = is_active.sum(dim=1).long()
+
+        if active_count.numel() > 0 and int(active_count.max().item()) >= self.condition_dim:
+            print(
+                f"Warning: active phase count exceeded expected max ({self.condition_dim - 1}); "
+                "clamping to valid range."
+            )
+            active_count = active_count.clamp(max=self.condition_dim - 1)
         
         # 4. Convert to One-Hot encoding [B, 4]
         count_onehot = F.one_hot(active_count, num_classes=self.condition_dim).float()
         
-        return count_onehot.to(x.device)
+        return count_onehot.to(x_time_first.device)
     
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
         """
@@ -971,6 +1024,14 @@ class Conditioner():
         if isinstance(x, torch.Tensor):
             target_device = x.device
         elif isinstance(x, np.ndarray):
+            target_device = torch.device('cpu')
+        elif isinstance(meter_id, torch.Tensor):
+            target_device = meter_id.device
+        elif isinstance(meter_id, np.ndarray):
+            target_device = torch.device('cpu')
+        elif isinstance(timestamps, torch.Tensor):
+            target_device = timestamps.device
+        elif isinstance(timestamps, np.ndarray):
             target_device = torch.device('cpu')
         
         for tag in self.tags:

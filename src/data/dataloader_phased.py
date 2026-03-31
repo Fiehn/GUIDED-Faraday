@@ -2,7 +2,7 @@ import math
 import torch
 import random
 import pyarrow.parquet as pq
-from torch.utils.data import IterableDataset, DataLoader, get_worker_info
+from torch.utils.data import IterableDataset, DataLoader, get_worker_info, TensorDataset
 from typing import Optional
 import numpy as np
 import json
@@ -208,6 +208,179 @@ class StreamingParquetBuffer(IterableDataset):
         return sequences
 
 
+class PhasedReplayDataloaders:
+    """Builds train/eval DataLoaders from a shared replay stream with optional GPU eval caching."""
+    def __init__(
+            self,
+            *,
+            sm_files,
+            window_spec: Optional[WindowSpec],
+            batch_size: int,
+            replay_buffer_capacity: int = 10000,
+            min_buffer_size: int = 2000,
+            normalizer: Optional[Normalizer] = None,
+            num_workers: int = 0,
+            hourly_aggregation: bool = False,
+            aggregation_divisor: float = 1.0,
+            eval_cache_device: Optional[torch.device] = None,
+            eval_cache_batches: Optional[int] = None,
+            cache_scan_batches: Optional[int] = None,
+    ):
+        self.batch_size = int(batch_size)
+        self.num_workers = int(num_workers)
+        self.eval_cache_device = eval_cache_device
+        self.eval_cache_batches = eval_cache_batches
+        self.cache_scan_batches = cache_scan_batches
+
+        self.dataset = StreamingParquetBuffer(
+            sm_files=sm_files,
+            replay_buffer_capacity=replay_buffer_capacity,
+            min_buffer_size=min_buffer_size,
+            window_spec=window_spec,
+            normalizer=normalizer,
+            num_workers=num_workers,
+            hourly_aggregation=hourly_aggregation,
+            aggregation_divisor=aggregation_divisor,
+        )
+
+        self.eval_loader = None
+
+    def _make_stream(self):
+        return DataLoader(self.dataset, batch_size=self.batch_size, num_workers=self.num_workers)
+
+    def _collect_cache(self, target_train: int, target_eval: int):
+        train_xs, train_cs = [], []
+        eval_xs, eval_cs = [], []
+        train_samples = 0
+        eval_samples = 0
+
+        target_train = max(0, int(target_train))
+        target_eval = max(0, int(target_eval))
+        total_batches = max(1, (target_train + target_eval + self.batch_size - 1) // self.batch_size)
+        max_scan_batches = self.cache_scan_batches or max(30, total_batches * 40)
+
+        for i, (x, cond) in enumerate(self._make_stream()):
+            x = x.float()
+            cond = cond.long()
+
+            n = x.shape[0]
+            remaining_train = max(0, target_train - train_samples)
+            remaining_eval = max(0, target_eval - eval_samples)
+            if remaining_train <= 0 and remaining_eval <= 0:
+                break
+
+            if remaining_eval > 0:
+                denom = max(1, remaining_train + remaining_eval)
+                p_eval = float(remaining_eval) / float(denom)
+                eval_mask = torch.rand(n) < p_eval
+
+                if eval_mask.sum().item() == 0 and remaining_eval > 0 and n > 1:
+                    eval_mask[torch.randint(0, n, (1,)).item()] = True
+                if (~eval_mask).sum().item() == 0 and remaining_train > 0 and n > 1:
+                    eval_mask[torch.randint(0, n, (1,)).item()] = False
+            else:
+                eval_mask = torch.zeros(n, dtype=torch.bool)
+
+            x_eval = x[eval_mask]
+            c_eval = cond[eval_mask]
+            x_train = x[~eval_mask]
+            c_train = cond[~eval_mask]
+
+            if remaining_train > 0 and x_train.shape[0] > 0:
+                take_train = min(remaining_train, x_train.shape[0])
+                train_xs.append(x_train[:take_train])
+                train_cs.append(c_train[:take_train])
+                train_samples += int(take_train)
+
+            if remaining_eval > 0 and x_eval.shape[0] > 0:
+                take_eval = min(remaining_eval, x_eval.shape[0])
+                eval_xs.append(x_eval[:take_eval])
+                eval_cs.append(c_eval[:take_eval])
+                eval_samples += int(take_eval)
+
+            if train_samples >= target_train and eval_samples >= target_eval:
+                break
+
+            if i >= max_scan_batches - 1:
+                print(f"Warning: reached scan limit ({max_scan_batches} batches) while collecting phased cache.")
+                break
+
+        if train_samples < target_train and len(eval_xs) > 0:
+            need = target_train - train_samples
+            x_backfill = torch.cat(eval_xs, dim=0)
+            c_backfill = torch.cat(eval_cs, dim=0)
+            take = min(need, x_backfill.shape[0])
+            if take > 0:
+                train_xs.append(x_backfill[:take])
+                train_cs.append(c_backfill[:take])
+                train_samples += int(take)
+
+        return train_xs, train_cs, eval_xs, eval_cs
+
+    def _build_eval_loader(self, eval_xs, eval_cs):
+        if len(eval_xs) == 0:
+            self.eval_loader = None
+            return
+
+        x_eval = torch.cat(eval_xs, dim=0)
+        c_eval = torch.cat(eval_cs, dim=0)
+
+        if torch.is_tensor(c_eval) and c_eval.dim() == 3 and c_eval.shape[1] >= 2:
+            meter_id = c_eval[:, 0, 0].long()
+            timestamps = c_eval[:, 1, 0].long()
+        elif torch.is_tensor(c_eval) and c_eval.dim() == 2 and c_eval.shape[1] >= 2:
+            meter_id = c_eval[:, 0].long()
+            timestamps = c_eval[:, 1].long()
+        else:
+            meter_id = torch.zeros(x_eval.shape[0], dtype=torch.long)
+            timestamps = torch.zeros(x_eval.shape[0], dtype=torch.long)
+
+        if self.eval_cache_device is not None:
+            x_eval = x_eval.to(self.eval_cache_device)
+            meter_id = meter_id.to(self.eval_cache_device)
+            timestamps = timestamps.to(self.eval_cache_device)
+
+        eval_ds = TensorDataset(x_eval, meter_id, timestamps)
+        eval_workers = 0
+        self.eval_loader = DataLoader(
+            eval_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=eval_workers,
+        )
+
+    def get_epoch_loaders(self, steps_per_epoch: int, eval_batches: int, refresh_eval: bool = False):
+        target_train = max(1, int(steps_per_epoch)) * self.batch_size
+        need_eval = int(eval_batches) > 0
+        target_eval = 0
+
+        if need_eval:
+            if self.eval_loader is None or refresh_eval:
+                eval_cache_batches = self.eval_cache_batches if self.eval_cache_batches is not None else eval_batches
+                target_eval = max(1, int(eval_cache_batches)) * self.batch_size
+
+        train_xs, train_cs, eval_xs, eval_cs = self._collect_cache(target_train, target_eval)
+
+        if len(train_xs) == 0:
+            return None, self.eval_loader
+
+        train_ds = TensorDataset(torch.cat(train_xs, dim=0), torch.cat(train_cs, dim=0))
+        train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True, num_workers=0)
+
+        if target_eval > 0:
+            self._build_eval_loader(eval_xs, eval_cs)
+
+        return train_loader, self.eval_loader
+
+    def refresh_eval_cache(self, eval_batches: int):
+        target_eval = max(1, int(eval_batches)) * self.batch_size
+        _, _, eval_xs, eval_cs = self._collect_cache(0, target_eval)
+        self._build_eval_loader(eval_xs, eval_cs)
+
+    def get_eval_loader(self):
+        return self.eval_loader
+
+
 class SMPhaseData:
     def __init__(
             self,
@@ -274,23 +447,3 @@ class SMPhaseData:
         # This function should return a list of all Parquet files in the data directory
         return [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.parquet')]
     
-
-if __name__ == "__main__":
-    normalizer = Normalizer(method='log1p_phase')
-    normalizer.fit(X = None)  # This will compute and save the normalization stats to 'normalization_stats.json'
-    # Example usage
-    data_module = SMPhaseData(
-        # data_dir='/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/cleaned_profiles',
-        data_dir='F:\Data\processed_data\second_batch\individual_sm_datasets\raw_profiles',
-        # data_dir='F:\Data\processed_data\second_batch\individual_sm_datasets\cleaned_profiles',
-        window_spec=WindowSpec(input_len=24, stride=1),
-        batch_size=32,
-        replay_buffer_capacity=10000,
-        seed=4,
-        num_workers=4,
-        normalizer=normalizer
-    )
-    data_module.setup()
-    for batch in data_module.train_loader:
-        print(batch)
-        break  # Just to test one batch

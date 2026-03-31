@@ -36,6 +36,16 @@ class SyntheticGenerator:
         self.device = device
         self._is_cvae = hasattr(model, 'conditioner') and model.conditioner is not None
 
+    def _prepare_condition_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Match training input layout for conditioners when available."""
+        if hasattr(self.model, "_to_phase_first") and hasattr(self.model, "_build_condition_input"):
+            try:
+                x_phase = self.model._to_phase_first(x)
+                return self.model._build_condition_input(x_phase)
+            except Exception:
+                return x
+        return x
+
     @torch.no_grad()
     def reconstruct(self, input_data: torch.Tensor,
                     num_reconstructions: int = 1,
@@ -74,7 +84,8 @@ class SyntheticGenerator:
             input_data = input_data.to(self.device, dtype=model_dtype)
         if self._is_cvae and meter_id is not None and timestamp is not None:
             # Conditions for the encoding are always based on the original meter_id and timestamp, to get the correct latent representation.
-            conditions = self.conditioner.get_conditions(input_data, meter_id, timestamp).to(self.device, dtype=model_dtype)
+            cond_input = self._prepare_condition_input(input_data)
+            conditions = self.conditioner.get_conditions(cond_input, meter_id, timestamp).to(self.device, dtype=model_dtype)
             
             # Ensure input_data is flattened appropriately
             if hasattr(self.model, '_set_encode'):

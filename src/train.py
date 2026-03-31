@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import shutil
 import yaml
 from types import SimpleNamespace
 from xml.parsers.expat import model
@@ -13,7 +14,7 @@ from src.model.cvae import *
 from src.model.set import *
 from src.model.vae import *
 from data.dataloader import *
-from data.dataloader_phased import StreamingParquetBuffer, WindowSpec as PhaseWindowSpec
+from data.dataloader_phased import StreamingParquetBuffer, WindowSpec as PhaseWindowSpec, PhasedReplayDataloaders
 from data.normalizer import *
 from src.test.run_validation import run_validation
 from src.model.hierarchical.aggregation import *
@@ -22,6 +23,7 @@ from src.visualization.visualizer import Visualizer
 from src.visualization.writer import Writer
 from evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
 from src.visualization.plot_styling import PlotStyle
+from src.model.model_utils import EarlyStopping
 import gc
 
 
@@ -42,6 +44,7 @@ def _load_train_config(config_path: str = None):
         raw = yaml.safe_load(f) or {}
 
     cfg = _to_namespace(raw)
+    cfg._config_path = os.path.abspath(config_path)
 
     # Aliases expected by existing train() implementation
     if not hasattr(cfg, "data"):
@@ -67,6 +70,18 @@ def _load_train_config(config_path: str = None):
         cfg.verbose = True
 
     return cfg
+
+
+def _save_training_config_snapshot(config, log_path: str):
+    """Save the YAML config used for training into the run report directory."""
+    os.makedirs(log_path, exist_ok=True)
+    src_path = getattr(config, "_config_path", None)
+    dst_path = os.path.join(log_path, "training_config_used.yaml")
+
+    if src_path and os.path.exists(src_path):
+        shutil.copy2(src_path, dst_path)
+    else:
+        print("Warning: could not resolve original config file path; skipping config snapshot save.")
 
 
 def _cfg_get(config, path, default=None):
@@ -339,9 +354,9 @@ def train(config):
             raise ValueError(f"No parquet files found for phased mode in: {data_dir}")
         
         # TODO: REMOVE THIS:
-        parquet_paths = parquet_paths[:20]  # temporary limit for testing
+        parquet_paths = parquet_paths[:2000]  # temporary limit for testing
 
-        print(f"Phased mode enabled. Using {len(parquet_paths)} parquet file(s).")
+        print(f"Phased mode enabled. Found {len(parquet_paths)} parquet file(s).")
 
         phased_cfg = getattr(config.data, "phased", SimpleNamespace())
         aggregation_energy_unit = str(getattr(phased_cfg, "aggregation_energy_unit", "wh")).lower()
@@ -357,6 +372,12 @@ def train(config):
         phased_workers = int(getattr(phased_cfg, "num_workers", config.dataloader.num_workers))
         steps_per_epoch = int(getattr(phased_cfg, "steps_per_epoch", 100))
         eval_batches = int(getattr(phased_cfg, "eval_batches", 5))
+        eval_every_n_epochs = int(getattr(phased_cfg, "eval_every_n_epochs", 1))
+        eval_cache_refresh = bool(getattr(phased_cfg, "eval_cache_refresh", False))
+        eval_cache_on_gpu = bool(getattr(phased_cfg, "eval_cache_on_gpu", str(device) != "cpu"))
+        cache_scan_batches = int(getattr(phased_cfg, "cache_scan_batches", 0)) or None
+
+        print("Phased mode will allocate train/eval from one shared replay cache each epoch.")
 
         normalizer = None
         norm_method = str(getattr(config.normalizer, "method", "log1p")).lower()
@@ -379,13 +400,14 @@ def train(config):
         else:
             print(f"Warning: phased_parquet mode currently expects normalization.method='log1p_phase'. Got '{norm_method}'. Continuing without normalization.")
         if conditioner.condition_items.get("user_profile") is not None:
-            conditioner.condition_items.get("user_profile", None).fit_on_files(parquet_paths)  # Fit user profiler on all data files for phased mode
+            conditioner.condition_items.get("user_profile", None).fit_on_files(parquet_paths)
         if config.window.aggregated and config.window.input_len != 24:
             print(f"Warning: window.aggregated is True but window.input_len is {config.window.input_len}. For hourly aggregation, consider setting input_len to 24.")
             config.window.input_len = 24
             config.window.stride = 24
         phase_window = PhaseWindowSpec(input_len=config.window.input_len, stride=config.window.stride)
-        train_ds = StreamingParquetBuffer(
+        eval_cache_device = device if eval_cache_on_gpu and str(device) != "cpu" else None
+        phased_replay = PhasedReplayDataloaders(
             sm_files=parquet_paths,
             replay_buffer_capacity=replay_capacity,
             min_buffer_size=min_buffer_size,
@@ -394,21 +416,39 @@ def train(config):
             num_workers=phased_workers,
             hourly_aggregation=config.window.aggregated,
             aggregation_divisor=aggregation_divisor,
-        )
-        train_loader = DataLoader(
-            train_ds,
             batch_size=config.dataloader.batch_size,
-            num_workers=phased_workers,
+            eval_cache_device=eval_cache_device,
+            eval_cache_batches=eval_batches,
+            cache_scan_batches=cache_scan_batches,
         )
 
         writer = Writer(log_dir=os.path.join(config.logging.log_dir, model_tag))
         optim = model.get_optimizer(lr=config.training.learning_rate, weight_decay=config.training.weight_decay)
+
+        use_early_stopping = bool(getattr(config.training.early_stopping, "enabled", False))
+        early_stopper = None
+        best_eval_loss = float("inf")
+        if use_early_stopping:
+            early_stopper = EarlyStopping(
+                patience=int(getattr(config.training.early_stopping, "patience", 10)),
+                min_delta=float(getattr(config.training.early_stopping, "min_delta", 0.001)),
+                mode='min',
+            )
 
         model = model.to(device)
         model.prior.to(device)
 
         print(f"Starting phased training for {config.training.num_epochs} epoch(s), {steps_per_epoch} step(s)/epoch")
         for epoch in range(config.training.num_epochs):
+            should_eval_epoch = eval_batches > 0 and ((epoch + 1) % max(1, eval_every_n_epochs) == 0)
+            train_loader, epoch_eval_loader = phased_replay.get_epoch_loaders(
+                steps_per_epoch=steps_per_epoch,
+                eval_batches=eval_batches if should_eval_epoch else 0,
+                refresh_eval=eval_cache_refresh and should_eval_epoch,
+            )
+            if train_loader is None:
+                raise RuntimeError("No phased training batches could be collected from replay stream.")
+
             model.train()
             epoch_loss = 0.0
             epoch_recon = 0.0
@@ -416,8 +456,6 @@ def train(config):
             n = 0
 
             for step, batch in enumerate(train_loader, start=1):
-                if step > steps_per_epoch:
-                    break
                 batch = model.move_to_device(batch, device)
                 loss_dict = model.train_core(
                     batch,
@@ -444,6 +482,47 @@ def train(config):
             writer.add_scalar('train_recon_loglikelihood_epoch', avg_recon, epoch)
             writer.add_scalar('train_kl_divergence_epoch', avg_kl, epoch)
 
+            # Optional epoch-level evaluation for phased SetGuideVAE runs.
+            if should_eval_epoch and hasattr(model, "validate") and epoch_eval_loader is not None:
+                try:
+                    eval_metrics = model.validate(
+                        valloader=epoch_eval_loader,
+                        num_samples=1,
+                        beta=config.training.beta,
+                        device=device,
+                    )
+                    print(
+                        f"Epoch [{epoch+1:4d}/{config.training.num_epochs}] "
+                        f"Eval Loss: {eval_metrics['loss']:.4f} | "
+                        f"Recon: {eval_metrics['recon_loglikelihood']:.4f} | "
+                        f"KL: {eval_metrics['kl_divergence']:.4f}"
+                    )
+                    writer.add_scalar('eval_loss_epoch', eval_metrics['loss'], epoch)
+                    writer.add_scalar('eval_recon_loglikelihood_epoch', eval_metrics['recon_loglikelihood'], epoch)
+                    writer.add_scalar('eval_kl_divergence_epoch', eval_metrics['kl_divergence'], epoch)
+
+                    if eval_metrics['loss'] < best_eval_loss:
+                        best_eval_loss = eval_metrics['loss']
+                        save_dir = os.path.join(config.logging.log_dir, model_tag)
+                        os.makedirs(save_dir, exist_ok=True)
+                        model.save_model(
+                            save_path=save_dir,
+                            model_name=f"{model_tag}_best",
+                            device=device,
+                            normalizer=normalizer,
+                        )
+
+                    if use_early_stopping and early_stopper is not None:
+                        early_stopper(train_metric=avg_loss, val_metric=eval_metrics['loss'], epoch=epoch)
+                        if early_stopper.early_stop:
+                            print(f"Early stopping triggered at epoch {epoch+1} (best eval loss: {best_eval_loss:.4f})")
+                            break
+                except Exception as e:
+                    print(f"Warning: skipped epoch eval loss computation due to: {e}")
+
+            if use_early_stopping and early_stopper is not None and early_stopper.early_stop:
+                break
+
             if (epoch + 1) % config.training.checkpointing.save_freq == 0:
                 save_dir = os.path.join(config.logging.log_dir, model_tag)
                 os.makedirs(save_dir, exist_ok=True)
@@ -452,26 +531,13 @@ def train(config):
         log_path = os.path.join(config.logging.log_dir, model_tag)
         os.makedirs(log_path, exist_ok=True)
         model.save_model(save_path=log_path, model_name=f"{model_tag}_final", device=device, normalizer=normalizer)
+        _save_training_config_snapshot(config=config, log_path=log_path)
 
-        # Build finite eval loader in (x, meter_id, timestamps) format
-        eval_ds = StreamingParquetBuffer(
-            sm_files=parquet_paths,
-            replay_buffer_capacity=replay_capacity,
-            min_buffer_size=min_buffer_size,
-            window_spec=phase_window,
-            normalizer=normalizer,
-            num_workers=phased_workers,
-            hourly_aggregation=config.window.aggregated,
-            aggregation_divisor=aggregation_divisor,
-        )
-        eval_stream = DataLoader(eval_ds, batch_size=config.dataloader.batch_size, num_workers=phased_workers)
-        combined_test_loader = _build_phased_eval_loader(
-            eval_stream=eval_stream,
-            batch_size=config.dataloader.batch_size,
-            num_workers=phased_workers,
-            eval_batches=eval_batches,
-            normalizer=normalizer,
-        )
+        # Use cached eval loader (kept separate from training cache)
+        combined_test_loader = phased_replay.get_eval_loader()
+        if combined_test_loader is None and eval_batches > 0:
+            phased_replay.refresh_eval_cache(eval_batches)
+            combined_test_loader = phased_replay.get_eval_loader()
 
         if combined_test_loader is not None:
             _run_evaluation_and_visualization(
@@ -528,10 +594,6 @@ def train(config):
     all_test_tensors = []
     log_path = os.path.join(config.logging.log_dir, model_tag)
     writer = Writer(log_dir=os.path.join(log_path, 'logs'))
-
-    # SAve training config
-    with open(os.path.join(log_path, 'training_config.yaml'), 'w') as f:
-        yaml.dump(config.config, f)
 
     i = 0
     for data_file in data_files:
@@ -626,6 +688,7 @@ def train(config):
         num_workers=config.data.dataloader.num_workers,
     )
     log_path = os.path.join(config.logging.log_dir, model_tag)
+    _save_training_config_snapshot(config=config, log_path=log_path)
     _run_evaluation_and_visualization(
         model=model,
         test_loader=combined_test_loader,

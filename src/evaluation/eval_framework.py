@@ -228,6 +228,28 @@ class EvalFramework:
     def _is_cvae(self) -> bool:
         """Check if model is a CVAE based on presence of conditioner on the model."""
         return hasattr(self.model, 'conditioner') and self.model.conditioner is not None
+
+    def _prepare_condition_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Match training input layout for conditioners when available."""
+        if hasattr(self.model, "_to_phase_first") and hasattr(self.model, "_build_condition_input"):
+            try:
+                x_phase = self.model._to_phase_first(x)
+                return self.model._build_condition_input(x_phase)
+            except Exception:
+                return x
+        return x
+
+    def _flatten_for_metrics(self, x: torch.Tensor) -> torch.Tensor:
+        """Flatten in the same order used during training when possible."""
+        if x.dim() == 3:
+            if hasattr(self.model, "_to_phase_first"):
+                try:
+                    x_phase = self.model._to_phase_first(x)
+                    return x_phase.reshape(x_phase.shape[0], -1)
+                except Exception:
+                    return x.reshape(x.shape[0], -1)
+            return x.reshape(x.shape[0], -1)
+        return x
     
     def _prepare_data(self) -> None:
         """Extract real data, reconstructed data, and synthetic data for metrics that need it."""
@@ -267,12 +289,13 @@ class EvalFramework:
                 
                 data = data.to(self.device)
                 if self._is_cvae():
+                    cond_input = self._prepare_condition_input(data)
                     if c is None or (hasattr(c, 'numel') and c.numel() == 0) or (hasattr(self.model, 'condition_dim') and c.shape[-1] != self.model.condition_dim):
-                        c = self.conditioner.get_conditions(data, meter_id=meter_ids, timestamps=timestamps)
+                        c = self.conditioner.get_conditions(cond_input, meter_id=meter_ids, timestamps=timestamps)
                     c = c.to(self.device)
                     condition_batches.append(c.cpu())
 
-                x_flat = data.reshape(data.shape[0], -1) if data.dim() == 3 else data
+                x_flat = self._flatten_for_metrics(data)
                 real_batches.append(x_flat.cpu().numpy())
 
                 if timestamps is not None:
@@ -318,11 +341,12 @@ class EvalFramework:
             torch.Tensor: Reconstructed data of shape `(batch_size, features)`
         """
         with torch.no_grad():
-            x_flat = x.reshape(x.shape[0], -1) if x.dim() == 3 else x
+            x_flat = self._flatten_for_metrics(x)
 
             if self._is_cvae():
                 # Use the model's own conditioner with real meter_id and timestamps
-                c = self.model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
+                cond_input = self._prepare_condition_input(x)
+                c = self.model.conditioner.get_conditions(cond_input, meter_id=meter_id, timestamps=timestamps)
                 c = self.model.move_to_device(c, device=self.device)
                 recon_params, _ = self.model.forward(x_flat, c, num_samples=1)
             else:
