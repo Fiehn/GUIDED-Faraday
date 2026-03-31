@@ -417,7 +417,7 @@ def train(config):
             raise ValueError(f"No parquet files found for phased mode in: {data_dir}")
         
         # TODO: REMOVE THIS:
-        parquet_paths = parquet_paths[:2000]  # temporary limit for testing
+        #parquet_paths = parquet_paths[:2000]  # temporary limit for testing
 
         print(f"Phased mode enabled. Found {len(parquet_paths)} parquet file(s).")
 

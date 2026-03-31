@@ -40,9 +40,9 @@ data:
   
   # Train/val/test split (by meter ID)
   splits:
-    train_ratio: 0.8
-    val_ratio: 0.10
-    test_ratio: 0.10
+    train_ratio: 0.9
+    val_ratio: 0.05
+    test_ratio: 0.05
     random_seed: 42
   
   # Windowing configuration
@@ -53,7 +53,7 @@ data:
   
   # DataLoader settings
   dataloader:
-    batch_size: 1024
+    batch_size: 2048
     num_workers: 6
     shuffle: false
 
@@ -110,7 +110,7 @@ model:
   
   # Prior configuration
   prior:
-    type: "vampprior"  # Options: "standard_gaussian", "standard_dictionary", 
+    type: "learnable_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
                                  # "learnable_gaussian", "learnable_dictionary", "vampprior"
     dictionary_size: 512         # Must be > input_dim (96 timesteps × 3 phases = 288)
     vamp_num_components: 40
@@ -186,7 +186,7 @@ training:
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 50
+  num_epochs: 150
   
   # Beta (KL weight) settings
   beta: 1.0

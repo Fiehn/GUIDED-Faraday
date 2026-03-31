@@ -110,7 +110,7 @@ class StreamingParquetBuffer(IterableDataset):
         # Building full_index before resampling can misalign (e.g., :45 vs :00)
         # and reindex would then wipe out all values as NaN.
         if self.aggregation:
-            df = df.resample(self.base_frequency).mean(min_count=1) # TODO: REMEMBER THIS MOTHERFUCKER! we are using kw not kwh on the 15 min scale
+            df = df.resample(self.base_frequency).mean() # TODO: REMEMBER THIS MOTHERFUCKER! we are using kw not kwh on the 15 min scale
             if self.aggregation_divisor != 1.0:
                 df = df / self.aggregation_divisor
 
