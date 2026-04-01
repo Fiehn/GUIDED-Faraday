@@ -2368,10 +2368,38 @@ class PerConditionEval(SyntheticMetric):
                     plt.savefig(feeder_plot_path, dpi=150, bbox_inches='tight')
                     plt.close()
 
+        # Split into input timesteps to see if it has an easier time predicting certain hours of the day (e.g., morning vs evening) 
+        hour_plot_path = os.path.join(plots_dir, 'aggregated_profiles_bar_hour_of_day.pdf')
+
+        input_length = real_data.shape[1]
+        if input_length == self.window_size:
+            hour_labels = [f"Hour {i}" for i in range(self.window_size)]
+            hour_real_totals = np.sum(real_data, axis=0)
+            hour_synth_totals = np.sum(synthetic_data, axis=0)
+
+            x = np.arange(len(hour_labels))
+            width = 0.38
+            fig, ax = plt.subplots(figsize=plot_style.figsize)
+            ax.bar(x - width / 2, hour_real_totals, width, label='Real', 
+                   color=color_real, alpha=0.9, linewidth=1.2)
+            ax.bar(x + width / 2, hour_synth_totals, width, label='Synthetic', 
+                   color=color_synthetic, alpha=0.9, linewidth=1.2)
+            ax.set_title(f'Aggregated Consumption by Hour of Day ({real_data.shape[0]} profiles)', fontsize=14, fontweight='bold')
+            ax.set_xlabel('Hour of Day', fontsize=12)
+            ax.set_ylabel('Aggregated Consumption (sum)', fontsize=12)
+            ax.set_xticks(x)
+            ax.set_xticklabels(hour_labels, rotation=20, ha='right')
+            ax.legend(fontsize=11)
+            ax.grid(axis='y', alpha=0.3, linestyle='--')
+            plt.tight_layout()
+            plt.savefig(hour_plot_path, dpi=150, bbox_inches='tight')
+            plt.close()
+
         return {
             'day_of_week': day_plot_path,
             'month_of_year': month_plot_path,
             'feeder': feeder_plot_path if feeder_ids is not None else None,
+            'hour_of_day': hour_plot_path,
         }
 
     def compute(self) -> float:
