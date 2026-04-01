@@ -331,6 +331,8 @@ def train(config):
                 conditioner.add_condition_item("month_of_year", MonthOfYearConditioner())
             elif condition_tag == "nr_phases_active":
                 conditioner.add_condition_item("nr_phases_active", ActivePhaseCountConditioner())
+            elif condition_tag == "heatpump_phase":
+                conditioner.add_condition_item("heatpump_phase", HeatpumpConditioner())
             else:
                 print(f"Warning: Unknown condition tag '{condition_tag}' in config. Skipping this conditioner.")
         

@@ -123,7 +123,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "holiday", ]  # List of conditioning tags to use ["day_of_week", "month_of_year", "user_profile", "holiday"]
+  tags: ["day_of_week", "month_of_year", "holiday", "heatpump_phase"]  # List of conditioning tags to use ["day_of_week", "month_of_year", "user_profile", "holiday"]
   
   # User profiling (based on LDA)
   user_profile:

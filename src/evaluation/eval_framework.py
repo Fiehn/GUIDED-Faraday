@@ -53,7 +53,7 @@ def _save_standalone_metric_result(metric_key: str, payload: Dict[str, Any],
         output_file (str): Path to the output JSON file.
     """
     try:
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
 
         existing = {}
         if os.path.exists(output_file):
@@ -80,6 +80,15 @@ def _flatten_windows(data: np.ndarray) -> np.ndarray:
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D array [N, L], got {arr.shape}")
     return arr.reshape(arr.shape[0], -1)
+
+
+def _resolve_output_directory(output_path: str | None) -> str:
+    """Resolve a writable directory from either a directory path or a JSON file path."""
+    if not output_path:
+        return '.'
+    if output_path.endswith('.json'):
+        return os.path.dirname(output_path) or '.'
+    return output_path
 
 def _rank_phases_by_total_consumption(data: np.ndarray) -> np.ndarray:
     arr = np.asarray(data)
@@ -755,14 +764,15 @@ class PhasedEvaluationSuite:
         return results
 
     def evaluate(self) -> Dict[str, Any]:
-        os.makedirs(self.output_path, exist_ok=True)
+        output_dir = _resolve_output_directory(self.output_path)
+        os.makedirs(output_dir, exist_ok=True)
         base = self._prepare_base_framework()
 
         real_phase = self._extract_phase_first(base._real_data, 'real data')
         recon_phase = self._extract_phase_first(base._reconstructed_data, 'reconstructed data')
         synthetic_phase = self._extract_phase_first(base._synthetic_data, 'synthetic data')
 
-        aggregated_dir = os.path.join(self.output_path, 'aggregated_phase_eval')
+        aggregated_dir = os.path.join(output_dir, 'aggregated_phase_eval')
         os.makedirs(aggregated_dir, exist_ok=True)
         aggregated_prepared = {
             'real_data': _flatten_windows(real_phase.sum(axis=1)),
@@ -785,7 +795,7 @@ class PhasedEvaluationSuite:
         num_phases = ranked_real.shape[1]
         for phase_idx in range(num_phases):
             phase_number = phase_idx + 1
-            phase_dir = os.path.join(self.output_path, f'ranked_phase_{phase_number}_eval')
+            phase_dir = os.path.join(output_dir, f'ranked_phase_{phase_number}_eval')
             os.makedirs(phase_dir, exist_ok=True)
             prepared = {
                 'real_data': _flatten_windows(ranked_real[:, phase_idx, :]),
@@ -805,7 +815,7 @@ class PhasedEvaluationSuite:
             'ranked_phases': ranked_results,
         }
 
-        summary_path = os.path.join(self.output_path, 'phased_eval_summary.json')
+        summary_path = os.path.join(output_dir, 'phased_eval_summary.json')
         with open(summary_path, 'w') as f:
             json.dump(_to_json_serializable(summary), f, indent=2)
         return summary
@@ -2004,7 +2014,7 @@ class PerConditionEval(SyntheticMetric):
 
     def __init__(self, window_size: int = 24, max_lag: int = 10, min_samples_per_group: int = 2,
                  verbose: bool = False, predictor_type: str = 'linear', tstr_epochs: int = 50,
-                 feeder_mapping_path: str = 'topology/cleaned/Cleaned_SM_Topology_mapping.json',
+                 feeder_mapping_path: str = 'data/topology/cleaned/Cleaned_SM_Topology_mapping.json',
                  min_samples_per_feeder: int = 5):
         self.window_size = window_size
         self.max_lag = max_lag
@@ -2241,9 +2251,9 @@ class PerConditionEval(SyntheticMetric):
         feeder_ids: np.ndarray = None,
     ) -> Dict[str, str]:
         """Create bar charts of aggregated real vs synthetic consumption by day and month."""
-        base_dir = os.path.dirname(self.output_path) if self.output_path and self.output_path.endswith('.json') else self.output_path
+        base_dir = _resolve_output_directory(self.output_path)
         # plots_dir = os.path.join(base_dir, 'Plots') if base_dir else 'Plots'
-        plots_dir = self.output_path
+        plots_dir = base_dir
         os.makedirs(plots_dir, exist_ok=True)
         
         # Plot style
@@ -2267,7 +2277,7 @@ class PerConditionEval(SyntheticMetric):
                 day_synth_totals.append(float(np.sum(synthetic_data[mask])))
                 day_counts.append(int(np.sum(mask)))
 
-        day_plot_path = os.path.join(plots_dir, 'aggregated_profiles_bar_day_of_week.png')
+        day_plot_path = os.path.join(plots_dir, 'aggregated_profiles_bar_day_of_week.pdf')
         if day_labels:
             x = np.arange(len(day_labels))
             width = 0.38
@@ -2300,7 +2310,7 @@ class PerConditionEval(SyntheticMetric):
                 month_synth_totals.append(float(np.sum(synthetic_data[mask])))
                 month_counts.append(int(np.sum(mask)))
 
-        month_plot_path = os.path.join(plots_dir, 'aggregated_profiles_bar_month_of_year.png')
+        month_plot_path = os.path.join(plots_dir, 'aggregated_profiles_bar_month_of_year.pdf')
         if month_labels:
             x = np.arange(len(month_labels))
             width = 0.38
@@ -2321,7 +2331,7 @@ class PerConditionEval(SyntheticMetric):
             plt.close()
 
         # Sum total consumption per feeder (if feeder_ids provided)
-        feeder_plot_path = os.path.join(plots_dir, 'aggregated_profiles_bar_feeder.png')
+        feeder_plot_path = os.path.join(plots_dir, 'aggregated_profiles_bar_feeder.pdf')
         if feeder_ids is not None:
             unique_feeders = [f for f in np.unique(feeder_ids) if f is not None and str(f).lower() != 'nan']
             
@@ -2551,7 +2561,9 @@ class PerConditionEval(SyntheticMetric):
         self.results_by_condition['tstr']['month_of_year'] = tstr_per_month
 
         # Save file
-        combined_output_file = os.path.join(self.output_path, 'eval_results.json')
+        output_dir = _resolve_output_directory(self.output_path)
+        os.makedirs(output_dir, exist_ok=True)
+        combined_output_file = os.path.join(output_dir, 'eval_results_condition.json')
         existing_payload = {}
         if os.path.exists(combined_output_file):
             try:

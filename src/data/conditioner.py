@@ -714,7 +714,8 @@ class HolidayConditioner(BaseConditioner):
         return random_holiday
     
 class HeatpumpConditioner(BaseConditioner):
-    """Flags whether a specific meter is associated with a heat pump.
+    """Flags whether a specific meter is associated with a heat pump. 
+    IN TOPOLOGY DATASET, NOT INFERRED FROM TIME SERIES. POSSIBLY NOT THAT GREAT
 
     Args:
         topology_path (str): Path to CSV file mapping meters to heat pump status.
@@ -955,7 +956,63 @@ class ActivePhaseCountConditioner(BaseConditioner):
         
         return F.one_hot(random_counts, num_classes=self.condition_dim).float()
 
+class HeatpumpPhaseConditioner(BaseConditioner):
+    """
+    Conditions the model on what kind of heat pump it has one-hot encoded as:
+    [No heat pump, 1-phase heat pump, 2-phase heat pump, 3-phase heat pump]
+
+    Checks the label propogation from path with index like "<PHASE><METER_ID>" and columns predicted_hp : bool
+
+    Then assigns dependent on the amount of active phases.
+    """
+    def __init__(self, topology_path = 'data/HP/label_propagation_predictions.csv'):
+        self.condition_dim = 4
+        self.topology_df = self._load_topology_df(topology_path)
+
     
+    def _load_topology_df(self, topology_path):
+        topology_df = pd.read_csv(topology_path)
+        # Assuming the 'meter_id' column has values like "L1_12345", "L2_12345", "L3_12345"
+        topology_df['phase'] = topology_df['meter_id'].str.extract(r'^(l\d)_')[0]
+        topology_df['base_meter_id'] = topology_df['meter_id'].str.extract(r'^l\d_(\d+)$')[0]
+        return topology_df
+
+    def get_conditions(
+            self,
+            x: torch.Tensor | np.ndarray | None,
+            meter_id: torch.Tensor | np.ndarray | None,
+            timestamps: torch.Tensor | list | None
+        ) -> torch.Tensor | None:
+        if isinstance(meter_id, torch.Tensor):
+            meter_id = meter_id.cpu().numpy()
+        heatpump_phase_status = []
+        for m_id in meter_id:
+            row = self.topology_df[self.topology_df['base_meter_id'] == str(m_id)]
+            if not row.empty:
+                phases = row['phase'].unique()
+                hp_phases = row[row['predicted_hp'] == True]['phase'].unique()
+                if len(hp_phases) == 0:
+                    heatpump_phase_status.append(0.0)  # No heat pump
+                elif len(hp_phases) == 1:
+                    heatpump_phase_status.append(1.0)  # 1-phase heat pump
+                elif len(hp_phases) == 2:
+                    heatpump_phase_status.append(2.0)  # 2-phase heat pump
+                elif len(hp_phases) >= 3:
+                    heatpump_phase_status.append(3.0)  # 3-phase heat pump
+                else:
+                    heatpump_phase_status.append(0.0)  # Default to no heat pump if something's off
+            else:
+                heatpump_phase_status.append(0.0)  # Default to no heat pump if meter not found
+        # one-hot encode the heat pump phase status
+        heatpump_phase_status = torch.tensor(heatpump_phase_status, dtype=torch.long)
+        heatpump_phase_onehot = F.one_hot(heatpump_phase_status, num_classes=self.condition_dim).float()
+        return heatpump_phase_onehot.to(heatpump_phase_status.device)
+    def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
+        # No heat pump: 50%, 1-phase: 20%, 2-phase: 20%, 3-phase: 10%
+        probs = torch.tensor([0.5, 0.2, 0.2, 0.1])
+        random_status = torch.multinomial(probs, batch_size, replacement=True)
+        return F.one_hot(random_status, num_classes=self.condition_dim).float()
+
 
 # =============
 # Conditioner Module - Holds an object that creates and determines type of conditioning to be used in Models
