@@ -437,7 +437,8 @@ def train(config):
         eval_batches = int(getattr(phased_cfg, "eval_batches", 5))
         eval_every_n_epochs = int(getattr(phased_cfg, "eval_every_n_epochs", 1))
         eval_cache_refresh = bool(getattr(phased_cfg, "eval_cache_refresh", False))
-        eval_cache_on_gpu = bool(getattr(phased_cfg, "eval_cache_on_gpu", str(device) != "cpu"))
+        # Keep eval cache on CPU by default to avoid GPU OOM from preloading full eval tensors.
+        eval_cache_on_gpu = bool(getattr(phased_cfg, "eval_cache_on_gpu", False))
         cache_scan_batches = int(getattr(phased_cfg, "cache_scan_batches", 0)) or None
 
         print("Phased mode will allocate train/eval from one shared replay cache each epoch.")
@@ -470,6 +471,10 @@ def train(config):
             config.window.stride = 24
         phase_window = PhaseWindowSpec(input_len=config.window.input_len, stride=config.window.stride)
         eval_cache_device = device if eval_cache_on_gpu and str(device) != "cpu" else None
+        if eval_cache_device is None:
+            print("Phased eval cache device: CPU (safer memory profile).")
+        else:
+            print(f"Phased eval cache device: {eval_cache_device}.")
         phased_replay = PhasedReplayDataloaders(
             sm_files=parquet_paths,
             replay_buffer_capacity=replay_capacity,

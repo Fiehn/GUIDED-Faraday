@@ -337,9 +337,17 @@ class PhasedReplayDataloaders:
             timestamps = torch.zeros(x_eval.shape[0], dtype=torch.long)
 
         if self.eval_cache_device is not None:
-            x_eval = x_eval.to(self.eval_cache_device)
-            meter_id = meter_id.to(self.eval_cache_device)
-            timestamps = timestamps.to(self.eval_cache_device)
+            try:
+                x_eval = x_eval.to(self.eval_cache_device)
+                meter_id = meter_id.to(self.eval_cache_device)
+                timestamps = timestamps.to(self.eval_cache_device)
+            except RuntimeError as e:
+                # Fall back to CPU cache if GPU preloading runs out of memory.
+                if "out of memory" in str(e).lower():
+                    print("Warning: eval cache GPU transfer OOM; falling back to CPU eval cache.")
+                    self.eval_cache_device = None
+                else:
+                    raise
 
         eval_ds = TensorDataset(x_eval, meter_id, timestamps)
         eval_workers = 0

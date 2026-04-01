@@ -46,6 +46,51 @@ class SyntheticGenerator:
                 return x
         return x
 
+    def _normalizer_feature_dim(self) -> int | None:
+        """Infer feature dimension expected by the normalizer stats."""
+        if self.normalizer is None:
+            return None
+        stats = getattr(self.normalizer, 'mean', None)
+        if stats is None:
+            return None
+        if isinstance(stats, torch.Tensor):
+            if stats.numel() == 0:
+                return None
+            return int(stats.reshape(-1).shape[0])
+        if isinstance(stats, np.ndarray):
+            if stats.size == 0:
+                return None
+            return int(stats.reshape(-1).shape[0])
+        try:
+            return int(np.asarray(stats).reshape(-1).shape[0])
+        except Exception:
+            return None
+
+    def _apply_normalizer(self, x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+        """Apply (inverse) normalization for 2D or 3D tensors with robust axis handling."""
+        if self.normalizer is None:
+            return x
+
+        fn = self.normalizer.inverse_transform if inverse else self.normalizer.transform
+        feature_dim = self._normalizer_feature_dim()
+
+        if x.dim() == 2:
+            return fn(x)
+
+        if x.dim() != 3:
+            raise ValueError(f"Expected 2D or 3D tensor for normalization, got shape {tuple(x.shape)}")
+
+        if feature_dim is not None and x.shape[-1] == feature_dim:
+            return fn(x.reshape(-1, feature_dim)).reshape_as(x)
+
+        if feature_dim is not None and x.shape[1] == feature_dim:
+            x_last = x.movedim(1, -1)
+            y_last = fn(x_last.reshape(-1, feature_dim)).reshape_as(x_last)
+            return y_last.movedim(-1, 1)
+
+        # Fallback for unknown feature dim: preserve existing behavior.
+        return fn(x.reshape(-1, x.shape[-1])).reshape_as(x)
+
     @torch.no_grad()
     def reconstruct(self, input_data: torch.Tensor,
                     num_reconstructions: int = 1,
@@ -79,7 +124,7 @@ class SyntheticGenerator:
         input_data = input_data.to(self.device, dtype=model_dtype)
 
         if self.normalizer is not None and not is_denormalized:
-            input_data = self.normalizer.transform(input_data.reshape(-1, input_data.shape[-1])).reshape(input_data.shape)
+            input_data = self._apply_normalizer(input_data, inverse=False)
             # Normalizers may return float64 tensors; align with model dtype for linear layers.
             input_data = input_data.to(self.device, dtype=model_dtype)
         if self._is_cvae and meter_id is not None and timestamp is not None:
@@ -129,6 +174,14 @@ class SyntheticGenerator:
 
         else:
             recon_params, _ = self.model.reconstruct(input_data)
+
+        # Normalize decoder param tensors to [S, B, D] to avoid accidental shape expansion.
+        # Some model.reconstruct() implementations return [B, D] instead of [S, B, D].
+        for k, v in recon_params.items():
+            if v.dim() == 2:
+                recon_params[k] = v.unsqueeze(0)
+            elif v.dim() != 3:
+                raise ValueError(f"Unexpected decoder param shape for '{k}': {tuple(v.shape)}")
 
         # recon_params has shape [S, B, D]. We decode each sample s to get [num_reconstructions, B, D]
         S_dim = recon_params['mu'].shape[0]
@@ -182,7 +235,7 @@ class SyntheticGenerator:
 
         # 2. Apply inverse transform so it's in actual kWh, not Z-scores
         if self.normalizer is not None and not is_denormalized:
-            output = self.normalizer.inverse_transform(output.reshape(-1, F)).reshape(-1, L, F)
+            output = self._apply_normalizer(output, inverse=True)
 
         # Return as 
         return output.reshape(N, B, -1)
@@ -226,6 +279,14 @@ class SyntheticGenerator:
             if isinstance(date, (int, float)):
                 date = datetime.fromtimestamp(date)
             conditions = self._build_conditions(meter_id=meter_id, timestamp=date, random_condition=random_cond)
+
+        if self._is_cvae and conditions is not None:
+            conditions = conditions.to(self.device)
+            # Ensure we have exactly one condition row per requested sample.
+            if conditions.shape[0] < num_samples:
+                repeats = (num_samples // conditions.shape[0]) + 1
+                conditions = conditions.repeat(repeats, 1)
+            conditions = conditions[:num_samples]
         
         valid_samples = []
         needed = num_samples
@@ -233,23 +294,31 @@ class SyntheticGenerator:
         # --- Batched Rejection Sampling ---
         for attempt in range(max_retries):
             if self._is_cvae:
+                # One prior sample per condition row to avoid quadratic SxB expansion.
+                cond_batch = conditions[:needed] if conditions is not None else None
                 samples = self.model.sample(
-                    conditions=conditions,
-                    num_prior_samples=needed,
+                    conditions=cond_batch,
+                    num_prior_samples=1,
                     num_x_samples=1,
                     device=self.device,
                     temperature=temperature
                 ) 
+                # [1, 1, B, D] -> [B, D]
+                samples = samples.squeeze(0).squeeze(0)
             else:
                 samples = self.model.sample(num_samples_prior=needed, num_samples_posterior=1, device=self.device, temperature=temperature)
+                if isinstance(samples, dict) and "samples" in samples:
+                    samples = samples["samples"]
+                # Collapse any extra sample dims into batch dim, keep last dim as feature dim.
+                samples = samples.reshape(-1, samples.shape[-1])
             
             if not use_rejection:
                 valid_samples.append(samples)
                 needed = 0
                 break
                 
-            # Flatten to evaluate maximums
-            flat_samples = samples.reshape(needed, -1)
+            # samples shape: [N, D]
+            flat_samples = samples.reshape(samples.shape[0], -1)
             max_vals, _ = flat_samples.abs().max(dim=-1)
             
             good_mask = max_vals < max_safe_z
@@ -265,16 +334,23 @@ class SyntheticGenerator:
         if needed > 0:
             print(f"Warning: Rejection sampling yielded {needed} flatline means to avoid explosions.")
             if self._is_cvae:
-                fallback = self.model.sample(conditions=conditions, num_prior_samples=needed, num_x_samples=1, device=self.device, temperature=0.0)
+                fallback = self.model.sample(
+                    conditions=conditions[:needed],
+                    num_prior_samples=1,
+                    num_x_samples=1,
+                    device=self.device,
+                    temperature=0.0,
+                ).squeeze(0).squeeze(0)
             else: 
                 fallback = self.model.sample(num_samples_prior=needed, num_samples_posterior=1, device=self.device, temperature=0.0)
+                if isinstance(fallback, dict) and "samples" in fallback:
+                    fallback = fallback["samples"]
+                fallback = fallback.reshape(-1, fallback.shape[-1])
             valid_samples.append(fallback)
-            
-        final_samples = torch.cat(valid_samples, dim=0)[:num_samples] # [S, 1, B, D]
-
-        # Flatten out S, 1, B into a single batch dimension for normalization
-        S, _, B, D = final_samples.shape
-        flat = final_samples.reshape(S * B, D)
+        
+        final_samples = torch.cat(valid_samples, dim=0)[:num_samples]  # [N, D]
+        N, D = final_samples.shape
+        flat = final_samples
         
         L = getattr(self.model, 'sequence_length', 24)
         F = D // L
@@ -282,12 +358,12 @@ class SyntheticGenerator:
         is_phase_first = getattr(self.model, 'num_features', None) is not None and getattr(self.model, 'element_dim', None) is not None
 
         if is_phase_first:
-            output = flat.reshape(S * B, F, L).transpose(1, 2)
+            output = flat.reshape(N, F, L).transpose(1, 2)
         else:
-            output = flat.reshape(S * B, L, F)
+            output = flat.reshape(N, L, F)
 
         if self.normalizer is not None:
-            output = self.normalizer.inverse_transform(output.reshape(-1, F)).reshape(S * B, L, F)
+            output = self.normalizer.inverse_transform(output.reshape(-1, F)).reshape(N, L, F)
 
         # If conditions had a batch size > 1 and S > 1, the returned shape is (S * B, L, F).
         # To remain compatible with callers expecting (num_samples, L, F), 

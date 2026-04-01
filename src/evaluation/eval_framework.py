@@ -18,9 +18,10 @@ from sklearn.decomposition import PCA
 from scipy.stats import wasserstein_distance
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
-from scipy import stats
+from scipy import stats 
 
 from src.visualization.plot_styling import PlotStyle
+from src.model.generators import SyntheticGenerator
 
 try:
     from tabulate import tabulate
@@ -236,6 +237,8 @@ class EvalFramework:
         self.conditioner = conditioner
         self.device = device
 
+        self.generator = SyntheticGenerator(model, conditioner, normalizer, device)
+
         self.window_size = window_size
         self.n_synthetic_samples = n_synthetic_samples
         self.output_path = output_path
@@ -294,6 +297,51 @@ class EvalFramework:
                     return x.reshape(x.shape[0], -1)
             return x.reshape(x.shape[0], -1)
         return x
+
+    def _normalizer_feature_dim(self) -> int | None:
+        """Infer feature dimension expected by the normalizer stats."""
+        if self.normalizer is None:
+            return None
+        stats = getattr(self.normalizer, 'mean', None)
+        if stats is None:
+            return None
+        if isinstance(stats, torch.Tensor):
+            if stats.numel() == 0:
+                return None
+            return int(stats.reshape(-1).shape[0])
+        if isinstance(stats, np.ndarray):
+            if stats.size == 0:
+                return None
+            return int(stats.reshape(-1).shape[0])
+        try:
+            return int(np.asarray(stats).reshape(-1).shape[0])
+        except Exception:
+            return None
+
+    def _inverse_transform_for_metrics(self, x: torch.Tensor) -> torch.Tensor:
+        """Inverse transform 2D/3D tensors while preserving [B, L, F] or [B, F, L] layout."""
+        if self.normalizer is None or not hasattr(self.normalizer, 'inverse_transform'):
+            return x
+
+        inv = self.normalizer.inverse_transform
+        feature_dim = self._normalizer_feature_dim()
+
+        if x.dim() == 2:
+            return inv(x)
+
+        if x.dim() != 3:
+            return inv(x)
+
+        if feature_dim is not None and x.shape[-1] == feature_dim:
+            return inv(x.reshape(-1, feature_dim)).reshape_as(x)
+
+        if feature_dim is not None and x.shape[1] == feature_dim:
+            x_last = x.movedim(1, -1)
+            y_last = inv(x_last.reshape(-1, feature_dim)).reshape_as(x_last)
+            return y_last.movedim(-1, 1)
+
+        # Fallback: assume feature axis is the last axis.
+        return inv(x.reshape(-1, x.shape[-1])).reshape_as(x)
     
     def _prepare_data(self) -> None:
         """Extract real data, reconstructed data, and synthetic data for metrics that need it."""
@@ -339,7 +387,10 @@ class EvalFramework:
                     c = c.to(self.device)
                     condition_batches.append(c.cpu())
 
-                x_flat = self._flatten_for_metrics(data)
+                # Denormalize with robust axis handling for [B, L, F] and [B, F, L].
+                data_denorm = self._inverse_transform_for_metrics(data)
+                
+                x_flat = self._flatten_for_metrics(data_denorm)
                 real_batches.append(x_flat.cpu().numpy())
 
                 if timestamps is not None:
@@ -384,32 +435,19 @@ class EvalFramework:
         Returns:
             torch.Tensor: Reconstructed data of shape `(batch_size, features)`
         """
-        with torch.no_grad():
-            x_flat = self._flatten_for_metrics(x)
+        recon = self.generator.reconstruct(x, meter_id=meter_id, timestamp=timestamps)
+        if recon is None:
+            raise ValueError("Generator returned None for reconstruction")
 
-            if self._is_cvae():
-                # Use the model's own conditioner with real meter_id and timestamps
-                cond_input = self._prepare_condition_input(x)
-                c = self.model.conditioner.get_conditions(cond_input, meter_id=meter_id, timestamps=timestamps)
-                c = self.model.move_to_device(c, device=self.device)
-                recon_params, _ = self.model.forward(x_flat, c, num_samples=1)
-            else:
-                recon_params, _ = self.model.forward(x_flat, num_samples=1)
+        # Expected from generator: [S, B, D]. Keep one reconstruction sample for metrics.
+        if recon.dim() == 3:
+            recon = recon[0]
 
-            if isinstance(recon_params, dict):
-                mu = recon_params.get('mu')
-                if mu is not None:
-                    recon = mu[0] if mu.dim() == 3 else mu
-                else:
-                    for key in ['recon', 'x_recon', 'reconstruction', 'x']:
-                        if key in recon_params:
-                            v = recon_params[key]
-                            recon = v[0] if v.dim() == 3 else v
-                            break
-                    else:
-                        raise ValueError(f"Cannot find reconstruction in decoder output. Keys: {list(recon_params.keys())}")
-            else:
-                recon = recon_params[0] if recon_params.dim() == 3 else recon_params
+        # If still time/feature shaped [B, L, F], flatten to [B, D].
+        if recon.dim() == 3:
+            recon = recon.reshape(recon.shape[0], -1)
+        elif recon.dim() != 2:
+            raise ValueError(f"Unexpected reconstruction shape: {tuple(recon.shape)}")
 
         return recon  # [B, D]
     
@@ -422,29 +460,22 @@ class EvalFramework:
          Returns:
              np.ndarray: Synthetic samples of shape (n_samples, features)
         """
-        with torch.no_grad():
-            if self._is_cvae():
-                # Use real conditions collected during _prepare_data
-                # TODO: GENERATOR HERE!
-                c = self._synthetic_conditions.to(self.device)  # [n_samples, C]
+        if self._is_cvae():
+            if self._synthetic_conditions is None:
+                raise ValueError("CVAE synthetic generation requires prepared conditions, but none were found.")
+            conditions = self._synthetic_conditions.to(self.device)
+            synthetic, _ = self.generator.generate(n_samples, conditions=conditions)
+        else:
+            synthetic, _ = self.generator.generate(n_samples)
 
-                samples = self.model.sample(
-                    conditions=c,
-                    num_prior_samples=1,
-                    num_x_samples=1,
-                    device=self.device,
-                )
-                # [1, 1, B, D] -> [B, D]
-                synthetic_flat = samples[0, 0]
+        if synthetic is None:
+            raise ValueError("Generator returned None for synthetic samples")
 
-            else:
-                result = self.model.sample(
-                    num_samples_prior=n_samples,
-                    num_samples_posterior=1,
-                )
-                synthetic_flat = result["samples"][:, 0, 0, :]  # [n_samples, D]
+        # Flatten [N, L, F] -> [N, D] for downstream metrics.
+        if synthetic.dim() == 3:
+            synthetic = synthetic.reshape(synthetic.shape[0], -1)
 
-        return synthetic_flat.cpu().numpy()
+        return synthetic.cpu().numpy()
 
     def _inject_data_into_metrics(self) -> None:
         """Inject prepared data into metrics that need it."""
@@ -1852,7 +1883,6 @@ class AggregatedProfiles(SyntheticMetric):
     n_samples (int): Number of time series to sample and aggregate (default: 100)
     window_size (int): Length of each time series window (default: 24)
     tau (int or 'auto'): Time delay for Flexibility Distance (default: 'auto, which uses median heuristic)
-    normalize (bool): Whether to normalize the distance by the variability of the real data (default: True) 
     """
     
     real_data: np.ndarray = None
@@ -1894,7 +1924,7 @@ class AggregatedProfiles(SyntheticMetric):
         
         # Compute Flexibility Distance
         fd_score = FlexibilityDistance.compute_fd_between_series(
-            real_aggregated, synth_aggregated, tau=self.tau, normalize=self.normalize
+            real_aggregated, synth_aggregated, tau=self.tau
         )
 
         _save_standalone_metric_result(
@@ -1905,7 +1935,6 @@ class AggregatedProfiles(SyntheticMetric):
                 'n_samples_used': int(n_agg),
                 'window_size': int(self.window_size),
                 'tau': self.tau,
-                'normalize': bool(self.normalize),
                 'real_aggregated': real_aggregated,
                 'synthetic_aggregated': synth_aggregated,
                 'updated_at_utc': datetime.utcnow().isoformat() + 'Z',

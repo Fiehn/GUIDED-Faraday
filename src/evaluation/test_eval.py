@@ -241,8 +241,7 @@ print("="*70)
 agg_metric = AggregatedProfiles(
     n_samples=100,
     window_size=window_size,
-    tau='auto',
-    normalize=True
+    tau='auto'
 )
 agg_metric.real_data = real_data
 agg_metric.synthetic_data = synthetic_data
