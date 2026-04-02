@@ -211,6 +211,7 @@ training:
     save_freq: 10 # save checkpoint every N epochs
     save_dir: "./models"
     save_best_model: true
+    save_best_after_fraction: 0.25 # start writing "best" checkpoint only after this fraction of total epochs
     save_final_model: true
   
   compile_model: false

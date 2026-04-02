@@ -3,6 +3,8 @@ import sys
 import argparse
 import shutil
 import yaml
+import time
+import math
 from types import SimpleNamespace
 from xml.parsers.expat import model
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -496,9 +498,23 @@ def train(config):
         writer = Writer(log_dir=os.path.join(config.logging.log_dir, model_tag))
         optim = model.get_optimizer(lr=config.training.learning_rate, weight_decay=config.training.weight_decay)
 
+        checkpoint_cfg = getattr(config.training, "checkpointing", SimpleNamespace())
+        save_best_model = bool(getattr(checkpoint_cfg, "save_best_model", True))
+        save_best_after_fraction = float(getattr(checkpoint_cfg, "save_best_after_fraction", 0.25))
+        save_best_after_fraction = max(0.0, min(1.0, save_best_after_fraction))
+        save_best_after_epoch = max(1, int(math.ceil(config.training.num_epochs * save_best_after_fraction)))
+        if save_best_model:
+            print(
+                f"Best-model checkpointing starts at epoch {save_best_after_epoch} "
+                f"({save_best_after_fraction:.0%} of training)."
+            )
+        else:
+            print("Best-model checkpointing is disabled by config.training.checkpointing.save_best_model.")
+
         use_early_stopping = bool(getattr(config.training.early_stopping, "enabled", False))
         early_stopper = None
         best_eval_loss = float("inf")
+        best_eval_loss_for_saving = float("inf")
         if use_early_stopping:
             early_stopper = EarlyStopping(
                 patience=int(getattr(config.training.early_stopping, "patience", 10)),
@@ -525,12 +541,16 @@ def train(config):
 
         print(f"Starting phased training for {config.training.num_epochs} epoch(s), {steps_per_epoch} step(s)/epoch")
         for epoch in range(config.training.num_epochs):
+            epoch_start_t = time.perf_counter()
             should_eval_epoch = eval_batches > 0 and ((epoch + 1) % max(1, eval_every_n_epochs) == 0)
+
+            cache_start_t = time.perf_counter()
             train_loader, epoch_eval_loader = phased_replay.get_epoch_loaders(
                 steps_per_epoch=steps_per_epoch,
                 eval_batches=eval_batches if should_eval_epoch else 0,
                 refresh_eval=eval_cache_refresh and should_eval_epoch,
             )
+            cache_time_s = time.perf_counter() - cache_start_t
             if train_loader is None:
                 raise RuntimeError("No phased training batches could be collected from replay stream.")
 
@@ -539,7 +559,10 @@ def train(config):
             epoch_recon = 0.0
             epoch_kl = 0.0
             n = 0
+            eval_time_s = 0.0
+            save_time_s = 0.0
 
+            train_start_t = time.perf_counter()
             for step, batch in enumerate(train_loader, start=1):
                 batch = model.move_to_device(batch, device)
                 loss_dict = model.train_core(
@@ -554,6 +577,7 @@ def train(config):
                 epoch_recon += float(loss_dict["recon_loglikelihood"].detach())
                 epoch_kl += float(loss_dict["kl_divergence"].detach())
                 n += 1
+            train_time_s = time.perf_counter() - train_start_t
 
             if n == 0:
                 raise RuntimeError("No batches were produced in phased training. Check parquet files and buffer settings.")
@@ -576,6 +600,7 @@ def train(config):
 
             # Optional epoch-level evaluation for phased SetGuideVAE runs.
             if should_eval_epoch and hasattr(model, "validate") and epoch_eval_loader is not None:
+                eval_start_t = time.perf_counter()
                 try:
                     eval_metrics = model.validate(
                         valloader=epoch_eval_loader,
@@ -599,14 +624,23 @@ def train(config):
 
                     if eval_metrics['loss'] < best_eval_loss:
                         best_eval_loss = eval_metrics['loss']
+
+                    if (
+                        save_best_model
+                        and (epoch + 1) >= save_best_after_epoch
+                        and eval_metrics['loss'] < best_eval_loss_for_saving
+                    ):
+                        best_eval_loss_for_saving = eval_metrics['loss']
                         save_dir = os.path.join(config.logging.log_dir, model_tag)
                         os.makedirs(save_dir, exist_ok=True)
+                        save_start_t = time.perf_counter()
                         model.save_model(
                             save_path=save_dir,
                             model_name=f"{model_tag}_best",
                             device=device,
                             normalizer=normalizer,
                         )
+                        save_time_s += time.perf_counter() - save_start_t
 
                     if use_early_stopping and early_stopper is not None:
                         early_stopper(train_metric=avg_loss, val_metric=eval_metrics['loss'], epoch=epoch)
@@ -615,6 +649,8 @@ def train(config):
                             break
                 except Exception as e:
                     print(f"Warning: skipped epoch eval loss computation due to: {e}")
+                finally:
+                    eval_time_s = time.perf_counter() - eval_start_t
 
             if use_early_stopping and early_stopper is not None and early_stopper.early_stop:
                 break
@@ -622,7 +658,16 @@ def train(config):
             if (epoch + 1) % config.training.checkpointing.save_freq == 0:
                 save_dir = os.path.join(config.logging.log_dir, model_tag)
                 os.makedirs(save_dir, exist_ok=True)
+                save_start_t = time.perf_counter()
                 model.save_model(save_path=save_dir, model_name=f"{model_tag}_epoch_{epoch+1}", device=device, normalizer=normalizer)
+                save_time_s += time.perf_counter() - save_start_t
+
+            total_epoch_time_s = time.perf_counter() - epoch_start_t
+            print(
+                f"Epoch [{epoch+1:4d}/{config.training.num_epochs}] Timing (s): "
+                f"cache={cache_time_s:.2f} | train={train_time_s:.2f} | eval={eval_time_s:.2f} | "
+                f"save={save_time_s:.2f} | total={total_epoch_time_s:.2f}"
+            )
 
         log_path = os.path.join(config.logging.log_dir, model_tag)
         os.makedirs(log_path, exist_ok=True)
