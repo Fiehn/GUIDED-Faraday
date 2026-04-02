@@ -91,6 +91,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         self.last_update_batch = 0
         self.kmeans_initialized = False
         self.is_fitted = False
+        self._profile_lookup_tensors = {}
 
         self.kmeans = MiniBatchKMeans(
             n_clusters=self.num_clusters,
@@ -105,6 +106,41 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         except Exception as e:
             if self.verbose:
                 print(f"Could not load existing UserProfiler model from {self.path}. Will fit a new model. Error: {e}")
+
+    def _invalidate_profile_lookup(self):
+        self._profile_lookup_tensors = {}
+
+    def _get_profile_lookup_for_device(self, device: torch.device):
+        key = str(device)
+        cached = self._profile_lookup_tensors.get(key)
+        if cached is not None:
+            return cached
+
+        if len(self.user_profiles_cache) == 0:
+            empty_lookup = (
+                torch.empty(0, dtype=torch.long, device=device),
+                torch.empty(0, self.n_topics, dtype=torch.float32, device=device),
+            )
+            self._profile_lookup_tensors[key] = empty_lookup
+            return empty_lookup
+
+        meter_ids_np = np.array([int(m) for m in self.user_profiles_cache.keys()], dtype=np.int64)
+        order = np.argsort(meter_ids_np)
+        meter_ids_sorted = meter_ids_np[order]
+        profiles_sorted = np.stack(
+            [
+                np.asarray(self.user_profiles_cache[int(m_id)], dtype=np.float32)
+                for m_id in meter_ids_sorted
+            ],
+            axis=0,
+        )
+
+        lookup = (
+            torch.from_numpy(meter_ids_sorted).to(device=device, dtype=torch.long),
+            torch.from_numpy(profiles_sorted).to(device=device, dtype=torch.float32),
+        )
+        self._profile_lookup_tensors[key] = lookup
+        return lookup
 
     def fit(self, train_loader):
         """
@@ -204,6 +240,8 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
             self.user_last_seen[m_id] = self.batch_counter
             self.resample_user_vector(m_id)
 
+        self._invalidate_profile_lookup()
+
         if self.path is not None:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             self.save(self.path)
@@ -244,14 +282,20 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         if self.cluster_centers_.ndim != 2:
             raise ValueError(f"cluster_centers_ must be 2D, got shape {self.cluster_centers_.shape}")
 
+        target_device = torch.device("cpu")
         if isinstance(meter_id, torch.Tensor):
-            meter_id = meter_id.cpu().numpy()
+            target_device = meter_id.device
+            meter_id = meter_id.detach().cpu().numpy().astype(np.int64, copy=False)
+        elif isinstance(meter_id, np.ndarray):
+            meter_id = meter_id.astype(np.int64, copy=False)
+        else:
+            meter_id = np.asarray(meter_id, dtype=np.int64)
 
         self.batch_counter += 1
         for m_id in meter_id:
-            self.user_last_seen[m_id] = self.batch_counter
+            self.user_last_seen[int(m_id)] = self.batch_counter
 
-        return self._get_cached_profiles(data, meter_id)
+        return self._get_cached_profiles(data, meter_id, device=target_device)
 
     def update_model_incremental(self, x_batch, meter_ids):
         """Incrementally updates the KMeans clustering and LDA topic model.
@@ -347,7 +391,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
                 self.gamma_cache[m_id] = gamma_u
                 self.resample_user_vector(m_id)
     
-    def _get_cached_profiles(self, data, meter_ids):
+    def _get_cached_profiles(self, data, meter_ids, device: torch.device = torch.device("cpu")):
         """Assembles profile vectors from cache. 
         
         Computes on-the-fly for unknown meters. Falls back to a uniform distribution 
@@ -360,21 +404,47 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         Returns:
             torch.Tensor: Profiles of shape `(batch_size, n_topics)`.
         """
+        meter_ids = np.asarray(meter_ids, dtype=np.int64)
+
         # FIX 5: compute missing profiles AND populate user_profiles_cache before assembling
-        missing_meters = [m for m in meter_ids if m not in self.user_profiles_cache]
+        missing_meters = [
+            int(m) for m in np.unique(meter_ids)
+            if int(m) not in self.user_profiles_cache
+        ]
         if missing_meters:
             if data is not None and self.cluster_centers_ is not None:
                 self._compute_profiles_for_batch(data, meter_ids, missing_meters)
             else:
                 # No data to compute from — initialise to uniform
                 for m_id in missing_meters:
-                    self.user_profiles_cache[m_id] = np.ones(self.n_topics, dtype=np.float32) / self.n_topics
+                    self.user_profiles_cache[int(m_id)] = np.ones(self.n_topics, dtype=np.float32) / self.n_topics
+                self._invalidate_profile_lookup()
 
-        profiles = np.zeros((len(meter_ids), self.n_topics), dtype=np.float32)
-        for i, m_id in enumerate(meter_ids):
-            profiles[i] = self.user_profiles_cache[m_id]
+        meter_ids_t = torch.as_tensor(meter_ids, dtype=torch.long, device=device)
+        lookup_ids, lookup_profiles = self._get_profile_lookup_for_device(device)
 
-        return torch.tensor(profiles, dtype=torch.float32)
+        if lookup_ids.numel() == 0:
+            return torch.full(
+                (meter_ids_t.shape[0], self.n_topics),
+                fill_value=(1.0 / self.n_topics),
+                dtype=torch.float32,
+                device=device,
+            )
+
+        idx = torch.searchsorted(lookup_ids, meter_ids_t)
+        idx_clamped = idx.clamp(max=lookup_ids.shape[0] - 1)
+        valid = (idx < lookup_ids.shape[0]) & (lookup_ids[idx_clamped] == meter_ids_t)
+
+        profiles = torch.full(
+            (meter_ids_t.shape[0], self.n_topics),
+            fill_value=(1.0 / self.n_topics),
+            dtype=torch.float32,
+            device=device,
+        )
+        if valid.any():
+            profiles[valid] = lookup_profiles[idx_clamped[valid]]
+
+        return profiles
 
     def _compute_profiles_for_batch(self, data, meter_id, target_meter_ids):
         """Computes and caches gamma and profile vectors for specific meters.
@@ -408,7 +478,8 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
             print(f"Warning: Feature dimension mismatch (x:{x_fit.shape[1]}, centers:{self.cluster_centers_.shape[1]}). Using uniform init for missing meters.")
             random_profiles = np.random.dirichlet(np.ones(self.n_topics), size=len(target_meter_ids))
             for i, m_id in enumerate(target_meter_ids):
-                self.user_profiles_cache[m_id] = torch.tensor(random_profiles[i], dtype=torch.float32)
+                self.user_profiles_cache[int(m_id)] = random_profiles[i].astype(np.float32)
+            self._invalidate_profile_lookup()
             return
 
         target_set = set(target_meter_ids)
@@ -432,8 +503,10 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         posterior = super().transform(X_corpus, normalize=False)
 
         for m_id, gamma_u in zip(computable, posterior):
-            self.gamma_cache[m_id] = gamma_u
-            self.resample_user_vector(m_id)
+            self.gamma_cache[int(m_id)] = gamma_u
+            self.resample_user_vector(int(m_id))
+
+        self._invalidate_profile_lookup()
 
     
     def fit_on_files(self, parquet_paths: list[str]):
@@ -506,6 +579,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
             if meter_id not in self.gamma_cache:
                 raise ValueError(f"Meter ID {meter_id} not found in gamma cache.")
             self.user_profiles_cache[meter_id] = np.random.dirichlet(self.gamma_cache[meter_id])
+        self._invalidate_profile_lookup()
 
     def get_random_conditions(self, batch_size):
         """Generates random user profiles for testing and random synthetic profiles.
@@ -539,6 +613,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         with open(path, "rb") as f:
             obj = pickle.load(f)
         self.__dict__.update(obj.__dict__)
+        self._invalidate_profile_lookup()
         if self.verbose:
             print(f"Loaded model with {len(self.user_profiles_cache)} cached profiles")
 
@@ -671,7 +746,44 @@ class HolidayConditioner(BaseConditioner):
         self.condition_dim = 1
         with open(holiday_path, 'r') as f:
             holidays = json.load(f)
-        self.holiday_dates = set(pd.to_datetime(holidays['dates']).date)
+
+        parsed = pd.to_datetime(holidays.get('dates', []), errors='coerce', utc=True)
+        parsed = parsed[~parsed.isna()]
+        normalized_days = np.unique((parsed.normalize().asi8 // 10**9 // 86400).astype(np.int64))
+
+        self.holiday_days_cpu = torch.from_numpy(normalized_days) if normalized_days.size > 0 else torch.empty(0, dtype=torch.long)
+        self._holiday_days_by_device = {}
+
+    def _get_holiday_days(self, device: torch.device) -> torch.Tensor:
+        key = str(device)
+        cached = self._holiday_days_by_device.get(key)
+        if cached is None:
+            cached = self.holiday_days_cpu.to(device=device, dtype=torch.long)
+            self._holiday_days_by_device[key] = cached
+        return cached
+
+    @staticmethod
+    def _timestamps_to_unix_seconds(timestamps, device: torch.device = torch.device('cpu')) -> torch.Tensor:
+        if isinstance(timestamps, torch.Tensor):
+            ts = timestamps
+            if ts.is_floating_point():
+                ts = torch.floor(ts)
+            return ts.to(device=device, dtype=torch.long)
+
+        if isinstance(timestamps, np.ndarray):
+            if np.issubdtype(timestamps.dtype, np.datetime64):
+                secs = timestamps.astype('datetime64[s]').astype(np.int64)
+            else:
+                secs = np.asarray(timestamps, dtype=np.int64)
+            return torch.from_numpy(secs).to(device=device, dtype=torch.long)
+
+        parsed = pd.to_datetime(timestamps, errors='coerce', utc=True)
+        if isinstance(parsed, pd.Timestamp):
+            parsed = pd.DatetimeIndex([parsed])
+
+        secs = parsed.asi8 // 10**9
+        return torch.from_numpy(secs.astype(np.int64)).to(device=device, dtype=torch.long)
+
     def get_conditions(
         self, 
         x: torch.Tensor | np.ndarray | None, 
@@ -688,18 +800,23 @@ class HolidayConditioner(BaseConditioner):
         Returns:
             torch.Tensor: Binary holiday indicators of shape `(batch_size, 1)`.
         """
-        if isinstance(timestamps, torch.Tensor):
-            device = timestamps.device
-            dates = pd.to_datetime(timestamps.cpu().numpy(), unit='s').date
-            is_holiday = torch.tensor([1.0 if d in self.holiday_dates else 0.0 for d in dates], device=device).unsqueeze(1)
-        else:
-            is_holiday = []
-            for ts in timestamps:
-                if isinstance(ts, (int, float)):
-                    ts = pd.Timestamp(ts, unit='s')
-                is_holiday.append(1.0 if ts.date() in self.holiday_dates else 0.0)
-            is_holiday = torch.tensor(is_holiday, dtype=torch.float32).unsqueeze(1)
-        return is_holiday
+        if timestamps is None:
+            if isinstance(meter_id, torch.Tensor):
+                return torch.zeros((meter_id.shape[0], 1), dtype=torch.float32, device=meter_id.device)
+            if isinstance(meter_id, np.ndarray):
+                return torch.zeros((meter_id.shape[0], 1), dtype=torch.float32)
+            return torch.zeros((1, 1), dtype=torch.float32)
+
+        device = timestamps.device if isinstance(timestamps, torch.Tensor) else torch.device('cpu')
+        unix_seconds = self._timestamps_to_unix_seconds(timestamps, device=device)
+        day_numbers = torch.div(unix_seconds, 86400, rounding_mode='floor')
+
+        holidays = self._get_holiday_days(device=device)
+        if holidays.numel() == 0:
+            return torch.zeros((day_numbers.shape[0], 1), dtype=torch.float32, device=device)
+
+        is_holiday = torch.isin(day_numbers, holidays).to(dtype=torch.float32)
+        return is_holiday.unsqueeze(1)
     
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
         """Generates random holiday conditions for testing.
@@ -726,7 +843,39 @@ class HeatpumpConditioner(BaseConditioner):
     """
     def __init__(self, topology_path = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
         self.condition_dim = 1
-        self.topology_df = pd.read_csv(topology_path)
+        topology_df = pd.read_csv(topology_path)
+
+        meter_col = pd.to_numeric(topology_df.get('meter_number'), errors='coerce')
+        value_series = topology_df.get('has_heat_pump')
+        if value_series is None:
+            status_series = pd.Series(np.zeros(len(topology_df), dtype=np.int64))
+        else:
+            if pd.api.types.is_bool_dtype(value_series):
+                status_series = value_series.fillna(False).astype(np.int64)
+            else:
+                status_series = value_series.astype(str).str.strip().str.lower().isin({'true', '1', 'yes'}).astype(np.int64)
+
+        compact = pd.DataFrame({'meter_id': meter_col, 'status': status_series})
+        compact = compact.dropna(subset=['meter_id']).drop_duplicates(subset=['meter_id'], keep='last')
+
+        meter_ids_np = compact['meter_id'].astype(np.int64).to_numpy()
+        status_np = compact['status'].astype(np.int64).to_numpy()
+        order = np.argsort(meter_ids_np)
+
+        self._meter_ids_cpu = torch.from_numpy(meter_ids_np[order]) if meter_ids_np.size > 0 else torch.empty(0, dtype=torch.long)
+        self._status_cpu = torch.from_numpy(status_np[order]) if status_np.size > 0 else torch.empty(0, dtype=torch.long)
+        self._lookup_by_device = {}
+
+    def _get_lookup(self, device: torch.device):
+        key = str(device)
+        cached = self._lookup_by_device.get(key)
+        if cached is None:
+            cached = (
+                self._meter_ids_cpu.to(device=device, dtype=torch.long),
+                self._status_cpu.to(device=device, dtype=torch.long),
+            )
+            self._lookup_by_device[key] = cached
+        return cached
     
     def get_conditions(
         self, 
@@ -745,22 +894,36 @@ class HeatpumpConditioner(BaseConditioner):
             torch.Tensor: Binary indicators of shape `(batch_size, 1)`. Defaults to 
                 0.0 if meter is not found.
         """
-        if isinstance(meter_id, torch.Tensor):
-            meter_id = meter_id.cpu().numpy()
-        
-        heatpump_status = []
-        for m_id in meter_id:
-            row = self.topology_df[self.topology_df['meter_number'] == m_id]
-            if not row.empty:
-                val = row['has_heat_pump'].iloc[0]
-                if str(val) == "True":
-                    heatpump_status.append(1.0)
-                else:
-                    heatpump_status.append(0.0)
-            else:
-                heatpump_status.append(0.0)
+        if meter_id is None:
+            if isinstance(timestamps, torch.Tensor):
+                return torch.zeros((timestamps.shape[0], 1), dtype=torch.float32, device=timestamps.device)
+            if isinstance(timestamps, np.ndarray):
+                return torch.zeros((timestamps.shape[0], 1), dtype=torch.float32)
+            return torch.zeros((1, 1), dtype=torch.float32)
 
-        return torch.tensor(heatpump_status, dtype=torch.float32).unsqueeze(1)
+        if isinstance(meter_id, torch.Tensor):
+            meter_ids = meter_id.to(dtype=torch.long)
+            device = meter_ids.device
+        else:
+            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)
+            device = meter_ids.device
+
+        lookup_ids, lookup_status = self._get_lookup(device=device)
+
+        if lookup_ids.numel() == 0:
+            return torch.zeros((meter_ids.shape[0], 1), dtype=torch.float32, device=device)
+
+        meter_ids = meter_ids.contiguous()
+        lookup_ids = lookup_ids.contiguous()
+        idx = torch.searchsorted(lookup_ids, meter_ids)
+        idx_clamped = idx.clamp(max=lookup_ids.shape[0] - 1)
+        valid = (idx < lookup_ids.shape[0]) & (lookup_ids[idx_clamped] == meter_ids)
+
+        status = torch.zeros(meter_ids.shape[0], dtype=torch.float32, device=device)
+        if valid.any():
+            status[valid] = lookup_status[idx_clamped[valid]].to(dtype=torch.float32)
+
+        return status.unsqueeze(1)
     
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
         """Generates random holiday conditions for testing.
@@ -786,7 +949,39 @@ class SolarPanelConditioner(BaseConditioner):
     """
     def __init__(self, topology_path = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
         self.condition_dim = 1
-        self.topology_df = pd.read_csv(topology_path)
+        topology_df = pd.read_csv(topology_path)
+
+        meter_col = pd.to_numeric(topology_df.get('meter_number'), errors='coerce')
+        value_series = topology_df.get('has_solar_panel')
+        if value_series is None:
+            status_series = pd.Series(np.zeros(len(topology_df), dtype=np.int64))
+        else:
+            if pd.api.types.is_bool_dtype(value_series):
+                status_series = value_series.fillna(False).astype(np.int64)
+            else:
+                status_series = value_series.astype(str).str.strip().str.lower().isin({'true', '1', 'yes'}).astype(np.int64)
+
+        compact = pd.DataFrame({'meter_id': meter_col, 'status': status_series})
+        compact = compact.dropna(subset=['meter_id']).drop_duplicates(subset=['meter_id'], keep='last')
+
+        meter_ids_np = compact['meter_id'].astype(np.int64).to_numpy()
+        status_np = compact['status'].astype(np.int64).to_numpy()
+        order = np.argsort(meter_ids_np)
+
+        self._meter_ids_cpu = torch.from_numpy(meter_ids_np[order]) if meter_ids_np.size > 0 else torch.empty(0, dtype=torch.long)
+        self._status_cpu = torch.from_numpy(status_np[order]) if status_np.size > 0 else torch.empty(0, dtype=torch.long)
+        self._lookup_by_device = {}
+
+    def _get_lookup(self, device: torch.device):
+        key = str(device)
+        cached = self._lookup_by_device.get(key)
+        if cached is None:
+            cached = (
+                self._meter_ids_cpu.to(device=device, dtype=torch.long),
+                self._status_cpu.to(device=device, dtype=torch.long),
+            )
+            self._lookup_by_device[key] = cached
+        return cached
     
     def get_conditions(
         self, 
@@ -805,22 +1000,36 @@ class SolarPanelConditioner(BaseConditioner):
             torch.Tensor: Binary indicators of shape `(batch_size, 1)`. Defaults to 
                 0.0 if meter is not found.
         """
-        if isinstance(meter_id, torch.Tensor):
-            meter_id = meter_id.cpu().numpy()
-        
-        solar_status = []
-        for m_id in meter_id:
-            row = self.topology_df[self.topology_df['meter_number'] == m_id]
-            if not row.empty:
-                val = row['has_solar_panel'].iloc[0]
-                if str(val) == "True":
-                    solar_status.append(1.0)
-                else:
-                    solar_status.append(0.0)
-            else:
-                solar_status.append(0.0)
+        if meter_id is None:
+            if isinstance(timestamps, torch.Tensor):
+                return torch.zeros((timestamps.shape[0], 1), dtype=torch.float32, device=timestamps.device)
+            if isinstance(timestamps, np.ndarray):
+                return torch.zeros((timestamps.shape[0], 1), dtype=torch.float32)
+            return torch.zeros((1, 1), dtype=torch.float32)
 
-        return torch.tensor(solar_status, dtype=torch.float32).unsqueeze(1)
+        if isinstance(meter_id, torch.Tensor):
+            meter_ids = meter_id.to(dtype=torch.long)
+            device = meter_ids.device
+        else:
+            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)
+            device = meter_ids.device
+
+        lookup_ids, lookup_status = self._get_lookup(device=device)
+
+        if lookup_ids.numel() == 0:
+            return torch.zeros((meter_ids.shape[0], 1), dtype=torch.float32, device=device)
+
+        meter_ids = meter_ids.contiguous()
+        lookup_ids = lookup_ids.contiguous()
+        idx = torch.searchsorted(lookup_ids, meter_ids)
+        idx_clamped = idx.clamp(max=lookup_ids.shape[0] - 1)
+        valid = (idx < lookup_ids.shape[0]) & (lookup_ids[idx_clamped] == meter_ids)
+
+        status = torch.zeros(meter_ids.shape[0], dtype=torch.float32, device=device)
+        if valid.any():
+            status[valid] = lookup_status[idx_clamped[valid]].to(dtype=torch.float32)
+
+        return status.unsqueeze(1)
     
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
         """Generates random solar panel conditions for testing.
@@ -967,15 +1176,63 @@ class HeatpumpPhaseConditioner(BaseConditioner):
     """
     def __init__(self, topology_path = 'data/HP/label_propagation_predictions.csv'):
         self.condition_dim = 4
-        self.topology_df = self._load_topology_df(topology_path)
+        self._meter_ids_cpu, self._phase_class_cpu = self._load_topology_df(topology_path)
+        self._lookup_by_device = {}
 
     
     def _load_topology_df(self, topology_path):
         topology_df = pd.read_csv(topology_path)
-        # Assuming the 'meter_id' column has values like "L1_12345", "L2_12345", "L3_12345"
-        topology_df['phase'] = topology_df['meter_id'].str.extract(r'^(l\d)_')[0]
-        topology_df['base_meter_id'] = topology_df['meter_id'].str.extract(r'^l\d_(\d+)$')[0]
-        return topology_df
+        meter_col = None
+        if 'Unnamed: 0' in topology_df.columns:
+            meter_col = topology_df['Unnamed: 0']
+        elif 'meter_id' in topology_df.columns:
+            meter_col = topology_df['meter_id']
+        else:
+            meter_col = topology_df.iloc[:, 0]
+
+        meter_key = meter_col.astype(str).str.lower()
+
+        phase = meter_key.str.extract(r'^(l\d)_', expand=False)
+        base_meter_id = pd.to_numeric(meter_key.str.extract(r'^l\d_(\d+)$', expand=False), errors='coerce')
+
+        predicted_series = topology_df.get('predicted_hp', pd.Series(np.zeros(len(topology_df), dtype=np.int64)))
+        if pd.api.types.is_bool_dtype(predicted_series):
+            predicted_bool = predicted_series.fillna(False)
+        else:
+            predicted_bool = predicted_series.astype(str).str.strip().str.lower().isin({'true', '1', 'yes'})
+
+        compact = pd.DataFrame(
+            {
+                'base_meter_id': base_meter_id,
+                'phase': phase,
+                'predicted_hp': predicted_bool,
+            }
+        ).dropna(subset=['base_meter_id', 'phase'])
+
+        hp_counts = compact[compact['predicted_hp']].groupby('base_meter_id')['phase'].nunique()
+
+        if hp_counts.empty:
+            return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
+
+        meter_ids_np = hp_counts.index.to_numpy(dtype=np.int64)
+        phase_classes_np = np.clip(hp_counts.to_numpy(dtype=np.int64), 0, 3)
+
+        order = np.argsort(meter_ids_np)
+        return (
+            torch.from_numpy(meter_ids_np[order]),
+            torch.from_numpy(phase_classes_np[order]),
+        )
+
+    def _get_lookup(self, device: torch.device):
+        key = str(device)
+        cached = self._lookup_by_device.get(key)
+        if cached is None:
+            cached = (
+                self._meter_ids_cpu.to(device=device, dtype=torch.long),
+                self._phase_class_cpu.to(device=device, dtype=torch.long),
+            )
+            self._lookup_by_device[key] = cached
+        return cached
 
     def get_conditions(
             self,
@@ -983,30 +1240,38 @@ class HeatpumpPhaseConditioner(BaseConditioner):
             meter_id: torch.Tensor | np.ndarray | None,
             timestamps: torch.Tensor | list | None
         ) -> torch.Tensor | None:
-        if isinstance(meter_id, torch.Tensor):
-            meter_id = meter_id.cpu().numpy()
-        heatpump_phase_status = []
-        for m_id in meter_id:
-            row = self.topology_df[self.topology_df['base_meter_id'] == str(m_id)]
-            if not row.empty:
-                phases = row['phase'].unique()
-                hp_phases = row[row['predicted_hp'] == True]['phase'].unique()
-                if len(hp_phases) == 0:
-                    heatpump_phase_status.append(0.0)  # No heat pump
-                elif len(hp_phases) == 1:
-                    heatpump_phase_status.append(1.0)  # 1-phase heat pump
-                elif len(hp_phases) == 2:
-                    heatpump_phase_status.append(2.0)  # 2-phase heat pump
-                elif len(hp_phases) >= 3:
-                    heatpump_phase_status.append(3.0)  # 3-phase heat pump
-                else:
-                    heatpump_phase_status.append(0.0)  # Default to no heat pump if something's off
+        if meter_id is None:
+            if isinstance(timestamps, torch.Tensor):
+                zeros = torch.zeros(timestamps.shape[0], dtype=torch.long, device=timestamps.device)
+            elif isinstance(timestamps, np.ndarray):
+                zeros = torch.zeros(timestamps.shape[0], dtype=torch.long)
             else:
-                heatpump_phase_status.append(0.0)  # Default to no heat pump if meter not found
-        # one-hot encode the heat pump phase status
-        heatpump_phase_status = torch.tensor(heatpump_phase_status, dtype=torch.long)
-        heatpump_phase_onehot = F.one_hot(heatpump_phase_status, num_classes=self.condition_dim).float()
-        return heatpump_phase_onehot.to(heatpump_phase_status.device)
+                zeros = torch.zeros(1, dtype=torch.long)
+            return F.one_hot(zeros, num_classes=self.condition_dim).float()
+
+        if isinstance(meter_id, torch.Tensor):
+            meter_ids = meter_id.to(dtype=torch.long)
+            device = meter_ids.device
+        else:
+            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)
+            device = meter_ids.device
+
+        lookup_ids, lookup_phase_class = self._get_lookup(device=device)
+        if lookup_ids.numel() == 0:
+            phase_class = torch.zeros_like(meter_ids, dtype=torch.long)
+            return F.one_hot(phase_class, num_classes=self.condition_dim).float()
+
+        meter_ids = meter_ids.contiguous()
+        lookup_ids = lookup_ids.contiguous()
+        idx = torch.searchsorted(lookup_ids, meter_ids)
+        idx_clamped = idx.clamp(max=lookup_ids.shape[0] - 1)
+        valid = (idx < lookup_ids.shape[0]) & (lookup_ids[idx_clamped] == meter_ids)
+
+        phase_class = torch.zeros_like(meter_ids, dtype=torch.long)
+        if valid.any():
+            phase_class[valid] = lookup_phase_class[idx_clamped[valid]]
+
+        return F.one_hot(phase_class, num_classes=self.condition_dim).float()
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
         # No heat pump: 50%, 1-phase: 20%, 2-phase: 20%, 3-phase: 10%
         probs = torch.tensor([0.5, 0.2, 0.2, 0.1])
@@ -1093,10 +1358,12 @@ class Conditioner():
         
         for tag in self.tags:
             cond = self.condition_items[tag].get_conditions(x, meter_id=meter_id, timestamps=timestamps)
+            if cond is None:
+                continue
             if isinstance(cond, np.ndarray):
                 cond = torch.tensor(cond, dtype=torch.float32)
             if target_device is not None and cond.device != target_device:
-                cond = cond.to(target_device)
+                cond = cond.to(target_device, non_blocking=True)
             conditions.append(cond)
         
         if len(conditions) == 0:

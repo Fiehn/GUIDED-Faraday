@@ -294,15 +294,15 @@ class VAE(nn.Module):
 
     def move_to_device(self, batch, device):
         if torch.is_tensor(batch):
-            return batch.to(device)
+            return batch.to(device, non_blocking=True)
         if isinstance(batch, (list, tuple)):
             return type(batch)(
-                b.to(device) if torch.is_tensor(b) else b
+                b.to(device, non_blocking=True) if torch.is_tensor(b) else b
                 for b in batch
             )
         if isinstance(batch, dict):
             return {
-                k: (v.to(device) if torch.is_tensor(v) else v)
+                k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
                 for k, v in batch.items()
             }
         return batch

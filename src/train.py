@@ -332,7 +332,7 @@ def train(config):
             elif condition_tag == "nr_phases_active":
                 conditioner.add_condition_item("nr_phases_active", ActivePhaseCountConditioner())
             elif condition_tag == "heatpump_phase":
-                conditioner.add_condition_item("heatpump_phase", HeatpumpConditioner())
+                conditioner.add_condition_item("heatpump_phase", HeatpumpPhaseConditioner())
             else:
                 print(f"Warning: Unknown condition tag '{condition_tag}' in config. Skipping this conditioner.")
         
@@ -490,6 +490,7 @@ def train(config):
             eval_cache_device=eval_cache_device,
             eval_cache_batches=eval_batches,
             cache_scan_batches=cache_scan_batches,
+            pin_memory=(str(device) != "cpu"),
         )
 
         writer = Writer(log_dir=os.path.join(config.logging.log_dir, model_tag))
@@ -560,11 +561,18 @@ def train(config):
             avg_loss = epoch_loss / n
             avg_recon = epoch_recon / n
             avg_kl = epoch_kl / n
-            print(f"Epoch [{epoch+1:4d}/{config.training.num_epochs}] Train Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | KL: {avg_kl:.4f}")
+            file_progress = phased_replay.get_file_progress()
+            print(
+                f"Epoch [{epoch+1:4d}/{config.training.num_epochs}] "
+                f"Train Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | KL: {avg_kl:.4f} | "
+                f"Files seen/completed: {file_progress['seen']}/{file_progress['completed']} of {file_progress['total']}"
+            )
 
             writer.add_scalar('train_loss_epoch', avg_loss, epoch)
             writer.add_scalar('train_recon_loglikelihood_epoch', avg_recon, epoch)
             writer.add_scalar('train_kl_divergence_epoch', avg_kl, epoch)
+            writer.add_scalar('stream_files_seen', file_progress['seen'], epoch)
+            writer.add_scalar('stream_files_completed', file_progress['completed'], epoch)
 
             # Optional epoch-level evaluation for phased SetGuideVAE runs.
             if should_eval_epoch and hasattr(model, "validate") and epoch_eval_loader is not None:

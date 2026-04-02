@@ -2,6 +2,7 @@ import math
 import torch
 import random
 import pyarrow.parquet as pq
+import multiprocessing as mp
 from torch.utils.data import IterableDataset, DataLoader, get_worker_info, TensorDataset
 from typing import Optional
 import numpy as np
@@ -33,6 +34,8 @@ class StreamingParquetBuffer(IterableDataset):
                  num_workers: int = 0,
                  hourly_aggregation: bool = False,
                  aggregation_divisor: float = 1.0,
+                 file_seen_map=None,
+                 file_completed_map=None,
                  ):
         self.sm_files = sm_files
         self.replay_buffer_capacity = replay_buffer_capacity
@@ -55,6 +58,24 @@ class StreamingParquetBuffer(IterableDataset):
             self.base_frequency = '1h'
         else:
             self.base_frequency = '15min'
+
+        # Shared (manager-backed) maps to track file coverage across worker processes.
+        self.file_seen_map = file_seen_map
+        self.file_completed_map = file_completed_map
+
+    def _mark_file_seen(self, file_path: str):
+        if self.file_seen_map is not None:
+            try:
+                self.file_seen_map[file_path] = 1
+            except Exception:
+                pass
+
+    def _mark_file_completed(self, file_path: str):
+        if self.file_completed_map is not None:
+            try:
+                self.file_completed_map[file_path] = 1
+            except Exception:
+                pass
     
     def _push_to_buffer(self, item):
         self.buffer[self.ptr] = item
@@ -153,26 +174,30 @@ class StreamingParquetBuffer(IterableDataset):
 
         # === Lazy parquet streaming ===
         for file in files_for_this_worker:
-            file_df, meter_id = self._load_file_dataframe(file)
-            if file_df is None or meter_id is None:
-                continue
+            self._mark_file_seen(file)
+            try:
+                file_df, meter_id = self._load_file_dataframe(file)
+                if file_df is None or meter_id is None:
+                    continue
 
-            sequences = self._extract_sequences(file_df, meter_id)
+                sequences = self._extract_sequences(file_df, meter_id)
 
-            for seq, cond in sequences:
-                # Apply normalization if normalizer is provided
-                if self.normalizer is not None:
-                    # seq shape is [24, 3], broadcasting with [3,]
-                    seq = self.normalizer.transform(seq)
-                seq = seq.T
+                for seq, cond in sequences:
+                    # Apply normalization if normalizer is provided
+                    if self.normalizer is not None:
+                        # seq shape is [24, 3], broadcasting with [3,]
+                        seq = self.normalizer.transform(seq)
+                    seq = seq.T
 
-                # Push the (seq, cond) pair into the replay buffer
-                self._push_to_buffer((seq, cond))
+                    # Push the (seq, cond) pair into the replay buffer
+                    self._push_to_buffer((seq, cond))
 
-                # Yield only when the buffer is adequately mixed
-                if self.current_size >= self.min_buffer_size:
-                    # The yield pauses the loop right here until PyTorch needs more data
-                    yield self._sample_from_buffer()
+                    # Yield only when the buffer is adequately mixed
+                    if self.current_size >= self.min_buffer_size:
+                        # The yield pauses the loop right here until PyTorch needs more data
+                        yield self._sample_from_buffer()
+            finally:
+                self._mark_file_completed(file)
     
     def _extract_sequences(self, df, meter_id):
         sequences = []
@@ -226,12 +251,23 @@ class PhasedReplayDataloaders:
             eval_cache_device: Optional[torch.device] = None,
             eval_cache_batches: Optional[int] = None,
             cache_scan_batches: Optional[int] = None,
+            pin_memory: bool = False,
     ):
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
         self.eval_cache_device = eval_cache_device
         self.eval_cache_batches = eval_cache_batches
         self.cache_scan_batches = cache_scan_batches
+        self.pin_memory = bool(pin_memory)
+        self.total_files = len(set(sm_files))
+
+        # Manager-backed maps are shared across DataLoader workers.
+        self._stats_manager = mp.Manager()
+        self._file_seen_map = self._stats_manager.dict()
+        self._file_completed_map = self._stats_manager.dict()
+
+        self.files_seen = 0
+        self.files_completed = 0
 
         self.dataset = StreamingParquetBuffer(
             sm_files=sm_files,
@@ -242,16 +278,58 @@ class PhasedReplayDataloaders:
             num_workers=num_workers,
             hourly_aggregation=hourly_aggregation,
             aggregation_divisor=aggregation_divisor,
+            file_seen_map=self._file_seen_map,
+            file_completed_map=self._file_completed_map,
         )
 
         self.eval_loader = None
+        self._stream_loader = None
+        self._stream_iter = None
+
+    def get_file_progress(self):
+        self.files_seen = len(self._file_seen_map)
+        self.files_completed = len(self._file_completed_map)
+        return {
+            "seen": int(self.files_seen),
+            "completed": int(self.files_completed),
+            "total": int(self.total_files),
+        }
 
     def _make_stream(self):
-        return DataLoader(self.dataset, batch_size=self.batch_size, num_workers=self.num_workers)
+        loader_kwargs = {
+            "batch_size": self.batch_size,
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+        }
+        if self.num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 2
+        return DataLoader(self.dataset, **loader_kwargs)
+
+    def _get_stream_loader(self):
+        if self._stream_loader is None:
+            self._stream_loader = self._make_stream()
+        return self._stream_loader
+
+    def _next_stream_batch(self):
+        loader = self._get_stream_loader()
+        if self._stream_iter is None:
+            self._stream_iter = iter(loader)
+
+        try:
+            return next(self._stream_iter)
+        except StopIteration:
+            self._stream_iter = iter(loader)
+            try:
+                return next(self._stream_iter)
+            except StopIteration:
+                return None
 
     def _collect_cache(self, target_train: int, target_eval: int):
-        train_xs, train_cs = [], []
-        eval_xs, eval_cs = [], []
+        train_x = None
+        train_c = None
+        eval_x = None
+        eval_c = None
         train_samples = 0
         eval_samples = 0
 
@@ -260,9 +338,22 @@ class PhasedReplayDataloaders:
         total_batches = max(1, (target_train + target_eval + self.batch_size - 1) // self.batch_size)
         max_scan_batches = self.cache_scan_batches or max(30, total_batches * 40)
 
-        for i, (x, cond) in enumerate(self._make_stream()):
+        for i in range(max_scan_batches):
+            batch = self._next_stream_batch()
+            if batch is None:
+                print("Warning: phased stream produced no data while collecting cache.")
+                break
+
+            x, cond = batch
             x = x.float()
             cond = cond.long()
+
+            if train_x is None and target_train > 0:
+                train_x = torch.empty((target_train, *x.shape[1:]), dtype=x.dtype)
+                train_c = torch.empty((target_train, *cond.shape[1:]), dtype=cond.dtype)
+            if eval_x is None and target_eval > 0:
+                eval_x = torch.empty((target_eval, *x.shape[1:]), dtype=x.dtype)
+                eval_c = torch.empty((target_eval, *cond.shape[1:]), dtype=cond.dtype)
 
             n = x.shape[0]
             remaining_train = max(0, target_train - train_samples)
@@ -289,42 +380,45 @@ class PhasedReplayDataloaders:
 
             if remaining_train > 0 and x_train.shape[0] > 0:
                 take_train = min(remaining_train, x_train.shape[0])
-                train_xs.append(x_train[:take_train])
-                train_cs.append(c_train[:take_train])
+                train_x[train_samples:train_samples + take_train].copy_(x_train[:take_train])
+                train_c[train_samples:train_samples + take_train].copy_(c_train[:take_train])
                 train_samples += int(take_train)
 
             if remaining_eval > 0 and x_eval.shape[0] > 0:
                 take_eval = min(remaining_eval, x_eval.shape[0])
-                eval_xs.append(x_eval[:take_eval])
-                eval_cs.append(c_eval[:take_eval])
+                eval_x[eval_samples:eval_samples + take_eval].copy_(x_eval[:take_eval])
+                eval_c[eval_samples:eval_samples + take_eval].copy_(c_eval[:take_eval])
                 eval_samples += int(take_eval)
 
             if train_samples >= target_train and eval_samples >= target_eval:
                 break
 
-            if i >= max_scan_batches - 1:
+            if i == max_scan_batches - 1:
                 print(f"Warning: reached scan limit ({max_scan_batches} batches) while collecting phased cache.")
-                break
 
-        if train_samples < target_train and len(eval_xs) > 0:
+        if train_samples < target_train and eval_x is not None and eval_samples > 0:
             need = target_train - train_samples
-            x_backfill = torch.cat(eval_xs, dim=0)
-            c_backfill = torch.cat(eval_cs, dim=0)
-            take = min(need, x_backfill.shape[0])
+            take = min(need, eval_samples)
             if take > 0:
-                train_xs.append(x_backfill[:take])
-                train_cs.append(c_backfill[:take])
+                train_x[train_samples:train_samples + take].copy_(eval_x[:take])
+                train_c[train_samples:train_samples + take].copy_(eval_c[:take])
                 train_samples += int(take)
 
-        return train_xs, train_cs, eval_xs, eval_cs
+        if train_x is not None:
+            train_x = train_x[:train_samples]
+        if train_c is not None:
+            train_c = train_c[:train_samples]
+        if eval_x is not None:
+            eval_x = eval_x[:eval_samples]
+        if eval_c is not None:
+            eval_c = eval_c[:eval_samples]
 
-    def _build_eval_loader(self, eval_xs, eval_cs):
-        if len(eval_xs) == 0:
+        return train_x, train_c, eval_x, eval_c
+
+    def _build_eval_loader(self, x_eval, c_eval):
+        if x_eval is None or c_eval is None or x_eval.shape[0] == 0:
             self.eval_loader = None
             return
-
-        x_eval = torch.cat(eval_xs, dim=0)
-        c_eval = torch.cat(eval_cs, dim=0)
 
         if torch.is_tensor(c_eval) and c_eval.dim() == 3 and c_eval.shape[1] >= 2:
             meter_id = c_eval[:, 0, 0].long()
@@ -351,11 +445,13 @@ class PhasedReplayDataloaders:
 
         eval_ds = TensorDataset(x_eval, meter_id, timestamps)
         eval_workers = 0
+        pin_eval_memory = self.pin_memory and x_eval.device.type == "cpu"
         self.eval_loader = DataLoader(
             eval_ds,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=eval_workers,
+            pin_memory=pin_eval_memory,
         )
 
     def get_epoch_loaders(self, steps_per_epoch: int, eval_batches: int, refresh_eval: bool = False):
@@ -368,23 +464,30 @@ class PhasedReplayDataloaders:
                 eval_cache_batches = self.eval_cache_batches if self.eval_cache_batches is not None else eval_batches
                 target_eval = max(1, int(eval_cache_batches)) * self.batch_size
 
-        train_xs, train_cs, eval_xs, eval_cs = self._collect_cache(target_train, target_eval)
+        train_x, train_c, eval_x, eval_c = self._collect_cache(target_train, target_eval)
 
-        if len(train_xs) == 0:
+        if train_x is None or train_c is None or train_x.shape[0] == 0:
             return None, self.eval_loader
 
-        train_ds = TensorDataset(torch.cat(train_xs, dim=0), torch.cat(train_cs, dim=0))
-        train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True, num_workers=0)
+        train_ds = TensorDataset(train_x, train_c)
+        pin_train_memory = self.pin_memory and train_x.device.type == "cpu"
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=pin_train_memory,
+        )
 
         if target_eval > 0:
-            self._build_eval_loader(eval_xs, eval_cs)
+            self._build_eval_loader(eval_x, eval_c)
 
         return train_loader, self.eval_loader
 
     def refresh_eval_cache(self, eval_batches: int):
         target_eval = max(1, int(eval_batches)) * self.batch_size
-        _, _, eval_xs, eval_cs = self._collect_cache(0, target_eval)
-        self._build_eval_loader(eval_xs, eval_cs)
+        _, _, eval_x, eval_c = self._collect_cache(0, target_eval)
+        self._build_eval_loader(eval_x, eval_c)
 
     def get_eval_loader(self):
         return self.eval_loader

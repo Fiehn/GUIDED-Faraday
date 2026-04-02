@@ -53,14 +53,14 @@ data:
   
   # DataLoader settings
   dataloader:
-    batch_size: 2048
+    batch_size:  2048
     num_workers: 6
     shuffle: false
 
   # Phased parquet streaming settings (used by SetGuideVAE phased training)
   phased:
     replay_buffer_capacity: 8192
-    min_buffer_size: 2048
+    min_buffer_size:  2048
     num_workers: 6
     steps_per_epoch: 100
     eval_batches: 5
@@ -131,7 +131,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "user_profile", "nr_phases_active"]  # List of conditioning tags to use ["day_of_week", "month_of_year", "user_profile", "holiday"]
+  tags: ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  # List of conditioning tags to use ["day_of_week", "month_of_year", "user_profile", "holiday"]
   
   # User profiling (based on LDA)
   user_profile:
@@ -150,7 +150,7 @@ conditioning:
 # HIERARCHICAL LATENT SPACE
 # ============================================================================
 hierarchy:
-  enabled: true
+  enabled: false
   levels: ["linear", "linear", "linear"] # eg. ["linear", "StochasticLevel", "VQLevel"]
   latent_dims: [64, 32, 16] # latent dimensions for each level
   top_down: [false, false, false] # whether to use top-down connections for each level
@@ -186,7 +186,7 @@ training:
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 150
+  num_epochs: 100
   
   # Beta (KL weight) settings
   beta: 1.0
@@ -202,7 +202,7 @@ training:
   
   # Early stopping
   early_stopping:
-    enabled: true
+    enabled: false
     patience: 7 # stop if no improvement for N validations
     min_delta: 0.001 # minimum improvement threshold
   
