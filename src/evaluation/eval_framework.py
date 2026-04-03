@@ -512,17 +512,6 @@ class EvalFramework:
                 real = np.asarray(self._real_data)[:n]
                 synth = np.asarray(self._synthetic_data)[:n]
 
-                # Denormalize in full shape first (if normalizer is available), then select feature 0.
-                if self.normalizer is not None and hasattr(self.normalizer, 'inverse_transform'):
-                    if real.ndim == 2 and real.shape[1] % metric.window_size == 0:
-                        f_real = real.shape[1] // metric.window_size
-                        real_t = torch.tensor(real, dtype=torch.float32).reshape(-1, metric.window_size, f_real)
-                        real = self.normalizer.inverse_transform(real_t).detach().cpu().numpy().reshape(-1, metric.window_size * f_real)
-                    if synth.ndim == 2 and synth.shape[1] % metric.window_size == 0:
-                        f_synth = synth.shape[1] // metric.window_size
-                        synth_t = torch.tensor(synth, dtype=torch.float32).reshape(-1, metric.window_size, f_synth)
-                        synth = self.normalizer.inverse_transform(synth_t).detach().cpu().numpy().reshape(-1, metric.window_size * f_synth)
-
                 # Convert flattened [N, L*F] -> [N, L] by selecting feature 0
                 if real.ndim == 2 and real.shape[1] != metric.window_size and real.shape[1] % metric.window_size == 0:
                     f_real = real.shape[1] // metric.window_size
@@ -2427,14 +2416,7 @@ class PerConditionEval(SyntheticMetric):
         real_data = real_data[:min_len]
         synthetic_data = synthetic_data[:min_len]
         timestamps = timestamps[:min_len]
-        
-        # Save plots
-        self._plot_aggregated_profiles_bars(
-            real_data, synthetic_data, 
-            np.array([datetime.utcfromtimestamp(ts).weekday() for ts in timestamps]),
-            np.array([datetime.utcfromtimestamp(ts).month for ts in timestamps]),
-            self._resolve_feeder_ids(len(real_data))
-        )
+
         if real_data.ndim != 2 or synthetic_data.ndim != 2:
             raise ValueError(f"Expected 2D arrays [N, D], got real={real_data.shape}, synthetic={synthetic_data.shape}")
         if real_data.shape[1] != self.window_size or synthetic_data.shape[1] != self.window_size:

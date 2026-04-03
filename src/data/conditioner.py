@@ -404,7 +404,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         Returns:
             torch.Tensor: Profiles of shape `(batch_size, n_topics)`.
         """
-        meter_ids = np.asarray(meter_ids, dtype=np.int64)
+        meter_ids = np.ascontiguousarray(np.asarray(meter_ids, dtype=np.int64))
 
         # FIX 5: compute missing profiles AND populate user_profiles_cache before assembling
         missing_meters = [
@@ -420,7 +420,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
                     self.user_profiles_cache[int(m_id)] = np.ones(self.n_topics, dtype=np.float32) / self.n_topics
                 self._invalidate_profile_lookup()
 
-        meter_ids_t = torch.as_tensor(meter_ids, dtype=torch.long, device=device)
+        meter_ids_t = torch.as_tensor(meter_ids, dtype=torch.long, device=device).contiguous()
         lookup_ids, lookup_profiles = self._get_profile_lookup_for_device(device)
 
         if lookup_ids.numel() == 0:

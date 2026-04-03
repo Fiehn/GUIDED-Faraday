@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import random
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,6 +16,114 @@ try:
 except ImportError:
     def tabulate(data, headers="keys", **kwargs):
         return str(data)
+
+
+DEFAULT_EVAL_DIRS = [
+    "models/SetGuideVAE_DictionaryCoder_20260402_211036",
+    "models/SetGuideVAE_DictionaryCoder_20260402_220630",
+    "models/SetGuideVAE_DictionaryCoder_20260403_110047",
+    "models/SetGuideVAE_DictionaryCoder_20260403_120423",
+    "models/SetGuideVAE_DictionaryCoder_20260403_123341",
+    "models/SetGuideVAE_DictionaryCoder_20260403_134100",
+]
+
+DEFAULT_MODEL_NAMES = [
+    "Agg. loss (SAB) (CNN) (ABL)",
+    "Agg. loss (SAB) (CNN) (No ABL)",
+    "Agg. loss (SAB) (CNN) (No ABL) (VAMP)",
+    "Agg. loss (ISAB) (CNN) (No ABL)",
+    "Agg. loss (ISAB) (CNN) (ABL)",
+    "Agg. loss (ISAB) (CNN) (No ABL) (Condition Dropout)",
+    "Sanity check (ISAB) (CNN) (No ABL) (beta=0)",
+]
+
+DEFAULT_MODEL_CONFIG_FILE = "training_config_used.yaml"
+
+
+def _resolve_shared_eval_config_for_model(model_dir: str, shared_eval_config: str | None) -> str:
+    """Resolve config path for shared reruns."""
+    if shared_eval_config and shared_eval_config.lower() != "auto":
+        return shared_eval_config
+
+    model_config = os.path.join(model_dir, DEFAULT_MODEL_CONFIG_FILE)
+    if os.path.exists(model_config):
+        return model_config
+
+    raise FileNotFoundError(
+        f"Missing model config: {model_config}. "
+        "Pass --shared_eval_config to use a global fallback config path."
+    )
+
+
+def rerun_shared_evaluation(
+    eval_dirs,
+    *,
+    config_path: str | None,
+    device: str,
+    max_files: int | None,
+    seed: int,
+    output_subdir: str,
+    include_visualizations: bool,
+    continue_on_error: bool,
+):
+    """Re-run phased evaluation for each model on one strict shared data plan."""
+    import torch
+    from src.evaluation.load_checkpoint import run_checkpoint_evaluation, resolve_shared_eval_plan
+
+    if not eval_dirs:
+        return []
+
+    # Strict shared-data mode: one reference config defines the exact data pool and cache settings.
+    shared_config_path = _resolve_shared_eval_config_for_model(eval_dirs[0], config_path)
+    shared_plan = resolve_shared_eval_plan(
+        config_path=shared_config_path,
+        max_files=max_files,
+        seed=seed,
+    )
+    shared_parquet_paths = shared_plan["parquet_paths"]
+    print(
+        "Strict shared-data mode enabled: "
+        f"config={shared_plan['config_path']}, files={len(shared_parquet_paths)}, "
+        f"batch_size={shared_plan['batch_size']}, eval_batches={shared_plan['eval_batches']}"
+    )
+
+    refreshed_eval_dirs = []
+    for model_dir in eval_dirs:
+        target_eval_dir = os.path.join(model_dir, output_subdir)
+        print(
+            f"Running shared-data eval for {model_dir} -> {target_eval_dir} "
+            f"(config={shared_plan['config_path']}, seed={seed}, strict_shared_files={len(shared_parquet_paths)})"
+        )
+
+        # Keep randomization stable across models so all runs sample from the same slice policy.
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+        try:
+            run_checkpoint_evaluation(
+                checkpoint_path=model_dir,
+                config_path=shared_plan["config_path"],
+                device=device,
+                max_files=None,
+                include_visualization=include_visualizations,
+                output_dir=target_eval_dir,
+                shared_parquet_paths=shared_parquet_paths,
+                strict_shared_eval=True,
+                eval_seed=seed,
+                override_batch_size=shared_plan["batch_size"],
+                override_eval_batches=shared_plan["eval_batches"],
+                override_min_buffer_size=shared_plan["min_buffer_size"],
+                override_replay_buffer_capacity=shared_plan["replay_buffer_capacity"],
+            )
+            refreshed_eval_dirs.append(os.path.normpath(target_eval_dir))
+        except Exception as exc:
+            if continue_on_error:
+                print(f"Warning: shared-data eval failed for {model_dir}: {exc}")
+                continue
+            raise
+
+    return refreshed_eval_dirs
 
 class PhasedModelComparator:
     """Class to compare evaluation results across multiple phased models."""
@@ -293,19 +402,100 @@ if __name__ == "__main__":
     parser.add_argument("--eval_dirs", nargs='+', required=False, help="List of paths to directories containing phased eval results.")
     parser.add_argument("--names", nargs='+', required=False, help="List of model names corresponding to the eval dirs.")
     parser.add_argument("--output_dir", type=str, default="evaluation_comparison_phased", help="Directory to save the comparison plots and table.")
+    parser.add_argument(
+        "--rerun_shared_eval",
+        action="store_true",
+        help="Re-run phased evaluation for each model on shared data before comparison.",
+    )
+    parser.add_argument(
+        "--shared_eval_config",
+        type=str,
+        default="auto",
+        help=(
+            "Config used for shared-data reruns. "
+            "Default 'auto' uses training_config_used.yaml from the first model in --eval_dirs as the shared reference."
+        ),
+    )
+    parser.add_argument(
+        "--shared_eval_device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Device used for shared-data reruns.",
+    )
+    parser.add_argument(
+        "--shared_eval_max_files",
+        type=int,
+        default=None,
+        help="Optional cap on number of parquet files used during shared-data reruns.",
+    )
+    parser.add_argument(
+        "--shared_eval_seed",
+        type=int,
+        default=42,
+        help="Random seed used before each shared-data rerun.",
+    )
+    parser.add_argument(
+        "--shared_eval_output_subdir",
+        type=str,
+        default="shared_eval",
+        help="Subdirectory inside each model dir where shared-data rerun outputs are written.",
+    )
+    parser.add_argument(
+        "--shared_eval_include_visualizations",
+        action="store_true",
+        help="Also run visualization generation during shared-data reruns.",
+    )
+    parser.add_argument(
+        "--continue_on_eval_error",
+        action="store_true",
+        help="Continue comparing remaining models when a shared-data rerun fails for one model.",
+    )
     
     args = parser.parse_args()
-    
-    args.eval_dirs = ["models\SetGuideVAE_DictionaryCoder_20260331_090912_aggloss", "models\SetGuideVAE_DictionaryCoder_20260330_230804", "models\SetGuideVAE_DictionaryCoder_20260331_113400_vamp"]
-    args.names = ["Agg. Loss", "New DataLoader", "VAMP Prior"]
+
+    if not args.eval_dirs:
+        args.eval_dirs = list(DEFAULT_EVAL_DIRS)
+    if not args.names:
+        args.names = list(DEFAULT_MODEL_NAMES)
 
     if len(args.eval_dirs) != len(args.names):
         print("Error: The number of evaluation directories must match the number of model names.")
         exit(1)
+
+    eval_dirs_to_compare = list(args.eval_dirs)
+    if args.rerun_shared_eval:
+        eval_dirs_to_compare = rerun_shared_evaluation(
+            eval_dirs=eval_dirs_to_compare,
+            config_path=args.shared_eval_config,
+            device=args.shared_eval_device,
+            max_files=args.shared_eval_max_files,
+            seed=args.shared_eval_seed,
+            output_subdir=args.shared_eval_output_subdir,
+            include_visualizations=args.shared_eval_include_visualizations,
+            continue_on_error=args.continue_on_eval_error,
+        )
+
+        if len(eval_dirs_to_compare) != len(args.names):
+            if args.continue_on_eval_error:
+                successful_dirs = {os.path.normpath(p) for p in eval_dirs_to_compare}
+                successful_pairs = [
+                    (name, os.path.normpath(os.path.join(src_dir, args.shared_eval_output_subdir)))
+                    for name, src_dir in zip(args.names, args.eval_dirs)
+                    if os.path.normpath(os.path.join(src_dir, args.shared_eval_output_subdir)) in successful_dirs
+                ]
+                if not successful_pairs:
+                    print("Error: No shared-data reruns succeeded. Nothing to compare.")
+                    exit(1)
+                args.names = [name for name, _ in successful_pairs]
+                eval_dirs_to_compare = [path for _, path in successful_pairs]
+            else:
+                print("Error: Shared-data rerun failed for at least one model. Use --continue_on_eval_error to continue.")
+                exit(1)
         
     comparator = PhasedModelComparator(args.output_dir)
     
-    for name, path in zip(args.names, args.eval_dirs):
+    for name, path in zip(args.names, eval_dirs_to_compare):
         comparator.add_model(name, path)
         
     comparator.compare()

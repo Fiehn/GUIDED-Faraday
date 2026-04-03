@@ -373,6 +373,8 @@ def train(config):
                 set_num_heads=set_cfg.num_heads,
                 set_num_inds=set_cfg.num_inds,
                 set_num_blocks=set_cfg.num_blocks,
+                is_isab=set_cfg.is_isab,
+                use_abl_pool=bool(getattr(set_cfg, "use_abl_pool", False)),
             )
             print(f"Initialized SetGuideVAE with input_dim={input_dim}, latent_dim={config.model.latent_dim}, encoder_type={config.model.encoder.type}, decoder_type={config.model.decoder.type}, prior_type={config.model.prior.type}, conditioner_tags={config.conditioning.tags}")
     elif model_type == "vae":
@@ -444,8 +446,14 @@ def train(config):
         # Keep eval cache on CPU by default to avoid GPU OOM from preloading full eval tensors.
         eval_cache_on_gpu = bool(getattr(phased_cfg, "eval_cache_on_gpu", False))
         cache_scan_batches = int(getattr(phased_cfg, "cache_scan_batches", 0)) or None
+        skip_corrupt_files = bool(getattr(phased_cfg, "skip_corrupt_files", True))
+        max_skip_warnings = int(getattr(phased_cfg, "max_skip_warnings", 20))
 
         print("Phased mode will allocate train/eval from one shared replay cache each epoch.")
+        if skip_corrupt_files:
+            print("Phased mode will skip unreadable/corrupt parquet files.")
+        else:
+            print("Phased mode will fail fast on unreadable/corrupt parquet files.")
 
         normalizer = None
         norm_method = str(getattr(config.normalizer, "method", "log1p")).lower()
@@ -493,6 +501,8 @@ def train(config):
             eval_cache_batches=eval_batches,
             cache_scan_batches=cache_scan_batches,
             pin_memory=(str(device) != "cpu"),
+            skip_corrupt_files=skip_corrupt_files,
+            max_skip_warnings=max_skip_warnings,
         )
 
         writer = Writer(log_dir=os.path.join(config.logging.log_dir, model_tag))
@@ -512,6 +522,8 @@ def train(config):
             print("Best-model checkpointing is disabled by config.training.checkpointing.save_best_model.")
 
         use_early_stopping = bool(getattr(config.training.early_stopping, "enabled", False))
+        stop_on_all_files_used = bool(getattr(config.training.early_stopping, "stop_on_all_files_used", True))
+        min_epochs_before_full_data_stop = int(getattr(config.training.early_stopping, "min_epochs_before_full_data_stop", 1))
         early_stopper = None
         best_eval_loss = float("inf")
         best_eval_loss_for_saving = float("inf")
@@ -589,7 +601,8 @@ def train(config):
             print(
                 f"Epoch [{epoch+1:4d}/{config.training.num_epochs}] "
                 f"Train Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | KL: {avg_kl:.4f} | "
-                f"Files seen/completed: {file_progress['seen']}/{file_progress['completed']} of {file_progress['total']}"
+                f"Files seen/completed/skipped: {file_progress['seen']}/{file_progress['completed']}/{file_progress.get('skipped', 0)} "
+                f"of {file_progress['total']}"
             )
 
             writer.add_scalar('train_loss_epoch', avg_loss, epoch)
@@ -597,6 +610,7 @@ def train(config):
             writer.add_scalar('train_kl_divergence_epoch', avg_kl, epoch)
             writer.add_scalar('stream_files_seen', file_progress['seen'], epoch)
             writer.add_scalar('stream_files_completed', file_progress['completed'], epoch)
+            writer.add_scalar('stream_files_skipped', file_progress.get('skipped', 0), epoch)
 
             # Optional epoch-level evaluation for phased SetGuideVAE runs.
             if should_eval_epoch and hasattr(model, "validate") and epoch_eval_loader is not None:
@@ -668,6 +682,18 @@ def train(config):
                 f"cache={cache_time_s:.2f} | train={train_time_s:.2f} | eval={eval_time_s:.2f} | "
                 f"save={save_time_s:.2f} | total={total_epoch_time_s:.2f}"
             )
+
+            if (
+                stop_on_all_files_used
+                and file_progress['total'] > 0
+                and file_progress['completed'] >= file_progress['total']
+                and (epoch + 1) >= max(1, min_epochs_before_full_data_stop)
+            ):
+                print(
+                    f"Early stop (all data used): completed {file_progress['completed']} "
+                    f"of {file_progress['total']} files at epoch {epoch+1}."
+                )
+                break
 
         log_path = os.path.join(config.logging.log_dir, model_tag)
         os.makedirs(log_path, exist_ok=True)

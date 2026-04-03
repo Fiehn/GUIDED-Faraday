@@ -425,7 +425,101 @@ class VAE(nn.Module):
             args['hierarchy_config'] = self.hierarchy.config.to_dict()
         else:
             args['hierarchy_config'] = None
+
+        # Persist SetGuideVAE-specific architecture so checkpoints are fully reconstructable.
+        if hasattr(self, 'sequence_length'):
+            args['sequence_length'] = int(getattr(self, 'sequence_length'))
+        if hasattr(self, 'num_features'):
+            args['num_features'] = int(getattr(self, 'num_features'))
+        if hasattr(self, 'set_hidden_dim'):
+            args['set_hidden_dim'] = int(getattr(self, 'set_hidden_dim'))
+
+        set_blocks = getattr(self, 'set_encoder_blocks', None)
+        if set_blocks is not None:
+            args['set_num_blocks'] = int(len(set_blocks))
+            if len(set_blocks) > 0:
+                first_block = set_blocks[0]
+                if hasattr(first_block, 'mab0') and hasattr(first_block, 'mab1'):
+                    args['is_isab'] = True
+                    if hasattr(first_block.mab0, 'num_heads'):
+                        args['set_num_heads'] = int(first_block.mab0.num_heads)
+                    if hasattr(first_block, 'inducing') and torch.is_tensor(first_block.inducing):
+                        args['set_num_inds'] = int(first_block.inducing.shape[1])
+                elif hasattr(first_block, 'mab'):
+                    args['is_isab'] = False
+                    if hasattr(first_block.mab, 'num_heads'):
+                        args['set_num_heads'] = int(first_block.mab.num_heads)
+
+        set_pool = getattr(self, 'set_pool', None)
+        args['use_abl_pool'] = bool(set_pool is not None)
+        if set_pool is not None and hasattr(set_pool, 'mab') and hasattr(set_pool.mab, 'num_heads'):
+            args['set_num_heads'] = int(set_pool.mab.num_heads)
         return args
+
+    @staticmethod
+    def _infer_setguide_constructor_args_from_state_dict(model_state_dict, input_dim=None):
+        """Infer shape-critical SetGuideVAE args from checkpoint weights for backward compatibility."""
+        inferred = {}
+        if not isinstance(model_state_dict, dict) or len(model_state_dict) == 0:
+            return inferred
+
+        def _try_infer_num_features_from_input():
+            input_dim_int = int(input_dim) if input_dim is not None else None
+            seq_len = inferred.get('sequence_length', None)
+            if input_dim_int is not None and seq_len is not None and seq_len > 0 and input_dim_int % seq_len == 0:
+                inferred['num_features'] = int(input_dim_int // seq_len)
+
+        # set_input_proj: [set_hidden_dim, sequence_length]
+        set_input_proj_w = model_state_dict.get('set_input_proj.weight', None)
+        if torch.is_tensor(set_input_proj_w) and set_input_proj_w.dim() == 2:
+            inferred['set_hidden_dim'] = int(set_input_proj_w.shape[0])
+            inferred['sequence_length'] = int(set_input_proj_w.shape[1])
+
+        # New SetGuideVAE projection head: set_element_proj [set_hidden_dim, 32 * sequence_length]
+        set_element_proj_w = model_state_dict.get('set_element_proj.weight', None)
+        if torch.is_tensor(set_element_proj_w) and set_element_proj_w.dim() == 2:
+            inferred['set_hidden_dim'] = int(set_element_proj_w.shape[0])
+            in_dim = int(set_element_proj_w.shape[1])
+            if in_dim % 32 == 0:
+                inferred['sequence_length'] = int(in_dim // 32)
+
+        try:
+            _try_infer_num_features_from_input()
+        except (TypeError, ValueError):
+            pass
+
+        # Number of set encoder blocks from key prefixes.
+        block_ids = set()
+        for key in model_state_dict.keys():
+            if not key.startswith('set_encoder_blocks.'):
+                continue
+            parts = key.split('.')
+            if len(parts) < 3:
+                continue
+            if parts[1].isdigit():
+                block_ids.add(int(parts[1]))
+        if block_ids:
+            inferred['set_num_blocks'] = max(block_ids) + 1
+
+        # Infer set block type from key patterns.
+        has_isab_keys = any('.mab0.' in k or '.mab1.' in k or '.inducing' in k for k in model_state_dict.keys())
+        has_sab_keys = any('.mab.' in k for k in model_state_dict.keys())
+        if has_isab_keys and not has_sab_keys:
+            inferred['is_isab'] = True
+        elif has_sab_keys and not has_isab_keys:
+            inferred['is_isab'] = False
+        elif has_isab_keys:
+            inferred['is_isab'] = True
+
+        if inferred.get('is_isab', False):
+            inducing = model_state_dict.get('set_encoder_blocks.0.inducing', None)
+            if torch.is_tensor(inducing) and inducing.dim() >= 2:
+                inferred['set_num_inds'] = int(inducing.shape[1])
+
+        # Infer pooling mode: ABL checkpoints contain set_pool.* keys.
+        inferred['use_abl_pool'] = any(k.startswith('set_pool.') for k in model_state_dict.keys())
+
+        return inferred
         
 
     def _infer_prior_type(self):
@@ -706,7 +800,7 @@ class VAE(nn.Module):
             raise ValueError("Checkpoint was saved with legacy format. Use load_model() on an existing instance instead.")
         
         model_info = checkpoint['model_info']
-        constructor_args = checkpoint['constructor_args']
+        constructor_args = dict(checkpoint.get('constructor_args', {}))
         model_class_name = model_info['model_class']
 
         if 'model_kwargs' in checkpoint:
@@ -717,6 +811,21 @@ class VAE(nn.Module):
         for k, v in kwargs.items():
             if k not in ('device', 'conditioner') and k not in constructor_args:
                 constructor_args[k] = v
+
+        # Backward compatibility for older SetGuideVAE checkpoints that did not
+        # persist set-encoder constructor arguments.
+        if model_class_name == 'SetGuideVAE':
+            inferred_set_args = cls._infer_setguide_constructor_args_from_state_dict(
+                model_state_dict=checkpoint.get('model_state_dict', {}),
+                input_dim=constructor_args.get('input_dim', None),
+            )
+            applied = {}
+            for k, v in inferred_set_args.items():
+                if k not in constructor_args or constructor_args[k] is None:
+                    constructor_args[k] = v
+                    applied[k] = v
+            if applied:
+                print(f"Inferred SetGuideVAE constructor args from checkpoint weights: {applied}")
 
         hier_raw = constructor_args.get('hierarchy_config', None)
         if hier_raw is not None and isinstance(hier_raw, dict):

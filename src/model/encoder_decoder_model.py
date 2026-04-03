@@ -146,7 +146,8 @@ class DictionaryCoder(torch.nn.Module):
                  dropout=True,
                  dropout_rate=0.2,
                  batch_norm=False,
-                 **_):
+                 layer_type='MLP',
+                 **kwargs):
         super(DictionaryCoder, self).__init__()
         if dictionary_size <= output_dim:
             raise ValueError("Dictionary size must be greater than output dimension")
@@ -160,15 +161,30 @@ class DictionaryCoder(torch.nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
 
-        self.parameterizer = Parameterizer(
-            input_dim=input_dim,
-            output_dim={"sigma": dictionary_size, "mu": output_dim},
-            dist_parameters=["mu", "sigma"],
-            num_hidden_layers=num_hidden_layers,
-            num_neurons=num_neurons,
-            dropout=dropout,
-            dropout_rate=dropout_rate,
-            batch_norm=batch_norm)
+        if layer_type == 'Conv1D' or layer_type == 'cnn':
+            self.parameterizer = HybridCNNParameterizer(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                dictionary_size=dictionary_size,
+                seq_len=24,
+                num_features=3
+            )
+        elif layer_type == 'Conv1D_Encoder':
+            self.parameterizer = TemporalCNNEncoder(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                seq_len=24,
+                num_features=3,
+                dist_parameters=["mu", "sigma"] if learn_sigma else ["mu"]
+            )
+        else:
+            self.parameterizer = Parameterizer(
+                input_dim=input_dim,
+                output_dim={"sigma": dictionary_size, "mu": output_dim},
+                dist_parameters=["mu", "sigma"],
+                block_type=layer_type,
+                **kwargs
+            )
         
         # The dictionary SigmaMapper is a learnable parameter
         # It maps the dictionary codes to the output space
@@ -412,6 +428,126 @@ class Parameterizer(nn.Module):
     def _num_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+class HybridCNNParameterizer(nn.Module):
+    """
+    Fuses a Temporal CNN (for the mean) with a flat Dictionary MLP (for the covariance).
+    This allows temporal precision for spike timing while keeping GUIDE-VAE's PDCC matrix.
+    """
+    def __init__(self, input_dim, output_dim, dictionary_size, seq_len=24, num_features=3, **_):
+        super().__init__()
+        self.seq_len = seq_len
+        self.num_features = num_features
+        self.output_dim = output_dim # 72 (24 * 3)
+        self.dictionary_size = dictionary_size
+        
+        # ==========================================
+        # BRANCH 1: CNN for the Mean (mu)
+        # ==========================================
+        self.seed_length = seq_len // 4  # 6 hours
+        self.seed_channels = 128
+        self.project_seed = nn.Linear(input_dim, self.seed_channels * self.seed_length)
+        
+        self.mu_upsample = nn.Sequential(
+            nn.ConvTranspose1d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm1d(64),
+            nn.GELU(),
+            
+            nn.ConvTranspose1d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm1d(32),
+            nn.GELU(),
+            
+            nn.Conv1d(32, 16, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(16, self.num_features, kernel_size=3, padding=1)
+        )
+
+        # ==========================================
+        # BRANCH 2: MLP for the Dictionary Variance (sigma)
+        # ==========================================
+        # Sigma expects a flat vector of size `dictionary_size`
+        self.sigma_mlp = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, self.dictionary_size)
+        )
+
+    def forward(self, x):
+        B = x.shape[0]
+        param_dict = {}
+
+        # --- 1. Generate mu using CNN ---
+        h_cnn = self.project_seed(x)
+        h_cnn = h_cnn.view(B, self.seed_channels, self.seed_length) 
+        out_mu = self.mu_upsample(h_cnn) # [B, 3, 24]
+        param_dict["mu"] = out_mu.reshape(B, -1) # Flatten to [B, 72] for loss function compatibility
+        
+        # --- 2. Generate sigma dictionary weights using MLP ---
+        param_dict["sigma"] = self.sigma_mlp(x) # [B, dictionary_size]
+
+        return param_dict
+
+    def _num_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+class TemporalCNNEncoder(nn.Module):
+    """
+    A CNN-1D Encoder. 
+    Reads a 24-hour time series, detects temporal patterns (spikes), 
+    and compresses it down to a flat vector for the latent space bottleneck.
+    """
+    def __init__(self, input_dim, output_dim, seq_len=24, num_features=3, dist_parameters=["mu", "sigma"], **_):
+        super().__init__()
+        self.dist_parameters = dist_parameters
+        
+        # Downsampling: [B, 3, 24] -> [B, 128, 6]
+        self.downsample_blocks = nn.Sequential(
+            nn.Conv1d(in_channels=num_features, out_channels=32, kernel_size=5, stride=1, padding=2),
+            nn.BatchNorm1d(32),
+            nn.GELU(),
+            
+            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm1d(64),
+            nn.GELU(),
+            
+            nn.Conv1d(in_channels=64, out_channels=128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+        )
+        
+        # The downsampled sequence is 6 time steps long with 128 channels
+        flattened_size = 128 * (seq_len // 4) 
+        
+        # Parameter-specific heads (Outputting the latent z params)
+        self.param_heads = nn.ModuleDict()
+        for param in dist_parameters:
+            self.param_heads[param] = nn.Sequential(
+                nn.Linear(flattened_size, 256),
+                nn.GELU(),
+                nn.Linear(256, output_dim)
+            )
+
+    def forward(self, x):
+        B = x.shape[0]
+        
+        # If input is flat [B, 72], reshape to [B, Channels, Time]
+        if x.dim() == 2:
+            x = x.view(B, 3, -1)
+            
+        h = self.downsample_blocks(x)
+        h = h.view(B, -1) # Flatten to [B, 768]
+        
+        param_dict = {}
+        for param in self.dist_parameters:
+            param_dict[param] = self.param_heads[param](h)
+            
+        return param_dict
+
+    def _num_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
 class NNBlock(nn.Module):
     def __init__(self, input_dim, output_dim, num_neurons=128, dropout=False, 
                  dropout_rate=0.2, batch_norm=False,num_hidden_layers=2, 
@@ -512,13 +648,21 @@ class NNBlock(nn.Module):
         else:
             layers = [nn.Linear(self.num_neurons, self.output_dim)] 
         return nn.Sequential(*layers)
-    
+
     
 def get_encoder_model(input_dim, latent_dim, type, **kwargs):
     if type == "dictionary":
         return DictionaryCoder(
             input_dim=input_dim,
             output_dim=latent_dim,
+            **kwargs
+        )
+    elif type == "dictionary_cnn":
+        return DictionaryCoder(
+            input_dim=input_dim,
+            output_dim=latent_dim,
+            layer_type='Conv1D_encoder',
+            learn_sigma=True,
             **kwargs
         )
     else:
@@ -533,6 +677,13 @@ def get_decoder_model(latent_dim, output_dim, type, **kwargs):
         return DictionaryCoder(
             input_dim=latent_dim,
             output_dim=output_dim,
+            **kwargs
+        )
+    elif type == "dictionary_cnn":
+        return DictionaryCoder(
+            input_dim=latent_dim,
+            output_dim=output_dim,
+            layer_type='Conv1D',
             **kwargs
         )
     else:

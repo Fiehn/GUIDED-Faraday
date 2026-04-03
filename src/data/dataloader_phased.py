@@ -1,6 +1,7 @@
 import math
 import torch
 import random
+import pyarrow as pa
 import pyarrow.parquet as pq
 import multiprocessing as mp
 from torch.utils.data import IterableDataset, DataLoader, get_worker_info, TensorDataset
@@ -36,6 +37,10 @@ class StreamingParquetBuffer(IterableDataset):
                  aggregation_divisor: float = 1.0,
                  file_seen_map=None,
                  file_completed_map=None,
+                 file_skipped_map=None,
+                 skip_corrupt_files: bool = True,
+                 max_skip_warnings: int = 20,
+                 sample_random: bool = True,
                  ):
         self.sm_files = sm_files
         self.replay_buffer_capacity = replay_buffer_capacity
@@ -62,6 +67,11 @@ class StreamingParquetBuffer(IterableDataset):
         # Shared (manager-backed) maps to track file coverage across worker processes.
         self.file_seen_map = file_seen_map
         self.file_completed_map = file_completed_map
+        self.file_skipped_map = file_skipped_map
+        self.skip_corrupt_files = bool(skip_corrupt_files)
+        self.max_skip_warnings = max(0, int(max_skip_warnings))
+        self._skip_warning_count = 0
+        self.sample_random = bool(sample_random)
 
     def _mark_file_seen(self, file_path: str):
         if self.file_seen_map is not None:
@@ -76,6 +86,47 @@ class StreamingParquetBuffer(IterableDataset):
                 self.file_completed_map[file_path] = 1
             except Exception:
                 pass
+
+    def _mark_file_skipped(self, file_path: str, reason: str):
+        if self.file_skipped_map is not None:
+            try:
+                self.file_skipped_map[file_path] = reason[:300]
+            except Exception:
+                pass
+
+    def _is_recoverable_file_error(self, error: Exception) -> bool:
+        if isinstance(error, OSError):
+            return True
+
+        arrow_exception = getattr(pa, "ArrowException", None)
+        if arrow_exception is not None and isinstance(error, arrow_exception):
+            return True
+
+        msg = str(error).lower()
+        tokens = (
+            "corrupt",
+            "snappy",
+            "parquet",
+            "decompression",
+            "invalid",
+        )
+        return any(token in msg for token in tokens)
+
+    def _warn_skipped_file(self, file_path: str, error: Exception):
+        if self.max_skip_warnings == 0:
+            return
+
+        if self._skip_warning_count < self.max_skip_warnings:
+            print(
+                "Warning: skipping unreadable parquet file "
+                f"{file_path} ({type(error).__name__}: {error})"
+            )
+            self._skip_warning_count += 1
+            if self._skip_warning_count == self.max_skip_warnings:
+                print(
+                    f"Warning: reached skip warning limit ({self.max_skip_warnings}) "
+                    "for this worker. Suppressing further skip logs."
+                )
     
     def _push_to_buffer(self, item):
         self.buffer[self.ptr] = item
@@ -85,7 +136,12 @@ class StreamingParquetBuffer(IterableDataset):
     def _sample_from_buffer(self):
         if self.current_size < self.min_buffer_size:
             raise ValueError(f"Buffer size {self.current_size} is less than the minimum required {self.min_buffer_size} for sampling.")
-        idx = random.randrange(self.current_size)
+        if self.sample_random:
+            idx = random.randrange(self.current_size)
+            return self.buffer[idx]
+
+        # Deterministic mode: always emit the newest inserted sample.
+        idx = (self.ptr - 1) % self.replay_buffer_capacity
         return self.buffer[idx]
 
     def _extract_meter_id(self, file_path: str) -> int:
@@ -196,6 +252,13 @@ class StreamingParquetBuffer(IterableDataset):
                     if self.current_size >= self.min_buffer_size:
                         # The yield pauses the loop right here until PyTorch needs more data
                         yield self._sample_from_buffer()
+            except Exception as e:
+                if self.skip_corrupt_files and self._is_recoverable_file_error(e):
+                    reason = f"{type(e).__name__}: {e}"
+                    self._mark_file_skipped(file, reason)
+                    self._warn_skipped_file(file, e)
+                    continue
+                raise
             finally:
                 self._mark_file_completed(file)
     
@@ -252,6 +315,9 @@ class PhasedReplayDataloaders:
             eval_cache_batches: Optional[int] = None,
             cache_scan_batches: Optional[int] = None,
             pin_memory: bool = False,
+            skip_corrupt_files: bool = True,
+            max_skip_warnings: int = 20,
+            sample_random: bool = True,
     ):
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
@@ -259,12 +325,14 @@ class PhasedReplayDataloaders:
         self.eval_cache_batches = eval_cache_batches
         self.cache_scan_batches = cache_scan_batches
         self.pin_memory = bool(pin_memory)
+        self.sample_random = bool(sample_random)
         self.total_files = len(set(sm_files))
 
         # Manager-backed maps are shared across DataLoader workers.
         self._stats_manager = mp.Manager()
         self._file_seen_map = self._stats_manager.dict()
         self._file_completed_map = self._stats_manager.dict()
+        self._file_skipped_map = self._stats_manager.dict()
 
         self.files_seen = 0
         self.files_completed = 0
@@ -280,6 +348,10 @@ class PhasedReplayDataloaders:
             aggregation_divisor=aggregation_divisor,
             file_seen_map=self._file_seen_map,
             file_completed_map=self._file_completed_map,
+            file_skipped_map=self._file_skipped_map,
+            skip_corrupt_files=skip_corrupt_files,
+            max_skip_warnings=max_skip_warnings,
+            sample_random=self.sample_random,
         )
 
         self.eval_loader = None
@@ -292,6 +364,7 @@ class PhasedReplayDataloaders:
         return {
             "seen": int(self.files_seen),
             "completed": int(self.files_completed),
+            "skipped": int(len(self._file_skipped_map)),
             "total": int(self.total_files),
         }
 

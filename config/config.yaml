@@ -53,20 +53,22 @@ data:
   
   # DataLoader settings
   dataloader:
-    batch_size:  2048
+    batch_size:  256
     num_workers: 6
     shuffle: false
 
   # Phased parquet streaming settings (used by SetGuideVAE phased training)
   phased:
-    replay_buffer_capacity: 8192
-    min_buffer_size:  2048
+    replay_buffer_capacity: 90000
+    min_buffer_size:  16000
     num_workers: 6
-    steps_per_epoch: 100
+    steps_per_epoch: 500
     eval_batches: 5
     eval_cache_on_gpu: true
     eval_cache_refresh: false
     cache_scan_batches: 0
+    skip_corrupt_files: true
+    max_skip_warnings: 20
     aggregation_energy_unit: "kwh" # "wh" keeps raw hourly sum scale, "kwh" divides hourly sums by 1000
 
 # ============================================================================
@@ -91,19 +93,19 @@ model:
   device: "cuda"
   
   # Latent dimension (size of latent vector z)
-  latent_dim: 64
+  latent_dim: 128
 
   # Encoder configuration
   encoder:
-    type: "dictionary"  # Options: "dictionary", "mlp", etc.
-    hidden_dims: [256, 256, 128]
+    type: "dictionary_cnn"  # Options: "dictionary", "mlp", "dictionary_cnn"
+    hidden_dims: [512, 512, 256]
     dropout: 0.2
     activation: "relu"
   
   # Decoder configuration
   decoder:
-    type: "dictionary"  # Options: "dictionary", "mlp", "gaussian_mlp"
-    hidden_dims: [128, 256, 256]
+    type: "dictionary_cnn"  # Options: "dictionary", "mlp", "gaussian_mlp"
+    hidden_dims: [256, 512, 512]
     dropout: 0.2
     activation: "relu"
     likelihood: "gaussian"  # Options: "gaussian", "student_t"
@@ -119,11 +121,13 @@ model:
 
   # SetGuideVAE set-encoder architecture configuration
   set:
-    hidden_dim: 128
+    hidden_dim: 256
     num_heads: 4
     num_inds: 16
     num_blocks: 2
     num_features: 3
+    is_isab: true
+    use_abl_pool: false
 
 # ============================================================================
 # CONDITIONING CONFIGURATION (for CVAE)
@@ -180,22 +184,22 @@ training:
   
   # Learning rate scheduler
   lr_scheduler:
-    enabled: false
-    scheduler_type: "step"  # Options: "step", "exponential", "cosine"
+    enabled: true
+    scheduler_type: "cosine"  # Options: "step", "exponential", "cosine"
     step_size: 10
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 100
+  num_epochs: 20
   
   # Beta (KL weight) settings
-  beta: 1.0
+  beta: 0.0 # 1.0
   
   # Cyclical beta annealing (prevents KL collapse)
   beta_annealing:
-    enabled: true
-    n_cycles: 4   
-    ratio: 0.5 # fraction of each cycle for warmup (0-1)
+    enabled: false # true
+    n_cycles: 2   
+    ratio: 0.25 # fraction of each cycle for warmup (0-1)
   
   # Weighted loss 
   weighted_loss: 0.0  # Set > 0 to enable (e.g., 0.1)
@@ -203,6 +207,8 @@ training:
   # Early stopping
   early_stopping:
     enabled: false
+    stop_on_all_files_used: true # for phased training: stop once replay stream has completed all files at least once
+    min_epochs_before_full_data_stop: 1
     patience: 7 # stop if no improvement for N validations
     min_delta: 0.001 # minimum improvement threshold
   

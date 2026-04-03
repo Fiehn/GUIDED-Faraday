@@ -146,6 +146,29 @@ def _resolve_parquet_paths(config: SimpleNamespace, project_root: Path, max_file
     return parquet_paths
 
 
+def resolve_shared_eval_plan(config_path: str, max_files: int | None = None, seed: int = 42) -> dict:
+    """Build a strict shared-data evaluation plan from one reference config."""
+    config = _load_config(config_path)
+    data_mode = str(getattr(config.data, "mode", "")).lower()
+    phased_mode = data_mode in {"phased", "phase", "parquet", "phased_parquet"}
+    if not phased_mode:
+        raise ValueError(
+            f"Shared eval plan requires phased parquet mode. Found mode='{data_mode}'."
+        )
+
+    phased_cfg = config.data.phased
+    parquet_paths = _resolve_parquet_paths(config, ROOT_DIR, max_files=max_files, seed=seed)
+
+    return {
+        "config_path": config._config_path,
+        "parquet_paths": parquet_paths,
+        "batch_size": int(config.dataloader.batch_size),
+        "eval_batches": int(getattr(phased_cfg, "eval_batches", 5)),
+        "min_buffer_size": int(getattr(phased_cfg, "min_buffer_size", 2000)),
+        "replay_buffer_capacity": int(getattr(phased_cfg, "replay_buffer_capacity", 10000)),
+    }
+
+
 def _prepare_phased_window(config: SimpleNamespace, model: SetGuideVAE, phased_cfg) -> tuple[WindowSpec, bool, float]:
     seq_len = int(getattr(model, "sequence_length", config.window.input_len))
     hourly_aggregation = bool(getattr(config.window, "aggregated", False))
@@ -180,26 +203,46 @@ def _build_eval_loader(
     max_files: int | None,
     seed: int,
     eval_device: torch.device,
+    shared_parquet_paths: list[str] | None = None,
+    strict_shared_eval: bool = False,
+    override_batch_size: int | None = None,
+    override_eval_batches: int | None = None,
+    override_min_buffer_size: int | None = None,
+    override_replay_buffer_capacity: int | None = None,
 ):
     phased_cfg = config.data.phased
-    parquet_paths = _resolve_parquet_paths(config, project_root, max_files, seed)
+    if shared_parquet_paths is not None:
+        parquet_paths = [str(Path(p).expanduser().resolve()) for p in shared_parquet_paths]
+        missing = [p for p in parquet_paths if not Path(p).exists()]
+        if missing:
+            raise FileNotFoundError(f"Shared parquet path(s) do not exist: {missing[:3]}")
+        print(f"Using strict shared parquet files: {len(parquet_paths)}")
+    else:
+        parquet_paths = _resolve_parquet_paths(config, project_root, max_files, seed)
+
     window, hourly_aggregation, aggregation_divisor = _prepare_phased_window(config, model, phased_cfg)
 
-    batch_size = int(config.dataloader.batch_size)
-    phased_workers = int(getattr(phased_cfg, "num_workers", config.dataloader.num_workers))
-    eval_batches = int(getattr(phased_cfg, "eval_batches", 5))
-    eval_cache_on_gpu = bool(
+    batch_size = int(override_batch_size) if override_batch_size is not None else int(config.dataloader.batch_size)
+    phased_workers = 0 if strict_shared_eval else int(getattr(phased_cfg, "num_workers", config.dataloader.num_workers))
+    eval_batches = int(override_eval_batches) if override_eval_batches is not None else int(getattr(phased_cfg, "eval_batches", 5))
+    eval_cache_on_gpu = False if strict_shared_eval else bool(
         getattr(phased_cfg, "eval_cache_on_gpu", str(eval_device) != "cpu")
     )
     eval_cache_device = eval_device if eval_cache_on_gpu and str(eval_device) != "cpu" else None
     cache_scan_batches = int(getattr(phased_cfg, "cache_scan_batches", 0)) or None
+    min_buffer_size = int(override_min_buffer_size) if override_min_buffer_size is not None else int(getattr(phased_cfg, "min_buffer_size", 2000))
+    replay_buffer_capacity = (
+        int(override_replay_buffer_capacity)
+        if override_replay_buffer_capacity is not None
+        else int(getattr(phased_cfg, "replay_buffer_capacity", 10000))
+    )
 
     replay = PhasedReplayDataloaders(
         sm_files=parquet_paths,
         window_spec=window,
         batch_size=batch_size,
-        replay_buffer_capacity=int(phased_cfg.replay_buffer_capacity),
-        min_buffer_size=int(phased_cfg.min_buffer_size),
+        replay_buffer_capacity=replay_buffer_capacity,
+        min_buffer_size=min_buffer_size,
         normalizer=normalizer,
         num_workers=phased_workers,
         hourly_aggregation=hourly_aggregation,
@@ -207,12 +250,47 @@ def _build_eval_loader(
         eval_cache_device=eval_cache_device,
         eval_cache_batches=eval_batches,
         cache_scan_batches=cache_scan_batches,
+        sample_random=not strict_shared_eval,
     )
 
     replay.refresh_eval_cache(eval_batches)
     test_loader = replay.get_eval_loader()
+
+    # Fallback for eval-only runs: training replay settings can be too strict
+    # and yield no batches, especially when files are split across workers.
     if test_loader is None:
-        raise RuntimeError("Could not build a cached evaluation loader.")
+        if strict_shared_eval:
+            fallback_min_buffer = max(1, min(min_buffer_size, batch_size))
+        else:
+            fallback_min_buffer = max(batch_size, min(min_buffer_size, batch_size * 2))
+
+        print(
+            "Eval cache was empty; retrying with "
+            f"num_workers=0 and min_buffer_size={fallback_min_buffer}."
+        )
+        replay = PhasedReplayDataloaders(
+            sm_files=parquet_paths,
+            window_spec=window,
+            batch_size=batch_size,
+            replay_buffer_capacity=replay_buffer_capacity,
+            min_buffer_size=fallback_min_buffer,
+            normalizer=normalizer,
+            num_workers=0,
+            hourly_aggregation=hourly_aggregation,
+            aggregation_divisor=aggregation_divisor,
+            eval_cache_device=eval_cache_device,
+            eval_cache_batches=eval_batches,
+            cache_scan_batches=cache_scan_batches,
+            sample_random=not strict_shared_eval,
+        )
+        replay.refresh_eval_cache(eval_batches)
+        test_loader = replay.get_eval_loader()
+
+    if test_loader is None:
+        raise RuntimeError(
+            "Could not build a cached evaluation loader. "
+            "Try increasing max-files or lowering data.phased.min_buffer_size."
+        )
     return test_loader
 
 
@@ -236,6 +314,7 @@ def _run_evaluation_and_visualization(
     device: torch.device,
     log_path: Path,
     config: SimpleNamespace,
+    include_visualization: bool = True,
 ):
     log_path.mkdir(parents=True, exist_ok=True)
     model.eval()
@@ -250,6 +329,9 @@ def _run_evaluation_and_visualization(
         output_path=str(log_path),
     )
     evaluator.evaluate()
+
+    if not include_visualization:
+        return
 
     writer = Writer(log_dir=str(log_path))
     vis_cfg = _get_visualize_config(config)
@@ -277,6 +359,15 @@ def run_checkpoint_evaluation(
     config_path: str,
     device: str = "auto",
     max_files: int | None = None,
+    include_visualization: bool = True,
+    output_dir: str | None = None,
+    shared_parquet_paths: list[str] | None = None,
+    strict_shared_eval: bool = False,
+    eval_seed: int = 42,
+    override_batch_size: int | None = None,
+    override_eval_batches: int | None = None,
+    override_min_buffer_size: int | None = None,
+    override_replay_buffer_capacity: int | None = None,
 ):
     config = _load_config(config_path)
     data_mode = str(getattr(config.data, "mode", "")).lower()
@@ -288,6 +379,14 @@ def run_checkpoint_evaluation(
 
     ckpt_file = _resolve_checkpoint_file(checkpoint_path)
     model_dir = ckpt_file.parent
+    if output_dir is None:
+        run_output_dir = model_dir
+    else:
+        run_output_dir = Path(output_dir).expanduser()
+        if not run_output_dir.is_absolute():
+            run_output_dir = ROOT_DIR / run_output_dir
+        run_output_dir = run_output_dir.resolve()
+
     selected_device = _select_device(device)
 
     print(f"Config: {config._config_path}")
@@ -315,8 +414,14 @@ def run_checkpoint_evaluation(
         normalizer=normalizer,
         project_root=ROOT_DIR,
         max_files=max_files,
-        seed=42,
+        seed=eval_seed,
         eval_device=selected_device,
+        shared_parquet_paths=shared_parquet_paths,
+        strict_shared_eval=strict_shared_eval,
+        override_batch_size=override_batch_size,
+        override_eval_batches=override_eval_batches,
+        override_min_buffer_size=override_min_buffer_size,
+        override_replay_buffer_capacity=override_replay_buffer_capacity,
     )
 
     _run_evaluation_and_visualization(
@@ -325,12 +430,14 @@ def run_checkpoint_evaluation(
         normalizer=normalizer,
         conditioner=conditioner,
         device=selected_device,
-        log_path=model_dir,
+        log_path=run_output_dir,
         config=config,
+        include_visualization=include_visualization,
     )
 
-    print("Done. Metrics + visualizations saved under:")
-    print(model_dir)
+    artifact_label = "Metrics + visualizations" if include_visualization else "Metrics"
+    print(f"Done. {artifact_label} saved under:")
+    print(run_output_dir)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -362,6 +469,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional cap on number of parquet files used for eval (random sample).",
     )
+    parser.add_argument(
+        "--no-visualize",
+        action="store_true",
+        help="Run evaluation only (skip visualization generation).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Optional output directory for eval artifacts. Defaults to the checkpoint directory.",
+    )
     return parser
 
 
@@ -372,4 +490,6 @@ if __name__ == "__main__":
         config_path=args.config,
         device=args.device,
         max_files=args.max_files,
+        include_visualization=not args.no_visualize,
+        output_dir=args.output_dir,
     )

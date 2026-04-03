@@ -42,6 +42,8 @@ class SetGuideVAE(CVAE):
         set_num_heads: int = 4,
         set_num_inds: int = 16,
         set_num_blocks: int = 2,
+        is_isab: bool = True,
+        use_abl_pool: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -62,21 +64,49 @@ class SetGuideVAE(CVAE):
 
         # Encoder architecture
         self.set_hidden_dim = int(set_hidden_dim)
-        self.set_input_proj = nn.Linear(self.element_dim, self.set_hidden_dim) # projecting from 24 -> 128 dim for each set element
-        self.set_encoder_blocks = nn.ModuleList([
-            ISAB(
+        # self.set_input_proj = nn.Linear(self.element_dim, self.set_hidden_dim) # projecting from 24 -> 128 dim for each set element
+        
+        # Using a small CNN to project each phase's 24-hour sequence into a higher-dimensional feature space before attention blocks. 
+        # This allows the model to learn temporal patterns within each phase before attending across phases. The kernel size and number of layers can be tuned.
+        self.set_input_proj = nn.Sequential(
+            nn.Conv1d(in_channels=1, out_channels=16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Flatten() # Now we flatten a temporally-aware feature map
+        )
+        self.set_element_proj = nn.Linear(32 * self.sequence_length, self.set_hidden_dim)
+        self.use_abl_pool = bool(use_abl_pool)
+
+        if is_isab:
+            self.set_encoder_blocks = nn.ModuleList([
+                ISAB(
+                    dim_in=self.set_hidden_dim,
+                    dim_out=self.set_hidden_dim,
+                    num_heads=set_num_heads,
+                    num_inds=set_num_inds,
+                )
+                for _ in range(max(1, int(set_num_blocks)))
+            ])
+        else:
+            self.set_encoder_blocks = nn.ModuleList([
+            SAB(
                 dim_in=self.set_hidden_dim,
                 dim_out=self.set_hidden_dim,
-                num_heads=set_num_heads,
-                num_inds=set_num_inds,
+                num_heads=set_num_heads
             )
             for _ in range(max(1, int(set_num_blocks)))
         ])
-        self.set_pool = ABL(dim=self.set_hidden_dim, num_heads=set_num_heads, num_seed_vectors=1) # pools 3 phases into 1 vector
+        if self.use_abl_pool:
+            self.set_pool = ABL(dim=self.set_hidden_dim, num_heads=set_num_heads, num_seed_vectors=1)
+            self.set_repr_dim = self.set_hidden_dim
+        else:
+            self.set_pool = None
+            self.set_repr_dim = self.set_hidden_dim * self.num_set_elements
 
         # Replace posterior encoder: it now consumes pooled set representation + conditions.
         self.encoder = get_encoder_model(
-            input_dim=self.set_hidden_dim + self.condition_dim,
+            input_dim=self.set_repr_dim + self.condition_dim,
             latent_dim=latent_dim,
             type=kwargs.get("encoder_type", "dictionary"),
             **kwargs,
@@ -84,13 +114,14 @@ class SetGuideVAE(CVAE):
 
         # Keep decoder/prior from CVAE 
         if isinstance(self.prior, VampPrior):
-            self.prior.set_encoder(self.encoder, input_shape=self.set_hidden_dim + self.condition_dim)
+            self.prior.set_encoder(self.encoder, input_shape=self.set_repr_dim + self.condition_dim)
 
         # Count trainable parameters for reporting
         self.num_parameters = (
             sum(p.numel() for p in self.set_input_proj.parameters() if p.requires_grad)
+            + sum(p.numel() for p in self.set_element_proj.parameters() if p.requires_grad)
             + sum(p.numel() for blk in self.set_encoder_blocks for p in blk.parameters() if p.requires_grad)
-            + sum(p.numel() for p in self.set_pool.parameters() if p.requires_grad)
+            + (sum(p.numel() for p in self.set_pool.parameters() if p.requires_grad) if self.set_pool is not None else 0)
             + self.encoder._num_parameters()
             + self.decoder._num_parameters()
         )
@@ -129,10 +160,27 @@ class SetGuideVAE(CVAE):
     # permuation-invariatn encoder 
     def _set_encode(self, x_phase_first: torch.Tensor) -> torch.Tensor:
         """Encode set elements to a pooled representation [B, H]."""
-        h = self.set_input_proj(x_phase_first)  # [B, F, H] # projecting from 24 -> 128 dim for each phase
+        B, F, L = x_phase_first.shape
+        if F != self.num_set_elements or L != self.sequence_length:
+            raise ValueError(
+                f"Expected set input [B, {self.num_set_elements}, {self.sequence_length}], got {tuple(x_phase_first.shape)}"
+            )
+
+        # Project each phase independently with the temporal CNN.
+        x_elements = x_phase_first.reshape(B * F, 1, L)
+        h = self.set_input_proj(x_elements)
+        if h.dim() > 2:
+            h = h.flatten(start_dim=1)
+        h = self.set_element_proj(h)
+        h = h.reshape(B, F, self.set_hidden_dim)
+
         for blk in self.set_encoder_blocks:
             h = blk(h) # passing through 2 ISAB blocks with attention between phases
-        pooled = self.set_pool(h).squeeze(1)  # [B, H] # pooling 3 phases into 1 vector using attentive pooling
+
+        if self.set_pool is not None:
+            pooled = self.set_pool(h).squeeze(1)  # [B, H]
+        else:
+            pooled = h.flatten(start_dim=1)  # [B, F*H] when ABL pooling is disabled
         return pooled
 
     def _unpack_batch(self, batch):
@@ -190,7 +238,7 @@ class SetGuideVAE(CVAE):
             recon_params[k] = recon_params[k].reshape(S, B, -1)
         return recon_params, q_params
 
-    def train_core(self, batch, optim, beta=1.0, weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
+    def train_core(self, batch, optim, beta=1.0, weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, condition_dropout=False, **_): # TODO: add condition_dropout argument
         self.train()
 
         x, meter_id, timestamps = self._unpack_batch(batch)
@@ -203,6 +251,14 @@ class SetGuideVAE(CVAE):
         # get conditions
         c = self.conditioner.get_conditions(x_for_conditions, meter_id=meter_id, timestamps=timestamps)
         c = self.move_to_device(c, device=x.device)
+
+        if condition_dropout:
+            # ==========================================
+            # CONDITION DROPOUT (The Fix for Posterior Collapse)
+            # Randomly zero out conditions 30% of the time during training.
+            # ==========================================
+            if self.training and torch.rand(1).item() < 0.3:
+                c = torch.zeros_like(c)
 
         # forward pass
         recon_params, q_params = self.forward(x_phase_first, c, num_samples=1)
@@ -281,6 +337,7 @@ class SetGuideVAE(CVAE):
             for perm in permutations:
                 x_permuted = x_phases[:, perm, :]
                 x_perm_flat = x_permuted.reshape(B, -1)
+                
                 ll = self.decoder.loglikelihood(x_perm_flat, recon_params_squeezed) 
                 ll_scores.append(ll.unsqueeze(1))
                 
@@ -296,7 +353,7 @@ class SetGuideVAE(CVAE):
         # --- STEP 3: Do the heavy math exactly ONCE with gradients ON ---
         best_ll = self.decoder.loglikelihood(x_optimal, recon_params_squeezed)
 
-        if False:
+        if True: # TODO
             # --- STEP 4: Aggregate Total Phases --- (THIS IS A TEST, WILL MAYBE BE USED IN FUTURE)
             # Get the predicted means and reshape to [B, F, L]
             mu_predicted = recon_params_squeezed["mu"].reshape(B, F, L)
@@ -323,7 +380,88 @@ class SetGuideVAE(CVAE):
             "recon_loglikelihood": best_ll.mean(),
             "kl_divergence": kl_divergences.mean()
         }
+    # def loss(self, x: torch.Tensor, recon_params, posterior_params, beta=1.0, weighted_loss=0.0, **_):
+    #     """
+    #     Permutation-Invariant MSE Loss (Diagnostic Test Version).
+    #     Replaces Gaussian NLL with pure Mean Squared Error. This forces the model 
+    #     to learn the shape of 'mu' without being able to cheat using 'sigma'.
+    #     """
+    #     # 1. Get KL Divergence
+    #     kl_divergences = self.encoder.kl_divergence(posterior_params, prior=self.prior) # [B]
+        
+    #     if recon_params["mu"].dim() == 3:
+    #         recon_params_squeezed = {k: v[0] for k, v in recon_params.items()}
+    #     else:
+    #         recon_params_squeezed = recon_params
 
+    #     B = x.shape[0]
+    #     L = self.sequence_length
+    #     F = self.num_features
+
+    #     x_phases = x.reshape(B, F, L)
+        
+    #     # Flatten mu for standard MSE calculation
+    #     mu_predicted = recon_params_squeezed["mu"].reshape(B, F * L)
+
+    #     permutations = [
+    #         [0, 1, 2], [0, 2, 1], 
+    #         [1, 0, 2], [1, 2, 0], 
+    #         [2, 0, 1], [2, 1, 0]
+    #     ]
+
+    #     # --- STEP 1: Find the best permutation (Lowest MSE) ---
+    #     with torch.no_grad():
+    #         mse_scores = []
+    #         for perm in permutations:
+    #             x_permuted = x_phases[:, perm, :]
+    #             x_perm_flat = x_permuted.reshape(B, -1)
+                
+    #             # Calculate MSE per sample (Summing over features and sequence length)
+    #             mse = torch.nn.functional.mse_loss(x_perm_flat, mu_predicted, reduction='none').sum(dim=1) 
+    #             mse_scores.append(mse.unsqueeze(1))
+                
+    #         all_mse = torch.cat(mse_scores, dim=1) # [B, 6]
+    #         # Since it is MSE, we want the MINIMUM error, not maximum likelihood
+    #         best_perm_idx = all_mse.argmin(dim=1) # [B]
+
+    #     # --- STEP 2: Construct the single optimal target batch ---
+    #     x_optimal = torch.empty_like(x)
+    #     for i in range(B):
+    #         best_p = permutations[best_perm_idx[i]]
+    #         x_optimal[i] = x_phases[i, best_p, :].reshape(-1)
+
+    #     # --- STEP 3: Do the heavy math exactly ONCE with gradients ON ---
+    #     best_mse = torch.nn.functional.mse_loss(x_optimal, mu_predicted, reduction='none').sum(dim=1)
+
+    #     if True: # TODO
+    #         # --- STEP 4: Aggregate Total Phases --- 
+    #         mu_predicted_phases = mu_predicted.reshape(B, F, L)
+            
+    #         # Sum across the phases (F dimension) -> [B, L]
+    #         mu_sum = mu_predicted_phases.sum(dim=1)
+    #         x_sum = x_phases.sum(dim=1)
+            
+    #         # Calculate MSE of the Aggregated Total
+    #         agg_mse = torch.nn.functional.mse_loss(mu_sum, x_sum, reduction='none').sum(dim=-1)
+
+    #         # --- FINAL COMBINED LOSS ---
+    #         # We MINIMIZE the total MSE, the Aggregate MSE, and the KL Divergence
+    #         agg_weight = 0.25 
+    #         total_loss_per_sample = best_mse + (beta * kl_divergences) + (agg_weight * agg_mse)
+    #     else:
+    #         total_loss_per_sample = best_mse + (beta * kl_divergences)
+
+    #     loss = total_loss_per_sample.mean()
+
+    #     return {
+    #         "loss": loss,
+    #         # We return NEGATIVE MSE as the log-likelihood stand-in. 
+    #         # This prevents your logger from crashing and correctly shows the error approaching 0.
+    #         "recon_loglikelihood": -best_mse.mean(), 
+    #         "kl_divergence": kl_divergences.mean()
+    #     }
+# test 1: MSE loss
+# test 2: standard prior. Lowers the available variance and encourages learning with the mean
 
 # ==============
 # NN Blocks
@@ -396,6 +534,21 @@ class ISAB(nn.Module):
         I = self.inducing.expand(B, -1, -1)
         H = self.mab0(I, X)
         return self.mab1(X, H)
+
+# === SAB (Set Attention Block) ===
+class SAB(nn.Module):
+    """
+    Standard Self-Attention for Sets. 
+    Exact O(N^2) attention. Best for small sets (like 3 phases).
+    """
+    def __init__(self, dim_in, dim_out, num_heads=4):
+        super(SAB, self).__init__()
+        self.mab = MAB(dim_Q=dim_in, dim_K=dim_in, dim_V=dim_out, num_heads=num_heads)
+
+    def forward(self, X):
+        # X: [B, N, dim_in]
+        # Queries, Keys, and Values are all the exact same set
+        return self.mab(X, X)
 
 # === ABL (Attentive Bottleneck Layer) ===
 class ABL(nn.Module):
