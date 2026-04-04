@@ -1,0 +1,107 @@
+skip_validation: true
+verbose: false
+
+data:
+  mode: "phased_parquet"
+  data_dir: "data/_parquet_smoke"
+  data_files: []
+  columns:
+    meter_id: "meter_number"
+    timestamp_dst: "timestamp_dst"
+    timestamp_utc: "timestamp_utc"
+    value_cols: ["hourly_energy_consumption"]
+  splits:
+    train_ratio: 0.9
+    val_ratio: 0.05
+    test_ratio: 0.05
+    random_seed: 42
+  window:
+    aggregated: false
+    input_len: 24
+    stride: 24
+  dataloader:
+    batch_size: 8
+    num_workers: 0
+    shuffle: false
+  phased:
+    replay_buffer_capacity: 2048
+    min_buffer_size: 4
+    num_workers: 0
+    steps_per_epoch: 1
+    eval_batches: 1
+    eval_every_n_epochs: 1
+    eval_cache_on_gpu: false
+    eval_cache_refresh: false
+    cache_scan_batches: 20
+    skip_corrupt_files: true
+    max_skip_warnings: 20
+    aggregation_energy_unit: "kwh"
+
+normalization:
+  method: "log1p_phase"
+
+model:
+  type: "diffusion"
+  device: "cpu"
+  latent_dim: 128
+  set:
+    num_features: 3
+  diffusion:
+    num_timesteps: 64
+    schedule_type: "cosine"
+    cosine_s: 0.008
+    max_beta: 0.999
+    beta_start: 1.0e-4
+    beta_end: 0.02
+    time_dim: 128
+    base_channels: 64
+    num_blocks: 4
+    self_attention_heads: 4
+    use_condition_cross_attention: true
+    condition_cross_attention_heads: 4
+    condition_tokens: 4
+    condition_dropout_prob: 0.10
+    reconstruction_noise_fraction: 0.30
+    deterministic_reconstruction: true
+
+conditioning:
+  tags: ["day_of_week", "month_of_year"]
+
+hierarchy:
+  enabled: false
+
+training:
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  gradient_clip: true
+  gradient_clip_max_norm: 1.0
+  num_epochs: 1
+  beta: 0.1
+  weighted_loss: 0.0
+  early_stopping:
+    enabled: false
+    stop_on_all_files_used: false
+    min_epochs_before_full_data_stop: 1
+    patience: 5
+    min_delta: 0.001
+  checkpointing:
+    save_freq: 1
+    save_dir: "./output/diffusion_smoke"
+    save_best_model: false
+    save_best_after_fraction: 0.25
+    save_final_model: true
+  compile_model: false
+
+logging:
+  log_dir: "./output/diffusion_smoke"
+
+evaluation:
+  device: "cpu"
+  n_synthetic_samples: 20
+
+visualize:
+  num_samples: 2
+  num_recon_per: 2
+  num_synthetic: 10
+  num_originals: 2
+  num_synthetic_per: 3

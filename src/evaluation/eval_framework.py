@@ -90,6 +90,18 @@ def _resolve_output_directory(output_path: str | None) -> str:
         return os.path.dirname(output_path) or '.'
     return output_path
 
+
+def _sanitize_numeric_array(data: np.ndarray, clip_abs: float = 1e6, fill_value: float = 0.0) -> np.ndarray:
+    """Return a finite float64 array with NaN/Inf handled and optional clipping."""
+    arr = np.asarray(data, dtype=np.float64)
+    if arr.size == 0:
+        return arr
+    if not np.isfinite(arr).all():
+        arr = np.nan_to_num(arr, nan=fill_value, posinf=clip_abs, neginf=-clip_abs)
+    if clip_abs is not None:
+        np.clip(arr, -clip_abs, clip_abs, out=arr)
+    return arr
+
 def _rank_phases_by_total_consumption(data: np.ndarray) -> np.ndarray:
     arr = np.asarray(data)
     if arr.ndim != 3:
@@ -101,8 +113,8 @@ def _rank_phases_by_total_consumption(data: np.ndarray) -> np.ndarray:
 
 
 def _align_phases_by_mse(reference: np.ndarray, candidate: np.ndarray) -> np.ndarray:
-    ref = np.asarray(reference)
-    cand = np.asarray(candidate)
+    ref = _sanitize_numeric_array(reference)
+    cand = _sanitize_numeric_array(candidate)
     if ref.ndim != 3 or cand.ndim != 3:
         raise ValueError(f"Expected 3D arrays [N, F, L], got {ref.shape} and {cand.shape}")
     if ref.shape != cand.shape:
@@ -117,14 +129,20 @@ def _align_phases_by_mse(reference: np.ndarray, candidate: np.ndarray) -> np.nda
         # Cost[j, k] = MSE between reference phase j and candidate phase k.
         diff = ref[i][:, None, :] - cand[i][None, :, :]
         cost = np.mean(diff * diff, axis=2)
-        row_ind, col_ind = linear_sum_assignment(cost)
-        aligned[i, row_ind, :] = cand[i, col_ind, :]
+        if not np.isfinite(cost).all():
+            aligned[i] = _rank_phases_by_total_consumption(cand[i:i + 1])[0]
+            continue
+        try:
+            row_ind, col_ind = linear_sum_assignment(cost)
+            aligned[i, row_ind, :] = cand[i, col_ind, :]
+        except ValueError:
+            aligned[i] = _rank_phases_by_total_consumption(cand[i:i + 1])[0]
     return aligned
 
 
 def _align_phases_to_reference_mean(reference: np.ndarray, candidate: np.ndarray) -> np.ndarray:
-    ref = np.asarray(reference)
-    cand = np.asarray(candidate)
+    ref = _sanitize_numeric_array(reference)
+    cand = _sanitize_numeric_array(candidate)
     if ref.ndim != 3 or cand.ndim != 3:
         raise ValueError(f"Expected 3D arrays [N, F, L], got {ref.shape} and {cand.shape}")
     if ref.shape[1:] != cand.shape[1:]:
@@ -138,7 +156,14 @@ def _align_phases_to_reference_mean(reference: np.ndarray, candidate: np.ndarray
     cand_mean = cand.mean(axis=0)
     diff = ref_mean[:, None, :] - cand_mean[None, :, :]
     cost = np.mean(diff * diff, axis=2)
-    row_ind, col_ind = linear_sum_assignment(cost)
+    if not np.isfinite(cost).all():
+        return _align_phases_by_mse(ref, cand)
+
+    try:
+        row_ind, col_ind = linear_sum_assignment(cost)
+    except ValueError:
+        return _align_phases_by_mse(ref, cand)
+
     aligned = np.empty_like(cand)
     aligned[:, row_ind, :] = cand[:, col_ind, :]
     return aligned
@@ -355,9 +380,9 @@ class EvalFramework:
     def _prepare_data(self) -> None:
         """Extract real data, reconstructed data, and synthetic data for metrics that need it."""
         if self.prepared_data is not None:
-            self._real_data = np.asarray(self.prepared_data.get('real_data'))
-            self._reconstructed_data = np.asarray(self.prepared_data.get('reconstructed_data'))
-            self._synthetic_data = np.asarray(self.prepared_data.get('synthetic_data'))
+            self._real_data = _sanitize_numeric_array(np.asarray(self.prepared_data.get('real_data')))
+            self._reconstructed_data = _sanitize_numeric_array(np.asarray(self.prepared_data.get('reconstructed_data')))
+            self._synthetic_data = _sanitize_numeric_array(np.asarray(self.prepared_data.get('synthetic_data')))
             self._timestamps = self.prepared_data.get('timestamps')
             self._meter_ids = self.prepared_data.get('meter_ids')
 
@@ -412,8 +437,8 @@ class EvalFramework:
                 recon = self._reconstruct(data, meter_id=meter_ids, timestamps=timestamps)
                 recon_batches.append(recon.cpu().numpy())
 
-        self._real_data = np.concatenate(real_batches, axis=0)
-        self._reconstructed_data = np.concatenate(recon_batches, axis=0)
+        self._real_data = _sanitize_numeric_array(np.concatenate(real_batches, axis=0))
+        self._reconstructed_data = _sanitize_numeric_array(np.concatenate(recon_batches, axis=0))
         self._meter_ids = np.concatenate(meter_id_batches, axis=0) if meter_id_batches else None
         self._timestamps = np.concatenate(timestamp_batches, axis=0) if timestamp_batches else None
 
@@ -429,7 +454,7 @@ class EvalFramework:
         else:
             self._synthetic_conditions = None
 
-        self._synthetic_data = self._generate_synthetic(self.n_synthetic_samples)
+        self._synthetic_data = _sanitize_numeric_array(self._generate_synthetic(self.n_synthetic_samples))
 
     
     def _reconstruct(self, x: torch.Tensor, 
@@ -1035,7 +1060,18 @@ class FlexibilityDistance(ReconstructionMetric):
         Returns:
             float: Flexibility distance (lower is better)
         """
+        x = _sanitize_numeric_array(x).reshape(-1)
+        y = _sanitize_numeric_array(y).reshape(-1)
+
+        if len(x) != len(y):
+            min_len = min(len(x), len(y))
+            x = x[:min_len]
+            y = y[:min_len]
+
         series_len = len(x)
+        if series_len == 0:
+            return 0.0
+
         indices = np.arange(series_len)
         
         # Auto tau based on value range and series length
@@ -1049,10 +1085,15 @@ class FlexibilityDistance(ReconstructionMetric):
         amplitude_cost = np.abs(x[:, None] - y[None, :])
         temporal_cost = np.abs(indices[:, None] - indices[None, :]) * tau_val
         cost_matrix = amplitude_cost + temporal_cost
+        if not np.isfinite(cost_matrix).all():
+            cost_matrix = np.nan_to_num(cost_matrix, nan=1e12, posinf=1e12, neginf=0.0)
         
         # Linear sum assignment (minimum cost)
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-        total_cost = float(cost_matrix[row_ind, col_ind].sum())
+        try:
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            total_cost = float(cost_matrix[row_ind, col_ind].sum())
+        except ValueError:
+            total_cost = float(np.mean(np.abs(x - y)))
         
         if normalize and series_len > 0:
             total_cost /= series_len
@@ -1153,7 +1194,9 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
             np.ndarray: kernel matrix [n, m]
         """
         sq_dists = cdist(X, Y, metric="sqeuclidean")
-        return np.exp(-sq_dists / (2 * sigma ** 2))
+        sq_dists = np.nan_to_num(sq_dists, nan=1e12, posinf=1e12, neginf=0.0)
+        denom = max(2.0 * (sigma ** 2), 1e-12)
+        return np.exp(-sq_dists / denom)
     
     def _median_heuristic_sigma(self, Z: np.ndarray, max_points: int =  2000) -> float:
         """Estimate kernel bandwidth using median pairwise distance.
@@ -1185,8 +1228,8 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
         Returns:
             float: MMD^2 statistic (lower is better)
         """
-        X = np.asarray(X)
-        Y = np.asarray(Y)
+        X = _sanitize_numeric_array(X)
+        Y = _sanitize_numeric_array(Y)
         n, m = X.shape[0], Y.shape[0]
         
         if n < 2 or m < 2:
@@ -1221,6 +1264,8 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
 
         real = self.real_data
         synthetic = self.synthetic_data
+        real = _sanitize_numeric_array(real)
+        synthetic = _sanitize_numeric_array(synthetic)
 
         # Subsample to avoid OOM (O(n^2) kernel matrix)
         if len(real) > self.max_samples:
@@ -1304,17 +1349,27 @@ class ACFDistribution(SyntheticMetric):
         Returns:
             np.ndarray: Array of ACF values for lags 1 to max_lag
         """
+        time_series = _sanitize_numeric_array(time_series).reshape(-1)
         n = len(time_series)
-        mean = np.mean(time_series)
-        c0 = np.sum((time_series - mean) ** 2) / n
+        if n == 0:
+            return np.zeros(max_lag, dtype=np.float64)
+
+        mean = float(np.mean(time_series))
+        centered = time_series - mean
+        c0 = float(np.mean(centered * centered))
+        if not np.isfinite(c0) or c0 <= 1e-12:
+            return np.zeros(max_lag, dtype=np.float64)
         
         acf_values = []
         for lag in range(1, max_lag + 1):
             if lag >= n:
                 acf_values.append(0.0)
                 continue
-            c_lag = np.sum((time_series[:-lag] - mean) * (time_series[lag:] - mean)) / n
-            acf_values.append(c_lag / c0 if c0 > 0 else 0.0)
+            c_lag = float(np.mean(centered[:-lag] * centered[lag:]))
+            if not np.isfinite(c_lag):
+                acf_values.append(0.0)
+            else:
+                acf_values.append(float(np.clip(c_lag / c0, -1.0, 1.0)))
         
         return np.array(acf_values)
     
@@ -1328,6 +1383,9 @@ class ACFDistribution(SyntheticMetric):
         
         # Reshape data to separate time series
         # Assuming data is [N, window_size * n_features], reshape to [N * n_features, window_size]
+        self.real_data = _sanitize_numeric_array(self.real_data)
+        self.synthetic_data = _sanitize_numeric_array(self.synthetic_data)
+
         n_features = self.real_data.shape[1] // self.window_size
         
         real_reshaped = self.real_data.reshape(-1, self.window_size, n_features)
@@ -1357,9 +1415,18 @@ class ACFDistribution(SyntheticMetric):
         for lag_idx in range(self.max_lag):
             real_lag_dist = real_acfs[:, lag_idx]
             synthetic_lag_dist = synthetic_acfs[:, lag_idx]
+
+            real_lag_dist = real_lag_dist[np.isfinite(real_lag_dist)]
+            synthetic_lag_dist = synthetic_lag_dist[np.isfinite(synthetic_lag_dist)]
+
+            if len(real_lag_dist) == 0 or len(synthetic_lag_dist) == 0:
+                ks_statistics.append(1.0)
+                continue
             
             # Kolmogorov-Smirnov test
             ks_stat, _ = stats.ks_2samp(real_lag_dist, synthetic_lag_dist)
+            if not np.isfinite(ks_stat):
+                ks_stat = 1.0
             ks_statistics.append(ks_stat)
         
         # Average KS statistic across all lags
@@ -1528,7 +1595,7 @@ class ClassicalStatistics(SyntheticMetric):
         Returns:
             Dict[str, Any]: Dictionary with statistical measures
         """
-        data = np.asarray(data)
+        data = _sanitize_numeric_array(data)
         if data.ndim != 2:
             raise ValueError(f"Expected 2D array [N, D], got shape {data.shape}")
         if data.shape[1] % self.window_size != 0:
@@ -1812,8 +1879,8 @@ class TSTR(SyntheticMetric):
         if self.real_data is None or self.synthetic_data is None:
             raise ValueError("TSTR requires injected real_data and synthetic_data before compute().")
 
-        real_data = np.asarray(self.real_data)
-        synthetic_data = np.asarray(self.synthetic_data)
+        real_data = _sanitize_numeric_array(np.asarray(self.real_data))
+        synthetic_data = _sanitize_numeric_array(np.asarray(self.synthetic_data))
 
         if len(real_data) < 2:
             raise ValueError("Need at least 2 real samples for an 80/20 train/test split.")
@@ -1907,8 +1974,8 @@ class AggregatedProfiles(SyntheticMetric):
     
     def compute(self) -> float:
         """Aggregate real and synthetic data, then compute Flexibility Distance."""
-        real_data = np.asarray(self.real_data)
-        synthetic_data = np.asarray(self.synthetic_data)
+        real_data = _sanitize_numeric_array(np.asarray(self.real_data))
+        synthetic_data = _sanitize_numeric_array(np.asarray(self.synthetic_data))
 
         # Extract consumption only (feature 0)
         real_n_features = real_data.shape[1] // self.window_size
@@ -2157,7 +2224,36 @@ class PerConditionEval(SyntheticMetric):
 
         if len(feeder_ids) != n_expected:
             raise ValueError(f"feeder_ids length ({len(feeder_ids)}) must match data length ({n_expected})")
-        return feeder_ids
+        return self._normalize_feeder_ids(feeder_ids)
+
+    @staticmethod
+    def _normalize_feeder_ids(feeder_ids: np.ndarray) -> np.ndarray:
+        labels = []
+        for raw in np.asarray(feeder_ids).reshape(-1):
+            if isinstance(raw, np.generic):
+                raw = raw.item()
+            if raw is None:
+                labels.append(None)
+                continue
+            sval = str(raw).strip()
+            if sval == "" or sval.lower() in {"nan", "none"}:
+                labels.append(None)
+            else:
+                labels.append(sval)
+        return np.array(labels, dtype=object)
+
+    @staticmethod
+    def _unique_valid_labels(labels: np.ndarray) -> List[str]:
+        unique = []
+        seen = set()
+        for label in np.asarray(labels).reshape(-1):
+            if label is None:
+                continue
+            sval = str(label)
+            if sval not in seen:
+                seen.add(sval)
+                unique.append(sval)
+        return unique
 
     def _compute_aggregated_profiles_per_feeder(
         self,
@@ -2167,7 +2263,8 @@ class PerConditionEval(SyntheticMetric):
     ) -> Dict[str, Dict[str, Any]]:
         """Compute AggregatedProfiles FD per feeder."""
         feeder_scores = {}
-        unique_feeders = [f for f in np.unique(feeder_ids) if f is not None and str(f).lower() != 'nan']
+        feeder_ids = self._normalize_feeder_ids(feeder_ids)
+        unique_feeders = self._unique_valid_labels(feeder_ids)
 
         for feeder in unique_feeders:
             n_group = int(np.sum(feeder_ids == feeder))
@@ -2248,6 +2345,9 @@ class PerConditionEval(SyntheticMetric):
         feeder_ids: np.ndarray = None,
     ) -> Dict[str, str]:
         """Create bar charts of aggregated real vs synthetic consumption by day and month."""
+        real_data = _sanitize_numeric_array(real_data)
+        synthetic_data = _sanitize_numeric_array(synthetic_data)
+
         base_dir = _resolve_output_directory(self.output_path)
         # plots_dir = os.path.join(base_dir, 'Plots') if base_dir else 'Plots'
         plots_dir = base_dir
@@ -2330,14 +2430,15 @@ class PerConditionEval(SyntheticMetric):
         # Sum total consumption per feeder (if feeder_ids provided)
         feeder_plot_path = os.path.join(plots_dir, 'aggregated_profiles_bar_feeder.pdf')
         if feeder_ids is not None:
-            unique_feeders = [f for f in np.unique(feeder_ids) if f is not None and str(f).lower() != 'nan']
+            feeder_ids = self._normalize_feeder_ids(feeder_ids)
+            unique_feeders = self._unique_valid_labels(feeder_ids)
             
             if unique_feeders:
                 feeder_labels = []
                 feeder_real_totals = []
                 feeder_synth_totals = []
                 feeder_counts = []
-                for feeder in sorted(unique_feeders):
+                for feeder in unique_feeders:
                     mask = feeder_ids == feeder
                     if np.sum(mask) > 0:
                         feeder_labels.append(str(feeder))
@@ -2412,8 +2513,8 @@ class PerConditionEval(SyntheticMetric):
         self.tstr_calculator.output_path = self.output_path
         self.aggregated_profiles_calculator.output_path = self.output_path
 
-        real_data = np.asarray(self.real_data)
-        synthetic_data = np.asarray(self.synthetic_data)
+        real_data = _sanitize_numeric_array(np.asarray(self.real_data))
+        synthetic_data = _sanitize_numeric_array(np.asarray(self.synthetic_data))
         timestamps = np.asarray(self.timestamps)
 
         if len(real_data) != len(synthetic_data):
@@ -2672,7 +2773,9 @@ class SetMaximumMeanDiscrepancy(SyntheticMetric):
 
     def _rbf_kernel_set(self, X: np.ndarray, Y: np.ndarray, sigma: float) -> np.ndarray:
         sq_dists = self._set_sqeuclidean_cdist(X, Y)
-        return np.exp(-sq_dists / (2 * sigma ** 2))
+        sq_dists = np.nan_to_num(sq_dists, nan=1e12, posinf=1e12, neginf=0.0)
+        denom = max(2.0 * (sigma ** 2), 1e-12)
+        return np.exp(-sq_dists / denom)
 
     def _median_heuristic_sigma_set(self, Z: np.ndarray, max_points: int = 1000) -> float:
         rng = np.random.default_rng(self.seed)
@@ -2685,6 +2788,9 @@ class SetMaximumMeanDiscrepancy(SyntheticMetric):
 
     def compute(self) -> float:
         # 1. Ensure data is correctly shaped as [N, F, L]
+        self.real_data = _sanitize_numeric_array(self.real_data)
+        self.synthetic_data = _sanitize_numeric_array(self.synthetic_data)
+
         N_real = self.real_data.shape[0]
         N_synth = self.synthetic_data.shape[0]
         L = self.real_data.shape[1] // self.n_features

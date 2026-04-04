@@ -28,6 +28,7 @@ from evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
 from src.visualization.plot_styling import PlotStyle
 from src.model.model_utils import EarlyStopping
 from src.model.art import AutoRegressiveTransformerVAE
+from src.model.diffusion import DiffusionModel, NoiseScheduler, ConditionalUNet1D
 import gc
 
 
@@ -290,8 +291,12 @@ def train(config):
 
     # === Model Setup ===
     model_type = str(config.model.type).lower()
+    conditioner = None
 
-    if model_type in {"cvae", "set_guide_vae", "art"}:
+    if model_type == "diffusion" and hierarchy is not None:
+        raise ValueError("DiffusionModel currently does not support hierarchy.enabled=true.")
+
+    if model_type in {"cvae", "set_guide_vae", "art", "diffusion"}:
         conditioner = Conditioner()
         for condition_tag in config.conditioning.tags:
             if condition_tag == "day_of_week":
@@ -322,7 +327,7 @@ def train(config):
             else:
                 print(f"Warning: Unknown condition tag '{condition_tag}' in config. Skipping this conditioner.")
         
-        if data_mode in {"phased", "phase", "parquet", "phased_parquet"} and model_type in {"set_guide_vae", "art"}:
+        if data_mode in {"phased", "phase", "parquet", "phased_parquet"} and model_type in {"set_guide_vae", "art", "diffusion"}:
             set_cfg = getattr(config.model, "set", SimpleNamespace(num_features=3))
             set_num_features = set_cfg.num_features if getattr(set_cfg, "num_features", None) is not None else 3
             input_dim = config.window.input_len * int(set_num_features)
@@ -379,6 +384,49 @@ def train(config):
                 sequence_length=config.window.input_len,
                 num_features=set_num_features,
             )
+        elif model_type == "diffusion":
+            diff_cfg = getattr(config.model, "diffusion", SimpleNamespace())
+            scheduler = NoiseScheduler(
+                num_timesteps=int(getattr(diff_cfg, "num_timesteps", 1000)),
+                beta_start=float(getattr(diff_cfg, "beta_start", 1e-4)),
+                beta_end=float(getattr(diff_cfg, "beta_end", 0.02)),
+                schedule_type=str(getattr(diff_cfg, "schedule_type", "linear")),
+                cosine_s=float(getattr(diff_cfg, "cosine_s", 0.008)),
+                max_beta=float(getattr(diff_cfg, "max_beta", 0.999)),
+                device=device,
+            )
+            denoiser = ConditionalUNet1D(
+                channels=int(set_num_features),
+                condition_dim=int(conditioner.get_condition_dim()),
+                time_dim=int(getattr(diff_cfg, "time_dim", 128)),
+                base_channels=int(getattr(diff_cfg, "base_channels", 128)),
+                num_blocks=int(getattr(diff_cfg, "num_blocks", 4)),
+                self_attention_heads=int(getattr(diff_cfg, "self_attention_heads", 4)),
+                use_condition_cross_attention=bool(getattr(diff_cfg, "use_condition_cross_attention", False)),
+                condition_attention_heads=int(
+                    getattr(
+                        diff_cfg,
+                        "condition_cross_attention_heads",
+                        getattr(diff_cfg, "condition_attention_heads", 4),
+                    )
+                ),
+                condition_tokens=int(getattr(diff_cfg, "condition_tokens", 4)),
+            )
+            model = DiffusionModel(
+                noise_scheduler=scheduler,
+                model=denoiser,
+                conditioner=conditioner,
+                sequence_length=config.window.input_len,
+                num_features=int(set_num_features),
+                condition_dropout_prob=float(getattr(diff_cfg, "condition_dropout_prob", 0.0)),
+                reconstruction_noise_fraction=float(getattr(diff_cfg, "reconstruction_noise_fraction", 0.3)),
+                deterministic_reconstruction=bool(getattr(diff_cfg, "deterministic_reconstruction", True)),
+            )
+            print(
+                f"Initialized DiffusionModel with sequence_length={config.window.input_len}, "
+                f"num_features={int(set_num_features)}, condition_dim={conditioner.get_condition_dim()}, "
+                f"schedule={scheduler.schedule_type}, cross_attention={denoiser.use_condition_cross_attention}"
+            )
     elif model_type == "vae":
         input_dim = config.window.input_len * len(config.columns.value_cols)
         model = VAE(input_dim=input_dim, latent_dim=config.model.latent_dim,
@@ -402,8 +450,10 @@ def train(config):
 
     # === Phased parquet path ===
     if phased_mode:
-        if model_type not in {"set_guide_vae", "art"}:
-            raise ValueError("Phased parquet mode currently supports only SetGuideVAE (set_guide_vae) model type.")
+        if model_type not in {"set_guide_vae", "art", "diffusion"}:
+            raise ValueError(
+                "Phased parquet mode currently supports set_guide_vae, art, and diffusion model types."
+            )
 
         parquet_paths = []
         configured_files = list(config.data_files) if len(config.data_files) > 0 else []
@@ -541,11 +591,12 @@ def train(config):
             )
 
         model = model.to(device)
-        model.prior.to(device)
+        if hasattr(model, "prior") and getattr(model, "prior", None) is not None and hasattr(model.prior, "to"):
+            model.prior.to(device)
         if model_type == "art" and hasattr(model, "normalizer") and model.normalizer is not None:
             model.normalizer = model.normalizer.to(device)
 
-        if not vamp_initialized and isinstance(model.prior, VampPrior):
+        if not vamp_initialized and hasattr(model, "prior") and isinstance(model.prior, VampPrior):
             init_from_data = bool(getattr(config.model.prior, "init_from_data", True))
             if init_from_data:
                 init_loader, _ = phased_replay.get_epoch_loaders(
@@ -829,7 +880,7 @@ def train(config):
         train_loader = dm.train_dataloader()
         val_loader = dm.val_dataloader()
 
-        if not vamp_initialized and isinstance(model.prior, VampPrior):
+        if not vamp_initialized and hasattr(model, "prior") and isinstance(model.prior, VampPrior):
             init_from_data = bool(getattr(config.model.prior, "init_from_data", True))
             if init_from_data:
                 init_batch = next(iter(train_loader), None)

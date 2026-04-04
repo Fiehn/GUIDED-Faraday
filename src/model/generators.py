@@ -35,6 +35,17 @@ class SyntheticGenerator:
         self.normalizer = normalizer
         self.device = device
         self._is_cvae = hasattr(model, 'conditioner') and model.conditioner is not None
+        self._is_diffusion = self._is_diffusion_model()
+
+    def _is_diffusion_model(self) -> bool:
+        return hasattr(self.model, 'noise_scheduler') and hasattr(self.model, 'reconstruct')
+
+    def _is_phase_first_model(self) -> bool:
+        return (
+            hasattr(self.model, '_to_phase_first')
+            and getattr(self.model, 'num_features', None) is not None
+            and getattr(self.model, 'sequence_length', None) is not None
+        )
 
     def _is_art_model(self) -> bool:
         """Best-effort capability check for ART-style token decoders."""
@@ -137,7 +148,25 @@ class SyntheticGenerator:
             input_data = self._apply_normalizer(input_data, inverse=False)
             # Normalizers may return float64 tensors; align with model dtype for linear layers.
             input_data = input_data.to(self.device, dtype=model_dtype)
-        if self._is_cvae and meter_id is not None and timestamp is not None:
+
+        if self._is_diffusion:
+            flat_output = self.model.reconstruct(
+                input_data,
+                meter_id=meter_id,
+                timestamps=timestamp,
+                c=new_conditions,
+                num_reconstructions=num_reconstructions,
+                temperature=temperature,
+                device=self.device,
+            )
+            if flat_output is None:
+                return None
+            if flat_output.dim() == 2:
+                flat_output = flat_output.unsqueeze(0)
+            if flat_output.dim() != 3:
+                raise ValueError(f"Unexpected diffusion reconstruction shape: {tuple(flat_output.shape)}")
+
+        elif self._is_cvae and meter_id is not None and timestamp is not None:
             # Conditions for the encoding are always based on the original meter_id and timestamp, to get the correct latent representation.
             cond_input = self._prepare_condition_input(input_data)
             conditions = self.conditioner.get_conditions(cond_input, meter_id, timestamp).to(self.device, dtype=model_dtype)
@@ -200,7 +229,7 @@ class SyntheticGenerator:
         else:
             recon_params, _ = self.model.reconstruct(input_data)
 
-        if not (self._is_cvae and meter_id is not None and timestamp is not None and self._is_art_model()):
+        if (not self._is_diffusion) and not (self._is_cvae and meter_id is not None and timestamp is not None and self._is_art_model()):
             # Normalize decoder param tensors to [S, B, D] to avoid accidental shape expansion.
             # Some model.reconstruct() implementations return [B, D] instead of [S, B, D].
             for k, v in recon_params.items():
@@ -386,7 +415,7 @@ class SyntheticGenerator:
         L = getattr(self.model, 'sequence_length', 24)
         F = D // L
 
-        is_phase_first = getattr(self.model, 'num_features', None) is not None and getattr(self.model, 'element_dim', None) is not None
+        is_phase_first = self._is_phase_first_model()
 
         if is_phase_first:
             output = flat.reshape(N, F, L).transpose(1, 2)
@@ -492,7 +521,7 @@ class SyntheticGenerator:
         F = flat.shape[0] // L
         
         # Safely un-flatten Phase-First data
-        is_phase_first = getattr(self.model, 'num_features', None) is not None and getattr(self.model, 'element_dim', None) is not None
+        is_phase_first = self._is_phase_first_model()
         
         if is_phase_first:
             return flat.reshape(F, L).T  # [F, L] transposed to [L, F]
@@ -554,7 +583,7 @@ class SyntheticGenerator:
 
         num_valid = candidates.shape[0]
         
-        is_phase_first = getattr(self.model, 'num_features', None) is not None and getattr(self.model, 'element_dim', None) is not None
+        is_phase_first = self._is_phase_first_model()
         if is_phase_first:
             candidates = candidates.reshape(num_valid, F, L).transpose(1, 2)
         else:
