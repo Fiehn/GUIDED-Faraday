@@ -147,6 +147,7 @@ class DictionaryCoder(torch.nn.Module):
                  dropout_rate=0.2,
                  batch_norm=False,
                  layer_type='MLP',
+                 learn_sigma=False,
                  **kwargs):
         super(DictionaryCoder, self).__init__()
         if dictionary_size <= output_dim:
@@ -355,7 +356,130 @@ class DictionaryCoder(torch.nn.Module):
 
     def get_marginal_sigmas(self,param_dict):
         return torch.sqrt(torch.diagonal(self.create_covariance_matrix(param_dict), dim1=-2, dim2=-1))
+
+# =================
+# Autoregressive Transformer Approach
+# =================
+
+class AutoregressiveTransformerCoder(torch.nn.Module):
+    def __init__(self, 
+                 latent_dim, 
+                 condition_dim, 
+                 num_bins=256, 
+                 seq_len=72, 
+                 d_model=256, 
+                 num_layers=4, 
+                 nhead=8):
+        super().__init__()
+        self.num_bins = num_bins
+        self.seq_len = seq_len
+        self.d_model = d_model
+        
+        # 1. Embed the integer tokens (like LLMs)
+        self.token_embedding = nn.Embedding(num_bins, d_model)
+
+        # 2. Positional encoding for autoregressive structure (So the model knows what hour/phase it is generating)
+        self.positional_embedding = nn.Embedding(seq_len, d_model)
+
+        # 3. Project the "prompt" (latent vector + conditions) to the model dimension
+        self.prompt_projection = nn.Linear(latent_dim + condition_dim, d_model)
+
+        # 4. The Transformer (We use standard Encoder layers but apply a Causal Mask) TODO: replace with different method if working well
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model*4,
+            batch_first=True, norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # 5. Output Head (Predicts probabilities for each bin at each time step)
+        self.to_logits = nn.Linear(d_model, num_bins)
     
+    def generate_causal_mask(self, sz, device):
+        # Creates a triangle of -inf. Prevents looking into the future. 
+        mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+    
+    def forward(self, z, c, target_tokens):
+        """
+        TRAINING PASS: Uses "Teacher Forcing". 
+        We pass the entire sequence at once, but the causal mask prevents cheating.
+        """
+        B = z.shape[0]
+        device = z.device
+
+        # 1. Create the prompt by concatenating z and c, then projecting
+        prompt = torch.cat([z, c], dim=-1)  # [B, latent_dim + condition_dim]
+        prompt_emb = self.prompt_projection(prompt).unsqueeze(1)  # [B, 1, d_model]
+
+        # 2. Embed the target tokens and add positional encoding
+        positions = torch.arange(0, self.seq_len, device=device).unsqueeze(0).expand(B, self.seq_len)  # [B, seq_len]
+        token_emb = self.token_embedding(target_tokens) + self.positional_embedding(positions) # [B, seq_len, d_model]
+
+        # 3. Shift targets right so we predict the NEXT token
+        # We prepend the prompt as the very first token!
+        # Input sequence: [Prompt, Token_0, Token_1, ..., Token_70]
+        # Target sequence to predict: [Token_0, Token_1, Token_2, ..., Token_71]
+        transformer_input = torch.cat([prompt_emb, token_emb[:, :-1, :]], dim=1)  # [B, seq_len, d_model]
+
+        # 4. Apply cauysal mask
+        causal_mask = self.generate_causal_mask(self.seq_len, device)  # [seq_len, seq_len]
+        transformer_out = self.transformer(transformer_input, mask=causal_mask)  # [B, seq_len, d_model]
+
+        # 5. Predict logits for each token
+        logits = self.to_logits(transformer_out)  # [B, seq_len, num_bins]
+        return {"logits": logits}
+
+    @torch.no_grad()
+    def sample(self, z, c, temperature=1.0):
+        """
+        GENERATION PASS: Autoregressive sampling.
+        We must generate one token at a time, feeding the result back into the model.
+        """
+        B = z.shape[0]
+        device = z.device
+        
+        prompt = torch.cat([z, c], dim=-1)
+        prompt_emb = self.prompt_projection(prompt).unsqueeze(1) # [B, 1, d_model]
+        
+        # Start with an empty sequence
+        generated_tokens = []
+
+        for t in range(self.seq_len):
+            if t == 0:
+                transformer_input = prompt_emb  # First input is just the prompt
+            else:
+                # Embed the generated tokens so far and add positional encoding
+                past_tokens = torch.stack(generated_tokens, dim=1)  # [B, t]
+                positions = torch.arange(0, t, device=device).unsqueeze(0).expand(B, t)  # [B, t]
+                token_emb = self.token_embedding(past_tokens) + self.positional_embedding(positions)  # [B, t, d_model]
+
+                # Input to transformer is prompt + past tokens
+                transformer_input = torch.cat([prompt_emb, token_emb], dim=1)  # [B, t+1, d_model]
+
+            # run transformer with appropriate causal mask
+            causal_mask = self.generate_causal_mask(transformer_input.size(1), device)
+            transformer_out = self.transformer(transformer_input, mask=causal_mask)  # [B, t+1, d_model]
+
+            # Last prediction
+            last_timestep_out = transformer_out[:, -1, :]  # [B, d_model]
+            next_token_logits = self.to_logits(last_timestep_out) / temperature  # [B, num_bins]
+
+            if temperature <= 0.0:
+                next_token = torch.argmax(next_token_logits, dim=-1)  # [B]
+            else:
+                probs = F.softmax(next_token_logits, dim=-1)  # [B, num_bins]
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B]
+            generated_tokens.append(next_token)
+        
+        # Stack generated tokens into a tensor
+        final_sequence = torch.stack(generated_tokens, dim=1)  # [B, seq_len]
+        return final_sequence
+    
+
+
 # === This is the actual network structure ===
 class Parameterizer(nn.Module):
     def __init__(self,
@@ -685,6 +809,22 @@ def get_decoder_model(latent_dim, output_dim, type, **kwargs):
             output_dim=output_dim,
             layer_type='Conv1D',
             **kwargs
+        )
+    elif type == "ART":
+        num_bins = kwargs.get("num_bins", 256)
+        seq_len = kwargs.get("seq_len", 72)
+        d_model = kwargs.get("d_model", 256)
+        condition_dim = kwargs.get("condition_dim", 0)
+        model_layers = kwargs.get("model_layers", 4)
+        num_heads = kwargs.get("num_heads", 8)
+        return AutoregressiveTransformerCoder(
+            latent_dim=latent_dim,
+            condition_dim=condition_dim,
+            num_bins=num_bins,
+            seq_len=seq_len,
+            d_model=d_model,
+            num_layers=model_layers,
+            nhead=num_heads
         )
     else:
         return GaussianCoder(

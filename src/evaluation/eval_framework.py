@@ -454,9 +454,17 @@ class EvalFramework:
 
         # If still time/feature shaped [B, L, F], flatten to [B, D].
         if recon.dim() == 3:
-            recon = recon.reshape(recon.shape[0], -1)
+            recon = self._flatten_for_metrics(recon)
         elif recon.dim() != 2:
             raise ValueError(f"Unexpected reconstruction shape: {tuple(recon.shape)}")
+
+        # For models with known [L, F], enforce the same phase-first flattening
+        # convention used for real data so phased extraction is consistent.
+        seq_len = int(getattr(self.model, 'sequence_length', 0) or 0)
+        n_feat = int(getattr(self.model, 'num_features', 0) or 0)
+        if recon.dim() == 2 and seq_len > 0 and n_feat > 0 and recon.shape[1] == seq_len * n_feat:
+            recon_lf = recon.reshape(recon.shape[0], seq_len, n_feat)
+            recon = self._flatten_for_metrics(recon_lf)
 
         return recon  # [B, D]
     
@@ -482,7 +490,7 @@ class EvalFramework:
 
         # Flatten [N, L, F] -> [N, D] for downstream metrics.
         if synthetic.dim() == 3:
-            synthetic = synthetic.reshape(synthetic.shape[0], -1)
+            synthetic = self._flatten_for_metrics(synthetic)
 
         return synthetic.cpu().numpy()
 
@@ -740,7 +748,7 @@ class PhasedEvaluationSuite:
             self.dataloader,
             normalizer=self.normalizer,
             conditioner=self.conditioner,
-            device='cpu',
+            device=self.device,
             window_size=self.window_size,
             n_synthetic_samples=self.n_synthetic_samples,
             output_path=output_path,

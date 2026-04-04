@@ -254,7 +254,7 @@ class SetGuideVAE(CVAE):
 
         if condition_dropout:
             # ==========================================
-            # CONDITION DROPOUT (The Fix for Posterior Collapse)
+            # CONDITION DROPOUT
             # Randomly zero out conditions 30% of the time during training.
             # ==========================================
             if self.training and torch.rand(1).item() < 0.3:

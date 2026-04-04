@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from datetime import datetime
 import json
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 import os
 import sys
@@ -1021,7 +1022,32 @@ class VAE(nn.Module):
         # === Setup Optimizer and Scheduler ===
         optim = self.get_optimizer(lr=lr, weight_decay=weight_decay)
         if lr_scheduler:
-            scheduler = torch.optim.lr_scheduler.StepLR(optim, **lr_scheduler_kwargs)
+            # TODO: Mostly for transformers
+            # 1. Grab total epochs from kwargs (default to 20 if not provided)
+            total_epochs = lr_scheduler_kwargs.get("total_epochs", 100)
+            warmup_epochs = 5 # Wake the transformer up gently over 5 epochs
+
+            # 2. Phase 1: Warmup (Start at 1% of max LR, linearly scale to 100%)
+            warmup_scheduler = LinearLR(
+                optim, 
+                start_factor=0.01, 
+                end_factor=1.0, 
+                total_iters=warmup_epochs
+            )
+
+            # 3. Phase 2: Cosine Decay (Smoothly curve the LR down to near zero for the remaining epochs)
+            decay_scheduler = CosineAnnealingLR(
+                optim, 
+                T_max=(total_epochs - warmup_epochs), 
+                eta_min=1e-6
+            )
+
+            # 4. Chain them together
+            scheduler = SequentialLR(
+                optim, 
+                schedulers=[warmup_scheduler, decay_scheduler], 
+                milestones=[warmup_epochs]
+            )
         
         if next(self.parameters()).device != torch.device(device):
             self.to(device)

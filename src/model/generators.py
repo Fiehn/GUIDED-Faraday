@@ -36,6 +36,16 @@ class SyntheticGenerator:
         self.device = device
         self._is_cvae = hasattr(model, 'conditioner') and model.conditioner is not None
 
+    def _is_art_model(self) -> bool:
+        """Best-effort capability check for ART-style token decoders."""
+        decoder = getattr(self.model, 'decoder', None)
+        return (
+            hasattr(self.model, 'tokenizer')
+            and decoder is not None
+            and hasattr(decoder, 'token_embedding')
+            and hasattr(decoder, 'sample')
+        )
+
     def _prepare_condition_input(self, x: torch.Tensor) -> torch.Tensor:
         """Match training input layout for conditioners when available."""
         if hasattr(self.model, "_to_phase_first") and hasattr(self.model, "_build_condition_input"):
@@ -160,66 +170,83 @@ class SyntheticGenerator:
                 conditions = new_conditions.to(self.device, dtype=model_dtype)
 
             c_expanded = conditions.unsqueeze(0).expand(1, -1, -1)
-            
-            dec_in = torch.cat([z_for_decoder, c_expanded], dim=-1)
-            S, B, DC = dec_in.shape
-            dec_in_flat = dec_in.reshape(S * B, DC)
 
-            # Decode latent samples to get reconstruction parameters
-            recon_params = self.model.decoder(dec_in_flat)   # dict of [S*B, D]
-            
-            # reshape recon params back to [S, B, D]
-            for k in recon_params:
-                recon_params[k] = recon_params[k].reshape(S, B, -1)
+            if self._is_art_model():
+                # ART decoder requires (z, c) and samples tokens autoregressively.
+                S, B, D_z = z_for_decoder.shape
+                D_c = c_expanded.shape[-1]
+                z_flat = z_for_decoder.reshape(S * B, D_z)
+                c_flat = c_expanded.reshape(S * B, D_c)
+
+                art_samples = []
+                for _ in range(max(1, int(num_reconstructions))):
+                    sampled_tokens = self.model.decoder.sample(z_flat, c_flat, temperature=temperature)
+                    sampled_tokens = sampled_tokens.reshape(S, B, -1)
+                    art_samples.append(self.model.tokenizer.decode(sampled_tokens))
+
+                flat_output = torch.cat(art_samples, dim=0)  # [S*num_recon, B, D]
+            else:
+                dec_in = torch.cat([z_for_decoder, c_expanded], dim=-1)
+                S, B, DC = dec_in.shape
+                dec_in_flat = dec_in.reshape(S * B, DC)
+
+                # Decode latent samples to get reconstruction parameters
+                recon_params = self.model.decoder(dec_in_flat)   # dict of [S*B, D]
+
+                # reshape recon params back to [S, B, D]
+                for k in recon_params:
+                    recon_params[k] = recon_params[k].reshape(S, B, -1)
 
         else:
             recon_params, _ = self.model.reconstruct(input_data)
 
-        # Normalize decoder param tensors to [S, B, D] to avoid accidental shape expansion.
-        # Some model.reconstruct() implementations return [B, D] instead of [S, B, D].
-        for k, v in recon_params.items():
-            if v.dim() == 2:
-                recon_params[k] = v.unsqueeze(0)
-            elif v.dim() != 3:
-                raise ValueError(f"Unexpected decoder param shape for '{k}': {tuple(v.shape)}")
+        if not (self._is_cvae and meter_id is not None and timestamp is not None and self._is_art_model()):
+            # Normalize decoder param tensors to [S, B, D] to avoid accidental shape expansion.
+            # Some model.reconstruct() implementations return [B, D] instead of [S, B, D].
+            for k, v in recon_params.items():
+                if v.dim() == 2:
+                    recon_params[k] = v.unsqueeze(0)
+                elif v.dim() != 3:
+                    raise ValueError(f"Unexpected decoder param shape for '{k}': {tuple(v.shape)}")
 
-        # recon_params has shape [S, B, D]. We decode each sample s to get [num_reconstructions, B, D]
-        S_dim = recon_params['mu'].shape[0]
-        xs_all = []
-        for s in range(S_dim):
-            params_s = {k: v[s] for k, v in recon_params.items()}
-            
-            # --- Rejection Sampling Loop for Reconstruction ---
-            valid_samples = []
-            needed = num_reconstructions
-            
-            for attempt in range(max_retries):
-                xs = self.model.decoder.sample(params_s, num_samples=needed, temperature=temperature)
-                
-                if not use_rejection:
-                    valid_samples.append(xs)
-                    needed = 0
-                    break
-                    
-                # Check safe maximums across the [needed, B, D] tensor
-                max_vals = xs.abs().amax(dim=-1) # [needed, B]
-                good_mask = (max_vals < max_safe_z).all(dim=-1) # Only keep if entire batch is safe
-                
-                good_xs = xs[good_mask]
-                if len(good_xs) > 0:
-                    valid_samples.append(good_xs)
-                    needed -= len(good_xs)
-                    
-                if needed <= 0:
-                    break
-                    
-            if needed > 0:
-                print(f"Warning: Rejection sampling failed to find safe reconstructions. Injecting {needed} flatline means.")
-                fallback = self.model.decoder.sample(params_s, num_samples=needed, temperature=0.0)
-                valid_samples.append(fallback)
-                
-            xs_all.append(torch.cat(valid_samples, dim=0)[:num_reconstructions])
-        flat_output = torch.cat(xs_all, dim=0)  # [S*num_recon, B, D]
+            # recon_params has shape [S, B, D]. We decode each sample s to get [num_reconstructions, B, D]
+            S_dim = recon_params['mu'].shape[0]
+            xs_all = []
+            for s in range(S_dim):
+                params_s = {k: v[s] for k, v in recon_params.items()}
+
+                # --- Rejection Sampling Loop for Reconstruction ---
+                valid_samples = []
+                needed = num_reconstructions
+
+                for attempt in range(max_retries):
+                    xs = self.model.decoder.sample(params_s, num_samples=needed, temperature=temperature)
+
+                    if not use_rejection:
+                        valid_samples.append(xs)
+                        needed = 0
+                        break
+
+                    # Check safe maximums across the [needed, B, D] tensor
+                    max_vals = xs.abs().amax(dim=-1) # [needed, B]
+                    good_mask = (max_vals < max_safe_z).all(dim=-1) # Only keep if entire batch is safe
+
+                    good_xs = xs[good_mask]
+                    if len(good_xs) > 0:
+                        valid_samples.append(good_xs)
+                        needed -= len(good_xs)
+
+                    if needed <= 0:
+                        break
+
+                if needed > 0:
+                    print(f"Warning: Rejection sampling failed to find safe reconstructions. Injecting {needed} flatline means.")
+                    fallback = self.model.decoder.sample(params_s, num_samples=needed, temperature=0.0)
+                    valid_samples.append(fallback)
+
+                xs_all.append(torch.cat(valid_samples, dim=0)[:num_reconstructions])
+            flat_output = torch.cat(xs_all, dim=0)  # [S*num_recon, B, D]
+
         N, B, D = flat_output.shape
         flat_output = flat_output.reshape(N * B, D)
 
@@ -234,7 +261,7 @@ class SyntheticGenerator:
             output = flat_output.reshape(-1, L, F)
 
         # 2. Apply inverse transform so it's in actual kWh, not Z-scores
-        if self.normalizer is not None and not is_denormalized:
+        if self.normalizer is not None and not is_denormalized and not self._is_art_model():
             output = self._apply_normalizer(output, inverse=True)
 
         # Return as 
@@ -273,6 +300,10 @@ class SyntheticGenerator:
         """
         self.model.eval()
         self.model.to(self.device)
+
+        if self._is_art_model():
+            # ART tokens are already bounded in output space; latent rejection on x-scale is not meaningful.
+            use_rejection = False
 
         if self._is_cvae and conditions is None:
             random_cond = (date is None)
@@ -362,7 +393,7 @@ class SyntheticGenerator:
         else:
             output = flat.reshape(N, L, F)
 
-        if self.normalizer is not None:
+        if self.normalizer is not None and not self._is_art_model():
             output = self.normalizer.inverse_transform(output.reshape(-1, F)).reshape(N, L, F)
 
         # If conditions had a batch size > 1 and S > 1, the returned shape is (S * B, L, F).
@@ -511,7 +542,7 @@ class SyntheticGenerator:
         F = candidates.shape[-1] // L
         
         # Pre-filter dangerous candidates before scoring
-        if use_rejection:
+        if use_rejection and not self._is_art_model():
             max_vals, _ = candidates.abs().max(dim=-1)
             good_mask = max_vals < max_safe_z
             if good_mask.any():
@@ -528,6 +559,10 @@ class SyntheticGenerator:
             candidates = candidates.reshape(num_valid, F, L).transpose(1, 2)
         else:
             candidates = candidates.reshape(num_valid, L, F) 
+
+        if self.normalizer is not None and self._is_art_model():
+            # ART samples decode directly to original scale; continuity scoring is done in normalized space.
+            candidates = self._apply_normalizer(candidates, inverse=False)
 
         # Score in Normalized Space
         level_gap = (prev_window[-1] - candidates[:,0]) ** 2  

@@ -230,7 +230,13 @@ class Normalizer:
         self.device = torch.device(device)
 
         def _move(t):
-            return t.to(self.device) if isinstance(t, torch.Tensor) else t
+            if isinstance(t, torch.Tensor):
+                return t.to(self.device)
+            if isinstance(t, np.ndarray):
+                return torch.from_numpy(t.astype(np.float32)).to(self.device)
+            if isinstance(t, (list, tuple)):
+                return torch.tensor(t, dtype=torch.float32, device=self.device)
+            return t
 
         self.mean = _move(self.mean)
         self.std  = _move(self.std)
@@ -265,7 +271,7 @@ class Normalizer:
         if X is None:
             # For log1p_phase, we can compute the stats from the entire dataset using the compute_normalization_stats function
             if self.method == 'log1p_phase':
-                self.mean, self.std = compute_normalization_stats(
+                mean_np, std_np = compute_normalization_stats(
                     sm_files=sm_files,
                     feature_cols=['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3'],
                     save_path=stats_path,
@@ -274,6 +280,9 @@ class Normalizer:
                     hourly_aggregation=hourly_aggregation,
                     aggregation_divisor=aggregation_divisor,
                 )
+                # Store as tensors so downstream device moves and arithmetic are well-defined.
+                self.mean = torch.as_tensor(mean_np, dtype=torch.float32, device=self.device).reshape(1, -1)
+                self.std = torch.as_tensor(std_np, dtype=torch.float32, device=self.device).reshape(1, -1)
                 self.fitted = True
                 return
             else:

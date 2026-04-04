@@ -5,6 +5,7 @@ import shutil
 import yaml
 import time
 import math
+import copy
 from types import SimpleNamespace
 from xml.parsers.expat import model
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -16,7 +17,7 @@ from src.model.cvae import *
 from src.model.set import *
 from src.model.vae import *
 from data.dataloader import *
-from data.dataloader_phased import StreamingParquetBuffer, WindowSpec as PhaseWindowSpec, PhasedReplayDataloaders
+from data.dataloader_phased import WindowSpec as PhaseWindowSpec, PhasedReplayDataloaders
 from data.normalizer import *
 from src.test.run_validation import run_validation
 from src.model.hierarchical.aggregation import *
@@ -26,6 +27,7 @@ from src.visualization.writer import Writer
 from evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
 from src.visualization.plot_styling import PlotStyle
 from src.model.model_utils import EarlyStopping
+from src.model.art import AutoRegressiveTransformerVAE
 import gc
 
 
@@ -73,7 +75,6 @@ def _load_train_config(config_path: str = None):
 
     return cfg
 
-
 def _save_training_config_snapshot(config, log_path: str):
     """Save the YAML config used for training into the run report directory."""
     os.makedirs(log_path, exist_ok=True)
@@ -84,82 +85,6 @@ def _save_training_config_snapshot(config, log_path: str):
         shutil.copy2(src_path, dst_path)
     else:
         print("Warning: could not resolve original config file path; skipping config snapshot save.")
-
-
-def _cfg_get(config, path, default=None):
-    """Safe getter for dict/namespace-like configs using dot paths."""
-    if config is None:
-        return default
-
-    cur = config
-    for key in path.split("."):
-        if cur is None:
-            return default
-        if isinstance(cur, dict):
-            cur = cur.get(key, None)
-        else:
-            cur = getattr(cur, key, None)
-    return default if cur is None else cur
-
-
-def _build_phased_eval_loader(eval_stream, batch_size: int, num_workers: int, eval_batches: int, normalizer=None):
-    """Build finite eval loader from phased stream, preferring non-zero windows."""
-    xs, ms, ts = [], [], []
-    max_scan_batches = max(20, max(1, eval_batches) * 20)
-    collected_samples = 0
-    target_samples = max(1, eval_batches) * int(batch_size)
-
-    for i, (x, cond) in enumerate(eval_stream):
-        meter_id = cond[:, 0, 0].long()
-        timestamps = cond[:, 1, 0].long()
-
-        # Detect non-zero in RAW space (important when x is normalized).
-        x_for_mask = x.float()
-        if normalizer is not None and hasattr(normalizer, "inverse_transform") and x_for_mask.dim() == 3:
-            try:
-                # phased loader yields [B, F, L]; inverse expects feature-last [B, L, F]
-                x_tf = x_for_mask.transpose(1, 2).detach().cpu()
-                x_raw_tf = normalizer.inverse_transform(x_tf)
-                x_for_mask = x_raw_tf.transpose(1, 2)
-            except Exception as e:
-                print(f"Warning: raw-space non-zero check failed ({e}); falling back to normalized-space check.")
-
-        nonzero_mask = x_for_mask.reshape(x_for_mask.shape[0], -1).abs().sum(dim=1) > 1e-8
-        if nonzero_mask.any():
-            xs.append(x[nonzero_mask].float())
-            ms.append(meter_id[nonzero_mask])
-            ts.append(timestamps[nonzero_mask])
-            collected_samples += int(nonzero_mask.sum().item())
-
-        if collected_samples >= target_samples:
-            break
-
-        if i >= max_scan_batches - 1:
-            print(f"Warning: reached scan limit ({max_scan_batches} batches) while collecting eval windows.")
-            break
-
-    if len(xs) == 0:
-        print("Warning: no non-zero eval windows found; falling back to first streamed eval batches.")
-        for i, (x, cond) in enumerate(eval_stream):
-            meter_id = cond[:, 0, 0].long()
-            timestamps = cond[:, 1, 0].long()
-            xs.append(x.float())
-            ms.append(meter_id)
-            ts.append(timestamps)
-            if i >= max(1, eval_batches) - 1:
-                break
-
-    if len(xs) == 0:
-        return None
-
-    combined_test_ds = TensorDataset(torch.cat(xs, 0), torch.cat(ms, 0), torch.cat(ts, 0))
-    return DataLoader(
-        combined_test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-    )
-
 
 def _init_vamp_prior_from_batch(model, batch, device, noise_scale: float = 0.01) -> bool:
     if not isinstance(getattr(model, "prior", None), VampPrior):
@@ -223,21 +148,80 @@ def _init_vamp_prior_from_batch(model, batch, device, noise_scale: float = 0.01)
 
 def _run_evaluation_and_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, phased_mode: bool):
     """Route evaluation by mode and run shared visualizations."""
+    eval_cfg = getattr(config, "evaluation", SimpleNamespace())
+    eval_device = str(getattr(eval_cfg, "device", device))
+    default_synth_samples = 300 if model.__class__.__name__ == "AutoRegressiveTransformerVAE" else 1000
+    n_synth_samples = int(getattr(eval_cfg, "n_synthetic_samples", default_synth_samples))
+
+    eval_normalizer = copy.deepcopy(normalizer) if normalizer is not None else None
+    if eval_normalizer is not None and hasattr(eval_normalizer, "to"):
+        eval_normalizer = eval_normalizer.to(eval_device)
+
     if phased_mode:
         phased_evaluator = PhasedEvaluationSuite(
             model,
             test_loader,
-            normalizer=normalizer,
+            normalizer=eval_normalizer,
             conditioner=conditioner,
-            device='cpu',
+            device=eval_device,
             window_size=config.window.input_len,
+            n_synthetic_samples=n_synth_samples,
             output_path=log_path,
         )
-        phased_evaluator.evaluate()
+        try:
+            phased_evaluator.evaluate()
+        except RuntimeError as e:
+            # Fall back to CPU for evaluation if GPU memory is insufficient.
+            if eval_device != "cpu" and "out of memory" in str(e).lower():
+                print("Warning: GPU OOM during evaluation. Retrying evaluation on CPU.")
+                cpu_normalizer = copy.deepcopy(normalizer) if normalizer is not None else None
+                if cpu_normalizer is not None and hasattr(cpu_normalizer, "to"):
+                    cpu_normalizer = cpu_normalizer.to("cpu")
+                phased_evaluator = PhasedEvaluationSuite(
+                    model,
+                    test_loader,
+                    normalizer=cpu_normalizer,
+                    conditioner=conditioner,
+                    device="cpu",
+                    window_size=config.window.input_len,
+                    n_synthetic_samples=n_synth_samples,
+                    output_path=log_path,
+                )
+                phased_evaluator.evaluate()
+            else:
+                raise
     else:
-        evaluator = EvalFramework(model, test_loader, normalizer,conditioner=conditioner, device='cpu', output_path=log_path)
+        evaluator = EvalFramework(
+            model,
+            test_loader,
+            eval_normalizer,
+            conditioner=conditioner,
+            device=eval_device,
+            n_synthetic_samples=n_synth_samples,
+            output_path=log_path,
+        )
         evaluator.register_all()
-        evaluator.evaluate()
+        try:
+            evaluator.evaluate()
+        except RuntimeError as e:
+            if eval_device != "cpu" and "out of memory" in str(e).lower():
+                print("Warning: GPU OOM during evaluation. Retrying evaluation on CPU.")
+                cpu_normalizer = copy.deepcopy(normalizer) if normalizer is not None else None
+                if cpu_normalizer is not None and hasattr(cpu_normalizer, "to"):
+                    cpu_normalizer = cpu_normalizer.to("cpu")
+                evaluator = EvalFramework(
+                    model,
+                    test_loader,
+                    cpu_normalizer,
+                    conditioner=conditioner,
+                    device="cpu",
+                    n_synthetic_samples=n_synth_samples,
+                    output_path=log_path,
+                )
+                evaluator.register_all()
+                evaluator.evaluate()
+            else:
+                raise
         evaluator.save_results(os.path.join(log_path, 'eval_results.json'))
 
     visualizer = Visualizer(model=model, writer=writer,
@@ -307,7 +291,7 @@ def train(config):
     # === Model Setup ===
     model_type = str(config.model.type).lower()
 
-    if model_type in {"cvae", "set_guide_vae"}:
+    if model_type in {"cvae", "set_guide_vae", "art"}:
         conditioner = Conditioner()
         for condition_tag in config.conditioning.tags:
             if condition_tag == "day_of_week":
@@ -338,11 +322,12 @@ def train(config):
             else:
                 print(f"Warning: Unknown condition tag '{condition_tag}' in config. Skipping this conditioner.")
         
-        if data_mode in {"phased", "phase", "parquet", "phased_parquet"} and model_type in {"set_guide_vae"}:
-            set_cfg = config.model.set
-            set_num_features = set_cfg.num_features if set_cfg.num_features is not None else 3
+        if data_mode in {"phased", "phase", "parquet", "phased_parquet"} and model_type in {"set_guide_vae", "art"}:
+            set_cfg = getattr(config.model, "set", SimpleNamespace(num_features=3))
+            set_num_features = set_cfg.num_features if getattr(set_cfg, "num_features", None) is not None else 3
             input_dim = config.window.input_len * int(set_num_features)
         else:
+            set_num_features = len(config.columns.value_cols)
             input_dim = config.window.input_len * len(config.columns.value_cols)
         if model_type == "cvae":
             model = CVAE(input_dim=input_dim, latent_dim=config.model.latent_dim, 
@@ -354,7 +339,7 @@ def train(config):
                         hierarchy_config=hierarchy,
                         )
             print(f"Initialized CVAE with input_dim={input_dim}, latent_dim={config.model.latent_dim}, encoder_type={config.model.encoder.type}, decoder_type={config.model.decoder.type}, prior_type={config.model.prior.type}, conditioner_tags={config.conditioning.tags}")
-        else:
+        elif model_type == "set_guide_vae":
             set_cfg = config.model.set
             set_num_features = set_cfg.num_features if set_cfg.num_features is not None else len(config.columns.value_cols)
             model = SetGuideVAE(
@@ -377,6 +362,23 @@ def train(config):
                 use_abl_pool=bool(getattr(set_cfg, "use_abl_pool", False)),
             )
             print(f"Initialized SetGuideVAE with input_dim={input_dim}, latent_dim={config.model.latent_dim}, encoder_type={config.model.encoder.type}, decoder_type={config.model.decoder.type}, prior_type={config.model.prior.type}, conditioner_tags={config.conditioning.tags}")
+        elif model_type == "art":
+            model = AutoRegressiveTransformerVAE(
+                input_dim=input_dim,
+                latent_dim=config.model.latent_dim,
+                conditioner=conditioner,
+                dictionary_size=config.model.prior.dictionary_size,
+                vamp_num_components=config.model.prior.vamp_num_components,
+                encoder_type=config.model.encoder.type,
+                decoder_type=config.model.decoder.type,
+                prior_type=config.model.prior.type,
+                hierarchy_config=hierarchy,
+                bin_size=config.model.art.num_bins,
+                nhead=config.model.art.transformer_num_heads,
+                num_layers=config.model.art.transformer_num_layers,
+                sequence_length=config.window.input_len,
+                num_features=set_num_features,
+            )
     elif model_type == "vae":
         input_dim = config.window.input_len * len(config.columns.value_cols)
         model = VAE(input_dim=input_dim, latent_dim=config.model.latent_dim,
@@ -400,7 +402,7 @@ def train(config):
 
     # === Phased parquet path ===
     if phased_mode:
-        if model_type not in {"set_guide_vae"}:
+        if model_type not in {"set_guide_vae", "art"}:
             raise ValueError("Phased parquet mode currently supports only SetGuideVAE (set_guide_vae) model type.")
 
         parquet_paths = []
@@ -475,6 +477,10 @@ def train(config):
             print("Using phased normalizer: log1p_phase")
         else:
             print(f"Warning: phased_parquet mode currently expects normalization.method='log1p_phase'. Got '{norm_method}'. Continuing without normalization.")
+        if model_type == "art" and normalizer is not None:
+            # We need to denormalize for tokenization in ART, so we must ensure the model has access to the normalizer.
+            model.normalizer = copy.deepcopy(normalizer)
+        
         if conditioner.condition_items.get("user_profile") is not None:
             conditioner.condition_items.get("user_profile", None).fit_on_files(parquet_paths)
         if config.window.aggregated and config.window.input_len != 24:
@@ -536,6 +542,8 @@ def train(config):
 
         model = model.to(device)
         model.prior.to(device)
+        if model_type == "art" and hasattr(model, "normalizer") and model.normalizer is not None:
+            model.normalizer = model.normalizer.to(device)
 
         if not vamp_initialized and isinstance(model.prior, VampPrior):
             init_from_data = bool(getattr(config.model.prior, "init_from_data", True))
@@ -741,6 +749,8 @@ def train(config):
         train_frac=config.data.splits.train_ratio,
         seed=config.data.splits.random_seed,
     )
+    if model_type == "art" and hasattr(model, "normalizer"):
+        model.normalizer = copy.deepcopy(normalizer).to(device)
 
     if hasattr(model, "conditioner") and model.conditioner is not None:
         user_profiler = model.conditioner.condition_items.get("user_profile")
@@ -882,7 +892,7 @@ def train(config):
 
 # run either VAE or CVAE test
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train VAE/CVAE/SetGuideVAE from YAML config")
+    parser = argparse.ArgumentParser(description="Train VAE/CVAE/SetGuideVAE/ART from YAML config")
     parser.add_argument("--config", type=str, default=os.path.join(parent_dir, "config", "config.yaml"))
     parser.add_argument("--skip-validation", action="store_true", default=False)
     parser.add_argument("--quiet", action="store_true", default=False)

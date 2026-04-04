@@ -1,4 +1,5 @@
 import argparse
+import copy
 import random
 import sys
 from pathlib import Path
@@ -17,11 +18,96 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from src.model.set import SetGuideVAE
+from src.model.art import AutoRegressiveTransformerVAE
 from src.data.dataloader_phased import WindowSpec, PhasedReplayDataloaders
 from src.visualization.writer import Writer
 from src.visualization.visualizer import Visualizer
 from src.visualization.plot_styling import PlotStyle
 from evaluation.eval_framework import PhasedEvaluationSuite
+
+
+def _checkpoint_model_class_name(checkpoint_file: Path) -> str | None:
+    try:
+        checkpoint = torch.load(str(checkpoint_file), map_location="cpu", weights_only=False)
+    except Exception as exc:
+        print(f"Warning: could not inspect checkpoint metadata for model class: {exc}")
+        return None
+
+    model_info = checkpoint.get("model_info", {}) if isinstance(checkpoint, dict) else {}
+    class_name = model_info.get("model_class", None) if isinstance(model_info, dict) else None
+    if isinstance(class_name, str) and class_name.strip():
+        return class_name.strip()
+    return None
+
+
+def _resolve_model_class_name(config: SimpleNamespace, checkpoint_file: Path) -> str:
+    class_name = _checkpoint_model_class_name(checkpoint_file)
+    if class_name is not None:
+        return class_name
+
+    model_type = str(getattr(getattr(config, "model", SimpleNamespace()), "type", "")).lower()
+    if model_type == "art":
+        return "AutoRegressiveTransformerVAE"
+    if model_type == "set_guide_vae":
+        return "SetGuideVAE"
+
+    raise ValueError(
+        "Could not determine model class from checkpoint metadata or config.model.type. "
+        f"Detected config.model.type='{model_type}'."
+    )
+
+
+def _resolve_model_loader_class(model_class_name: str):
+    if model_class_name == "SetGuideVAE":
+        return SetGuideVAE
+    if model_class_name == "AutoRegressiveTransformerVAE":
+        return AutoRegressiveTransformerVAE
+    raise ValueError(
+        "Unsupported model class for phased checkpoint evaluation: "
+        f"'{model_class_name}'. Supported: SetGuideVAE, AutoRegressiveTransformerVAE."
+    )
+
+
+def _build_model_load_kwargs(config: SimpleNamespace, model_class_name: str) -> dict:
+    model_cfg = getattr(config, "model", SimpleNamespace())
+    kwargs = {}
+
+    if hasattr(config, "window") and hasattr(config.window, "input_len"):
+        kwargs["sequence_length"] = int(config.window.input_len)
+
+    set_cfg = getattr(model_cfg, "set", SimpleNamespace())
+    kwargs["num_features"] = int(getattr(set_cfg, "num_features", 3) or 3)
+
+    prior_cfg = getattr(model_cfg, "prior", SimpleNamespace())
+    if getattr(prior_cfg, "dictionary_size", None) is not None:
+        kwargs["dictionary_size"] = int(prior_cfg.dictionary_size)
+    if getattr(prior_cfg, "vamp_num_components", None) is not None:
+        kwargs["vamp_num_components"] = int(prior_cfg.vamp_num_components)
+
+    if model_class_name == "SetGuideVAE":
+        if getattr(set_cfg, "hidden_dim", None) is not None:
+            kwargs["set_hidden_dim"] = int(set_cfg.hidden_dim)
+        if getattr(set_cfg, "num_heads", None) is not None:
+            kwargs["set_num_heads"] = int(set_cfg.num_heads)
+        if getattr(set_cfg, "num_inds", None) is not None:
+            kwargs["set_num_inds"] = int(set_cfg.num_inds)
+        if getattr(set_cfg, "num_blocks", None) is not None:
+            kwargs["set_num_blocks"] = int(set_cfg.num_blocks)
+        if getattr(set_cfg, "is_isab", None) is not None:
+            kwargs["is_isab"] = bool(set_cfg.is_isab)
+        if getattr(set_cfg, "use_abl_pool", None) is not None:
+            kwargs["use_abl_pool"] = bool(set_cfg.use_abl_pool)
+
+    if model_class_name == "AutoRegressiveTransformerVAE":
+        art_cfg = getattr(model_cfg, "art", SimpleNamespace())
+        if getattr(art_cfg, "num_bins", None) is not None:
+            kwargs["bin_size"] = int(art_cfg.num_bins)
+        if getattr(art_cfg, "transformer_num_heads", None) is not None:
+            kwargs["nhead"] = int(art_cfg.transformer_num_heads)
+        if getattr(art_cfg, "transformer_num_layers", None) is not None:
+            kwargs["num_layers"] = int(art_cfg.transformer_num_layers)
+
+    return kwargs
 
 
 def _to_namespace(obj):
@@ -169,7 +255,7 @@ def resolve_shared_eval_plan(config_path: str, max_files: int | None = None, see
     }
 
 
-def _prepare_phased_window(config: SimpleNamespace, model: SetGuideVAE, phased_cfg) -> tuple[WindowSpec, bool, float]:
+def _prepare_phased_window(config: SimpleNamespace, model, phased_cfg) -> tuple[WindowSpec, bool, float]:
     seq_len = int(getattr(model, "sequence_length", config.window.input_len))
     hourly_aggregation = bool(getattr(config.window, "aggregated", False))
     aggregation_energy_unit = str(getattr(phased_cfg, "aggregation_energy_unit", "wh")).lower()
@@ -197,7 +283,7 @@ def _prepare_phased_window(config: SimpleNamespace, model: SetGuideVAE, phased_c
 
 def _build_eval_loader(
     config: SimpleNamespace,
-    model: SetGuideVAE,
+    model,
     normalizer,
     project_root: Path,
     max_files: int | None,
@@ -309,7 +395,8 @@ def _run_evaluation_and_visualization(
     *,
     model,
     test_loader,
-    normalizer,
+    normalizer_eval,
+    normalizer_viz,
     conditioner,
     device: torch.device,
     log_path: Path,
@@ -322,7 +409,7 @@ def _run_evaluation_and_visualization(
     evaluator = PhasedEvaluationSuite(
         model,
         test_loader,
-        normalizer=normalizer,
+        normalizer=normalizer_eval,
         conditioner=conditioner,
         device=str(device),
         window_size=config.window.input_len,
@@ -341,7 +428,7 @@ def _run_evaluation_and_visualization(
         plot_style=PlotStyle(),
         log_dir=str(log_path),
         device=device,
-        normalizer=normalizer,
+        normalizer=normalizer_viz,
         conditioner=conditioner,
     )
     visualizer.visualize(
@@ -393,7 +480,15 @@ def run_checkpoint_evaluation(
     print(f"Checkpoint: {ckpt_file}")
     print(f"Device: {selected_device}")
 
-    model, normalizer_ckpt = SetGuideVAE.load_from_checkpoint(str(ckpt_file), device=selected_device)
+    model_class_name = _resolve_model_class_name(config=config, checkpoint_file=ckpt_file)
+    model_loader_class = _resolve_model_loader_class(model_class_name)
+    model_load_kwargs = _build_model_load_kwargs(config=config, model_class_name=model_class_name)
+    print(f"Loading model class: {model_class_name}")
+    model, normalizer_ckpt = model_loader_class.load_from_checkpoint(
+        str(ckpt_file),
+        device=selected_device,
+        **model_load_kwargs,
+    )
     model.eval()
 
     conditioner = getattr(model, "conditioner", None)
@@ -405,13 +500,23 @@ def run_checkpoint_evaluation(
             "To avoid normalization mismatches, this script requires a checkpoint-embedded normalizer."
         )
 
-    normalizer = normalizer_ckpt
-    print(f"Using normalizer loaded from checkpoint (method={getattr(normalizer, 'method', 'unknown')}).")
+    normalizer_eval = copy.deepcopy(normalizer_ckpt)
+    if hasattr(normalizer_eval, "to"):
+        normalizer_eval = normalizer_eval.to(selected_device)
+
+    normalizer_loader = copy.deepcopy(normalizer_ckpt)
+    if hasattr(normalizer_loader, "to"):
+        normalizer_loader = normalizer_loader.to("cpu")
+
+    if getattr(model, "__class__", None) is not None and model.__class__.__name__ == "AutoRegressiveTransformerVAE":
+        model.normalizer = normalizer_eval
+
+    print(f"Using normalizer loaded from checkpoint (method={getattr(normalizer_eval, 'method', 'unknown')}).")
 
     test_loader = _build_eval_loader(
         config=config,
         model=model,
-        normalizer=normalizer,
+        normalizer=normalizer_loader,
         project_root=ROOT_DIR,
         max_files=max_files,
         seed=eval_seed,
@@ -427,7 +532,8 @@ def run_checkpoint_evaluation(
     _run_evaluation_and_visualization(
         model=model,
         test_loader=test_loader,
-        normalizer=normalizer,
+        normalizer_eval=normalizer_eval,
+        normalizer_viz=normalizer_loader,
         conditioner=conditioner,
         device=selected_device,
         log_path=run_output_dir,
@@ -442,7 +548,7 @@ def run_checkpoint_evaluation(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Load a SetGuideVAE checkpoint and run evaluation + visualizations in one command."
+        description="Load a phased checkpoint and run evaluation + visualizations in one command."
     )
     parser.add_argument(
         "--checkpoint",
