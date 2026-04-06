@@ -62,6 +62,7 @@ data:
     steps_per_epoch: 10
     eval_batches: 5
     aggregation_energy_unit: "kwh" # set to "kwh" to divide hourly aggregated sums by 1000
+    output_aggregate_stream: false # when true, phased loader emits (x, cond, agg)
 
 # ============================================================================
 # NORMALIZATION CONFIGURATION

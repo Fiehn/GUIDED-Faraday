@@ -107,11 +107,25 @@ def _init_vamp_prior_from_batch(model, batch, device, noise_scale: float = 0.01)
             enc_in = torch.cat([set_repr, c], dim=-1)
         elif isinstance(model, CVAE):
             if len(batch) == 4:
-                x, c, meter_id, timestamps = batch
-                if c.numel() == 0 or c.shape[-1] != model.condition_dim:
+                x, second, third, fourth = batch
+                if torch.is_tensor(second) and second.dim() >= 2:
+                    c = second
+                    meter_id = third
+                    timestamps = fourth
+                else:
+                    c = None
+                    meter_id = second
+                    timestamps = third
+                if c is None or c.numel() == 0 or c.shape[-1] != model.condition_dim:
                     c = model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
             elif len(batch) == 3:
-                x, meter_id, timestamps = batch
+                x, second, third = batch
+                if torch.is_tensor(second) and second.dim() == 3 and second.shape[1] >= 2:
+                    meter_id = second[:, 0, 0].long()
+                    timestamps = second[:, 1, 0].long()
+                else:
+                    meter_id = second
+                    timestamps = third
                 c = model.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
             elif len(batch) == 2:
                 x, meter_id = batch
@@ -248,20 +262,27 @@ def train(config):
 
     data_mode = str(getattr(config.data, "mode", "csv")).lower()
     phased_mode = data_mode in {"phased", "phase", "parquet", "phased_parquet"}
+    validation_model_type = str(getattr(config.model, "type", "vae")).lower()
 
     if phased_mode and not config.skip_validation:
         print("Phased parquet mode detected. Skipping CSV-based pre-validation (run_validation).")
     if (not config.skip_validation) and (not phased_mode):
-        validation_passed = run_validation(
-            model_type=config.model.type,
-            use_test_data=True,  # use small test data for fast validation
-            verbose=config.verbose
-        )
-        if not validation_passed:
-            print("\nValidation failed! Please fix issues before training.")
-            print("To skip validation, set skip_validation=True in the config (not recommended)")
-            return
-        print("\nValidation passed! Proceeding to training\n")
+        if validation_model_type in {"vae", "cvae"}:
+            validation_passed = run_validation(
+                model_type=validation_model_type,
+                use_test_data=True,  # use small test data for fast validation
+                verbose=config.verbose
+            )
+            if not validation_passed:
+                print("\nValidation failed! Please fix issues before training.")
+                print("To skip validation, set skip_validation=True in the config (not recommended)")
+                return
+            print("\nValidation passed! Proceeding to training\n")
+        else:
+            print(
+                "CSV mode pre-validation currently supports only VAE/CVAE. "
+                f"Skipping pre-validation for model_type='{validation_model_type}'."
+            )
     
     # === Hierarchical latent space setup ===
     if config.hierarchy.enabled:
@@ -327,13 +348,14 @@ def train(config):
             else:
                 print(f"Warning: Unknown condition tag '{condition_tag}' in config. Skipping this conditioner.")
         
-        if data_mode in {"phased", "phase", "parquet", "phased_parquet"} and model_type in {"set_guide_vae", "art", "diffusion"}:
-            set_cfg = getattr(config.model, "set", SimpleNamespace(num_features=3))
-            set_num_features = set_cfg.num_features if getattr(set_cfg, "num_features", None) is not None else 3
-            input_dim = config.window.input_len * int(set_num_features)
+        set_cfg = getattr(config.model, "set", SimpleNamespace(num_features=None))
+        csv_num_features = len(config.columns.value_cols)
+        if phased_mode and model_type in {"set_guide_vae", "art", "diffusion"}:
+            phased_num_features = getattr(set_cfg, "num_features", None)
+            set_num_features = int(phased_num_features) if phased_num_features is not None else 3
         else:
-            set_num_features = len(config.columns.value_cols)
-            input_dim = config.window.input_len * len(config.columns.value_cols)
+            set_num_features = int(csv_num_features)
+        input_dim = config.window.input_len * int(set_num_features)
         if model_type == "cvae":
             model = CVAE(input_dim=input_dim, latent_dim=config.model.latent_dim, 
                         conditioner=conditioner, dictionary_size=config.model.prior.dictionary_size, 
@@ -346,7 +368,10 @@ def train(config):
             print(f"Initialized CVAE with input_dim={input_dim}, latent_dim={config.model.latent_dim}, encoder_type={config.model.encoder.type}, decoder_type={config.model.decoder.type}, prior_type={config.model.prior.type}, conditioner_tags={config.conditioning.tags}")
         elif model_type == "set_guide_vae":
             set_cfg = config.model.set
-            set_num_features = set_cfg.num_features if set_cfg.num_features is not None else len(config.columns.value_cols)
+            if phased_mode:
+                set_num_features = set_cfg.num_features if set_cfg.num_features is not None else int(set_num_features)
+            else:
+                set_num_features = len(config.columns.value_cols)
             model = SetGuideVAE(
                 input_dim=input_dim,
                 latent_dim=config.model.latent_dim,
@@ -500,6 +525,14 @@ def train(config):
         cache_scan_batches = int(getattr(phased_cfg, "cache_scan_batches", 0)) or None
         skip_corrupt_files = bool(getattr(phased_cfg, "skip_corrupt_files", True))
         max_skip_warnings = int(getattr(phased_cfg, "max_skip_warnings", 20))
+        output_aggregate_stream = bool(getattr(phased_cfg, "output_aggregate_stream", False))
+
+        if output_aggregate_stream:
+            print(
+                "Phased aggregate stream enabled: train/eval loaders emit aggregate tensors "
+                "alongside phased tensors. Current ART/Diffusion/SET-GUIDE paths will ignore "
+                "the aggregate unless a splitter-specific model consumes it."
+            )
 
         print("Phased mode will allocate train/eval from one shared replay cache each epoch.")
         if skip_corrupt_files:
@@ -557,6 +590,7 @@ def train(config):
             eval_cache_batches=eval_batches,
             cache_scan_batches=cache_scan_batches,
             pin_memory=(str(device) != "cpu"),
+            output_aggregate_stream=output_aggregate_stream,
             skip_corrupt_files=skip_corrupt_files,
             max_skip_warnings=max_skip_warnings,
         )

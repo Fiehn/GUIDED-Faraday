@@ -1,5 +1,6 @@
 from src.model.cvae import *
 import torch
+import itertools
 from src.data.conditioner import Conditioner
 from src.model.cvae import get_encoder_model, VampPrior
 from src.model.vae import HierarchicalConfig
@@ -185,9 +186,24 @@ class SetGuideVAE(CVAE):
 
     def _unpack_batch(self, batch):
         """ Unpack batch supporting (x, meter_id, timestamps), (x, cond), or (x, meter_id) formats. """
+        if len(batch) == 4:
+            x, second, third, fourth = batch
+            # Regular CSV dataloader: (x, c, meter_id, timestamps)
+            if torch.is_tensor(second) and second.dim() >= 2:
+                return x, third, fourth
+            # Eval/extended tuple: (x, meter_id, timestamps, agg)
+            return x, second, third
+
         if len(batch) == 3:
-            x, meter_id, timestamps = batch
-            return x, meter_id, timestamps
+            x, second, third = batch
+            # Phased condition tensor: cond=[B, 2, L]
+            if torch.is_tensor(second) and second.dim() == 3 and second.shape[1] >= 2:
+                meter_id = second[:, 0, 0].long()
+                timestamps = second[:, 1, 0].long()
+                return x, meter_id, timestamps
+
+            # Plain tuple: (x, meter_id, timestamps)
+            return x, second, third
 
         if len(batch) != 2:
             raise ValueError("SetGuideVAE expects batches as (x, meter_id, timestamps), (x, meter_id), or (x, cond)")
@@ -325,30 +341,33 @@ class SetGuideVAE(CVAE):
 
         x_phases = x.reshape(B, F, L)
 
-        permutations = [
-            [0, 1, 2], [0, 2, 1], 
-            [1, 0, 2], [1, 2, 0], 
-            [2, 0, 1], [2, 1, 0]
-        ]
+        # --- STEP 1/2: Find the best permutation and construct optimal target ---
+        if F <= 1:
+            x_optimal = x
+        else:
+            # Full permutation search is factorial in F. Keep exact behavior for small F.
+            max_perm_features = 6
+            if F > max_perm_features:
+                permutations = [list(range(F))]
+            else:
+                permutations = [list(p) for p in itertools.permutations(range(F))]
 
-        # --- STEP 1: Find the best permutation ---
-        with torch.no_grad():
-            ll_scores = []
-            for perm in permutations:
-                x_permuted = x_phases[:, perm, :]
-                x_perm_flat = x_permuted.reshape(B, -1)
-                
-                ll = self.decoder.loglikelihood(x_perm_flat, recon_params_squeezed) 
-                ll_scores.append(ll.unsqueeze(1))
-                
-            all_ll = torch.cat(ll_scores, dim=1) # [B, 6]
-            best_perm_idx = all_ll.argmax(dim=1) # [B]
+            with torch.no_grad():
+                ll_scores = []
+                for perm in permutations:
+                    x_permuted = x_phases[:, perm, :]
+                    x_perm_flat = x_permuted.reshape(B, -1)
 
-        # --- STEP 2: Construct the single optimal target batch ---
-        x_optimal = torch.empty_like(x)
-        for i in range(B):
-            best_p = permutations[best_perm_idx[i]]
-            x_optimal[i] = x_phases[i, best_p, :].reshape(-1)
+                    ll = self.decoder.loglikelihood(x_perm_flat, recon_params_squeezed)
+                    ll_scores.append(ll.unsqueeze(1))
+
+                all_ll = torch.cat(ll_scores, dim=1)
+                best_perm_idx = all_ll.argmax(dim=1)
+
+            x_optimal = torch.empty_like(x)
+            for i in range(B):
+                best_p = permutations[int(best_perm_idx[i].item())]
+                x_optimal[i] = x_phases[i, best_p, :].reshape(-1)
 
         # --- STEP 3: Do the heavy math exactly ONCE with gradients ON ---
         best_ll = self.decoder.loglikelihood(x_optimal, recon_params_squeezed)

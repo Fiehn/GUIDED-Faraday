@@ -70,6 +70,7 @@ data:
     skip_corrupt_files: true
     max_skip_warnings: 20
     aggregation_energy_unit: "kwh" # "wh" keeps raw hourly sum scale, "kwh" divides hourly sums by 1000
+    output_aggregate_stream: false # when true, phased loader emits (x, cond, agg) for splitter-model pipelines
 
 # ============================================================================
 # NORMALIZATION CONFIGURATION

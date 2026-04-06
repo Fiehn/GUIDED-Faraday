@@ -741,14 +741,29 @@ class DiffusionModel(nn.Module):
     def _unpack_batch(self, batch):
         """Support (x, meter_id, timestamps), (x, cond), (x, meter_id), and (x, c, meter_id, timestamps)."""
         provided_conditions = None
+        expected_cond_dim = getattr(getattr(self.model, "cond_proj", None), "in_features", None)
 
         if isinstance(batch, (list, tuple)) and len(batch) == 4:
-            x, c, meter_id, timestamps = batch
-            return x, meter_id, timestamps, c
+            x, second, third, fourth = batch
+            # Regular CSV explicit tuple: (x, c, meter_id, timestamps)
+            if (
+                torch.is_tensor(second)
+                and second.dim() >= 2
+                and expected_cond_dim is not None
+                and int(expected_cond_dim) > 0
+                and second.shape[-1] == int(expected_cond_dim)
+            ):
+                return x, third, fourth, second
+            # Extended eval tuple: (x, meter_id, timestamps, agg)
+            return x, second, third, None
 
         if isinstance(batch, (list, tuple)) and len(batch) == 3:
-            x, meter_id, timestamps = batch
-            return x, meter_id, timestamps, None
+            x, second, third = batch
+            if torch.is_tensor(second) and second.dim() == 3 and second.shape[1] >= 2:
+                meter_id = second[:, 0, 0].long()
+                timestamps = second[:, 1, 0].long()
+                return x, meter_id, timestamps, None
+            return x, second, third, None
 
         if not isinstance(batch, (list, tuple)) or len(batch) != 2:
             raise ValueError(
@@ -759,7 +774,6 @@ class DiffusionModel(nn.Module):
         meter_id = second
         timestamps = None
 
-        expected_cond_dim = getattr(getattr(self.model, "cond_proj", None), "in_features", None)
         if torch.is_tensor(second) and second.dim() == 3 and second.shape[1] >= 2:
             meter_id = second[:, 0, 0].long()
             timestamps = second[:, 1, 0].long()

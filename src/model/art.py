@@ -354,9 +354,22 @@ class AutoRegressiveTransformerVAE(CVAE):
         return x_phase_first.transpose(1, 2)
     def _unpack_batch(self, batch):
         """ Unpack batch supporting (x, meter_id, timestamps), (x, cond), or (x, meter_id) formats. """
+        if len(batch) == 4:
+            x, second, third, fourth = batch
+            # Regular CSV dataloader: (x, c, meter_id, timestamps)
+            if torch.is_tensor(second) and second.dim() >= 2:
+                return x, third, fourth
+            # Eval/extended tuple: (x, meter_id, timestamps, agg)
+            return x, second, third
+
         if len(batch) == 3:
-            x, meter_id, timestamps = batch
-            return x, meter_id, timestamps
+            x, second, third = batch
+            if torch.is_tensor(second) and second.dim() == 3 and second.shape[1] >= 2:
+                meter_id = second[:, 0, 0].long()
+                timestamps = second[:, 1, 0].long()
+                return x, meter_id, timestamps
+
+            return x, second, third
 
         if len(batch) != 2:
             raise ValueError("ART expects batches as (x, meter_id, timestamps), (x, meter_id), or (x, cond)")

@@ -40,6 +40,7 @@ class StreamingParquetBuffer(IterableDataset):
                  file_skipped_map=None,
                  skip_corrupt_files: bool = True,
                  max_skip_warnings: int = 20,
+                 output_aggregate_stream: bool = False,
                  sample_random: bool = True,
                  ):
         self.sm_files = sm_files
@@ -71,6 +72,7 @@ class StreamingParquetBuffer(IterableDataset):
         self.skip_corrupt_files = bool(skip_corrupt_files)
         self.max_skip_warnings = max(0, int(max_skip_warnings))
         self._skip_warning_count = 0
+        self.output_aggregate_stream = bool(output_aggregate_stream)
         self.sample_random = bool(sample_random)
 
     def _mark_file_seen(self, file_path: str):
@@ -243,10 +245,18 @@ class StreamingParquetBuffer(IterableDataset):
                     if self.normalizer is not None:
                         # seq shape is [24, 3], broadcasting with [3,]
                         seq = self.normalizer.transform(seq)
+                    agg = None
+                    if self.output_aggregate_stream:
+                        agg = seq.sum(dim=1, keepdim=True)
                     seq = seq.T
+                    if agg is not None:
+                        agg = agg.T
 
-                    # Push the (seq, cond) pair into the replay buffer
-                    self._push_to_buffer((seq, cond))
+                    # Push the sample into the replay buffer
+                    if agg is not None:
+                        self._push_to_buffer((seq, cond, agg))
+                    else:
+                        self._push_to_buffer((seq, cond))
 
                     # Yield only when the buffer is adequately mixed
                     if self.current_size >= self.min_buffer_size:
@@ -315,6 +325,7 @@ class PhasedReplayDataloaders:
             eval_cache_batches: Optional[int] = None,
             cache_scan_batches: Optional[int] = None,
             pin_memory: bool = False,
+            output_aggregate_stream: bool = False,
             skip_corrupt_files: bool = True,
             max_skip_warnings: int = 20,
             sample_random: bool = True,
@@ -325,6 +336,7 @@ class PhasedReplayDataloaders:
         self.eval_cache_batches = eval_cache_batches
         self.cache_scan_batches = cache_scan_batches
         self.pin_memory = bool(pin_memory)
+        self.output_aggregate_stream = bool(output_aggregate_stream)
         self.sample_random = bool(sample_random)
         self.total_files = len(set(sm_files))
 
@@ -351,6 +363,7 @@ class PhasedReplayDataloaders:
             file_skipped_map=self._file_skipped_map,
             skip_corrupt_files=skip_corrupt_files,
             max_skip_warnings=max_skip_warnings,
+            output_aggregate_stream=self.output_aggregate_stream,
             sample_random=self.sample_random,
         )
 
@@ -401,8 +414,10 @@ class PhasedReplayDataloaders:
     def _collect_cache(self, target_train: int, target_eval: int):
         train_x = None
         train_c = None
+        train_agg = None
         eval_x = None
         eval_c = None
+        eval_agg = None
         train_samples = 0
         eval_samples = 0
 
@@ -417,16 +432,27 @@ class PhasedReplayDataloaders:
                 print("Warning: phased stream produced no data while collecting cache.")
                 break
 
-            x, cond = batch
+            has_agg = isinstance(batch, (list, tuple)) and len(batch) == 3
+            if has_agg:
+                x, cond, agg = batch
+            else:
+                x, cond = batch
+                agg = None
             x = x.float()
             cond = cond.long()
+            if agg is not None:
+                agg = agg.float()
 
             if train_x is None and target_train > 0:
                 train_x = torch.empty((target_train, *x.shape[1:]), dtype=x.dtype)
                 train_c = torch.empty((target_train, *cond.shape[1:]), dtype=cond.dtype)
+                if agg is not None:
+                    train_agg = torch.empty((target_train, *agg.shape[1:]), dtype=agg.dtype)
             if eval_x is None and target_eval > 0:
                 eval_x = torch.empty((target_eval, *x.shape[1:]), dtype=x.dtype)
                 eval_c = torch.empty((target_eval, *cond.shape[1:]), dtype=cond.dtype)
+                if agg is not None:
+                    eval_agg = torch.empty((target_eval, *agg.shape[1:]), dtype=agg.dtype)
 
             n = x.shape[0]
             remaining_train = max(0, target_train - train_samples)
@@ -450,17 +476,27 @@ class PhasedReplayDataloaders:
             c_eval = cond[eval_mask]
             x_train = x[~eval_mask]
             c_train = cond[~eval_mask]
+            if agg is not None:
+                agg_eval = agg[eval_mask]
+                agg_train = agg[~eval_mask]
+            else:
+                agg_eval = None
+                agg_train = None
 
             if remaining_train > 0 and x_train.shape[0] > 0:
                 take_train = min(remaining_train, x_train.shape[0])
                 train_x[train_samples:train_samples + take_train].copy_(x_train[:take_train])
                 train_c[train_samples:train_samples + take_train].copy_(c_train[:take_train])
+                if train_agg is not None and agg_train is not None:
+                    train_agg[train_samples:train_samples + take_train].copy_(agg_train[:take_train])
                 train_samples += int(take_train)
 
             if remaining_eval > 0 and x_eval.shape[0] > 0:
                 take_eval = min(remaining_eval, x_eval.shape[0])
                 eval_x[eval_samples:eval_samples + take_eval].copy_(x_eval[:take_eval])
                 eval_c[eval_samples:eval_samples + take_eval].copy_(c_eval[:take_eval])
+                if eval_agg is not None and agg_eval is not None:
+                    eval_agg[eval_samples:eval_samples + take_eval].copy_(agg_eval[:take_eval])
                 eval_samples += int(take_eval)
 
             if train_samples >= target_train and eval_samples >= target_eval:
@@ -475,20 +511,26 @@ class PhasedReplayDataloaders:
             if take > 0:
                 train_x[train_samples:train_samples + take].copy_(eval_x[:take])
                 train_c[train_samples:train_samples + take].copy_(eval_c[:take])
+                if train_agg is not None and eval_agg is not None:
+                    train_agg[train_samples:train_samples + take].copy_(eval_agg[:take])
                 train_samples += int(take)
 
         if train_x is not None:
             train_x = train_x[:train_samples]
         if train_c is not None:
             train_c = train_c[:train_samples]
+        if train_agg is not None:
+            train_agg = train_agg[:train_samples]
         if eval_x is not None:
             eval_x = eval_x[:eval_samples]
         if eval_c is not None:
             eval_c = eval_c[:eval_samples]
+        if eval_agg is not None:
+            eval_agg = eval_agg[:eval_samples]
 
-        return train_x, train_c, eval_x, eval_c
+        return train_x, train_c, train_agg, eval_x, eval_c, eval_agg
 
-    def _build_eval_loader(self, x_eval, c_eval):
+    def _build_eval_loader(self, x_eval, c_eval, agg_eval=None):
         if x_eval is None or c_eval is None or x_eval.shape[0] == 0:
             self.eval_loader = None
             return
@@ -508,6 +550,8 @@ class PhasedReplayDataloaders:
                 x_eval = x_eval.to(self.eval_cache_device)
                 meter_id = meter_id.to(self.eval_cache_device)
                 timestamps = timestamps.to(self.eval_cache_device)
+                if agg_eval is not None:
+                    agg_eval = agg_eval.to(self.eval_cache_device)
             except RuntimeError as e:
                 # Fall back to CPU cache if GPU preloading runs out of memory.
                 if "out of memory" in str(e).lower():
@@ -516,7 +560,10 @@ class PhasedReplayDataloaders:
                 else:
                     raise
 
-        eval_ds = TensorDataset(x_eval, meter_id, timestamps)
+        if agg_eval is not None:
+            eval_ds = TensorDataset(x_eval, meter_id, timestamps, agg_eval)
+        else:
+            eval_ds = TensorDataset(x_eval, meter_id, timestamps)
         eval_workers = 0
         pin_eval_memory = self.pin_memory and x_eval.device.type == "cpu"
         self.eval_loader = DataLoader(
@@ -537,12 +584,15 @@ class PhasedReplayDataloaders:
                 eval_cache_batches = self.eval_cache_batches if self.eval_cache_batches is not None else eval_batches
                 target_eval = max(1, int(eval_cache_batches)) * self.batch_size
 
-        train_x, train_c, eval_x, eval_c = self._collect_cache(target_train, target_eval)
+        train_x, train_c, train_agg, eval_x, eval_c, eval_agg = self._collect_cache(target_train, target_eval)
 
         if train_x is None or train_c is None or train_x.shape[0] == 0:
             return None, self.eval_loader
 
-        train_ds = TensorDataset(train_x, train_c)
+        if train_agg is not None:
+            train_ds = TensorDataset(train_x, train_c, train_agg)
+        else:
+            train_ds = TensorDataset(train_x, train_c)
         pin_train_memory = self.pin_memory and train_x.device.type == "cpu"
         train_loader = DataLoader(
             train_ds,
@@ -553,82 +603,15 @@ class PhasedReplayDataloaders:
         )
 
         if target_eval > 0:
-            self._build_eval_loader(eval_x, eval_c)
+            self._build_eval_loader(eval_x, eval_c, eval_agg)
 
         return train_loader, self.eval_loader
 
     def refresh_eval_cache(self, eval_batches: int):
         target_eval = max(1, int(eval_batches)) * self.batch_size
-        _, _, eval_x, eval_c = self._collect_cache(0, target_eval)
-        self._build_eval_loader(eval_x, eval_c)
+        _, _, _, eval_x, eval_c, eval_agg = self._collect_cache(0, target_eval)
+        self._build_eval_loader(eval_x, eval_c, eval_agg)
 
     def get_eval_loader(self):
         return self.eval_loader
 
-
-class SMPhaseData:
-    def __init__(
-            self,
-            data_dir: str,
-            filename: Optional[str] = None,
-            window_spec: Optional[WindowSpec] = None,
-            batch_size: int = 32,
-            replay_buffer_capacity: int = 10000,
-            seed: Optional[int] = None,
-            train_frac: float = 0.8,
-            val_frac: float = 0.1,
-            test_frac: float = 0.1,
-            normalizer: Optional[Normalizer] = None,
-            num_workers: int = 0,
-            time_series_info_json: Optional[str] = None,
-            hourly_aggregation: bool = False,
-                aggregation_divisor: float = 1.0,
-            **kwargs
-    ):
-        if filename is not None:
-            self.data_files = [filename]
-        else:
-            self.data_files = self._get_all_files(data_dir, time_series_info_json)
-        
-        self.window_spec = window_spec
-        self.batch_size = batch_size
-        self.replay_buffer_capacity = replay_buffer_capacity
-        if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-        self.train_frac = train_frac
-        self.val_frac = val_frac
-        self.test_frac = test_frac
-        self.normalizer = normalizer
-        self.num_workers = num_workers
-        self.train_loader = None
-        self.val_loader = None
-        self.test_loader = None
-        self.aggregation = hourly_aggregation
-        self.aggregation_divisor = float(aggregation_divisor) if float(aggregation_divisor) > 0 else 1.0
-
-    def setup(self) -> None:
-        # Create the streaming dataset
-        dataset = StreamingParquetBuffer(
-            sm_files=self.data_files,
-            replay_buffer_capacity=self.replay_buffer_capacity,
-            window_spec=self.window_spec,
-            normalizer=self.normalizer,
-            num_workers=self.num_workers,
-            hourly_aggregation=self.aggregation,
-            aggregation_divisor=self.aggregation_divisor,
-        )
-
-        # Create the DataLoaders with the streaming dataset
-        self.train_loader = DataLoader(dataset, batch_size=self.batch_size, num_workers=self.num_workers)
-
-    def _get_all_files(self, data_dir, time_series_info_json=None):
-        if time_series_info_json is not None:
-            with open(time_series_info_json, 'r') as f:
-                info = json.load(f)
-            # json does not have paths but names of the files, so we need to reconstruct the paths
-            return [os.path.join(data_dir, filename) for filename in info['files']]
-        # This function should return a list of all Parquet files in the data directory
-        return [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.parquet')]
-    
