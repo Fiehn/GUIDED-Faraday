@@ -6,6 +6,7 @@ import yaml
 import time
 import math
 import copy
+import json
 from types import SimpleNamespace
 from xml.parsers.expat import model
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -29,6 +30,7 @@ from src.visualization.plot_styling import PlotStyle
 from src.model.model_utils import EarlyStopping
 from src.model.art import AutoRegressiveTransformerVAE
 from src.model.diffusion import DiffusionModel, NoiseScheduler, ConditionalUNet1D
+from src.model.phase_splitter import HierarchicalSplitter
 import gc
 
 
@@ -314,10 +316,13 @@ def train(config):
     model_type = str(config.model.type).lower()
     conditioner = None
 
+    if model_type == "phase_splitter" and not phased_mode:
+        raise ValueError("phase_splitter is currently supported only with data.mode='phased_parquet'.")
+
     if model_type == "diffusion" and hierarchy is not None:
         raise ValueError("DiffusionModel currently does not support hierarchy.enabled=true.")
 
-    if model_type in {"cvae", "set_guide_vae", "art", "diffusion"}:
+    if model_type in {"cvae", "set_guide_vae", "art", "diffusion", "phase_splitter"}:
         conditioner = Conditioner()
         for condition_tag in config.conditioning.tags:
             if condition_tag == "day_of_week":
@@ -350,7 +355,7 @@ def train(config):
         
         set_cfg = getattr(config.model, "set", SimpleNamespace(num_features=None))
         csv_num_features = len(config.columns.value_cols)
-        if phased_mode and model_type in {"set_guide_vae", "art", "diffusion"}:
+        if phased_mode and model_type in {"set_guide_vae", "art", "diffusion", "phase_splitter"}:
             phased_num_features = getattr(set_cfg, "num_features", None)
             set_num_features = int(phased_num_features) if phased_num_features is not None else 3
         else:
@@ -452,6 +457,16 @@ def train(config):
                 f"num_features={int(set_num_features)}, condition_dim={conditioner.get_condition_dim()}, "
                 f"schedule={scheduler.schedule_type}, cross_attention={denoiser.use_condition_cross_attention}"
             )
+        elif model_type == "phase_splitter":
+            model = HierarchicalSplitter(
+                conditioner=conditioner,
+                sequence_length=config.window.input_len,
+                condition_dim=int(conditioner.get_condition_dim()),
+            )
+            print(
+                f"Initialized HierarchicalSplitter with sequence_length={config.window.input_len}, "
+                f"condition_dim={int(conditioner.get_condition_dim())}, conditioner_tags={config.conditioning.tags}"
+            )
     elif model_type == "vae":
         input_dim = config.window.input_len * len(config.columns.value_cols)
         model = VAE(input_dim=input_dim, latent_dim=config.model.latent_dim,
@@ -475,9 +490,9 @@ def train(config):
 
     # === Phased parquet path ===
     if phased_mode:
-        if model_type not in {"set_guide_vae", "art", "diffusion"}:
+        if model_type not in {"set_guide_vae", "art", "diffusion", "phase_splitter"}:
             raise ValueError(
-                "Phased parquet mode currently supports set_guide_vae, art, and diffusion model types."
+                "Phased parquet mode currently supports set_guide_vae, art, diffusion, and phase_splitter model types."
             )
 
         parquet_paths = []
@@ -526,6 +541,9 @@ def train(config):
         skip_corrupt_files = bool(getattr(phased_cfg, "skip_corrupt_files", True))
         max_skip_warnings = int(getattr(phased_cfg, "max_skip_warnings", 20))
         output_aggregate_stream = bool(getattr(phased_cfg, "output_aggregate_stream", False))
+        if model_type == "phase_splitter" and not output_aggregate_stream:
+            output_aggregate_stream = True
+            print("For phase_splitter, forcing data.phased.output_aggregate_stream=true.")
 
         if output_aggregate_stream:
             print(
@@ -798,7 +816,7 @@ def train(config):
             phased_replay.refresh_eval_cache(eval_batches)
             combined_test_loader = phased_replay.get_eval_loader()
 
-        if combined_test_loader is not None:
+        if combined_test_loader is not None and model_type != "phase_splitter":
             _run_evaluation_and_visualization(
                 model=model,
                 test_loader=combined_test_loader,
@@ -810,6 +828,37 @@ def train(config):
                 phased_mode=True,
                 conditioner=conditioner,
             )
+        elif model_type == "phase_splitter":
+            if combined_test_loader is None:
+                print("Warning: no phased eval loader available; skipping phase_splitter quality evaluation.")
+            else:
+                try:
+                    split_metrics = model.evaluate_split_quality(
+                        combined_test_loader,
+                        device=device,
+                        normalizer=normalizer,
+                        plot_dir=log_path,
+                        num_plot_samples=6,
+                    )
+                    print("Phase Splitter quality metrics:")
+                    print(
+                        f"  PI-MSE={split_metrics['pi_mse']:.6f} | "
+                        f"PI-MAE={split_metrics['pi_mae']:.6f} | "
+                        f"Phase-Energy-MAE={split_metrics['phase_energy_mae']:.6f} | "
+                        f"Agg-Conservation-MAE={split_metrics['aggregate_conservation_mae']:.6f} | "
+                        f"PI-R2={split_metrics['pi_r2']:.6f} | "
+                        f"N={int(split_metrics['num_samples'])}"
+                    )
+                    if "examples_plot_path" in split_metrics:
+                        print(f"  Examples plot: {split_metrics['examples_plot_path']}")
+                    if "phase_mae_boxplot_path" in split_metrics:
+                        print(f"  Phase MAE boxplot: {split_metrics['phase_mae_boxplot_path']}")
+                    split_metrics_path = os.path.join(log_path, "phase_splitter_eval.json")
+                    with open(split_metrics_path, "w") as f:
+                        json.dump(split_metrics, f, indent=2)
+                    print(f"Saved phase splitter evaluation to {split_metrics_path}")
+                except Exception as e:
+                    print(f"Warning: phase_splitter quality evaluation failed: {e}")
 
         if writer is not None:
             writer.close()
