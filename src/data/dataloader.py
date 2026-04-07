@@ -511,6 +511,9 @@ class SmartMeterDataModule:
                 def __iter__(self):
                     for x, m, t in self.dm._yield_train_batches():
                         yield x, None, m, t
+            user_profiler.fit(StreamLoader(self))
+
+    def _fit_normalizer(self):
         """Fit normalizer on training meters only, streamed one meter at a time.
 
         If the normalizer is already fitted (e.g. pre-fitted across multiple
