@@ -12,15 +12,16 @@ verbose: true
 # ============================================================================
 data:
   # Data mode: "csv" (SmartMeterDataModule) or "phased_parquet" (StreamingParquetBuffer)
-  mode: "phased_parquet"
+  mode: "csv"
 
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
   # data_dir: "./data/raw_profiles"
-  data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+  #data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
   # data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
   #data_dir: "data/raw_profiles"
+  data_dir: "F:/Data/processed_data/hourly_data"
 
 
   # CSV filename to load
@@ -55,12 +56,12 @@ data:
   dataloader:
     batch_size:  256
     num_workers: 6
-    shuffle: false
+    shuffle: true
 
   # Phased parquet streaming settings (used by SetGuideVAE phased training)
   phased:
-    replay_buffer_capacity: 90000
-    min_buffer_size:  16000
+    replay_buffer_capacity: 200000
+    min_buffer_size:  20000
     num_workers: 6
     steps_per_epoch: 500
     eval_batches: 5
@@ -77,7 +78,7 @@ data:
 # ============================================================================
 normalization:
   # Type of normalization: "log1p", "student_t", "zero_preserved_log", "log1p_phase"
-  method: "log1p_phase"
+  method: "log1p"
   
   # Log1p specific parameters
   log1p:
@@ -87,8 +88,8 @@ normalization:
 # MODEL ARCHITECTURE CONFIGURATION
 # ============================================================================
 model:
-  # Model type: "vae", "cvae", "art", "set_guide_vae", "diffusion"
-  type: "diffusion"
+  # Model type: "vae", "cvae", "art", "set_guide_vae", "diffusion", "phase_splitter"
+  type: "cvae"
   
   # Device for training: "cpu" or "cuda"
   device: "cuda"
@@ -105,7 +106,7 @@ model:
   
   # Decoder configuration
   decoder:
-    type: "art"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
+    type: "dictionary"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
     hidden_dims: [256, 512, 512]
     dropout: 0.2
     activation: "relu"
@@ -113,9 +114,9 @@ model:
   
   # Prior configuration
   prior:
-    type: "learnable_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
+    type: "vampprior"  # Options: "standard_gaussian", "standard_dictionary", 
                                  # "learnable_gaussian", "learnable_dictionary", "vampprior"
-    dictionary_size: 512         # Must be > input_dim (96 timesteps × 3 phases = 288)
+    dictionary_size: 256         # Must be > input_dim (96 timesteps × 3 phases = 288)
     vamp_num_components: 40
     init_from_data: true
     init_noise_scale: 0.01
@@ -149,7 +150,7 @@ model:
     use_condition_cross_attention: true
     condition_cross_attention_heads: 16
     condition_tokens: 16
-    condition_dropout_prob: 0.10
+    condition_dropout_prob: 0.20
     reconstruction_noise_fraction: 0.30
     deterministic_reconstruction: true
 # ============================================================================
@@ -158,16 +159,16 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]
+  tags: ["day_of_week", "month_of_year", "user_profile", "holiday"]
   # ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  
   
   # User profiling (based on LDA)
   user_profile:
     online: true
-    n_topics: 20 # number of LDA topics
-    num_clusters: 200 # number of KMeans clusters for "words"
+    n_topics: 128 # number of LDA topics
+    num_clusters: 860 # number of KMeans clusters for "words"
     random_state: 42
-    cache_path: "./models/UserProfiles/user_profiles.pkl"
+    cache_path: "./models/UserProfiles/user_profiles1.pkl"
     verbose: false
   
   # Online user profiling (for OnlineCVAE)
@@ -199,7 +200,7 @@ training:
   # Optimization settings
   optimizer: "adam"  # Options: "adam", "adamw", "sgd"
   
-  learning_rate: 1.0e-3
+  learning_rate: 5.0e-4
   weight_decay: 1.0e-4
   
   # Gradient clipping
@@ -214,19 +215,19 @@ training:
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 10
+  num_epochs: 100
   
   # Beta (KL weight) settings
-  beta: 0.1 # 1.0
+  beta: 1.0 # 1.0
   
   # Cyclical beta annealing (prevents KL collapse)
   beta_annealing:
-    enabled: false # true
-    n_cycles: 1   
-    ratio: 0.25 # fraction of each cycle for warmup (0-1)
+    enabled: true # true
+    n_cycles: 8   
+    ratio: 0.5 # fraction of each cycle for warmup (0-1)
   
   # Weighted loss 
-  weighted_loss: 0.0  # Set > 0 to enable (e.g., 0.1)
+  weighted_loss: 0.5  # Set > 0 to enable (e.g., 0.1)
   
   # Early stopping
   early_stopping:

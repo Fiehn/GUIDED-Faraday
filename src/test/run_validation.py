@@ -84,7 +84,7 @@ def build_model(
             conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
             conditioner.add_condition_item(
                 "user_profile",
-                UserProfiler(n_topics=5, num_clusters=30, random_state=42),
+                UserProfiler(n_topics=5, num_clusters=30, random_state=42, path=None),
             )
 
         model = CVAE(
@@ -139,7 +139,7 @@ def run_validation(
     # ---- conditioner (CVAE only) ----
     conditioner = None
     if model_type.lower() == "cvae":
-        profiler = UserProfiler(n_topics=5, num_clusters=3, random_state=42)
+        profiler = UserProfiler(n_topics=5, num_clusters=3, random_state=42, path=None)
         profiler.fit(train_loader)
 
         conditioner = Conditioner()

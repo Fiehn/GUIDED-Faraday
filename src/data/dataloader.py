@@ -499,6 +499,8 @@ class SmartMeterDataModule:
         rng.shuffle(meter_ids)
 
         n = len(meter_ids)
+        n_train = 0
+        n_val = 0
         if n == 0:
             self.train_ids, self.val_ids, self.test_ids = [], [], []
         else:
@@ -594,6 +596,10 @@ class SmartMeterDataModule:
                 def __iter__(self):
                     for x, m, t in self.dm._yield_train_batches():
                         yield x, None, m, t
+
+            user_profiler.fit(StreamLoader(self))
+
+    def _fit_normalizer(self):
         """Fit normalizer on training meters only, streamed one meter at a time.
 
         If the normalizer is already fitted (e.g. pre-fitted across multiple
@@ -933,7 +939,32 @@ def fit_userprofiler_on_files(
                     normalizer=normalizer,
                     conditioner=None # none to prevent recursive fit!
                 )
-                from tqdm import tqdm
+
+                # Initialize loader + meter splits for streaming without materializing datasets.
+                dm.loader.load(filename)
+                meter_ids = dm.loader.meter_ids()
+                if dm.max_meters is not None:
+                    meter_ids = meter_ids[:dm.max_meters]
+
+                rng = np.random.default_rng(dm.seed)
+                rng.shuffle(meter_ids)
+
+                n = len(meter_ids)
+                if n == 0:
+                    dm.train_ids, dm.val_ids, dm.test_ids = [], [], []
+                else:
+                    n_train = max(1, int(n * dm.train_frac))
+                    n_val = max(0, int(n * dm.val_frac))
+
+                    if n >= 2 and (n_train + n_val) >= n:
+                        n_val = max(0, n - n_train - 1)
+                        if n_train >= n:
+                            n_train = n - 1
+
+                    dm.train_ids = meter_ids[:n_train]
+                    dm.val_ids = meter_ids[n_train:n_train + n_val]
+                    dm.test_ids = meter_ids[n_train + n_val:]
+
                 print(f"  -> Profiling {filename}...")
                 for x, m, t in dm._yield_train_batches():
                     # yield 4 items exactly like UserProfiler.fit expects: x, cond, meter, time

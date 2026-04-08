@@ -93,7 +93,17 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         self.is_fitted = False
         self._profile_lookup_tensors = {}
 
-        self.kmeans = MiniBatchKMeans(
+        self.kmeans = self._build_kmeans()
+
+        if self.path is not None:
+            try:
+                self.load(self.path)
+            except Exception as e:
+                if self.verbose:
+                    print(f"Could not load existing UserProfiler model from {self.path}. Will fit a new model. Error: {e}")
+
+    def _build_kmeans(self) -> MiniBatchKMeans:
+        return MiniBatchKMeans(
             n_clusters=self.num_clusters,
             random_state=self.random_state,
             verbose=1 if self.verbose else 0,
@@ -101,11 +111,37 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
             n_init='auto'
         )
 
-        try:
-            self.load(self.path)
-        except Exception as e:
-            if self.verbose:
-                print(f"Could not load existing UserProfiler model from {self.path}. Will fit a new model. Error: {e}")
+    def _clear_cached_user_state(self):
+        self.lambda_matrix = None
+        self.cluster_centers_ = None
+        self.user_profiles_cache = {}
+        self.gamma_cache = {}
+        self.user_last_seen = {}
+        self.kmeans_initialized = False
+        self.is_fitted = False
+        self._invalidate_profile_lookup()
+
+    def _current_feature_dim(self) -> int | None:
+        if self.cluster_centers_ is not None and getattr(self.cluster_centers_, "ndim", 0) == 2:
+            return int(self.cluster_centers_.shape[1])
+        n_features = getattr(self.kmeans, "n_features_in_", None)
+        if n_features is None:
+            return None
+        return int(n_features)
+
+    def _ensure_kmeans_feature_dim(self, incoming_feature_dim: int, context: str):
+        expected_feature_dim = self._current_feature_dim()
+        if expected_feature_dim is None or expected_feature_dim == int(incoming_feature_dim):
+            return
+
+        if self.verbose:
+            print(
+                f"[UserProfiler] Feature dimension changed in {context} "
+                f"({expected_feature_dim} -> {incoming_feature_dim}). Resetting cached profiler state."
+            )
+
+        self.kmeans = self._build_kmeans()
+        self._clear_cached_user_state()
 
     def _invalidate_profile_lookup(self):
         self._profile_lookup_tensors = {}
@@ -163,6 +199,12 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         if self.verbose:
             print("Fitting UserProfiler model")
             print("Phase 1: Clustering to create 'words")
+
+        # Full fit should rebuild user-specific cache from current training data.
+        self.user_profiles_cache = {}
+        self.gamma_cache = {}
+        self.user_last_seen = {}
+        self._invalidate_profile_lookup()
         
         # === Phase 1: Incremental clustering to create "words" ===
         batch_count = 0
@@ -178,7 +220,15 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
             if len(data_fit) == 0:
                 continue
 
-            self.kmeans.partial_fit(data_fit)
+            self._ensure_kmeans_feature_dim(data_fit.shape[1], context="fit")
+            if data_fit.shape[0] < self.num_clusters:
+                repeat_factor = int(math.ceil(self.num_clusters / max(1, data_fit.shape[0])))
+                idx = np.tile(np.arange(data_fit.shape[0]), repeat_factor)[:self.num_clusters]
+                data_kmeans = data_fit[idx]
+            else:
+                data_kmeans = data_fit
+
+            self.kmeans.partial_fit(data_kmeans)
             total_timesteps += data_fit.shape[0]
             batch_count += 1
         
@@ -344,6 +394,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
             x_kmeans = x_valid
             meter_ids_kmeans = meter_ids_valid
 
+        self._ensure_kmeans_feature_dim(x_kmeans.shape[1], context="update_model_incremental")
         self.kmeans.partial_fit(x_kmeans)
         # self.kmeans.partial_fit(x_valid)
         self.cluster_centers_ = self.kmeans.cluster_centers_

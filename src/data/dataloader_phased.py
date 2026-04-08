@@ -221,7 +221,7 @@ class StreamingParquetBuffer(IterableDataset):
 
         if worker_info is None:
             # Single-process data loading
-            files_for_this_worker = self.sm_files
+            files_for_this_worker = list(self.sm_files) # copy the list
         else:
             # Multi-process data loading
             per_worker = int(math.ceil(len(self.sm_files) / float(worker_info.num_workers)))
@@ -229,6 +229,9 @@ class StreamingParquetBuffer(IterableDataset):
             end_idx = min(start_idx + per_worker, len(self.sm_files))
 
             files_for_this_worker = self.sm_files[start_idx:end_idx]
+        
+        if self.sample_random:
+            random.shuffle(files_for_this_worker)
 
         # === Lazy parquet streaming ===
         for file in files_for_this_worker:

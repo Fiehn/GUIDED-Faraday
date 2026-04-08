@@ -44,8 +44,10 @@ class SplitterCNN(nn.Module):
             
         logits = self.out_conv(h) # [B, 3, 24]
         
-        # Softmax Constraint
-        proportions = F.softmax(logits, dim=1) 
+        # Divide by a temperature (e.g., 2.0 to 5.0) to prevent logit explosion
+        # This keeps the probabilities from snapping to 1.0/0.0 too early in training
+        temperature = 3.0 
+        proportions = F.softmax(logits / temperature, dim=1)
         
         return proportions
     
