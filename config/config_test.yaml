@@ -13,6 +13,8 @@ verbose: true
 data:
   # Data mode: "csv" (SmartMeterDataModule) or "phased_parquet" (StreamingParquetBuffer)
   mode: "phased_parquet"
+  # CSV mode only: when true, SmartMeterCSV skips CSV parsing and reads only parquet cache files.
+  parquet_only: false
 
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"

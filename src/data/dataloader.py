@@ -46,6 +46,7 @@ class SmartMeterCSV:
             This column is loaded but not used in the DataFrame index, so it can be omitted to save I/O if not needed.
         value_cols (Sequence[str]): Names of the value columns to load (e.g., consumption, production).
         nan_as_zero (bool): Whether to replace NaN values in the value columns with 0. Defaults to True.
+        parquet_only (bool): If True, bypass CSV parsing and read only parquet cache files.
 
     Attributes:
         df (pd.DataFrame | None): The loaded DataFrame after calling load(). Indexed by
@@ -61,6 +62,7 @@ class SmartMeterCSV:
         timestamp_utc_col: str | None = None, # UTC column – loaded but never used; omit to save I/O
         value_cols: Sequence[str],               # names of the value columns (e.g., consumption, production)
         nan_as_zero: bool = True,                # whether to replace NaN with 0
+        parquet_only: bool = False,
         max_failed_value_ratio: float | None = 0.90,
         max_bad_examples: int = 5,
     ): 
@@ -71,6 +73,7 @@ class SmartMeterCSV:
         self.timestamp_utc_col = timestamp_utc_col
         self.value_cols = list(value_cols)
         self.nan_as_zero = nan_as_zero
+        self.parquet_only = parquet_only
         self.max_failed_value_ratio = max_failed_value_ratio
         self.max_bad_examples = max_bad_examples
 
@@ -93,22 +96,59 @@ class SmartMeterCSV:
         Returns:
             pd.DataFrame: The loaded DataFrame, indexed by (meter_id, timestamp_dst_col) with value columns as specified in the constructor.
         """
-        path_candidates = [
-            os.path.join(self.csv_path, filename),
-            os.path.join(self.data_dir, filename),
-        ]
-        path = next((p for p in path_candidates if os.path.exists(p)), None)
-        if path is None:
-            raise FileNotFoundError(
-                f"File {filename} not found in {self.csv_path} or {self.data_dir}"
-            )
-
-        parquet_name = os.path.splitext(filename)[0] + ".parquet"
+        parquet_name = os.path.splitext(os.path.basename(filename))[0] + ".parquet"
         cache_dirs = [
             os.path.join(self.data_dir, "_parquet_cache"),
             os.path.join(self.data_dir, "parquet"),
         ]
-        cache_candidates = [os.path.join(cache_dir, parquet_name) for cache_dir in cache_dirs]
+
+        cache_candidates: list[str] = []
+        if os.path.isabs(filename):
+            cache_candidates.append(filename)
+        else:
+            cache_candidates.append(os.path.join(self.data_dir, filename))
+            for cache_dir in cache_dirs:
+                cache_candidates.append(os.path.join(cache_dir, filename))
+        for cache_dir in cache_dirs:
+            cache_candidates.append(os.path.join(cache_dir, parquet_name))
+
+        # De-duplicate candidates while preserving order
+        seen_cache_paths: set[str] = set()
+        unique_cache_candidates: list[str] = []
+        for p in cache_candidates:
+            npth = os.path.normpath(p)
+            if npth not in seen_cache_paths:
+                seen_cache_paths.add(npth)
+                unique_cache_candidates.append(p)
+        cache_candidates = unique_cache_candidates
+
+        if self.parquet_only:
+            for parquet_path in cache_candidates:
+                if os.path.exists(parquet_path):
+                    self.df = pd.read_parquet(parquet_path, engine="pyarrow")
+                    return self.df
+            raise FileNotFoundError(
+                f"Parquet-only mode enabled and no cache file found for '{filename}'. "
+                f"Looked in: {cache_candidates}"
+            )
+
+        if os.path.isabs(filename):
+            path_candidates = [filename]
+        else:
+            path_candidates = [
+                os.path.join(self.csv_path, filename),
+                os.path.join(self.data_dir, filename),
+            ]
+        path = next((p for p in path_candidates if os.path.exists(p)), None)
+
+        if path is None:
+            parquet_fallback = next((p for p in cache_candidates if os.path.exists(p)), None)
+            if parquet_fallback is not None:
+                self.df = pd.read_parquet(parquet_fallback, engine="pyarrow")
+                return self.df
+            raise FileNotFoundError(
+                f"File {filename} not found in {self.csv_path} or {self.data_dir}"
+            )
 
         # --- fast path: read from cache ---
         for parquet_path in cache_candidates:
@@ -413,6 +453,7 @@ class SmartMeterDataModule:
             train_frac (float): Fraction of meters to use for training. Defaults to 0.8.
             val_frac (float): Fraction of meters to use for validation. Defaults to 0.1.
             max_meters (int | None): Optional maximum number of meters to include in the dataset (for debugging or memory constraints). If None, all meters are included.
+            parquet_only (bool): If True, bypass CSV parsing and read only parquet cache files.
             normalizer: Optional normalizer object with .fit() and .transform() methods to apply normalization based on training data statistics.
             conditioner: Optional conditioner object with a .get_conditions() method to generate condition embeddings/features.
 
@@ -449,6 +490,7 @@ class SmartMeterDataModule:
         train_frac: float = 0.8,
         val_frac: float = 0.1,
         max_meters: int | None = None,
+        parquet_only: bool = False,
         normalizer = None,
         conditioner = None,
     ):
@@ -458,6 +500,7 @@ class SmartMeterDataModule:
             timestamp_dst_col=timestamp_dst_col,
             timestamp_utc_col=timestamp_utc_col,
             value_cols=feature_cols,
+            parquet_only=parquet_only,
         )
         self.filename = filename
         self.feature_cols = list(feature_cols)
@@ -778,6 +821,7 @@ def fit_normalizer_on_files(
     seed: int = 0,
     stats_path: str | None = None,
     force_refit: bool = False,
+    parquet_only: bool = False,
 ) -> None:
     """Fit a Normalizer across all data files using one streaming Welford pass.
 
@@ -799,6 +843,7 @@ def fit_normalizer_on_files(
     stats_path (str | None): Optional path to save/load the fitted normalizer stats. If None, defaults to <data_dir>/_parquet_cache/normalizer_<method>.pt.
     force_refit (bool): If True, forces refitting the normalizer from scratch even
         if cached stats are available. Defaults to False.
+    parquet_only (bool): If True, load only parquet cache files while fitting.
     """
     if stats_path is None:
         stats_path = os.path.join(
@@ -821,13 +866,20 @@ def fit_normalizer_on_files(
                 stats_mtime = os.path.getmtime(stats_path)
                 source_mtimes = []
                 for f in filenames:
-                    pq = os.path.join(data_dir, "_parquet_cache",
-                                      os.path.splitext(f)[0] + ".parquet")
-                    csv = os.path.join(data_dir, f)
-                    if os.path.exists(pq):
-                        source_mtimes.append(os.path.getmtime(pq))
-                    elif os.path.exists(csv):
-                        source_mtimes.append(os.path.getmtime(csv))
+                    source_candidates = []
+                    if os.path.isabs(f):
+                        source_candidates.append(f)
+                    else:
+                        source_candidates.append(os.path.join(data_dir, f))
+                        source_candidates.append(os.path.join(data_dir, "csv", f))
+
+                    parquet_name = os.path.splitext(os.path.basename(f))[0] + ".parquet"
+                    source_candidates.append(os.path.join(data_dir, "_parquet_cache", parquet_name))
+                    source_candidates.append(os.path.join(data_dir, "parquet", parquet_name))
+
+                    existing_mtimes = [os.path.getmtime(p) for p in source_candidates if os.path.exists(p)]
+                    if existing_mtimes:
+                        source_mtimes.append(max(existing_mtimes))
                 if not source_mtimes or max(source_mtimes) <= stats_mtime:
                     # Restore stats into normalizer
                     ns = saved["normalizer_state"]
@@ -846,6 +898,7 @@ def fit_normalizer_on_files(
         meter_col=meter_col,
         timestamp_dst_col=timestamp_dst_col,
         value_cols=feature_cols,
+        parquet_only=parquet_only,
     )
 
     feature_list = list(feature_cols)
@@ -903,6 +956,7 @@ def fit_userprofiler_on_files(
     train_frac: float = 0.8,
     normalizer=None,
     force_refit: bool = False,
+    parquet_only: bool = False,
 ) -> None:
     
     if user_profiler is None:
@@ -936,6 +990,7 @@ def fit_userprofiler_on_files(
                     shuffle_train=False, # Must be false to properly build coherent time series words if sequential matters, actually UserProfiler just needs windows
                     seed=seed,
                     train_frac=train_frac,
+                    parquet_only=parquet_only,
                     normalizer=normalizer,
                     conditioner=None # none to prevent recursive fit!
                 )

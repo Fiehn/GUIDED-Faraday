@@ -867,7 +867,26 @@ def train(config):
         return model
 
     # Load data sequentially based on what is in the folder and train the model in an online fashion
-    all_data_files = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv") and not f.startswith("test")])
+    parquet_only = bool(getattr(config.data, "parquet_only", False))
+    if parquet_only:
+        cache_dirs = [
+            os.path.join(data_dir, "_parquet_cache"),
+            os.path.join(data_dir, "parquet"),
+        ]
+        all_data_files = []
+        for cache_dir in cache_dirs:
+            if not os.path.isdir(cache_dir):
+                continue
+            all_data_files.extend(
+                [f for f in os.listdir(cache_dir) if f.endswith(".parquet") and not f.startswith("test")]
+            )
+        all_data_files = sorted(set(all_data_files))
+        print(
+            f"CSV mode with parquet-only loading enabled. "
+            f"Found {len(all_data_files)} parquet cache file(s)."
+        )
+    else:
+        all_data_files = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv") and not f.startswith("test")])
     
     data_files = config.data.data_files if len(config.data.data_files) > 0 else all_data_files
     print(f"Data files to be used for training: {data_files}")
@@ -882,6 +901,7 @@ def train(config):
         timestamp_dst_col=config.data.columns.timestamp_dst,
         train_frac=config.data.splits.train_ratio,
         seed=config.data.splits.random_seed,
+        parquet_only=parquet_only,
     )
     if model_type == "art" and hasattr(model, "normalizer"):
         model.normalizer = copy.deepcopy(normalizer).to(device)
@@ -902,7 +922,8 @@ def train(config):
                 num_workers=config.data.dataloader.num_workers,
                 seed=config.data.splits.random_seed,
                 train_frac=config.data.splits.train_ratio,
-                normalizer=normalizer
+                normalizer=normalizer,
+                parquet_only=parquet_only,
             )
 
     all_test_tensors = []
@@ -948,6 +969,7 @@ def train(config):
             train_frac=config.data.splits.train_ratio,
             val_frac=config.data.splits.val_ratio,
             max_meters=None,
+            parquet_only=parquet_only,
             normalizer=normalizer,
             conditioner=conditioner,
         )
