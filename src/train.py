@@ -1036,6 +1036,7 @@ def train(config):
     _save_training_config_snapshot(config=config, log_path=log_path)
     _run_evaluation_and_visualization(
         model=model,
+	conditioner=conditioner,
         test_loader=combined_test_loader,
         normalizer=normalizer,
         writer=writer,

@@ -4,7 +4,7 @@
 # This configuration file centralizes all parameters for model training,
 # data loading, and conditioning. 
 
-skip_validation: false
+skip_validation: true
 verbose: true
 
 # ============================================================================
@@ -12,9 +12,9 @@ verbose: true
 # ============================================================================
 data:
   # Data mode: "csv" (SmartMeterDataModule) or "phased_parquet" (StreamingParquetBuffer)
-  mode: "phased_parquet"
+  mode: "csv"
   # CSV mode only: when true, SmartMeterCSV skips CSV parsing and reads only parquet cache files.
-  parquet_only: false
+  parquet_only: true
 
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
@@ -22,7 +22,7 @@ data:
   #data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
   # data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
-  data_dir: "data/3p"
+  data_dir: "data/"
 
 
   # CSV filename to load
@@ -55,7 +55,7 @@ data:
   
   # DataLoader settings
   dataloader:
-    batch_size:  64
+    batch_size:  256
     num_workers: 0
     shuffle: false
 
@@ -79,7 +79,7 @@ data:
 # ============================================================================
 normalization:
   # Type of normalization: "log1p", "student_t", "zero_preserved_log", "log1p_phase"
-  method: "log1p_phase"
+  method: "log1p"
   
   # Log1p specific parameters
   log1p:
@@ -90,13 +90,13 @@ normalization:
 # ============================================================================
 model:
   # Model type: "vae", "cvae", "art", "set_guide_vae", "diffusion", "phase_splitter"
-  type: "phase_splitter"
+  type: "cvae"
   
   # Device for training: "cpu" or "cuda"
   device: "cuda"
   
   # Latent dimension (size of latent vector z)
-  latent_dim: 128
+  latent_dim: 64
 
   # Encoder configuration
   encoder:
@@ -107,7 +107,7 @@ model:
   
   # Decoder configuration
   decoder:
-    type: "art"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
+    type: "dictionary"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
     hidden_dims: [256, 512, 512]
     dropout: 0.2
     activation: "relu"
@@ -117,7 +117,7 @@ model:
   prior:
     type: "learnable_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
                                  # "learnable_gaussian", "learnable_dictionary", "vampprior"
-    dictionary_size: 512         # Must be > input_dim (96 timesteps × 3 phases = 288)
+    dictionary_size: 256         # Must be > input_dim (96 timesteps × 3 phases = 288)
     vamp_num_components: 40
     init_from_data: true
     init_noise_scale: 0.01
@@ -160,7 +160,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]
+  tags: ["day_of_week", "month_of_year", "nr_phases_active", "holiday", "heatpump_phase"]
   # ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  
   
   # User profiling (based on LDA)
@@ -219,7 +219,7 @@ training:
   num_epochs: 10
   
   # Beta (KL weight) settings
-  beta: 0.1 # 1.0
+  beta: 1.0 # 1.0
   
   # Cyclical beta annealing (prevents KL collapse)
   beta_annealing:
