@@ -461,12 +461,14 @@ class Visualizer:
         plt.savefig(sigma_mapper_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
 
-    def visualize_latent_space(self, test_loader, PCA: bool = True, tSNE: bool = True):
+    def visualize_latent_space(self, test_loader, PCA: bool = True, tSNE: bool = True, max_samples: int = 1000):
         """Visualize the latent space using t-SNE or PCA."""
         from sklearn.decomposition import PCA
         from sklearn.manifold import TSNE
 
         latents = []
+
+        # we cut the 
 
         self.model.eval()
         with torch.no_grad():
@@ -506,6 +508,8 @@ class Visualizer:
                 z = self.model.encoder.reparameterize(q_params, num_samples=1).squeeze(0)
                 
                 latents.append(z.cpu().numpy())
+                if len(latents) >= max_samples // x.shape[0]:
+                    break
         
         latents = np.concatenate(latents, axis=0)
 
