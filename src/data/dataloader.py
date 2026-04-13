@@ -131,16 +131,33 @@ class SmartMeterCSV:
                 seen_cache_paths.add(npth)
                 unique_cache_candidates.append(p)
         cache_candidates = unique_cache_candidates
+        parquet_candidates = [
+            p for p in cache_candidates
+            if os.path.splitext(p)[1].lower() == ".parquet"
+        ]
 
         if self.parquet_only:
-            for parquet_path in cache_candidates:
-                if os.path.exists(parquet_path):
+            unreadable_cache_errors: list[str] = []
+            for parquet_path in parquet_candidates:
+                if not os.path.exists(parquet_path):
+                    continue
+                try:
                     self.df = pd.read_parquet(parquet_path, engine="pyarrow")
                     self._apply_nan_policy(self.df)
                     return self.df
+                except Exception as e:
+                    unreadable_cache_errors.append(
+                        f"{parquet_path} ({type(e).__name__}: {e})"
+                    )
+
+            details = (
+                f"Unreadable parquet cache candidates: {unreadable_cache_errors}"
+                if unreadable_cache_errors
+                else f"Looked in: {parquet_candidates}"
+            )
             raise FileNotFoundError(
                 f"Parquet-only mode enabled and no cache file found for '{filename}'. "
-                f"Looked in: {cache_candidates}"
+                f"{details}"
             )
 
         if os.path.isabs(filename):
@@ -153,24 +170,44 @@ class SmartMeterCSV:
         path = next((p for p in path_candidates if os.path.exists(p)), None)
 
         if path is None:
-            parquet_fallback = next((p for p in cache_candidates if os.path.exists(p)), None)
-            if parquet_fallback is not None:
-                self.df = pd.read_parquet(parquet_fallback, engine="pyarrow")
-                self._apply_nan_policy(self.df)
-                return self.df
+            unreadable_cache_errors: list[str] = []
+            for parquet_fallback in parquet_candidates:
+                if not os.path.exists(parquet_fallback):
+                    continue
+                try:
+                    self.df = pd.read_parquet(parquet_fallback, engine="pyarrow")
+                    self._apply_nan_policy(self.df)
+                    return self.df
+                except Exception as e:
+                    unreadable_cache_errors.append(
+                        f"{parquet_fallback} ({type(e).__name__}: {e})"
+                    )
+
+            details = (
+                f" Unreadable parquet cache candidates: {unreadable_cache_errors}."
+                if unreadable_cache_errors
+                else ""
+            )
             raise FileNotFoundError(
-                f"File {filename} not found in {self.csv_path} or {self.data_dir}"
+                f"File {filename} not found in {self.csv_path} or {self.data_dir}.{details}"
             )
 
         # --- fast path: read from cache ---
-        for parquet_path in cache_candidates:
+        for parquet_path in parquet_candidates:
             if (
                 os.path.exists(parquet_path)
                 and os.path.getmtime(parquet_path) >= os.path.getmtime(path)
             ):
-                self.df = pd.read_parquet(parquet_path, engine="pyarrow")
-                self._apply_nan_policy(self.df)
-                return self.df
+                try:
+                    self.df = pd.read_parquet(parquet_path, engine="pyarrow")
+                    self._apply_nan_policy(self.df)
+                    return self.df
+                except Exception as e:
+                    print(
+                        "Warning: unreadable parquet cache "
+                        f"{parquet_path}; rebuilding from CSV. "
+                        f"({type(e).__name__}: {e})"
+                    )
 
         # --- slow path: parse CSV in chunks, build Parquet cache ---
         columns_to_load = [self.meter_col, self.timestamp_dst_col] + self.value_cols
@@ -1083,7 +1120,9 @@ def prepare_data_cache(data_dir: str, normalizer_path: str) -> None:
     Args:
         data_dir (str): The directory containing the CSV files to be cached. 
             The Parquet files will be saved in a "parquet" subdirectory within this directory.
-        normalizer_path (str): Optional path to save the fitted normalizer stats after processing all files. If None, defaults to <data_dir>/parquet/normalizer.pt.
+        normalizer_path (str): Optional file path to save fitted normalizer stats.
+            If None, defaults to <data_dir>/_parquet_cache/normalizer.pt.
+            If a directory path is provided, the file will be saved as <dir>/normalizer.pt.
     """
     import sys
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1094,6 +1133,10 @@ def prepare_data_cache(data_dir: str, normalizer_path: str) -> None:
     normalizer = Normalizer(method="log1p")
     if normalizer_path is None:
         normalizer_path = os.path.join(data_dir, "_parquet_cache", "normalizer.pt")
+    else:
+        normalizer_path = os.path.abspath(normalizer_path)
+        if os.path.isdir(normalizer_path):
+            normalizer_path = os.path.join(normalizer_path, "normalizer.pt")
     
     csv_path = os.path.join(data_dir, "csv")
     if os.path.exists(csv_path):
@@ -1112,8 +1155,11 @@ def prepare_data_cache(data_dir: str, normalizer_path: str) -> None:
             meter_col="meter_number",
             timestamp_dst_col="timestamp_dst",
             value_cols=["hourly_energy_consumption",],
+            nan_as_zero=False,
+            parquet_only=False,
         )
         csv_loader.load(filename)
+        print(f"{csv_loader.df.isna().sum().sum()} NaN values in {filename} (will be cached as-is, but normalizer fitting will handle them according to its configuration)")
     
     # Then fit normalizer and conditioner across all files using the streaming multi-file fitting functions, which will read from the parquet cache we just prepared for efficiency
     fit_normalizer_on_files(
