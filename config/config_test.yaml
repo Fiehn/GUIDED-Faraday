@@ -160,13 +160,13 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "nr_phases_active", "holiday", "heatpump_phase"]
+  tags: ["day_of_week", "month_of_year", "user_profile", "holiday", "heatpump_phase"]
   # ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  
   
   # User profiling (based on LDA)
   user_profile:
-    online: true
-    n_topics: 20 # number of LDA topics
+    online: false
+    n_topics: 40 # number of LDA topics
     num_clusters: 200 # number of KMeans clusters for "words"
     random_state: 42
     cache_path: "./models/UserProfiles/user_profiles.pkl"

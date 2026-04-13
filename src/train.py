@@ -265,7 +265,7 @@ def _run_evaluation_and_visualization(model, test_loader, normalizer, conditione
                          num_originals=config.visualize.num_originals,
                          num_synthetic_per=config.visualize.num_synthetic_per)
 
-def train(config):
+def train(config, train_only_user_profile: bool = False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device: ", device)
     # Up the recursion limit for deep models
@@ -943,6 +943,12 @@ def train(config):
                 nan_as_zero=nan_as_zero,
                 parquet_only=parquet_only,
             )
+            if train_only_user_profile:
+                # This is done because the user profiler is trained on the cpu..
+                # This means it needs a different node than the rest of the model, which is on the gpu.
+                # A different slurm job will be used to train just the user profiler, and then the rest of the model will be trained with the user profiler frozen.
+                print("train_only_user_profile is True, so exiting after fitting user profiler.")
+                return model
 
     all_test_tensors = []
     log_path = os.path.join(config.logging.log_dir, model_tag)
@@ -1073,12 +1079,13 @@ if __name__ == "__main__":
     parser.add_argument("--skip-validation", action="store_true", default=False)
     parser.add_argument("--quiet", action="store_true", default=False)
     parser.add_argument("--load_path_model", type=str, default=None, help="Path to a saved model to load and visualize without training")
+    parser.add_argument("--fit_user_profiler_only", action="store_true", default=False, help="Only fit the user profiler on the data without training a model (implies --skip-validation)")
     args = parser.parse_args()
 
     config = _load_train_config(args.config)
     config.skip_validation = bool(args.skip_validation)
     config.verbose = not bool(args.quiet)
 
-    train(config)
+    train(config, args.fit_user_profiler_only)
 
 

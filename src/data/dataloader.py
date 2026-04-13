@@ -1017,8 +1017,6 @@ def fit_normalizer_on_files(
     }, stats_path)
     print(f"[Normalizer] Stats fitted on {len(filenames)} file(s) and saved to {stats_path}")
 
-
-
 def fit_userprofiler_on_files(
     user_profiler,
     data_dir: str,
