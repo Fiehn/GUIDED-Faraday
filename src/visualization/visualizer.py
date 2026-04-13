@@ -117,11 +117,32 @@ class Visualizer:
         total = 0
         first_batch = None
 
+        if test_loader is None:
+            raise RuntimeError("No test_loader provided for visualization.")
+
         for batch_idx, batch in enumerate(test_loader):
-            if not isinstance(batch, (tuple, list)) or len(batch) != 3:
+            if not isinstance(batch, (tuple, list)):
                 continue
 
-            x, meter_id, timestamps = batch
+            if len(batch) == 4:
+                # CSV mode: (x, conditions, meter_id, timestamps)
+                x, _, meter_id, timestamps = batch
+            elif len(batch) == 3:
+                # Common format: (x, meter_id, timestamps)
+                x, meter_id, timestamps = batch
+            elif len(batch) == 2:
+                # Phased format: (x, cond=[B,2,L]) where cond channels can carry ids/time
+                x, cond = batch
+                meter_id = cond[:, 0, 0].long() if torch.is_tensor(cond) and cond.dim() == 3 and cond.shape[1] >= 2 else None
+                timestamps = cond[:, 1, 0].long() if torch.is_tensor(cond) and cond.dim() == 3 and cond.shape[1] >= 2 else None
+            else:
+                continue
+
+            if meter_id is None:
+                meter_id = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            if timestamps is None:
+                timestamps = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+
             if first_batch is None:
                 first_batch = (x, meter_id, timestamps)
 
@@ -450,7 +471,9 @@ class Visualizer:
         self.model.eval()
         with torch.no_grad():
             for batch in test_loader:
-                if isinstance(batch, (tuple, list)) and len(batch) == 3:
+                if isinstance(batch, (tuple, list)) and len(batch) == 4:
+                    x, _, meter_id, timestamps = batch
+                elif isinstance(batch, (tuple, list)) and len(batch) == 3:
                     x, meter_id, timestamps = batch
                 elif isinstance(batch, (tuple, list)) and len(batch) == 2:
                     # phased format (x, cond=[B,2,L])

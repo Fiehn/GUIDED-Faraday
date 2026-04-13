@@ -53,12 +53,16 @@ def _save_standalone_metric_result(metric_key: str, payload: Dict[str, Any],
         output_file (str): Path to the output JSON file.
     """
     try:
-        os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
+        resolved_output = output_file or 'models/eval_results.json'
+        if os.path.isdir(resolved_output) or not str(resolved_output).lower().endswith('.json'):
+            resolved_output = os.path.join(resolved_output, 'eval_results.json')
+
+        os.makedirs(os.path.dirname(resolved_output) or '.', exist_ok=True)
 
         existing = {}
-        if os.path.exists(output_file):
+        if os.path.exists(resolved_output):
             try:
-                with open(output_file, 'r') as f:
+                with open(resolved_output, 'r') as f:
                     existing = json.load(f)
             except (json.JSONDecodeError, OSError):
                 existing = {}
@@ -69,10 +73,10 @@ def _save_standalone_metric_result(metric_key: str, payload: Dict[str, Any],
         existing.setdefault('standalone_metrics', {})
         existing['standalone_metrics'][metric_key] = _to_json_serializable(payload)
 
-        with open(output_file, 'w') as f:
+        with open(resolved_output, 'w') as f:
             json.dump(existing, f, indent=2)
     except Exception as e:
-        print(f"Warning: failed to save standalone metric '{metric_key}' to {output_file}: {e}")
+        print(f"Warning: failed to save standalone metric '{metric_key}' to {resolved_output}: {e}")
 
 
 def _flatten_windows(data: np.ndarray) -> np.ndarray:

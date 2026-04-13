@@ -45,7 +45,8 @@ class SmartMeterCSV:
         timestamp_utc_col (str | None): Name of the UTC timestamp column in the CSV.
             This column is loaded but not used in the DataFrame index, so it can be omitted to save I/O if not needed.
         value_cols (Sequence[str]): Names of the value columns to load (e.g., consumption, production).
-        nan_as_zero (bool): Whether to replace NaN values in the value columns with 0. Defaults to True.
+        nan_as_zero (bool): Whether to replace NaN values in the value columns with 0 after loading.
+            Parquet caches are always stored NaN-preserving regardless of this flag.
         parquet_only (bool): If True, bypass CSV parsing and read only parquet cache files.
 
     Attributes:
@@ -61,7 +62,7 @@ class SmartMeterCSV:
         timestamp_dst_col: str,                  # name of the DST timestamp column
         timestamp_utc_col: str | None = None, # UTC column – loaded but never used; omit to save I/O
         value_cols: Sequence[str],               # names of the value columns (e.g., consumption, production)
-        nan_as_zero: bool = True,                # whether to replace NaN with 0
+        nan_as_zero: bool = True,                # apply NaN->0 policy after load (cache remains raw)
         parquet_only: bool = False,
         max_failed_value_ratio: float | None = 0.90,
         max_bad_examples: int = 5,
@@ -80,6 +81,14 @@ class SmartMeterCSV:
         self.df: pd.DataFrame | None = None
         self.last_quality_report: dict[str, int | float | str] | None = None
 
+    def _apply_nan_policy(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not self.nan_as_zero:
+            return df
+        cols = [c for c in self.value_cols if c in df.columns]
+        if cols:
+            df.loc[:, cols] = df.loc[:, cols].fillna(0.0)
+        return df
+
     def load(self, filename: str) -> pd.DataFrame:
         """Load CSV (or a Parquet cache thereof) into a MultiIndex DataFrame.
 
@@ -96,7 +105,8 @@ class SmartMeterCSV:
         Returns:
             pd.DataFrame: The loaded DataFrame, indexed by (meter_id, timestamp_dst_col) with value columns as specified in the constructor.
         """
-        parquet_name = os.path.splitext(os.path.basename(filename))[0] + ".parquet"
+        base_stem = os.path.splitext(os.path.basename(filename))[0]
+        parquet_name = f"{base_stem}.parquet"
         cache_dirs = [
             os.path.join(self.data_dir, "_parquet_cache"),
             os.path.join(self.data_dir, "parquet"),
@@ -126,6 +136,7 @@ class SmartMeterCSV:
             for parquet_path in cache_candidates:
                 if os.path.exists(parquet_path):
                     self.df = pd.read_parquet(parquet_path, engine="pyarrow")
+                    self._apply_nan_policy(self.df)
                     return self.df
             raise FileNotFoundError(
                 f"Parquet-only mode enabled and no cache file found for '{filename}'. "
@@ -145,6 +156,7 @@ class SmartMeterCSV:
             parquet_fallback = next((p for p in cache_candidates if os.path.exists(p)), None)
             if parquet_fallback is not None:
                 self.df = pd.read_parquet(parquet_fallback, engine="pyarrow")
+                self._apply_nan_policy(self.df)
                 return self.df
             raise FileNotFoundError(
                 f"File {filename} not found in {self.csv_path} or {self.data_dir}"
@@ -157,6 +169,7 @@ class SmartMeterCSV:
                 and os.path.getmtime(parquet_path) >= os.path.getmtime(path)
             ):
                 self.df = pd.read_parquet(parquet_path, engine="pyarrow")
+                self._apply_nan_policy(self.df)
                 return self.df
 
         # --- slow path: parse CSV in chunks, build Parquet cache ---
@@ -217,9 +230,6 @@ class SmartMeterCSV:
                         )
 
                 chunk[c] = numeric_values.astype(np.float32)
-            if self.nan_as_zero:
-                for c in self.value_cols:
-                    chunk[c] = chunk[c].fillna(0.0)
             chunks.append(chunk)
             rows_seen += len(chunk)
 
@@ -262,7 +272,8 @@ class SmartMeterCSV:
         df.to_parquet(parquet_path, engine="pyarrow", compression="zstd")
 
         self.df = df
-        return df
+        self._apply_nan_policy(self.df)
+        return self.df
 
     # returns all unique meter IDs in the index
     def meter_ids(self) -> List[int]:
@@ -490,6 +501,7 @@ class SmartMeterDataModule:
         train_frac: float = 0.8,
         val_frac: float = 0.1,
         max_meters: int | None = None,
+        nan_as_zero: bool = True,
         parquet_only: bool = False,
         normalizer = None,
         conditioner = None,
@@ -500,6 +512,7 @@ class SmartMeterDataModule:
             timestamp_dst_col=timestamp_dst_col,
             timestamp_utc_col=timestamp_utc_col,
             value_cols=feature_cols,
+            nan_as_zero=nan_as_zero,
             parquet_only=parquet_only,
         )
         self.filename = filename
@@ -512,6 +525,7 @@ class SmartMeterDataModule:
         self.train_frac = train_frac
         self.val_frac = val_frac
         self.max_meters = max_meters
+        self.nan_as_zero = nan_as_zero
 
         self.normalizer = normalizer
         self.conditioner = conditioner
@@ -664,6 +678,12 @@ class SmartMeterDataModule:
                 values   = meter_df[self.feature_cols].to_numpy(dtype=np.float32)
                 if values.size == 0:
                     continue
+                if self.nan_as_zero:
+                    values = np.nan_to_num(values, nan=0.0)
+                else:
+                    values = values[np.isfinite(values).all(axis=1)]
+                    if values.size == 0:
+                        continue
                 self.normalizer.fit_incremental(values)
                 any_data = True
             if not any_data:
@@ -677,6 +697,12 @@ class SmartMeterDataModule:
                 values   = meter_df[self.feature_cols].to_numpy(dtype=np.float32)
                 if values.size == 0:
                     continue
+                if self.nan_as_zero:
+                    values = np.nan_to_num(values, nan=0.0)
+                else:
+                    values = values[np.isfinite(values).all(axis=1)]
+                    if values.size == 0:
+                        continue
                 all_values.append(values)
             if not all_values:
                 raise ValueError("No training data available to fit normalizer.")
@@ -821,6 +847,7 @@ def fit_normalizer_on_files(
     seed: int = 0,
     stats_path: str | None = None,
     force_refit: bool = False,
+    nan_as_zero: bool = True,
     parquet_only: bool = False,
 ) -> None:
     """Fit a Normalizer across all data files using one streaming Welford pass.
@@ -846,9 +873,10 @@ def fit_normalizer_on_files(
     parquet_only (bool): If True, load only parquet cache files while fitting.
     """
     if stats_path is None:
+        cache_tag = "nan0" if nan_as_zero else "nanraw"
         stats_path = os.path.join(
             data_dir, "_parquet_cache",
-            f"normalizer_{normalizer.method}.pt",
+            f"normalizer_{normalizer.method}_{cache_tag}.pt",
         )
 
     # --- try cache ---
@@ -861,6 +889,7 @@ def fit_normalizer_on_files(
                 and manifest.get("train_frac") == train_frac
                 and manifest.get("seed")       == seed
                 and manifest.get("feature_cols") == list(feature_cols)
+                and manifest.get("nan_as_zero", True) == nan_as_zero
             ):
                 # Invalidate if any source parquet (or CSV) is newer than stats
                 stats_mtime = os.path.getmtime(stats_path)
@@ -873,7 +902,8 @@ def fit_normalizer_on_files(
                         source_candidates.append(os.path.join(data_dir, f))
                         source_candidates.append(os.path.join(data_dir, "csv", f))
 
-                    parquet_name = os.path.splitext(os.path.basename(f))[0] + ".parquet"
+                    base_stem = os.path.splitext(os.path.basename(f))[0]
+                    parquet_name = f"{base_stem}.parquet"
                     source_candidates.append(os.path.join(data_dir, "_parquet_cache", parquet_name))
                     source_candidates.append(os.path.join(data_dir, "parquet", parquet_name))
 
@@ -898,6 +928,7 @@ def fit_normalizer_on_files(
         meter_col=meter_col,
         timestamp_dst_col=timestamp_dst_col,
         value_cols=feature_cols,
+        nan_as_zero=nan_as_zero,
         parquet_only=parquet_only,
     )
 
@@ -910,6 +941,16 @@ def fit_normalizer_on_files(
         n_train = max(1, int(len(meter_ids) * train_frac))
         for mid in meter_ids[:n_train]:
             vals = csv_loader.meter_frame(mid)[feature_list].to_numpy(dtype=np.float32)
+            if vals.size == 0:
+                continue
+
+            if nan_as_zero:
+                vals = np.nan_to_num(vals, nan=0.0)
+            else:
+                # Keep cache NaNs, but normalizer fitting requires finite values.
+                finite_mask = np.isfinite(vals).all(axis=1)
+                vals = vals[finite_mask]
+
             if vals.size > 0:
                 normalizer.fit_incremental(vals)
 
@@ -934,6 +975,7 @@ def fit_normalizer_on_files(
             "train_frac":   train_frac,
             "seed":         seed,
             "feature_cols": list(feature_cols),
+            "nan_as_zero":  nan_as_zero,
         },
     }, stats_path)
     print(f"[Normalizer] Stats fitted on {len(filenames)} file(s) and saved to {stats_path}")
@@ -956,6 +998,7 @@ def fit_userprofiler_on_files(
     train_frac: float = 0.8,
     normalizer=None,
     force_refit: bool = False,
+    nan_as_zero: bool = True,
     parquet_only: bool = False,
 ) -> None:
     
@@ -990,6 +1033,7 @@ def fit_userprofiler_on_files(
                     shuffle_train=False, # Must be false to properly build coherent time series words if sequential matters, actually UserProfiler just needs windows
                     seed=seed,
                     train_frac=train_frac,
+                    nan_as_zero=nan_as_zero,
                     parquet_only=parquet_only,
                     normalizer=normalizer,
                     conditioner=None # none to prevent recursive fit!

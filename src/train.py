@@ -165,6 +165,17 @@ def _init_vamp_prior_from_batch(model, batch, device, noise_scale: float = 0.01)
 
 def _run_evaluation_and_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, phased_mode: bool):
     """Route evaluation by mode and run shared visualizations."""
+    if test_loader is None:
+        print("Warning: test_loader is None; skipping evaluation and visualization.")
+        return
+    try:
+        if len(test_loader) == 0:
+            print("Warning: test_loader has no batches; skipping evaluation and visualization.")
+            return
+    except TypeError:
+        # Some iterable loaders may not implement __len__; continue and rely on iteration.
+        pass
+
     eval_cfg = getattr(config, "evaluation", SimpleNamespace())
     eval_device = str(getattr(eval_cfg, "device", device))
     default_synth_samples = 300 if model.__class__.__name__ == "AutoRegressiveTransformerVAE" else 1000
@@ -867,6 +878,7 @@ def train(config):
         return model
 
     # Load data sequentially based on what is in the folder and train the model in an online fashion
+    nan_as_zero = bool(getattr(config.data, "nan_as_zero", True))
     parquet_only = bool(getattr(config.data, "parquet_only", False))
     if parquet_only:
         cache_dirs = [
@@ -877,18 +889,22 @@ def train(config):
         for cache_dir in cache_dirs:
             if not os.path.isdir(cache_dir):
                 continue
-            all_data_files.extend(
-                [f for f in os.listdir(cache_dir) if f.endswith(".parquet") and not f.startswith("test")]
-            )
+            cache_files = [f for f in os.listdir(cache_dir) if f.endswith(".parquet") and not f.startswith("test")]
+            all_data_files.extend(cache_files)
         all_data_files = sorted(set(all_data_files))
         print(
             f"CSV mode with parquet-only loading enabled. "
-            f"Found {len(all_data_files)} parquet cache file(s)."
+            f"Found {len(all_data_files)} parquet cache file(s). "
+            f"NaN handling is applied at load time (nan_as_zero={nan_as_zero})."
         )
     else:
         all_data_files = sorted([f for f in os.listdir(data_dir) if f.endswith(".csv") and not f.startswith("test")])
     
     data_files = config.data.data_files if len(config.data.data_files) > 0 else all_data_files
+    if len(data_files) == 0:
+        raise FileNotFoundError(
+            f"No training data files found (parquet_only={parquet_only}, nan_as_zero={nan_as_zero})."
+        )
     print(f"Data files to be used for training: {data_files}")
     
     normalizer = Normalizer(method=config.normalization.method)
@@ -901,6 +917,7 @@ def train(config):
         timestamp_dst_col=config.data.columns.timestamp_dst,
         train_frac=config.data.splits.train_ratio,
         seed=config.data.splits.random_seed,
+        nan_as_zero=nan_as_zero,
         parquet_only=parquet_only,
     )
     if model_type == "art" and hasattr(model, "normalizer"):
@@ -923,6 +940,7 @@ def train(config):
                 seed=config.data.splits.random_seed,
                 train_frac=config.data.splits.train_ratio,
                 normalizer=normalizer,
+                nan_as_zero=nan_as_zero,
                 parquet_only=parquet_only,
             )
 
@@ -969,6 +987,7 @@ def train(config):
             train_frac=config.data.splits.train_ratio,
             val_frac=config.data.splits.val_ratio,
             max_meters=None,
+            nan_as_zero=nan_as_zero,
             parquet_only=parquet_only,
             normalizer=normalizer,
             conditioner=conditioner,
@@ -1036,7 +1055,7 @@ def train(config):
     _save_training_config_snapshot(config=config, log_path=log_path)
     _run_evaluation_and_visualization(
         model=model,
-	conditioner=conditioner,
+	    conditioner=conditioner,
         test_loader=combined_test_loader,
         normalizer=normalizer,
         writer=writer,
