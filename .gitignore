@@ -23,6 +23,7 @@ topology/
 !src/models/*.py
 
 output/
+slurmjobs/outputs/
 
 !src/data/
 !src/data/*.py

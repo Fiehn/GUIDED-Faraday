@@ -1,9 +1,0 @@
-Using device:  cuda
-Phased parquet mode detected. Skipping CSV-based pre-validation (run_validation).
-Initialized CVAE with input_dim=24, latent_dim=64, encoder_type=dictionary_cnn, decoder_type=dictionary, prior_type=learnable_dictionary, conditioner_tags=['day_of_week', 'month_of_year', 'nr_phases_active', 'holiday', 'heatpump_phase']
-Traceback (most recent call last):
-  File "/home/s204617/synthcode/rasmus-clara-synthetic-data/src/train.py", line 1062, in <module>
-    train(config)
-  File "/home/s204617/synthcode/rasmus-clara-synthetic-data/src/train.py", line 494, in train
-    raise ValueError(
-ValueError: Phased parquet mode currently supports set_guide_vae, art, diffusion, and phase_splitter model types.
