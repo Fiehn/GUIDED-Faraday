@@ -56,8 +56,8 @@ data:
   # DataLoader settings
   dataloader:
     batch_size:  256
-    num_workers: 0
-    shuffle: false
+    num_workers: 8
+    shuffle: true
 
   # Phased parquet streaming settings (used by SetGuideVAE phased training)
   phased:
@@ -223,12 +223,12 @@ training:
   
   # Cyclical beta annealing (prevents KL collapse)
   beta_annealing:
-    enabled: false # true
+    enabled: true # true
     n_cycles: 1   
     ratio: 0.25 # fraction of each cycle for warmup (0-1)
   
   # Weighted loss 
-  weighted_loss: 0.0  # Set > 0 to enable (e.g., 0.1)
+  weighted_loss: 0.2  # Set > 0 to enable (e.g., 0.1)
   
   # Early stopping
   early_stopping:
@@ -240,7 +240,7 @@ training:
   
   # Model checkpointing
   checkpointing:
-    save_freq: 10 # save checkpoint every N epochs
+    save_freq: 5 # save checkpoint every N epochs
     save_dir: "./models"
     save_best_model: true
     save_best_after_fraction: 0.25 # start writing "best" checkpoint only after this fraction of total epochs
