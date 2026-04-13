@@ -36,7 +36,7 @@ data:
     value_cols: ["hourly_energy_consumption",]  # List of measurement columns
   
   # Data loading options
-  nan_as_zero: true
+  nan_as_zero: false
   dtype_meter: "int32"
   dtype_values: "float32"
   
