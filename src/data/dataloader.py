@@ -504,6 +504,9 @@ class SmartMeterDataModule:
             parquet_only (bool): If True, bypass CSV parsing and read only parquet cache files.
             normalizer: Optional normalizer object with .fit() and .transform() methods to apply normalization based on training data statistics.
             conditioner: Optional conditioner object with a .get_conditions() method to generate condition embeddings/features.
+            user_profile_online (bool): Whether an already-fitted UserProfiler may be
+                updated incrementally during setup. If False, the profiler is treated
+                as frozen after initial fitting/loading.
 
         Attributes:
             loader (SmartMeterCSV): The underlying data loader that reads the CSV and provides meter-specific DataFrames.
@@ -542,6 +545,7 @@ class SmartMeterDataModule:
         parquet_only: bool = False,
         normalizer = None,
         conditioner = None,
+        user_profile_online: bool = True,
     ):
         self.loader = SmartMeterCSV(
             data_dir=data_dir,
@@ -566,6 +570,7 @@ class SmartMeterDataModule:
 
         self.normalizer = normalizer
         self.conditioner = conditioner
+        self.user_profile_online = bool(user_profile_online)
 
         self._train_ds = None 
         self._val_ds = None
@@ -679,6 +684,9 @@ class SmartMeterDataModule:
         user_profiler = self.conditioner.condition_items["user_profile"]
         
         if getattr(user_profiler, 'is_fitted', False):
+            if not self.user_profile_online:
+                print("[Conditioner] UserProfiler already fitted. Online updates disabled; skipping incremental update.")
+                return
             print("[Conditioner] UserProfiler already fitted. Performing incremental update...")
             for x_batch, m_batch, _ in self._yield_train_batches():
                 user_profiler.update_model_incremental(x_batch, m_batch)

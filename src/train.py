@@ -953,6 +953,13 @@ def train(config, train_only_user_profile: bool = False):
     all_test_tensors = []
     log_path = os.path.join(config.logging.log_dir, model_tag)
     writer = Writer(log_dir=os.path.join(log_path, 'logs'))
+    user_profile_online = bool(
+        getattr(
+            getattr(getattr(config, "conditioning", SimpleNamespace()), "user_profile", SimpleNamespace()),
+            "online",
+            False,
+        )
+    )
 
     i = 0
     for data_file in data_files:
@@ -997,6 +1004,7 @@ def train(config, train_only_user_profile: bool = False):
             parquet_only=parquet_only,
             normalizer=normalizer,
             conditioner=conditioner,
+            user_profile_online=user_profile_online,
         )
         dm.setup()
 
