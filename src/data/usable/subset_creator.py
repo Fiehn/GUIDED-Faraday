@@ -8,7 +8,7 @@ def create_subset(meters_file: str, output_file: str, data_dir: str):
     # The meters are in the csv file. The parquet datafiles are sorted by month,
     # so we load each month file and filter the data for the meters in the csv file, then save the filtered data to a new parquet file.
     meters_df = pd.read_csv(meters_file)
-    meter_ids = meters_df['meter_id'].tolist()
+    meter_ids = meters_df['meter_nr'].tolist()
     # Get the list of parquet files in the data directory
     parquet_dir = os.path.join(data_dir, '_parquet_cache')
     parquet_files = [f for f in os.listdir(parquet_dir) if f.endswith('.parquet')]
@@ -19,7 +19,7 @@ def create_subset(meters_file: str, output_file: str, data_dir: str):
     for parquet_file in parquet_files:
         parquet_path = os.path.join(parquet_dir, parquet_file)
         df = pd.read_parquet(parquet_path)
-        filtered_df = df[df['meter_id'].isin(meter_ids)]
+        filtered_df = df[df['meter_nr'].isin(meter_ids)]
         filtered_dfs.append(filtered_df)
     # Concatenate all the filtered dataframes into a single dataframe
     subset_df = pd.concat(filtered_dfs, ignore_index=True)
