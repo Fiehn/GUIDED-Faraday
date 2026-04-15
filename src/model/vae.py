@@ -44,6 +44,10 @@ class VAE(nn.Module):
                  decoder_type = "dictionary",
                  prior_type = None,
                  device="cpu",
+                 encoder_hidden_dims=None,
+                 decoder_hidden_dims=None,
+                 encoder_dropout=None,
+                 decoder_dropout=None,
                  hierarchy_config: HierarchicalConfig = None,
                  **_):
         super(VAE, self).__init__()
@@ -70,8 +74,38 @@ class VAE(nn.Module):
 
         self.device = device
 
+        encoder_model_kwargs = {}
+        if encoder_hidden_dims is not None:
+            encoder_model_kwargs["hidden_dims"] = list(encoder_hidden_dims)
+        if isinstance(encoder_dropout, bool):
+            encoder_model_kwargs["dropout"] = encoder_dropout
+        elif encoder_dropout is not None:
+            try:
+                encoder_dropout_rate = float(encoder_dropout)
+                encoder_model_kwargs["dropout"] = encoder_dropout_rate > 0.0
+                encoder_model_kwargs["dropout_rate"] = encoder_dropout_rate
+            except (TypeError, ValueError):
+                encoder_model_kwargs["dropout"] = bool(encoder_dropout)
+
+        decoder_model_kwargs = {}
+        if decoder_hidden_dims is not None:
+            decoder_model_kwargs["hidden_dims"] = list(decoder_hidden_dims)
+        if isinstance(decoder_dropout, bool):
+            decoder_model_kwargs["dropout"] = decoder_dropout
+        elif decoder_dropout is not None:
+            try:
+                decoder_dropout_rate = float(decoder_dropout)
+                decoder_model_kwargs["dropout"] = decoder_dropout_rate > 0.0
+                decoder_model_kwargs["dropout_rate"] = decoder_dropout_rate
+            except (TypeError, ValueError):
+                decoder_model_kwargs["dropout"] = bool(decoder_dropout)
+
         # 1. Create encoder and decoder and the latent module for the hierarchy if specified
-        self.encoder = get_encoder_model(input_dim=input_dim, latent_dim=latent_dim, type=encoder_type, dictionary_size=dictionary_size)
+        self.encoder = get_encoder_model(input_dim=input_dim, 
+                                         latent_dim=latent_dim, 
+                                         type=encoder_type, 
+                                         dictionary_size=dictionary_size,
+                                         **encoder_model_kwargs)
 
         # Hierarchical latent module (optional) - can be used to add multiple levels of latent variables with different strategies and connections between them
         self.hierarchy = None
@@ -83,7 +117,11 @@ class VAE(nn.Module):
             )
             self.decoder_input_dim = self.hierarchy.output_dim
             
-        self.decoder = get_decoder_model(latent_dim=self.decoder_input_dim, output_dim=input_dim, type=decoder_type, dictionary_size=dictionary_size)
+        self.decoder = get_decoder_model(latent_dim=self.decoder_input_dim, 
+                                         output_dim=input_dim, 
+                                         type=decoder_type, 
+                                         dictionary_size=dictionary_size,
+                                         **decoder_model_kwargs)
 
         # 2. Create prior after encoder (VampPrior needs a reference to the encoder)
         if prior_type is None:

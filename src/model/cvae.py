@@ -26,13 +26,49 @@ class CVAE(VAE):
 
         super().__init__(input_dim=input_dim, latent_dim=latent_dim, distribution_dict=distribution_dict, prior_type=prior_type, hierarchy_config=hierarchy_config, **kwargs)
 
+        base_kwargs = dict(kwargs)
+        for key in ("encoder_hidden_dims", "decoder_hidden_dims", "encoder_dropout", "decoder_dropout"):
+            base_kwargs.pop(key, None)
+
+        encoder_hidden_dims = kwargs.get("encoder_hidden_dims", None)
+        decoder_hidden_dims = kwargs.get("decoder_hidden_dims", None)
+        encoder_dropout = kwargs.get("encoder_dropout", None)
+        decoder_dropout = kwargs.get("decoder_dropout", None)
+
+        encoder_model_kwargs = {}
+        if encoder_hidden_dims is not None:
+            encoder_model_kwargs["hidden_dims"] = list(encoder_hidden_dims)
+        if isinstance(encoder_dropout, bool):
+            encoder_model_kwargs["dropout"] = encoder_dropout
+        elif encoder_dropout is not None:
+            try:
+                encoder_dropout_rate = float(encoder_dropout)
+                encoder_model_kwargs["dropout"] = encoder_dropout_rate > 0.0
+                encoder_model_kwargs["dropout_rate"] = encoder_dropout_rate
+            except (TypeError, ValueError):
+                encoder_model_kwargs["dropout"] = bool(encoder_dropout)
+
+        decoder_model_kwargs = {}
+        if decoder_hidden_dims is not None:
+            decoder_model_kwargs["hidden_dims"] = list(decoder_hidden_dims)
+        if isinstance(decoder_dropout, bool):
+            decoder_model_kwargs["dropout"] = decoder_dropout
+        elif decoder_dropout is not None:
+            try:
+                decoder_dropout_rate = float(decoder_dropout)
+                decoder_model_kwargs["dropout"] = decoder_dropout_rate > 0.0
+                decoder_model_kwargs["dropout_rate"] = decoder_dropout_rate
+            except (TypeError, ValueError):
+                decoder_model_kwargs["dropout"] = bool(decoder_dropout)
+
         # Now override encoder and decoder with conditioned versions
         # Encoder takes [x, c] as input
         self.encoder = get_encoder_model(
             input_dim=input_dim + self.condition_dim,
             latent_dim=latent_dim,
             type=kwargs.get("encoder_type", "dictionary"),
-            **kwargs,
+            **encoder_model_kwargs,
+            **base_kwargs,
         )
 
         # Decoder takes [z, c] as input
@@ -40,7 +76,8 @@ class CVAE(VAE):
             latent_dim=self.decoder_input_dim + self.condition_dim,
             output_dim=input_dim,
             type=kwargs.get("decoder_type", "dictionary"),
-            **kwargs,
+            **decoder_model_kwargs,
+            **base_kwargs,
         )
 
         # If VampPrior, re-point it to the new (conditioned) encoder and resize pseudo-inputs

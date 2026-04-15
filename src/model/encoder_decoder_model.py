@@ -10,6 +10,7 @@ class GaussianCoder(torch.nn.Module):
                  sigma_fixed=1.0,
                  num_hidden_layers=2,
                  num_neurons = 64,
+                 hidden_dims=None,
                  dropout = True,
                  dropout_rate = 0.2,
                  batch_norm = False,
@@ -27,6 +28,7 @@ class GaussianCoder(torch.nn.Module):
             dist_parameters=["mu", "sigma"],
             num_hidden_layers=num_hidden_layers,
             num_neurons=num_neurons,
+            hidden_dims=hidden_dims,
             dropout=dropout,
             dropout_rate=dropout_rate,
             batch_norm=batch_norm)
@@ -143,6 +145,7 @@ class DictionaryCoder(torch.nn.Module):
                  average_max_std=1.0,
                  num_hidden_layers=2,
                  num_neurons=64,
+                 hidden_dims=None,
                  dropout=True,
                  dropout_rate=0.2,
                  batch_norm=False,
@@ -162,29 +165,56 @@ class DictionaryCoder(torch.nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
 
-        if layer_type == 'Conv1D' or layer_type == 'cnn':
+        layer_type_key = str(layer_type).lower()
+        seq_len = int(kwargs.get("seq_len", kwargs.get("sequence_length", 24)))
+        if seq_len <= 0:
+            seq_len = 24
+
+        if layer_type_key in {"conv1d", "cnn"}:
+            num_features = kwargs.get("num_features", None)
+            if num_features is None:
+                if output_dim % seq_len == 0:
+                    num_features = max(1, output_dim // seq_len)
+                else:
+                    num_features = 1
+                    seq_len = int(output_dim)
             self.parameterizer = HybridCNNParameterizer(
                 input_dim=input_dim,
                 output_dim=output_dim,
                 dictionary_size=dictionary_size,
-                seq_len=24,
-                num_features=3
+                seq_len=seq_len,
+                num_features=int(num_features),
+                hidden_dim=hidden_dims,
             )
-        elif layer_type == 'Conv1D_Encoder':
+        elif layer_type_key in {"conv1d_encoder", "cnn_encoder"}:
+            num_features = kwargs.get("num_features", None)
+            if num_features is None:
+                if input_dim % seq_len == 0:
+                    num_features = max(1, input_dim // seq_len)
+                else:
+                    num_features = 1
+                    seq_len = int(input_dim)
             self.parameterizer = TemporalCNNEncoder(
                 input_dim=input_dim,
                 output_dim=output_dim,
-                seq_len=24,
-                num_features=3,
-                dist_parameters=["mu", "sigma"] if learn_sigma else ["mu"]
+                seq_len=seq_len,
+                num_features=int(num_features),
+                dist_parameters=["mu", "sigma"] if learn_sigma else ["mu"],
+                hidden_dims=hidden_dims,
             )
         else:
             self.parameterizer = Parameterizer(
                 input_dim=input_dim,
                 output_dim={"sigma": dictionary_size, "mu": output_dim},
                 dist_parameters=["mu", "sigma"],
+                num_hidden_layers=num_hidden_layers,
+                num_neurons=num_neurons,
+                hidden_dims=hidden_dims,
+                dropout=dropout,
+                dropout_rate=dropout_rate,
+                batch_norm=batch_norm,
+                resnets=bool(kwargs.get("resnets", True)),
                 block_type=layer_type,
-                **kwargs
             )
         
         # The dictionary SigmaMapper is a learnable parameter
@@ -395,6 +425,9 @@ class AutoregressiveTransformerCoder(torch.nn.Module):
 
         # 5. Output Head (Predicts probabilities for each bin at each time step)
         self.to_logits = nn.Linear(d_model, num_bins)
+
+    def _num_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
     def generate_causal_mask(self, sz, device):
         # Creates a triangle of -inf. Prevents looking into the future. 
@@ -486,8 +519,8 @@ class Parameterizer(nn.Module):
                  input_dim,
                  output_dim,
                  dist_parameters,
-                 num_hidden_layers=2,
                  num_neurons=128,
+                 hidden_dims=None,
                  dropout=False,
                  dropout_rate=0.2,
                  batch_norm=False,
@@ -497,6 +530,8 @@ class Parameterizer(nn.Module):
         super(Parameterizer, self).__init__()
         self.dist_parameters = dist_parameters
         self.num_neurons = num_neurons
+        self.hidden_dims = hidden_dims if hidden_dims is not None else []
+        
         
         # Shared block using NNBlock (outputs to num_neurons)
         self.shared_block = NNBlock(
@@ -506,11 +541,11 @@ class Parameterizer(nn.Module):
             dropout=dropout,
             dropout_rate=dropout_rate,
             batch_norm=batch_norm,
-            num_hidden_layers=num_hidden_layers,
-            resnet=resnets,
+            hidden_dims=self.hidden_dims,
+            resnets=resnets,
             type=block_type
         )
-        
+
         # Build parameter-specific heads using NNBlock
         self.param_heads = nn.ModuleDict()
         
@@ -557,10 +592,15 @@ class HybridCNNParameterizer(nn.Module):
     Fuses a Temporal CNN (for the mean) with a flat Dictionary MLP (for the covariance).
     This allows temporal precision for spike timing while keeping GUIDE-VAE's PDCC matrix.
     """
-    def __init__(self, input_dim, output_dim, dictionary_size, seq_len=24, num_features=3, **_):
+    def __init__(self, input_dim, output_dim, 
+                 dictionary_size, 
+                 seq_len=24, 
+                 num_features=3, 
+                 hidden_dim = None,
+                 **_):
         super().__init__()
-        self.seq_len = seq_len
-        self.num_features = num_features
+        self.seq_len = int(seq_len)
+        self.num_features = int(num_features)
         self.output_dim = output_dim # 72 (24 * 3)
         self.dictionary_size = dictionary_size
         
@@ -571,19 +611,34 @@ class HybridCNNParameterizer(nn.Module):
         self.seed_channels = 128
         self.project_seed = nn.Linear(input_dim, self.seed_channels * self.seed_length)
         
-        self.mu_upsample = nn.Sequential(
-            nn.ConvTranspose1d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm1d(64),
-            nn.GELU(),
-            
-            nn.ConvTranspose1d(64, 32, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm1d(32),
-            nn.GELU(),
-            
-            nn.Conv1d(32, 16, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv1d(16, self.num_features, kernel_size=3, padding=1)
-        )
+        if hidden_dim:
+            cnn_hidden = [int(v) for v in hidden_dim if int(v) > 0]
+            c1 = cnn_hidden[0] if len(cnn_hidden) > 0 else 64
+            c2 = cnn_hidden[1] if len(cnn_hidden) > 1 else max(c1 // 2, 16)
+            c3 = cnn_hidden[2] if len(cnn_hidden) > 2 else max(c2 // 2, self.num_features)
+            self.mu_upsample = nn.Sequential(
+                nn.ConvTranspose1d(self.seed_channels, c1, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm1d(c1),
+                nn.GELU(),
+                nn.ConvTranspose1d(c1, c2, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm1d(c2),
+                nn.GELU(),
+                nn.Conv1d(c2, c3, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv1d(c3, self.num_features, kernel_size=3, padding=1),
+            )
+        else:
+            self.mu_upsample = nn.Sequential(
+                nn.ConvTranspose1d(self.seed_channels, 64, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm1d(64),
+                nn.GELU(),
+                nn.ConvTranspose1d(64, 32, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm1d(32),
+                nn.GELU(),
+                nn.Conv1d(32, 16, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv1d(16, self.num_features, kernel_size=3, padding=1),
+            )
 
         # ==========================================
         # BRANCH 2: MLP for the Dictionary Variance (sigma)
@@ -606,6 +661,9 @@ class HybridCNNParameterizer(nn.Module):
         h_cnn = self.project_seed(x)
         h_cnn = h_cnn.view(B, self.seed_channels, self.seed_length) 
         out_mu = self.mu_upsample(h_cnn) # [B, 3, 24]
+        if out_mu.shape[-1] != self.seq_len:
+            # Keep the temporal output size aligned with the configured sequence length.
+            out_mu = F.interpolate(out_mu, size=self.seq_len, mode="linear", align_corners=False)
         param_dict["mu"] = out_mu.reshape(B, -1) # Flatten to [B, 72] for loss function compatibility
         
         # --- 2. Generate sigma dictionary weights using MLP ---
@@ -622,27 +680,51 @@ class TemporalCNNEncoder(nn.Module):
     Reads a 24-hour time series, detects temporal patterns (spikes), 
     and compresses it down to a flat vector for the latent space bottleneck.
     """
-    def __init__(self, input_dim, output_dim, seq_len=24, num_features=3, dist_parameters=["mu", "sigma"], **_):
+    def __init__(self, input_dim, 
+                 output_dim, 
+                 seq_len=24, 
+                 num_features=3, 
+                 dist_parameters=["mu", "sigma"], 
+                 hidden_dims=None,
+                 **_):
         super().__init__()
         self.dist_parameters = dist_parameters
+        self.num_features = int(num_features)
+        self.seq_len = int(seq_len)
         
-        # Downsampling: [B, 3, 24] -> [B, 128, 6]
-        self.downsample_blocks = nn.Sequential(
-            nn.Conv1d(in_channels=num_features, out_channels=32, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm1d(32),
-            nn.GELU(),
-            
-            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm1d(64),
-            nn.GELU(),
-            
-            nn.Conv1d(in_channels=64, out_channels=128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm1d(128),
-            nn.GELU(),
-        )
+        self.downsample_blocks = nn.Sequential()
+
+        if hidden_dims:
+            in_channels = self.num_features
+            for i, out_channels in enumerate([int(v) for v in hidden_dims]):
+                self.downsample_blocks.add_module(f"Conv_{i}", nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1))
+                self.downsample_blocks.add_module(f"BatchNorm_{i}", nn.BatchNorm1d(out_channels))
+                self.downsample_blocks.add_module(f"GELU_{i}", nn.GELU())
+                if (i+1) % 2 == 0:  # Downsample every 2 layers
+                    self.downsample_blocks.add_module(f"Downsample_{i}", nn.Conv1d(out_channels, out_channels, kernel_size=4, stride=2, padding=1))
+                    self.downsample_blocks.add_module(f"BatchNorm_Down_{i}", nn.BatchNorm1d(out_channels))
+                    self.downsample_blocks.add_module(f"GELU_Down_{i}", nn.GELU())
+                in_channels = out_channels
+        else:
+            # Downsampling: [B, 3, 24] -> [B, 128, 6]
+            self.downsample_blocks = nn.Sequential(
+                nn.Conv1d(in_channels=num_features, out_channels=32, kernel_size=5, stride=1, padding=2),
+                nn.BatchNorm1d(32),
+                nn.GELU(),
+                
+                nn.Conv1d(in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm1d(64),
+                nn.GELU(),
+                
+                nn.Conv1d(in_channels=64, out_channels=128, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm1d(128),
+                nn.GELU(),
+            )
         
-        # The downsampled sequence is 6 time steps long with 128 channels
-        flattened_size = 128 * (seq_len // 4) 
+        # Infer flattened size from the actual downsampling stack.
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.num_features, self.seq_len)
+            flattened_size = int(self.downsample_blocks(dummy).reshape(1, -1).shape[1])
         
         # Parameter-specific heads (Outputting the latent z params)
         self.param_heads = nn.ModuleDict()
@@ -658,7 +740,13 @@ class TemporalCNNEncoder(nn.Module):
         
         # If input is flat [B, 72], reshape to [B, Channels, Time]
         if x.dim() == 2:
-            x = x.view(B, 3, -1)
+            if x.shape[1] % self.num_features != 0:
+                raise ValueError(
+                    f"TemporalCNNEncoder expected flattened dim divisible by num_features={self.num_features}, got {x.shape[1]}"
+                )
+            x = x.view(B, self.num_features, -1)
+        elif x.dim() == 3 and x.shape[1] != self.num_features and x.shape[2] == self.num_features:
+            x = x.transpose(1, 2)
             
         h = self.downsample_blocks(x)
         h = h.view(B, -1) # Flatten to [B, 768]
@@ -675,8 +763,10 @@ class TemporalCNNEncoder(nn.Module):
 class NNBlock(nn.Module):
     def __init__(self, input_dim, output_dim, num_neurons=128, dropout=False, 
                  dropout_rate=0.2, batch_norm=False,num_hidden_layers=2, 
-                 resnet=True, type='MLP', **_):
+                 resnet=True, resnets=None, type='MLP', hidden_dims=None, **_):
         super(NNBlock, self).__init__()
+        if resnets is not None:
+            resnet = bool(resnets)
         self.resnet = resnet
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -686,6 +776,13 @@ class NNBlock(nn.Module):
         self.batch_norm = batch_norm
         self.num_hidden_layers = num_hidden_layers
         self.layer_type = type
+
+        if hidden_dims is not None and len(hidden_dims) > 0:
+            self.hidden_dims = [int(n) for n in hidden_dims]
+        else:
+            depth = max(0, int(self.num_hidden_layers))
+            # Include one dimension for input projection and `depth` hidden transitions.
+            self.hidden_dims = [int(self.num_neurons)] * (depth + 1)
 
         self.input_layer = self._build_input_layer()
         self.hidden_layer = self._build_hidden_layer()
@@ -721,64 +818,67 @@ class NNBlock(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
     def _build_input_layer(self):
+        start_n_neurons = self.hidden_dims[0]
         if self.layer_type == 'MLP':
-            layers = [nn.Linear(self.input_dim, self.num_neurons), nn.ReLU()]
+            layers = [nn.Linear(self.input_dim, start_n_neurons), nn.ReLU()]
         elif self.layer_type == 'Conv1D':
-            layers = [nn.Conv1d(self.input_dim, self.num_neurons, kernel_size=3, padding=1), nn.ReLU()]
+            layers = [nn.Conv1d(self.input_dim, start_n_neurons, kernel_size=3, padding=1), nn.ReLU()]
         elif self.layer_type == 'LSTM':
-            layers = [nn.LSTM(self.input_dim, self.num_neurons, batch_first=True)]
+            layers = [nn.LSTM(self.input_dim, start_n_neurons, batch_first=True)]
         elif self.layer_type == 'Transformer':
-            layers = [nn.TransformerEncoderLayer(d_model=self.input_dim, nhead=4, dim_feedforward=self.num_neurons), nn.ReLU()]
+            layers = [nn.TransformerEncoderLayer(d_model=self.input_dim, nhead=4, dim_feedforward=start_n_neurons), nn.ReLU()]
         else:
-            layers = [nn.Linear(self.input_dim, self.num_neurons), nn.ReLU()]
+            layers = [nn.Linear(self.input_dim, start_n_neurons), nn.ReLU()]
 
         if self.batch_norm:
-            layers.append(nn.LayerNorm(self.num_neurons))
+            layers.append(nn.LayerNorm(start_n_neurons))
         if self.dropout:
             layers.append(nn.Dropout(self.dropout_rate * 0.5))  # Less dropout in the first layer
         return nn.Sequential(*layers)
     def _build_hidden_layer(self):
         layers = []
-        for _ in range(self.num_hidden_layers):
+        for in_n, out_n in zip(self.hidden_dims[:-1], self.hidden_dims[1:]):
             if self.layer_type == 'MLP':
-                layers.append(nn.Linear(self.num_neurons, self.num_neurons))
+                layers.append(nn.Linear(in_n, out_n))
                 layers.append(nn.ReLU())
             elif self.layer_type == 'Conv1D':
-                layers.append(nn.Conv1d(self.num_neurons, self.num_neurons, kernel_size=3, padding=1))
+                layers.append(nn.Conv1d(in_n, out_n, kernel_size=3, padding=1))
                 layers.append(nn.ReLU())
             elif self.layer_type == 'LSTM':
-                layers.append(nn.LSTM(self.num_neurons, self.num_neurons, batch_first=True))
+                layers.append(nn.LSTM(in_n, out_n, batch_first=True))
             elif self.layer_type == 'Transformer':
-                layers.append(nn.TransformerEncoderLayer(d_model=self.num_neurons, nhead=4, dim_feedforward=self.num_neurons))
+                layers.append(nn.TransformerEncoderLayer(d_model=in_n, nhead=4, dim_feedforward=out_n))
                 layers.append(nn.ReLU())
             else:
-                layers.append(nn.Linear(self.num_neurons, self.num_neurons))
+                layers.append(nn.Linear(in_n, out_n))
                 layers.append(nn.ReLU())
 
             if self.batch_norm:
-                layers.append(nn.BatchNorm1d(self.num_neurons))
+                layers.append(nn.BatchNorm1d(out_n))
             if self.dropout:
                 layers.append(nn.Dropout(self.dropout_rate))
         return nn.Sequential(*layers)
     def _build_output_layer(self):
+        end_n_neurons = self.hidden_dims[-1]
         if self.layer_type == 'MLP':
-            layers = [nn.Linear(self.num_neurons, self.output_dim)] 
+            layers = [nn.Linear(end_n_neurons, self.output_dim)] 
         elif self.layer_type == 'Conv1D':
-            layers = [nn.Conv1d(self.num_neurons, self.output_dim, kernel_size=3, padding=1)]
+            layers = [nn.Conv1d(end_n_neurons, self.output_dim, kernel_size=3, padding=1)]
         elif self.layer_type == 'LSTM':
-            layers = [nn.LSTM(self.num_neurons, self.output_dim, batch_first=True)]
+            layers = [nn.LSTM(end_n_neurons, self.output_dim, batch_first=True)]
         elif self.layer_type == 'Transformer':
-            layers = [nn.TransformerEncoderLayer(d_model=self.num_neurons, nhead=4, dim_feedforward=self.num_neurons), nn.ReLU(), nn.Linear(self.num_neurons, self.output_dim)]
+            layers = [nn.TransformerEncoderLayer(d_model=end_n_neurons, nhead=4, dim_feedforward=end_n_neurons), nn.ReLU(), nn.Linear(end_n_neurons, self.output_dim)]
         else:
-            layers = [nn.Linear(self.num_neurons, self.output_dim)] 
+            layers = [nn.Linear(end_n_neurons, self.output_dim)] 
         return nn.Sequential(*layers)
 
     
-def get_encoder_model(input_dim, latent_dim, type, **kwargs):
+def get_encoder_model(input_dim, latent_dim, type, hidden_dims=None, **kwargs):
     if type == "dictionary":
         return DictionaryCoder(
             input_dim=input_dim,
             output_dim=latent_dim,
+            hidden_dims=hidden_dims,
             **kwargs
         )
     elif type == "dictionary_cnn":
@@ -787,6 +887,7 @@ def get_encoder_model(input_dim, latent_dim, type, **kwargs):
             output_dim=latent_dim,
             layer_type='Conv1D_encoder',
             learn_sigma=True,
+            hidden_dims=hidden_dims,
             **kwargs
         )
     else:
@@ -794,13 +895,15 @@ def get_encoder_model(input_dim, latent_dim, type, **kwargs):
             input_dim=input_dim,
             output_dim=latent_dim,
             learn_sigma=True,
+            hidden_dims=hidden_dims,
             **kwargs
         )
-def get_decoder_model(latent_dim, output_dim, type, **kwargs):
+def get_decoder_model(latent_dim, output_dim, type, hidden_dims=None, **kwargs):
     if type == "dictionary":
         return DictionaryCoder(
             input_dim=latent_dim,
             output_dim=output_dim,
+            hidden_dims=hidden_dims,
             **kwargs
         )
     elif type == "dictionary_cnn":
@@ -808,6 +911,7 @@ def get_decoder_model(latent_dim, output_dim, type, **kwargs):
             input_dim=latent_dim,
             output_dim=output_dim,
             layer_type='Conv1D',
+            hidden_dims=hidden_dims,
             **kwargs
         )
     elif type == "ART":
@@ -831,5 +935,6 @@ def get_decoder_model(latent_dim, output_dim, type, **kwargs):
             input_dim=latent_dim,
             output_dim=output_dim,
             learn_sigma=True,
+            hidden_dims=hidden_dims,
             **kwargs
         )

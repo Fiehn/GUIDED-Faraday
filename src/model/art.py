@@ -35,6 +35,7 @@ class AutoRegressiveTransformerVAE(CVAE):
                  num_features: int = 3,
                  num_layers: int = 4,
                  nhead: int = 4,
+                 d_model: int = 256,
                  dim_feedforward: int = 128,
                  bin_size: int = 256,
                  normalizer: Normalizer = None,
@@ -43,6 +44,9 @@ class AutoRegressiveTransformerVAE(CVAE):
         num_layers = int(kwargs.pop("transformer_num_layers", num_layers))
         nhead = int(kwargs.pop("transformer_num_heads", nhead))
         bin_size = int(kwargs.pop("num_bins", bin_size))
+        d_model = int(kwargs.pop("transformer_d_model", d_model))
+        if nhead < 1:
+            raise ValueError(f"transformer_num_heads must be >= 1, got {nhead}")
 
         super().__init__(
             input_dim=input_dim,
@@ -55,6 +59,7 @@ class AutoRegressiveTransformerVAE(CVAE):
         )
         self.sequence_length = int(sequence_length)
         self.num_features = int(num_features)
+        self.d_model = int(d_model)
         self.tokenizer = Tokenizer(max_val=10.0, num_bins=bin_size)
         self.normalizer = normalizer
 
@@ -66,15 +71,17 @@ class AutoRegressiveTransformerVAE(CVAE):
             num_bins=bin_size,
             seq_len=self.sequence_length * self.num_features,
             condition_dim=self.condition_dim,
+            d_model=d_model,
             model_layers=num_layers,
             num_heads=nhead,
+            hidden_dims=kwargs.get("decoder_hidden_dims", None)
         )
 
         # Keep decoder/prior from CVAE 
         if isinstance(self.prior, VampPrior):
             self.prior.set_encoder(self.encoder, input_shape=self.input_dim + self.condition_dim)
 
-        self.num_parameters = sum(p.numel() for p in self.parameters())
+        self.num_parameters = sum(p.numel() for p in self.parameters() if p.requires_grad)
     
     def forward(self, x, c, num_samples=1, target_tokens=None):
         if target_tokens is None:

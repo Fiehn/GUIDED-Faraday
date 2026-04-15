@@ -105,12 +105,33 @@ class SetGuideVAE(CVAE):
             self.set_pool = None
             self.set_repr_dim = self.set_hidden_dim * self.num_set_elements
 
+        encoder_hidden_dims = kwargs.get("encoder_hidden_dims", None)
+        encoder_dropout = kwargs.get("encoder_dropout", None)
+
+        encoder_model_kwargs = {}
+        if encoder_hidden_dims is not None:
+            encoder_model_kwargs["hidden_dims"] = list(encoder_hidden_dims)
+        if isinstance(encoder_dropout, bool):
+            encoder_model_kwargs["dropout"] = encoder_dropout
+        elif encoder_dropout is not None:
+            try:
+                encoder_dropout_rate = float(encoder_dropout)
+                encoder_model_kwargs["dropout"] = encoder_dropout_rate > 0.0
+                encoder_model_kwargs["dropout_rate"] = encoder_dropout_rate
+            except (TypeError, ValueError):
+                encoder_model_kwargs["dropout"] = bool(encoder_dropout)
+
+        encoder_base_kwargs = dict(kwargs)
+        for key in ("encoder_hidden_dims", "decoder_hidden_dims", "encoder_dropout", "decoder_dropout"):
+            encoder_base_kwargs.pop(key, None)
+
         # Replace posterior encoder: it now consumes pooled set representation + conditions.
         self.encoder = get_encoder_model(
             input_dim=self.set_repr_dim + self.condition_dim,
             latent_dim=latent_dim,
             type=kwargs.get("encoder_type", "dictionary"),
-            **kwargs,
+            **encoder_model_kwargs,
+            **encoder_base_kwargs,
         )
 
         # Keep decoder/prior from CVAE 

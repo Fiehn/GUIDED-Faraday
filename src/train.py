@@ -326,6 +326,12 @@ def train(config, train_only_user_profile: bool = False):
     # === Model Setup ===
     model_type = str(config.model.type).lower()
     conditioner = None
+    encoder_cfg = getattr(config.model, "encoder", SimpleNamespace())
+    decoder_cfg = getattr(config.model, "decoder", SimpleNamespace())
+    encoder_hidden_dims = getattr(encoder_cfg, "hidden_dims", None)
+    decoder_hidden_dims = getattr(decoder_cfg, "hidden_dims", None)
+    encoder_dropout = getattr(encoder_cfg, "dropout", None)
+    decoder_dropout = getattr(decoder_cfg, "dropout", None)
 
     if model_type == "phase_splitter" and not phased_mode:
         raise ValueError("phase_splitter is currently supported only with data.mode='phased_parquet'.")
@@ -380,6 +386,10 @@ def train(config, train_only_user_profile: bool = False):
                         decoder_type=config.model.decoder.type,
                         prior_type=config.model.prior.type,
                         hierarchy_config=hierarchy,
+                        encoder_hidden_dims=encoder_hidden_dims,
+                        decoder_hidden_dims=decoder_hidden_dims,
+                        encoder_dropout=encoder_dropout,
+                        decoder_dropout=decoder_dropout,
                         )
             print(f"Initialized CVAE with input_dim={input_dim}, latent_dim={config.model.latent_dim}, encoder_type={config.model.encoder.type}, decoder_type={config.model.decoder.type}, prior_type={config.model.prior.type}, conditioner_tags={config.conditioning.tags}")
         elif model_type == "set_guide_vae":
@@ -406,6 +416,10 @@ def train(config, train_only_user_profile: bool = False):
                 set_num_blocks=set_cfg.num_blocks,
                 is_isab=set_cfg.is_isab,
                 use_abl_pool=bool(getattr(set_cfg, "use_abl_pool", False)),
+                encoder_hidden_dims=encoder_hidden_dims,
+                decoder_hidden_dims=decoder_hidden_dims,
+                encoder_dropout=encoder_dropout,
+                decoder_dropout=decoder_dropout,
             )
             print(f"Initialized SetGuideVAE with input_dim={input_dim}, latent_dim={config.model.latent_dim}, encoder_type={config.model.encoder.type}, decoder_type={config.model.decoder.type}, prior_type={config.model.prior.type}, conditioner_tags={config.conditioning.tags}")
         elif model_type == "art":
@@ -422,8 +436,13 @@ def train(config, train_only_user_profile: bool = False):
                 bin_size=config.model.art.num_bins,
                 nhead=config.model.art.transformer_num_heads,
                 num_layers=config.model.art.transformer_num_layers,
+                d_model=getattr(config.model.art, "d_model", 256),
                 sequence_length=config.window.input_len,
                 num_features=set_num_features,
+                encoder_hidden_dims=encoder_hidden_dims,
+                decoder_hidden_dims=decoder_hidden_dims,
+                encoder_dropout=encoder_dropout,
+                decoder_dropout=decoder_dropout,
             )
         elif model_type == "diffusion":
             diff_cfg = getattr(config.model, "diffusion", SimpleNamespace())
@@ -487,6 +506,10 @@ def train(config, train_only_user_profile: bool = False):
                     dictionary_size=config.model.prior.dictionary_size,
                     vamp_num_components=config.model.prior.vamp_num_components,
                     hierarchy_config=hierarchy,
+                    encoder_hidden_dims=encoder_hidden_dims,
+                    decoder_hidden_dims=decoder_hidden_dims,
+                    encoder_dropout=encoder_dropout,
+                    decoder_dropout=decoder_dropout,
                     )
         print(f"Initialized VAE with input_dim={input_dim}, latent_dim={config.model.latent_dim}, encoder_type={config.model.encoder.type}, decoder_type={config.model.decoder.type}, prior_type={config.model.prior.type}")
     else:
