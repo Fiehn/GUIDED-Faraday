@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from visualization.writer import Writer
 import json
 from model.model_utils import *
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 
 class NoiseScheduler:
