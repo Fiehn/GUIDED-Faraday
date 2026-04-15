@@ -6,6 +6,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from visualization.writer import Writer
+import json
+from model.model_utils import *
+
 
 class NoiseScheduler:
     def __init__(
@@ -800,3 +804,239 @@ class DiffusionModel(nn.Module):
                 for k, v in batch.items()
             }
         return batch
+    
+    def fit(self,
+            trainloader,
+            valloader = None,
+            lr = 1e-3,
+            weight_decay = 1e-4,
+            gradient_clip = None,
+            gradient_clip_kwargs = {"max_norm": 1.0},
+            lr_scheduler = False,
+            lr_scheduler_kwargs = {"step_size": 10, "gamma": 0.9},
+            beta = 1.0,
+            beta_annealing = False,  # Enable cyclical beta annealing to avoid posterior collapse
+            beta_annealing_kwargs = {"n_cycles": 4, "ratio": 0.5},  # kwargs for CyclicalBetaScheduler
+            epochs = 1000,
+            validation_freq = 1,
+            validation_num_samples = 10,
+            device = "cpu", 
+            early_stopping = True,
+            early_stopping_kwargs = {"patience": 10, "min_delta": 0.001},
+            save_epoch_freq = 10,
+            writer = None,
+            log_dir = './models/',
+            model_name = None, # Optionally specify model name for saving
+            normalizer = None,
+            compile_model = False, # Whether to use torch.compile for faster training (PyTorch 2.0+)
+            weighted_loss = 0.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
+            **_):
+
+        # === Generate a model tag ===
+        if model_name is None:
+            model_tag = self.get_tag()
+        else:
+            model_tag = model_name
+        os.makedirs(log_dir, exist_ok=True)
+        model_save_path = os.path.join(log_dir, model_tag)
+
+        # === Take Kwarg Inputs ===
+        fit_kwargs = dict(locals())
+        for key in ["self", "trainloader", "valloader", "writer", "_"]:
+            fit_kwargs.pop(key, None)
+        self.model_kwargs.update(fit_kwargs)
+        self.model_kwargs['model_tag'] = model_tag
+        
+        # === Save training configuration ===        
+       
+        log_dir_tagged = os.path.join(log_dir, model_tag)   # <-- move here
+        # === Initialize TensorBoard writer ===
+        if writer is None:
+            log_dir_tagged = os.path.join(log_dir, model_tag)
+            writer = Writer(log_dir=log_dir_tagged)
+            print(f"Writer logging to: {log_dir_tagged}")
+            # Log configuration to Writer
+            writer.add_text('Config/model_tag', model_tag, 0)
+        
+
+        # === Setup Optimizer and Scheduler ===
+        optim = self.get_optimizer(lr=lr, weight_decay=weight_decay)
+        if lr_scheduler:
+            # TODO: Mostly for transformers
+            # 1. Grab total epochs from kwargs (default to 20 if not provided)
+            total_epochs = lr_scheduler_kwargs.get("total_epochs", 100)
+            warmup_epochs = 5 # Wake the transformer up gently over 5 epochs
+
+            # 2. Phase 1: Warmup (Start at 1% of max LR, linearly scale to 100%)
+            warmup_scheduler = LinearLR(
+                optim, 
+                start_factor=0.01, 
+                end_factor=1.0, 
+                total_iters=warmup_epochs
+            )
+
+            # 3. Phase 2: Cosine Decay (Smoothly curve the LR down to near zero for the remaining epochs)
+            decay_scheduler = CosineAnnealingLR(
+                optim, 
+                T_max=(total_epochs - warmup_epochs), 
+                eta_min=1e-6
+            )
+
+            # 4. Chain them together
+            scheduler = SequentialLR(
+                optim, 
+                schedulers=[warmup_scheduler, decay_scheduler], 
+                milestones=[warmup_epochs]
+            )
+        
+        if next(self.parameters()).device != torch.device(device):
+            self.to(device)
+        self.prior.to(device)
+
+        if early_stopping:
+            earlystopping = EarlyStopping(**early_stopping_kwargs)
+        
+        # === Training Loop ===
+        self.train()
+        global_step = 0
+        best_val_loss = float('inf')
+        best_epoch = 0
+
+        for epoch in range(epochs):
+            epoch_train_loss = 0.0
+            epoch_train_recon = 0.0
+            epoch_train_kl = 0.0
+            num_batches = 0
+
+            for batch in trainloader:
+                global_step += 1
+
+                batch = self.move_to_device(batch, device)
+
+                loss_dict = self.train_core(
+                    batch, 
+                    optim, 
+                    gradient_clip=gradient_clip, 
+                    gradient_clip_kwargs=gradient_clip_kwargs,
+                    weighted_loss=weighted_loss,
+                )
+                
+                # Accumulate epoch losses
+                epoch_train_loss += loss_dict["loss"].item()
+                epoch_train_recon += loss_dict["recon_loglikelihood"].item()
+                epoch_train_kl += loss_dict["kl_divergence"].item()
+                num_batches += 1
+                
+                # Log training metrics per iteration
+                writer.add_scalar('train_loss', loss_dict["loss"].item(), global_step)
+                writer.add_scalar('train_recon_loglikelihood', loss_dict["recon_loglikelihood"].item(), global_step)
+                writer.add_scalar('train_kl_divergence', loss_dict["kl_divergence"].item(), global_step)
+
+            # Compute average epoch losses
+            avg_train_loss = epoch_train_loss / num_batches
+            avg_train_recon = epoch_train_recon / num_batches
+            avg_train_kl = epoch_train_kl / num_batches
+            
+            # Log epoch-level training metrics
+            writer.add_scalar('train_loss_epoch', avg_train_loss, epoch)
+            writer.add_scalar('train_recon_loglikelihood_epoch', avg_train_recon, epoch)
+            writer.add_scalar('train_kl_divergence_epoch', avg_train_kl, epoch)
+            
+            # Log learning rate
+            current_lr = optim.param_groups[0]['lr']
+            writer.add_scalar('train_learning_rate', current_lr, epoch)
+
+            # === Validation Phase ===
+            val_loss_dict = None
+            if valloader is not None and ((epoch + 1) % validation_freq == 0):
+                val_loss_dict = self.validate(valloader, num_samples=validation_num_samples, device=device)
+                
+                # Log validation metrics
+                writer.add_scalar('val_loss_epoch', val_loss_dict["loss"], epoch)
+                writer.add_scalar('val_recon_loglikelihood_epoch', val_loss_dict["recon_loglikelihood"], epoch)
+                writer.add_scalar('val_kl_divergence_epoch', val_loss_dict["kl_divergence"], epoch)
+
+                
+                 # === Save Best Model ===
+                if val_loss_dict["loss"] < best_val_loss:
+                    best_val_loss = val_loss_dict["loss"]
+                    best_epoch = epoch
+                    best_model_path = os.path.join(log_dir_tagged, f"{model_tag}_best.pt")
+                    self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_best", device=device, normalizer=normalizer)
+                    print(f"    New best model saved (Val Loss: {best_val_loss:.4f})")
+
+                # Print progress
+                print(f"Epoch [{epoch+1:4d}/{epochs}] "
+                      f"Train Loss: {avg_train_loss:.4f} | "
+                      f"Val Loss: {val_loss_dict['loss']:.4f} | "
+                      f"LR: {current_lr:.2e} | "
+                      f"Best: {best_val_loss:.4f}@{best_epoch+1}")
+
+                # Early stopping check
+                if early_stopping:
+                    is_best = earlystopping(val_metric=val_loss_dict["loss"],train_metric=avg_train_loss, epoch=epoch)
+                    if earlystopping.early_stop:
+                        print(f"\n{'='*60}")
+                        print(f"Early stopping triggered at epoch {epoch+1}")
+                        print(f"Best model at epoch {best_epoch+1} with Val Loss: {best_val_loss:.4f}")
+                        print(f"{'='*60}\n")
+                        writer.add_text('Training/early_stop', 
+                                      f'Stopped at epoch {epoch+1}, Best: {best_epoch+1}', epoch)
+                        break
+            else:
+                # No validation - just print training progress
+                print(f"Epoch [{epoch+1:4d}/{epochs}] "
+                      f"Train Loss: {avg_train_loss:.4f} | "
+                      f"Recon: {avg_train_recon:.4f} | "
+                      f"KL: {avg_train_kl:.4f} | "
+                      f"LR: {current_lr:.2e}")
+                
+            # === Learning Rate Scheduler Step ===
+            if lr_scheduler:
+                scheduler.step()
+            
+            # Save Model Checkpoint
+            if (epoch + 1) % save_epoch_freq == 0:
+                checkpoint_path = os.path.join(log_dir_tagged, f"{model_tag}_epoch_{epoch+1}.pt")
+                self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_epoch_{epoch+1}", device=device, normalizer=normalizer)
+                print(f"    Checkpoint saved: epoch_{epoch+1}")
+        
+        # === Training Complete ===
+        print(f"\n{'='*60}")
+        print(f"Training complete: {model_tag}")
+        print(f"Best model: Epoch {best_epoch+1} with Val Loss: {best_val_loss:.4f}")
+        print(f"Model saved to: {os.path.join(log_dir_tagged, model_tag)}")
+        print(f"{'='*60}\n")
+
+        final_model_path = os.path.join(log_dir_tagged, f"{model_tag}_final.pt")
+        self.to("cpu")
+        self.prior.to("cpu")
+        self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_final", device="cpu", normalizer=normalizer)
+        # Restore model to the training device so it's ready for inference after fit() returns
+        self.to(device)
+        self.prior.to(device)
+
+        # Save training summary
+        summary = {
+            'model_tag': model_tag,
+            'total_epochs': epoch + 1,
+            'best_epoch': best_epoch + 1,
+            'best_val_loss': best_val_loss,
+            'final_train_loss': avg_train_loss,
+            'early_stopped': early_stopping and earlystopping.early_stop,
+        }
+        summary_path = os.path.join(log_dir_tagged, f"{model_tag}_summary.json")
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=4)
+
+        # Log final summary to TensorBoard
+        summary_text = "\n".join([f"{k}: {v}" for k, v in summary.items()])
+        writer.add_text('Training/summary', summary_text, epoch)
+        
+        self.eval()
+        
+        # Close writer
+        if writer is not None:
+            writer.close()
+            print(f"Writter logs saved to: {log_dir_tagged}")
+        return model_tag, writer
