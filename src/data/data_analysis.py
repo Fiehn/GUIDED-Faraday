@@ -239,6 +239,68 @@ class SmartMeterDayPlotter:
                 return c
 
         pref = []
+# Plotting each phase & aggregated
+# Plotting: `selected_meter` and `selected_day` to plot a specific smart meter and exact day.
+
+class SmartMeterDayPlotter:
+    def __init__(
+        self,
+        data_dir_parquet: str,
+        verbose: bool = False,
+        data_mode: str = "phased_parquet",
+        hourly_csv_path: str = None,
+        interval_freq: str = "15min",
+        hourly_energy_col: str = "hourly_energy_consumption",
+    ):
+        self.data_dir_parquet = data_dir_parquet
+        self.verbose = verbose
+        self.data_mode = data_mode
+        self.hourly_csv_path = hourly_csv_path
+        self.interval_freq = interval_freq
+        self.hourly_energy_col = hourly_energy_col
+        self.hourly_df = None
+        self.meter_to_file = self._build_meter_file_map()
+
+    def _log(self, msg: str):
+        if self.verbose:
+            print(msg)
+
+    def _build_meter_file_map(self):
+        if self.data_mode == "hourly_csv":
+            if self.hourly_csv_path is None or (not os.path.exists(self.hourly_csv_path)):
+                raise FileNotFoundError(f"Hourly CSV not found: {self.hourly_csv_path}")
+
+            self.hourly_df = pd.read_csv(self.hourly_csv_path)
+            if "meter_number" not in self.hourly_df.columns:
+                raise ValueError("Hourly CSV must contain 'meter_number' column")
+
+            meters = sorted(pd.to_numeric(self.hourly_df["meter_number"], errors="coerce").dropna().astype(int).unique().tolist())
+            return {meter: self.hourly_csv_path for meter in meters}
+
+        parquet_files = sorted(glob.glob(f"{self.data_dir_parquet}/*.parquet"))
+        meter_to_file = {}
+        for p in parquet_files:
+            m = re.search(r"sm_(\d+)\.parquet$", os.path.basename(p))
+            if m:
+                meter_to_file[int(m.group(1))] = p
+        return meter_to_file
+
+    def available_meters(self):
+        return sorted(self.meter_to_file.keys())
+
+    @staticmethod
+    def _pick_col(cols, base):
+        matches = [c for c in cols if c.startswith(base)]
+        return matches[0] if matches else None
+
+    def _pick_time_column(self, df):
+        cols = list(df.columns)
+
+        for c in ["timestamp_utc", "timestamp_dst", "timestamp"]:
+            if c in cols:
+                return c
+
+        pref = []
         for c in cols:
             lc = c.lower()
             if lc.startswith("timestamp_utc") or lc.startswith("timestamp_dst") or lc.startswith("timestamp"):
@@ -1025,6 +1087,11 @@ if weekday_stats is not None:
 else:
     weekday_stats_path = None
 
+
+
+
+
+# Summary 
 run_summary_path = save_json(
     {
         "day_profile_csv": day_df_path,
