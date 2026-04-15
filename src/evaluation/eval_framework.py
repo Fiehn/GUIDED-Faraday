@@ -548,14 +548,21 @@ class EvalFramework:
                 n = min(len(self._real_data), len(self._synthetic_data))
                 real = np.asarray(self._real_data)[:n]
                 synth = np.asarray(self._synthetic_data)[:n]
+                phase_first_flatten = hasattr(self.model, '_to_phase_first')
 
                 # Convert flattened [N, L*F] -> [N, L] by selecting feature 0
                 if real.ndim == 2 and real.shape[1] != metric.window_size and real.shape[1] % metric.window_size == 0:
                     f_real = real.shape[1] // metric.window_size
-                    real = real.reshape(-1, metric.window_size, f_real)[:, :, 0]
+                    if phase_first_flatten:
+                        real = real.reshape(-1, f_real, metric.window_size)[:, 0, :]
+                    else:
+                        real = real.reshape(-1, metric.window_size, f_real)[:, :, 0]
                 if synth.ndim == 2 and synth.shape[1] != metric.window_size and synth.shape[1] % metric.window_size == 0:
                     f_synth = synth.shape[1] // metric.window_size
-                    synth = synth.reshape(-1, metric.window_size, f_synth)[:, :, 0]
+                    if phase_first_flatten:
+                        synth = synth.reshape(-1, f_synth, metric.window_size)[:, 0, :]
+                    else:
+                        synth = synth.reshape(-1, metric.window_size, f_synth)[:, :, 0]
 
                 metric.real_data = real
                 metric.synthetic_data = synth
@@ -1967,29 +1974,54 @@ class AggregatedProfiles(SyntheticMetric):
     synthetic_data: np.ndarray = None
     output_path: str = None
     
-    def __init__(self, n_samples: int = 100, window_size: int = 24, tau: str = 'auto'):
+    def __init__(self, n_samples: int = 100, window_size: int = 24, tau: str = 'auto',
+                 plot_filename: str = 'aggregated_profiles_comparison.pdf'):
         self.n_samples = n_samples
         self.window_size = window_size
         self.tau = tau
+        self.plot_filename = plot_filename
     
     @property
     def name(self) -> str:
         return "Aggregated Profiles (Flexibility Distance)"
+
+    def _uses_phase_first_flatten(self) -> bool:
+        return hasattr(self, 'model') and self.model is not None and hasattr(self.model, '_to_phase_first')
+
+    def _extract_consumption_feature(self, data: np.ndarray) -> np.ndarray:
+        arr = _sanitize_numeric_array(np.asarray(data))
+        if arr.ndim != 2:
+            raise ValueError(f"Expected 2D flattened array [N, D], got {arr.shape}")
+
+        if arr.shape[1] == self.window_size:
+            return arr
+
+        if arr.shape[1] % self.window_size != 0:
+            raise ValueError(
+                f"Flattened dimension {arr.shape[1]} is not divisible by window_size {self.window_size}"
+            )
+
+        n_features = arr.shape[1] // self.window_size
+        if n_features == 1:
+            return arr.reshape(-1, self.window_size)
+
+        if self._uses_phase_first_flatten():
+            # Flatten order is [f0_t0..f0_tL-1, f1_t0..], so feature 0 is contiguous.
+            return arr.reshape(-1, n_features, self.window_size)[:, 0, :]
+
+        # Fallback for time-first flatten order [t0_f0, t0_f1, ..., t1_f0, ...].
+        return arr.reshape(-1, self.window_size, n_features)[:, :, 0]
     
     def compute(self) -> float:
         """Aggregate real and synthetic data, then compute Flexibility Distance."""
-        real_data = _sanitize_numeric_array(np.asarray(self.real_data))
-        synthetic_data = _sanitize_numeric_array(np.asarray(self.synthetic_data))
-
-        # Extract consumption only (feature 0)
-        real_n_features = real_data.shape[1] // self.window_size
-        synth_n_features = synthetic_data.shape[1] // self.window_size
-        
-        real_data = real_data.reshape(-1, self.window_size, real_n_features)[:, :, 0]
-        synthetic_data = synthetic_data.reshape(-1, self.window_size, synth_n_features)[:, :, 0]
+        real_data = self._extract_consumption_feature(self.real_data)
+        synthetic_data = self._extract_consumption_feature(self.synthetic_data)
         
         # Use the same number of samples for fair comparison
         n_agg = min(self.n_samples, len(real_data), len(synthetic_data))
+        if n_agg < 1:
+            raise ValueError("AggregatedProfiles requires at least one sample in both real and synthetic data")
+
         real_samples = real_data[:n_agg]
         synth_samples = synthetic_data[:n_agg]
         
@@ -2040,11 +2072,11 @@ class AggregatedProfiles(SyntheticMetric):
         ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        
-        # Ensure output_path doesn't contain a filename
-        base_dir = os.path.dirname(self.output_path) if self.output_path and self.output_path.endswith('.json') else self.output_path
-        
-        plt.savefig(os.path.join(base_dir, 'aggregated_profiles_comparison.pdf'), dpi=150, bbox_inches='tight')
+
+        base_dir = _resolve_output_directory(self.output_path)
+        os.makedirs(base_dir, exist_ok=True)
+        plot_filename = self.plot_filename or 'aggregated_profiles_comparison.pdf'
+        plt.savefig(os.path.join(base_dir, plot_filename), dpi=150, bbox_inches='tight')
         plt.close()
         
 
@@ -2168,16 +2200,28 @@ class PerConditionEval(SyntheticMetric):
                 print(f"Warning: TSTR computation failed{label_suffix}: {e}")
             return None
 
-    def _compute_subset_aggregated_profiles(self, real_subset: np.ndarray, synthetic_subset: np.ndarray):
+    def _compute_subset_aggregated_profiles(self, real_subset: np.ndarray, synthetic_subset: np.ndarray,
+                                            group_type: str = 'all', group_value: Any = 'all'):
         """Compute AggregatedProfiles score for one subset; return None if too few samples."""
         if len(real_subset) < self.min_samples_per_group or len(synthetic_subset) < self.min_samples_per_group:
             return None
 
         try:
-            self.aggregated_profiles_calculator.real_data = real_subset
-            self.aggregated_profiles_calculator.synthetic_data = synthetic_subset
-            self.aggregated_profiles_calculator.output_path = self.output_path
-            return float(self.aggregated_profiles_calculator.compute())
+            group_key = self._sanitize_label_for_filename(group_type)
+            group_val = self._sanitize_label_for_filename(group_value)
+            plot_filename = f"aggregated_profiles_comparison_{group_key}_{group_val}.pdf"
+
+            metric = AggregatedProfiles(
+                n_samples=self.aggregated_profiles_calculator.n_samples,
+                window_size=self.aggregated_profiles_calculator.window_size,
+                tau=self.aggregated_profiles_calculator.tau,
+                plot_filename=plot_filename,
+            )
+            metric.model = getattr(self, 'model', None)
+            metric.real_data = real_subset
+            metric.synthetic_data = synthetic_subset
+            metric.output_path = self.output_path
+            return float(metric.compute())
         except Exception as e:
             if self.verbose:
                 print(f"Warning: AggregatedProfiles computation failed: {e}")
@@ -2259,6 +2303,21 @@ class PerConditionEval(SyntheticMetric):
                 unique.append(sval)
         return unique
 
+    @staticmethod
+    def _sanitize_label_for_filename(label: Any) -> str:
+        text = str(label).strip().lower()
+        safe = []
+        for ch in text:
+            if ch.isalnum():
+                safe.append(ch)
+            else:
+                safe.append('_')
+        out = ''.join(safe)
+        while '__' in out:
+            out = out.replace('__', '_')
+        out = out.strip('_')
+        return out or 'group'
+
     def _compute_aggregated_profiles_per_feeder(
         self,
         real_data: np.ndarray,
@@ -2275,8 +2334,12 @@ class PerConditionEval(SyntheticMetric):
             if n_group < self.min_samples_per_feeder:
                 continue
 
-            score = self._compute_subset_aggregated_profiles(real_data[feeder_ids == feeder], 
-                                                             synthetic_data[feeder_ids == feeder])
+            score = self._compute_subset_aggregated_profiles(
+                real_data[feeder_ids == feeder],
+                synthetic_data[feeder_ids == feeder],
+                group_type='feeder',
+                group_value=str(feeder),
+            )
             if score is None:
                 continue
 
@@ -2623,14 +2686,20 @@ class PerConditionEval(SyntheticMetric):
         for day in range(7):
             if np.sum( days_of_week == day) > 0:
                 aggregated_profiles_per_day[day] = self._compute_subset_aggregated_profiles(
-                    real_data[ days_of_week == day], synthetic_data[ days_of_week == day]
+                    real_data[ days_of_week == day],
+                    synthetic_data[ days_of_week == day],
+                    group_type='day_of_week',
+                    group_value=day,
                 )
 
         aggregated_profiles_per_month = {}
         for month in range(1, 13):
             if np.sum(months_of_year == month) > 0:
                 aggregated_profiles_per_month[month] = self._compute_subset_aggregated_profiles(
-                    real_data[months_of_year == month], synthetic_data[months_of_year == month]
+                    real_data[months_of_year == month],
+                    synthetic_data[months_of_year == month],
+                    group_type='month_of_year',
+                    group_value=month,
                 )
 
         aggregated_profiles_per_feeder = {}
