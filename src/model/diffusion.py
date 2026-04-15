@@ -892,8 +892,7 @@ class DiffusionModel(nn.Module):
         
         if next(self.parameters()).device != torch.device(device):
             self.to(device)
-        self.prior.to(device)
-
+        
         if early_stopping:
             earlystopping = EarlyStopping(**early_stopping_kwargs)
         
@@ -1011,12 +1010,9 @@ class DiffusionModel(nn.Module):
 
         final_model_path = os.path.join(log_dir_tagged, f"{model_tag}_final.pt")
         self.to("cpu")
-        self.prior.to("cpu")
         self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_final", device="cpu", normalizer=normalizer)
         # Restore model to the training device so it's ready for inference after fit() returns
         self.to(device)
-        self.prior.to(device)
-
         # Save training summary
         summary = {
             'model_tag': model_tag,
