@@ -26,9 +26,42 @@ from src.model.generators import SyntheticGenerator
 try:
     from tabulate import tabulate
 except ImportError:
-    # Fallback if tabulate not installed
+    # Fallback if tabulate is not installed: render a simple ASCII grid table.
     def tabulate(data, headers="keys", **kwargs):
-        return str(data)
+        rows = [list(r) for r in data]
+        if isinstance(headers, (list, tuple)):
+            header_row = [str(h) for h in headers]
+        else:
+            header_row = []
+
+        str_rows = [["" if c is None else str(c) for c in r] for r in rows]
+        if header_row:
+            str_rows = [header_row] + str_rows
+
+        if not str_rows:
+            return ""
+
+        n_cols = max(len(r) for r in str_rows)
+        norm_rows = [r + [""] * (n_cols - len(r)) for r in str_rows]
+        col_widths = [max(len(r[c]) for r in norm_rows) for c in range(n_cols)]
+
+        def _hline() -> str:
+            return "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
+
+        def _row(cells) -> str:
+            return "| " + " | ".join(cells[c].ljust(col_widths[c]) for c in range(n_cols)) + " |"
+
+        out = [_hline()]
+        start_idx = 0
+        if header_row:
+            out.append(_row(norm_rows[0]))
+            out.append(_hline())
+            start_idx = 1
+
+        for r in norm_rows[start_idx:]:
+            out.append(_row(r))
+        out.append(_hline())
+        return "\n".join(out)
 
 
 def _to_json_serializable(obj: Any) -> Any:
@@ -76,7 +109,8 @@ def _save_standalone_metric_result(metric_key: str, payload: Dict[str, Any],
         with open(resolved_output, 'w') as f:
             json.dump(existing, f, indent=2)
     except Exception as e:
-        print(f"Warning: failed to save standalone metric '{metric_key}' to {resolved_output}: {e}")
+        # Keep this helper quiet by default to avoid noisy evaluation logs.
+        pass
 
 
 def _flatten_windows(data: np.ndarray) -> np.ndarray:
@@ -259,6 +293,9 @@ class EvalFramework:
         output_path: str = 'models/eval_results.json',
         prepared_data: Dict[str, Any] = None,
         evaluation_title: str = 'EVALUATION RESULTS',
+        verbose: bool = False,
+        include_mean_baseline: bool = True,
+        baseline_reference_data: np.ndarray = None,
     ):
         """Initialize evaluation framework.
         
@@ -282,11 +319,15 @@ class EvalFramework:
         self.output_path = output_path
         self.prepared_data = prepared_data
         self.evaluation_title = evaluation_title
+        self.verbose = bool(verbose)
+        self.include_mean_baseline = bool(include_mean_baseline)
+        self.baseline_reference_data = baseline_reference_data
         
         # Metrics storage 
         self.reconstruction_metrics: Dict[str, ReconstructionMetric] = {}
         self.synthetic_metrics: Dict[str, SyntheticMetric] = {}
         self.results: Dict[str, float] = {}
+        self.baseline_results: Dict[str, float] = {}
 
         self._real_data: np.ndarray = None  # Cache real data for synthetic metrics that need it
         self._reconstructed_data: np.ndarray = None  # Cache reconstructed data for metrics that need it
@@ -392,7 +433,8 @@ class EvalFramework:
 
             return
 
-        print("Preparing data for evaluation metrics...")
+        if self.verbose:
+            print("Preparing data for evaluation metrics...")
         real_batches = []
         recon_batches = []
         condition_batches = []
@@ -604,47 +646,45 @@ class EvalFramework:
         Returns:
             Dict[str, float]: Dictionary mapping metric names to their computed values
         """
-        print("\n" + "="*70)
-        print(self.evaluation_title)
-        print("="*70 + "\n")
+        print(f"[{self.evaluation_title}] Running evaluation...")
         
         # Prepare data for metrics that need it (reconstructions, synthetic samples)
         self._prepare_data()
         self._inject_data_into_metrics()
 
+        if self.verbose:
+            n_real = 0 if self._real_data is None else int(len(self._real_data))
+            n_synth = 0 if self._synthetic_data is None else int(len(self._synthetic_data))
+            print(f"Prepared data: real={n_real}, synthetic={n_synth}")
+
         self.results = {}
         
         # Run reconstruction metrics
         if self.reconstruction_metrics:
-            print("RECONSTRUCTION METRICS")
-            print("-" * 70)
             for name, metric in self.reconstruction_metrics.items():
-                print(f"  {name}...", end=" ", flush=True)
                 try:
                     value = metric.compute()
                     self.results[name] = value
-                    print(f"{value:.6f}")
                 except Exception as e:
-                    print(f"Error: {e}")
+                    if self.verbose:
+                        print(f"Warning: metric '{name}' failed: {e}")
                     self.results[name] = None
-            print()
         
         # Run synthetic metrics
         if self.synthetic_metrics:
-            print("SYNTHETIC DATA METRICS")
-            print("-" * 70)
             for name, metric in self.synthetic_metrics.items():
-                print(f"  {name}...", end=" ", flush=True)
                 try:
                     value = metric.compute()
                     self.results[name] = value
-                    print(f"{value:.6f}")
                 except Exception as e:
-                    print(f"Error: {e}")
+                    if self.verbose:
+                        print(f"Warning: metric '{name}' failed: {e}")
                     self.results[name] = None
-            print()
+
+        self.baseline_results = self._compute_mean_baseline_results() if self.include_mean_baseline else {}
         
-        # Display results table
+        self._print_interpretation_guide()
+        # Display detailed metric table after the high-level guide/scorecard.
         self._print_results_table()
         
         return self.results
@@ -657,15 +697,17 @@ class EvalFramework:
 
         self.results = {}
         for name, metric in self.reconstruction_metrics.items():
-            print(f"  {name}...", end=" ", flush=True)
             try:
                 value = metric.compute()
                 self.results[name] = value
-                print(f"{value:.6f}")
             except Exception as e:
-                print(f"Error: {e}")
+                if self.verbose:
+                    print(f"Warning: metric '{name}' failed: {e}")
                 self.results[name] = None
 
+        self.baseline_results = self._compute_mean_baseline_results(reconstruction_only=True) if self.include_mean_baseline else {}
+
+        self._print_interpretation_guide()
         self._print_results_table()
         return self.results
 
@@ -677,36 +719,186 @@ class EvalFramework:
 
         self.results = {}
         for name, metric in self.synthetic_metrics.items():
-            print(f"  {name}...", end=" ", flush=True)
             try:
                 value = metric.compute()
                 self.results[name] = value
-                print(f"{value:.6f}")
             except Exception as e:
-                print(f"Error: {e}")
+                if self.verbose:
+                    print(f"Warning: metric '{name}' failed: {e}")
                 self.results[name] = None
 
+        self.baseline_results = self._compute_mean_baseline_results(synthetic_only=True) if self.include_mean_baseline else {}
+
+        self._print_interpretation_guide()
         self._print_results_table()
         return self.results
 
+    def _make_mean_baseline_batch(self, n_rows: int, n_features: int) -> np.ndarray:
+        """Create a constant baseline where each sample is the global mean profile."""
+        if n_rows <= 0 or n_features <= 0:
+            return np.zeros((0, 0), dtype=np.float64)
+
+        if self.baseline_reference_data is not None:
+            ref = np.asarray(self.baseline_reference_data)
+        else:
+            ref = np.asarray(self._real_data) if self._real_data is not None else None
+
+        if ref is None or ref.size == 0:
+            return np.zeros((n_rows, n_features), dtype=np.float64)
+
+        if ref.ndim == 1:
+            ref = ref.reshape(1, -1)
+        elif ref.ndim > 2:
+            ref = ref.reshape(ref.shape[0], -1)
+
+        ref = _sanitize_numeric_array(ref)
+        mean_profile = np.mean(ref, axis=0, keepdims=True)
+
+        if mean_profile.shape[1] != n_features:
+            min_features = min(mean_profile.shape[1], n_features)
+            padded = np.zeros((1, n_features), dtype=np.float64)
+            padded[:, :min_features] = mean_profile[:, :min_features]
+            mean_profile = padded
+
+        return np.repeat(mean_profile, n_rows, axis=0)
+
+    def _metric_direction(self, metric_name: str) -> str:
+        """Return optimization direction for display/benchmarking."""
+        if metric_name == "TSTR (Train on Synthetic, Test on Real)":
+            return "target_1"
+        if "Log-Likelihood" in metric_name or metric_name == "Visual Evaluations":
+            return "higher"
+        return "lower"
+
+    def _is_better_than_baseline(self, metric_name: str, model_value: float, baseline_value: float) -> bool | None:
+        if model_value is None or baseline_value is None:
+            return None
+        try:
+            model = float(model_value)
+            base = float(baseline_value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(model) or not np.isfinite(base):
+            return None
+
+        direction = self._metric_direction(metric_name)
+        if direction == "higher":
+            return model > base
+        if direction == "target_1":
+            return abs(model - 1.0) < abs(base - 1.0)
+        return model < base
+
+    def _compute_mean_baseline_results(self, reconstruction_only: bool = False, synthetic_only: bool = False) -> Dict[str, float]:
+        """Evaluate the same metrics against a simple mean-profile baseline."""
+        baseline_results: Dict[str, float] = {}
+        baseline_output_file = os.path.join(_resolve_output_directory(self.output_path), 'eval_results_baseline_mean.json')
+
+        def _run_metric_with_baseline(metric: EvaluationMetric, use_recon: bool) -> float | None:
+            # Skip metrics that are either too expensive/noisy or not meaningful for constant baselines.
+            if isinstance(metric, (PerConditionEval, VisualEvaluation)):
+                return None
+
+            original_attrs = {}
+            for attr in ("real_data", "reconstructed_data", "synthetic_data", "output_path", "verbose"):
+                if hasattr(metric, attr):
+                    original_attrs[attr] = getattr(metric, attr)
+
+            try:
+                n_real = 0 if self._real_data is None else int(len(self._real_data))
+                d_real = 0 if self._real_data is None or np.asarray(self._real_data).ndim != 2 else int(np.asarray(self._real_data).shape[1])
+                if n_real <= 0 or d_real <= 0:
+                    return None
+
+                if hasattr(metric, "real_data"):
+                    metric.real_data = self._real_data
+
+                if use_recon and hasattr(metric, "reconstructed_data"):
+                    metric.reconstructed_data = self._make_mean_baseline_batch(n_real, d_real)
+                if (not use_recon) and hasattr(metric, "synthetic_data"):
+                    n_synth = 0 if self._synthetic_data is None else int(len(self._synthetic_data))
+                    d_synth = d_real if self._synthetic_data is None or np.asarray(self._synthetic_data).ndim != 2 else int(np.asarray(self._synthetic_data).shape[1])
+                    metric.synthetic_data = self._make_mean_baseline_batch(n_synth, d_synth)
+
+                if hasattr(metric, "output_path"):
+                    metric.output_path = baseline_output_file
+                if hasattr(metric, "verbose"):
+                    metric.verbose = False
+
+                value = metric.compute()
+                return float(value) if isinstance(value, (float, int, np.floating, np.integer)) else None
+            except Exception:
+                return None
+            finally:
+                for attr, value in original_attrs.items():
+                    setattr(metric, attr, value)
+
+        if not synthetic_only:
+            for name, metric in self.reconstruction_metrics.items():
+                baseline_results[name] = _run_metric_with_baseline(metric, use_recon=True)
+
+        if not reconstruction_only:
+            for name, metric in self.synthetic_metrics.items():
+                baseline_results[name] = _run_metric_with_baseline(metric, use_recon=False)
+
+        return baseline_results
+
     def _print_results_table(self) -> None:
         """Print results in a formatted table."""
-        print("\n" + "="*70)
-        print("EVALUATION RESULTS")
-        print("="*70 + "\n")
+        print("\nEvaluation summary")
 
         table_data = []
         for name, value in self.results.items():
-            if value is not None:
-                if isinstance(value, float):
-                    table_data.append([name, f"{value:.6f}"])
-                else:
-                    table_data.append([name, str(value)])
-            else:
-                table_data.append([name, "ERROR"])
+            baseline_value = self.baseline_results.get(name, None) if isinstance(self.baseline_results, dict) else None
 
-        headers = ["Metric", "Value"]
+            model_str = "ERROR" if value is None else (f"{float(value):.6f}" if isinstance(value, (float, int, np.floating, np.integer)) else str(value))
+            base_str = "-"
+            delta_str = "-"
+            better_str = "-"
+
+            if baseline_value is not None and isinstance(baseline_value, (float, int, np.floating, np.integer)):
+                base_str = f"{float(baseline_value):.6f}"
+                if isinstance(value, (float, int, np.floating, np.integer)):
+                    direction = self._metric_direction(name)
+                    if direction == "target_1":
+                        model_dist = abs(float(value) - 1.0)
+                        base_dist = abs(float(baseline_value) - 1.0)
+                        delta_str = f"{(base_dist - model_dist):+.6f}"
+                    else:
+                        delta_str = f"{(float(value) - float(baseline_value)):+.6f}"
+
+                    better = self._is_better_than_baseline(name, float(value), float(baseline_value))
+                    better_str = "yes" if better else ("no" if better is not None else "-")
+
+            goal = self._metric_direction(name)
+            goal_label = "target=1" if goal == "target_1" else ("higher" if goal == "higher" else "lower")
+            table_data.append([name, goal_label, model_str, base_str, delta_str, better_str])
+
+        headers = ["Metric", "Goal", "Model", "Mean Baseline", "Delta", "Better vs Baseline"]
         print(tabulate(table_data, headers=headers, tablefmt="grid"))
+        print()
+
+    def _print_interpretation_guide(self) -> None:
+        """Print short guidance on what to inspect first in the results."""
+        if not self.results:
+            return
+
+        compared = 0
+        better = 0
+        for name, model_value in self.results.items():
+            base_value = self.baseline_results.get(name, None) if isinstance(self.baseline_results, dict) else None
+            is_better = self._is_better_than_baseline(name, model_value, base_value)
+            if is_better is None:
+                continue
+            compared += 1
+            better += int(is_better)
+
+        print("What to look for")
+        print("1. Check 'Better vs Baseline': you want as many 'yes' rows as possible.")
+        print("2. Prioritize Reconstruction RMSE and Reconstruction MSE first: these reflect direct fidelity.")
+        print("3. Then inspect distribution metrics (MMD, ACF, Classical Statistics): they reflect realism of generated profiles.")
+        print("4. For TSTR, the goal is close to 1.0 (not simply lower or higher).")
+        if compared > 0:
+            print(f"Baseline scorecard: {better}/{compared} metrics better than mean baseline.")
         print()
 
     def get_results(self) -> Dict[str, float]:
@@ -726,7 +918,8 @@ class EvalFramework:
         }
         with open(output_path, 'w') as f:
             json.dump(results_serializable, f, indent=2)
-        print(f"Results saved to {output_path}")
+        if self.verbose:
+            print(f"Results saved to {output_path}")
 
 
 class PhasedEvaluationSuite:
@@ -763,6 +956,7 @@ class PhasedEvaluationSuite:
             n_synthetic_samples=self.n_synthetic_samples,
             output_path=self.output_path,
             evaluation_title='PHASED DATA PREPARATION',
+            verbose=False,
         )
         framework._prepare_data()
         return framework
@@ -790,6 +984,7 @@ class PhasedEvaluationSuite:
             output_path=output_path,
             prepared_data=prepared_data,
             evaluation_title=title,
+            verbose=False,
         )
         evaluator.register_all(phased=True)
         results = evaluator.evaluate()
@@ -1570,10 +1765,10 @@ class VisualEvaluation(SyntheticMetric):
         try:
             self.pca()
             self.tsne()
-            print(f"  Visual evaluation plots saved to {self.output_path}")
             return 1.0  # Success
         except Exception as e:
-            print(f"  Error generating visualizations: {e}")
+            if getattr(self, 'verbose', False):
+                print(f"Warning: visual evaluation plotting failed: {e}")
             return 0.0  # Failure
 
 
@@ -2400,7 +2595,8 @@ class PerConditionEval(SyntheticMetric):
                 }
             }
         except Exception as e:
-            print(f"Warning: ClassicalStatistics computation failed: {e}")
+            if self.verbose:
+                print(f"Warning: ClassicalStatistics computation failed: {e}")
             return None
 
     def _plot_aggregated_profiles_bars(
