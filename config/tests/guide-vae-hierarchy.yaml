@@ -101,21 +101,21 @@ model:
   # Encoder configuration
   encoder:
     type: "dictionary"  # Options: "dictionary", "mlp", "dictionary_cnn"
-    hidden_dims: [512, 512, 512, 256]
+    hidden_dims: [512, 512, 512, 256, 256]
     dropout: 0.2
     activation: "relu"
   
   # Decoder configuration
   decoder:
     type: "dictionary"  # Options: "dictionary", "mlp", "art"
-    hidden_dims: [256, 512, 512, 512]
+    hidden_dims: [256, 256, 512, 512, 512]
     dropout: 0.2
     activation: "relu"
     likelihood: "gaussian"  # Options: "gaussian", "student_t"
   
   # Prior configuration
   prior:
-    type: "standard_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
+    type: "learnable_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
                                  # "learnable_gaussian", "learnable_dictionary", "vampprior"
     dictionary_size: 256         # Must be > input_dim (96 timesteps × 3 phases = 288)
     vamp_num_components: 40
@@ -182,7 +182,7 @@ conditioning:
 hierarchy:
   enabled: true
   levels: ["linear", "stochastic", "linear", "linear"] # Available: [linear, stochastic, vq, information_bottleneck]
-  latent_dims: [64, 256, 256, 64] # latent dimensions for each level
+  latent_dims: [128, 256, 256, 128] # latent dimensions for each level
   top_down: [false, true, true, false] # whether to use top-down connections for each level
   bottom_up: [false, true, true, false] # whether to use bottom-up connections for each level
   loss_weights: [1.0, 1.0, 1.0, 1.0] # weights for KL loss at each level
@@ -235,8 +235,8 @@ training:
     enabled: true
     stop_on_all_files_used: true # for phased training: stop once replay stream has completed all files at least once
     min_epochs_before_full_data_stop: 10
-    patience: 10 # stop if no improvement for N validations
-    min_delta: 0.001 # minimum improvement threshold
+    patience: 50 # stop if no improvement for N validations
+    min_delta: 0.0001 # minimum improvement threshold
   
   # Model checkpointing
   checkpointing:

@@ -101,14 +101,14 @@ model:
   # Encoder configuration
   encoder:
     type: "dictionary"  # Options: "dictionary", "mlp", "dictionary_cnn"
-    hidden_dims: [512, 512, 256]
+    hidden_dims: [512, 1024, 512, 256]
     dropout: 0.2
     activation: "relu"
   
   # Decoder configuration
   decoder:
     type: "dictionary"  # Options: "dictionary", "mlp", "art"
-    hidden_dims: [256, 512, 512]
+    hidden_dims: [256, 512, 1024, 512]
     dropout: 0.2
     activation: "relu"
     likelihood: "gaussian"  # Options: "gaussian", "student_t"
@@ -235,8 +235,8 @@ training:
     enabled: true
     stop_on_all_files_used: true # for phased training: stop once replay stream has completed all files at least once
     min_epochs_before_full_data_stop: 10
-    patience: 10 # stop if no improvement for N validations
-    min_delta: 0.001 # minimum improvement threshold
+    patience: 50 # stop if no improvement for N validations
+    min_delta: 0.0001 # minimum improvement threshold
   
   # Model checkpointing
   checkpointing:
