@@ -26,7 +26,7 @@ data:
 
 
   # CSV filename to load
-  data_files: ["data/test_data_small.csv"] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
+  data_files: ["data/test_data_eval.csv"] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
   
   # CSV column specifications
   columns:
@@ -90,7 +90,7 @@ normalization:
 # ============================================================================
 model:
   # Model type: "vae", "cvae", "art", "set_guide_vae", "diffusion", "phase_splitter"
-  type: "cvae"
+  type: "set_guide_vae"
   
   # Device for training: "cpu" or "cuda"
   device: "cuda"
