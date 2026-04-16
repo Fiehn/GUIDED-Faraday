@@ -271,10 +271,6 @@ class DictionaryCoder(torch.nn.Module):
         eps = torch.randn((num_samples, mu.shape[0], self.dictionary_size)).to(mu.device)
 
         # Scale by sigma in dictionary space: [num_samples, batch_size, dictionary_size]
-        print("mu shape:", mu.shape)
-        print("sigma shape:", sigma.shape)
-        print("eps shape:", eps.shape)
-        print("num_samples:", num_samples)
         z_dict = eps * sigma.unsqueeze(0)
 
         # Map to output space using SigmaMapper: [output_dim, dictionary_size]
