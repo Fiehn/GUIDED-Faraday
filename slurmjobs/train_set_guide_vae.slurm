@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --partition=v100
+#SBATCH --partition=gpuq
 #SBATCH --time 12:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=8
