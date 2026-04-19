@@ -24,7 +24,7 @@ data:
 
 
   # CSV filename to load
-  data_files: [] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
+  data_files: ["data/test_data_eval.csv"] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
   
   # CSV column specifications
   columns:

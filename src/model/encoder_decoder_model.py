@@ -200,6 +200,7 @@ class DictionaryCoder(torch.nn.Module):
                 seq_len=seq_len,
                 num_features=int(num_features),
                 dist_parameters=["mu", "sigma"] if learn_sigma else ["mu"],
+                param_output_dims={"mu": output_dim, "sigma": dictionary_size} if learn_sigma else None,
                 hidden_dims=hidden_dims,
             )
         else:
@@ -685,10 +686,12 @@ class TemporalCNNEncoder(nn.Module):
                  seq_len=24, 
                  num_features=3, 
                  dist_parameters=["mu", "sigma"], 
+                 param_output_dims=None,
                  hidden_dims=None,
                  **_):
         super().__init__()
         self.dist_parameters = dist_parameters
+        self.param_output_dims = param_output_dims or {}
         self.num_features = int(num_features)
         self.seq_len = int(seq_len)
         
@@ -729,10 +732,11 @@ class TemporalCNNEncoder(nn.Module):
         # Parameter-specific heads (Outputting the latent z params)
         self.param_heads = nn.ModuleDict()
         for param in dist_parameters:
+            head_output_dim = int(self.param_output_dims.get(param, output_dim))
             self.param_heads[param] = nn.Sequential(
                 nn.Linear(flattened_size, 256),
                 nn.GELU(),
-                nn.Linear(256, output_dim)
+                nn.Linear(256, head_output_dim)
             )
 
     def forward(self, x):
