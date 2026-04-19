@@ -13,6 +13,8 @@ class CVAE(VAE):
         distribution_dict: dict = None,
         prior_type: str = None,
         hierarchy_config: HierarchicalConfig = None,
+        phased_mode: bool = False,
+        sequence_length: int = 24,
         **kwargs,
     ):
         if distribution_dict is None:
@@ -24,7 +26,14 @@ class CVAE(VAE):
         self.condition_dim = conditioner.get_condition_dim()
         self.latent_dim = int(latent_dim)
 
-        super().__init__(input_dim=input_dim, latent_dim=latent_dim, distribution_dict=distribution_dict, prior_type=prior_type, hierarchy_config=hierarchy_config, **kwargs)
+        super().__init__(input_dim=input_dim, 
+                         latent_dim=latent_dim, 
+                         distribution_dict=distribution_dict, 
+                         prior_type=prior_type, 
+                         hierarchy_config=hierarchy_config, 
+                         phased_mode=phased_mode,
+                         sequence_length=sequence_length,
+                        **kwargs)
 
         base_kwargs = dict(kwargs)
         for key in ("encoder_hidden_dims", "decoder_hidden_dims", "encoder_dropout", "decoder_dropout"):
@@ -87,12 +96,6 @@ class CVAE(VAE):
         # Recalculate num_parameters after overriding encoder/decoder
         self.num_parameters = self.encoder._num_parameters() + self.decoder._num_parameters()
 
-    def _prep_inputs(self, x: torch.Tensor) -> torch.Tensor:
-        """ Flatten [B, L, F] to [B, D] if needed """
-        if x.dim() == 3:
-            return x.reshape(x.shape[0], -1)
-        return x
-
     def forward(self, x: torch.Tensor, c: torch.Tensor, num_samples: int = 1):
         """
         Forward pass with pre-computed conditions.
@@ -151,27 +154,9 @@ class CVAE(VAE):
 
     def train_core(self, batch, optim, beta=1.0,weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
         self.train()
-        if len(batch) == 4:
-            x, c, meter_id, timestamps = batch
-            if c.numel() == 0 or c.shape[-1] != self.condition_dim:
-                c = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
-            c = self.move_to_device(c, device=x.device)
-        elif len(batch) == 3:
-            x, meter_id, timestamps = batch
-            c = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
-            c = self.move_to_device(c, device=x.device)
-        elif len(batch) == 2:
-            x, meter_id = batch
-            timestamps = None
-            c = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
-            c = self.move_to_device(c, device=x.device)
-        else:
-            x = batch
-            c = self.conditioner.get_conditions(x)
-            meter_id = None
-            timestamps = None
-            c = self.move_to_device(c, device=x.device)
-
+        x, meter_id, timestamps, agg = self._unpack_batch(batch)
+                
+        c = self._build_conditions(x_phase_first=self._to_phase_first(x), meter_id=meter_id, timestamps=timestamps)
         # Prep inputs: [B, L, F] -> [B, D] if needed
         x = self._prep_inputs(x)
 
@@ -184,6 +169,7 @@ class CVAE(VAE):
         loss_dict["loss"].backward()
 
         if gradient_clip is not None:
+            gradient_clip_kwargs = gradient_clip_kwargs or {}
             torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_kwargs.get("max_norm", 1.0))
 
         optim.step()
@@ -192,28 +178,13 @@ class CVAE(VAE):
     @torch.no_grad()
     def validate(self, valloader, num_samples: int = 1, beta: float = 1.0, device: str = "cpu"):
         self.eval()
-        agg = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
+        metrics = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
         num_batches = 0
 
-        for batch in valloader:
-            if len(batch) == 4:
-                x, c, meter_id, timestamps = batch
-                if c.numel() == 0 or c.shape[-1] != self.condition_dim:
-                    c = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
-            elif len(batch) == 3:
-                x, meter_id, timestamps = batch
-                c = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
-            elif len(batch) == 2:
-                x, meter_id = batch
-                timestamps = None
-                c = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamps)
-            else:
-                x = batch[0] if isinstance(batch, (list, tuple)) else batch
-                c = self.conditioner.get_conditions(x)
-                meter_id = None
-                timestamps = None
+        for batch in valloader:            
+            x, meter_id, timestamps, _agg = self._unpack_batch(batch)
                 
-            c = self.move_to_device(c, device=device)
+            c = self._build_conditions(x_phase_first=self._to_phase_first(x), meter_id=meter_id, timestamps=timestamps)
 
             # Keep original 3D shape for conditioning
             x_3d = x.to(device)
@@ -225,13 +196,13 @@ class CVAE(VAE):
             recon_params, q_params = self.forward(x_flat, c, num_samples=1)
             loss_dict = self.loss(x_flat, recon_params, q_params, beta=beta)
 
-            for k in agg:
-                agg[k] += float(loss_dict[k])
+            for k in metrics:
+                metrics[k] += float(loss_dict[k])
             num_batches += 1
 
-        for k in agg:
-            agg[k] /= max(num_batches, 1)
-        return agg
+        for k in metrics:
+            metrics[k] /= max(num_batches, 1)
+        return metrics
 
     @torch.no_grad()
     def sample(self, conditions: torch.Tensor, num_prior_samples: int = 1, num_x_samples: int = 1, device: str = "cpu", **kwargs):

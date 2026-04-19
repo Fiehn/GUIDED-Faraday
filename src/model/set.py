@@ -45,6 +45,7 @@ class SetGuideVAE(CVAE):
         set_num_blocks: int = 2,
         is_isab: bool = True,
         use_abl_pool: bool = False,
+        phased_mode: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -54,6 +55,8 @@ class SetGuideVAE(CVAE):
             distribution_dict=distribution_dict,
             prior_type=prior_type,
             hierarchy_config=hierarchy_config,
+            phased_mode=phased_mode,
+            sequence_length=sequence_length,
             **kwargs,
         )
 
@@ -174,11 +177,6 @@ class SetGuideVAE(CVAE):
             f"num_features={self.num_features}, sequence_length={self.sequence_length}"
         )
 
-    # transpose input only for conditioner 
-    def _build_condition_input(self, x_phase_first: torch.Tensor) -> torch.Tensor:
-        """Convert [B, F, L] -> [B, L, F] for conditioner compatibility."""
-        return x_phase_first.transpose(1, 2)
-
     # permuation-invariatn encoder 
     def _set_encode(self, x_phase_first: torch.Tensor) -> torch.Tensor:
         """Encode set elements to a pooled representation [B, H]."""
@@ -275,7 +273,7 @@ class SetGuideVAE(CVAE):
             recon_params[k] = recon_params[k].reshape(S, B, -1)
         return recon_params, q_params
 
-    def train_core(self, batch, optim, beta=1.0, weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, condition_dropout=False, **_): # TODO: add condition_dropout argument
+    def train_core(self, batch, optim, beta=1.0, weighted_loss=0.0, gradient_clip=None, gradient_clip_max_norm=None, condition_dropout=False, **_): # TODO: add condition_dropout argument
         self.train()
 
         x, meter_id, timestamps = self._unpack_batch(batch)
@@ -307,7 +305,7 @@ class SetGuideVAE(CVAE):
 
         # gradient clipping
         if gradient_clip is not None:
-            torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_kwargs.get("max_norm", 1.0))
+            torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_max_norm)
 
         optim.step()
         return loss_dict

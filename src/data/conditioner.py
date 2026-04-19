@@ -146,6 +146,48 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
     def _invalidate_profile_lookup(self):
         self._profile_lookup_tensors = {}
 
+    def _prepare_kmeans_input(self, batch_data, context: str) -> np.ndarray:
+        """Project batch input to [B, D] using current profiler feature-width contract.
+
+        Accepts 2D [B, D] and 3D [B, F, L]/[B, L, F] tensors.
+        For 3D input, chooses a projection that matches the fitted KMeans feature
+        width when available:
+            - D == L: collapse feature/phase axis by summation.
+            - D == L*F: flatten after canonicalizing to [B, L, F].
+        """
+        if isinstance(batch_data, torch.Tensor):
+            batch_data = batch_data.detach().cpu().numpy()
+
+        x = np.asarray(batch_data)
+        if x.ndim == 2:
+            return x.astype(np.float32, copy=False)
+
+        if x.ndim != 3:
+            raise ValueError(f"{context}: expected 2D or 3D input, got {x.ndim}D")
+
+        bsz, d1, d2 = x.shape
+        expected_dim = self._current_feature_dim()
+
+        if expected_dim is not None:
+            if expected_dim == d2:
+                # [B, F, L] -> [B, L]
+                return x.sum(axis=1, dtype=np.float32)
+            if expected_dim == d1:
+                # [B, L, F] -> [B, L]
+                return x.sum(axis=2, dtype=np.float32)
+            if expected_dim == d1 * d2:
+                # Flatten in canonical [B, L, F] order.
+                if d1 in (1, 3) and d2 not in (1, 3):
+                    return np.transpose(x, (0, 2, 1)).reshape(bsz, -1).astype(np.float32, copy=False)
+                return x.reshape(bsz, -1).astype(np.float32, copy=False)
+
+        # Fallback if no fitted width is known yet (or ambiguous dimensions).
+        if d1 in (1, 3) and d2 not in (1, 3):
+            return x.sum(axis=1, dtype=np.float32)
+        if d2 in (1, 3) and d1 not in (1, 3):
+            return x.sum(axis=2, dtype=np.float32)
+        return x.reshape(bsz, -1).astype(np.float32, copy=False)
+
     def _get_profile_lookup_for_device(self, device: torch.device):
         key = str(device)
         cached = self._profile_lookup_tensors.get(key)
@@ -210,7 +252,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         batch_count = 0
         total_timesteps = 0
 
-        for data, c, meter_id, timestamps in tqdm(train_loader, desc="Clustering batches"):
+        for data, meter_id, _, _ in tqdm(train_loader, desc="Clustering batches"):
             batch_size, seq_len, num_features = data.shape
             data_flat = data.cpu().numpy().reshape(batch_size, seq_len * num_features)  # [B, L*F]
 
@@ -242,7 +284,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         # === Phase 2: Create corpus and fit LDA model ===
         meter_corpus = {} # dict: meter_id -> cluster counts
 
-        for data, c, meter_id, timestamps in tqdm(train_loader, desc="Creating corpus batches"):
+        for data, meter_id, _, _ in tqdm(train_loader, desc="Creating corpus batches"):
             batch_size, seq_len, num_features = data.shape
             data_batch = data.cpu().numpy().reshape(batch_size, seq_len * num_features)  # [B*T, F]
             meter_id_flat = meter_id.cpu().numpy() 
@@ -362,18 +404,10 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         Raises:
             ValueError: If `x_batch` does not have 2 or 3 dimensions.
         """
-        if isinstance(x_batch, torch.Tensor):
-            x_batch = x_batch.cpu().numpy()
         if isinstance(meter_ids, torch.Tensor):
             meter_ids = meter_ids.cpu().numpy()
 
-        if x_batch.ndim == 3:
-            batch_size, seq_len, num_features = x_batch.shape
-            x_flat = x_batch.reshape(batch_size, seq_len * num_features)
-        elif x_batch.ndim == 2:
-            x_flat = x_batch
-        else:
-            raise ValueError(f"Expected x to have 2 or 3 dimensions, got {x_batch.ndim}")
+        x_flat = self._prepare_kmeans_input(x_batch, context="update_model_incremental")
 
         valid_mask = ~np.isnan(x_flat).any(axis=1)
         x_valid = x_flat[valid_mask]
@@ -508,18 +542,10 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         Raises:
             ValueError: If data dimensionality is incorrect or feature sizes mismatch.
         """
-        if isinstance(data, torch.Tensor):
-            data = data.cpu().numpy()
         if isinstance(meter_id, torch.Tensor):
             meter_id = meter_id.cpu().numpy()
 
-        if data.ndim == 3:
-            batch_size, seq_len, num_features = data.shape
-            x_batch = data.reshape(batch_size, seq_len * num_features)
-        elif data.ndim == 2:
-            x_batch = data
-        else:
-            raise ValueError(f"Expected data to have 2 or 3 dimensions, got {data.ndim}")
+        x_batch = self._prepare_kmeans_input(data, context="_compute_profiles_for_batch")
 
         valid_mask = ~np.isnan(x_batch).any(axis=1)
         x_fit = x_batch[valid_mask]
@@ -533,10 +559,13 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
             self._invalidate_profile_lookup()
             return
 
-        target_set = set(target_meter_ids)
-        selected_indices = [i for i, m in enumerate(meter_id_valid) if m in target_set]
-        x_selected = x_fit[selected_indices]
-        meter_id_selected = meter_id_valid[selected_indices]
+        target_set = {int(m) for m in target_meter_ids}
+        selected_mask = np.isin(meter_id_valid.astype(np.int64, copy=False), np.fromiter(target_set, dtype=np.int64))
+        x_selected = x_fit[selected_mask]
+        meter_id_selected = meter_id_valid[selected_mask]
+
+        if x_selected.shape[0] == 0:
+            return
 
         labels = cdist(x_selected, self.cluster_centers_).argmin(axis=1)
         meter_corpus = {}
@@ -560,7 +589,13 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         self._invalidate_profile_lookup()
 
     
-    def fit_on_files(self, parquet_paths: list[str]):
+    def fit_on_files(self, parquet_paths: list[str],
+                     window_spec = None,
+                     feature_cols = None,
+                     hourly_aggregation = False,
+                     aggregation_divisor = 1,
+                     phased = True
+                     ):
         """Convenience method to fit the model directly on a list of parquet files.
 
         Args:
@@ -590,8 +625,12 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
             sm_files=parquet_paths, 
             replay_buffer_capacity=10000, 
             min_buffer_size=5184,
-            window_spec=WindowSpec(input_len=24, stride=24), 
-            num_workers=0
+            window_spec=window_spec, 
+            num_workers=0,
+            feature_cols=feature_cols,
+            hourly_aggregation=hourly_aggregation,
+            aggregation_divisor=aggregation_divisor,
+            phased_mode=phased
         )
         
         loader = DataLoader(phased_ds, batch_size=1024, num_workers=0)
@@ -600,12 +639,12 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
             def __init__(self, loader):
                 self.loader = loader
             def __iter__(self):
-                for x, cond in self.loader:
+                for x, meter_id, _, _ in self.loader:
                     # Transpose x from [B, 3, 24] to [B, 24, 3] 
                     # so it matches the inference shape
                     x_time_first = x.transpose(1, 2)
                     
-                    yield x_time_first, None, cond[:, 0, 0], cond[:, 1, 0]
+                    yield x_time_first, meter_id, None, None
                     
         self.fit(WrapperLoader(loader))
         return self

@@ -11,10 +11,8 @@ verbose: true
 # DATA LOADING CONFIGURATION
 # ============================================================================
 data:
-  # Data mode: "csv" (SmartMeterDataModule) or "phased_parquet" (StreamingParquetBuffer)
-  mode: "csv"
-  # CSV mode only: when true, SmartMeterCSV skips CSV parsing and reads only parquet cache files.
-  parquet_only: true
+  # Data mode: "csv" (SmartMeterDataModule) or "phased" (StreamingParquetBuffer)
+  mode: "phased"
 
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
@@ -22,11 +20,11 @@ data:
   #data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
   # data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
-  data_dir: "data/"
+  data_dir: "data/_parquet_smoke"
 
 
   # CSV filename to load
-  data_files: ["data/test_data_small.csv"] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
+  data_files: [] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
   
   # CSV column specifications
   columns:
@@ -36,15 +34,13 @@ data:
     value_cols: ["hourly_energy_consumption",]  # List of measurement columns
   
   # Data loading options
-  nan_as_zero: false
-  dtype_meter: "int32"
-  dtype_values: "float32"
+  nan_as_zero: false # Currently only for CSV data mode
   
   # Train/val/test split (by meter ID)
   splits:
-    train_ratio: 0.9
-    val_ratio: 0.05
-    test_ratio: 0.05
+    train_ratio: 0.8
+    val_ratio: 0.1
+    test_ratio: 0.1
     random_seed: 42
   
   # Windowing configuration
@@ -54,25 +50,20 @@ data:
     stride: 24     # Non-overlapping windows (one per day)
   
   # DataLoader settings
-  dataloader:
-    batch_size: 32
-    num_workers: 8
-    shuffle: true
-
-  # Phased parquet streaming settings (used by SetGuideVAE phased training)
-  phased:
-    replay_buffer_capacity: 2000
-    min_buffer_size:  256
-    num_workers: 0
-    steps_per_epoch: 500
-    eval_batches: 5
-    eval_cache_on_gpu: true
-    eval_cache_refresh: false
-    cache_scan_batches: 0
-    skip_corrupt_files: true
-    max_skip_warnings: 20
-    aggregation_energy_unit: "kwh" # "wh" keeps raw hourly sum scale, "kwh" divides hourly sums by 1000
-    output_aggregate_stream: false # when true, phased loader emits (x, cond, agg) for splitter-model pipelines
+  batch_size: 32
+  shuffle: true
+  replay_buffer_capacity: 2000
+  min_buffer_size: 0
+  num_workers: 0
+  steps_per_epoch: 500
+  eval_batches: 5
+  eval_cache_on_gpu: true
+  eval_cache_refresh: false
+  cache_scan_batches: 0
+  skip_corrupt_files: true
+  max_skip_warnings: 20
+  aggregation_energy_unit: "kwh" # "wh" keeps raw hourly sum scale, "kwh" divides hourly sums by 1000
+  output_aggregate_stream: false # when true, phased loader emits (x, cond, agg) for splitter-model pipelines
 
 # ============================================================================
 # NORMALIZATION CONFIGURATION
@@ -92,9 +83,6 @@ model:
   # Model type: "vae", "cvae", "art", "set_guide_vae", "diffusion", "phase_splitter"
   type: "cvae"
   
-  # Device for training: "cpu" or "cuda"
-  device: "cuda"
-  
   # Latent dimension (size of latent vector z)
   latent_dim: 64
 
@@ -103,24 +91,24 @@ model:
     type: "dictionary"  # Options: "dictionary", "mlp", "dictionary_cnn"
     hidden_dims: [32, 64, 64]
     dropout: 0.2
-    activation: "relu"
   
   # Decoder configuration
   decoder:
     type: "dictionary_cnn"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
     hidden_dims: [64, 64, 32]
     dropout: 0.2
-    activation: "relu"
-    likelihood: "gaussian"  # Options: "gaussian", "student_t"
   
   # Prior configuration
   prior:
-    type: "learnable_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
+    type: "vampprior"  # Options: "standard_gaussian", "standard_dictionary", 
                                  # "learnable_gaussian", "learnable_dictionary", "vampprior"
     dictionary_size: 256         # Must be > input_dim (96 timesteps × 3 phases = 288)
     vamp_num_components: 40
     init_from_data: true
     init_noise_scale: 0.01
+
+  phase_splitter:
+    base_channels: 64
 
   # SetGuideVAE set-encoder architecture configuration
   set:
@@ -136,6 +124,7 @@ model:
     num_bins: 64 # Amount of discrete bins to tokenize the data into
     transformer_num_heads: 8 # Amount of heads in the transformer.
     transformer_num_layers: 4 # Amount of hidden layers in the transformer structure.
+    d_model: 64
 
   diffusion:
     num_timesteps: 200
@@ -211,7 +200,7 @@ training:
   # Learning rate scheduler
   lr_scheduler:
     enabled: true
-    scheduler_type: "cosine"  # Options: "step", "exponential", "cosine"
+    scheduler_type: "cosine"  # Options: "step", "exponential", "cosine", "seq"
     step_size: 10
     gamma: 0.9
   
@@ -269,19 +258,3 @@ visualize:
   num_synthetic: 40
   num_originals: 4
   num_synthetic_per: 10
-
-# ============================================================================
-# ADVANCED 
-# ============================================================================
-advanced: 
-  # Number of CPU threads for PyTorch
-  num_threads: 0
-  
-  # Deterministic training
-  deterministic: true
-  seed: 42
-  
-  # Profile training performance
-  profiling:
-    enabled: false
-    profile_dir: "./profiles"

@@ -7,6 +7,8 @@ from typing import Dict, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 
+from src.model.model import BaseModel
+
 class SplitterCNN(nn.Module):
     def __init__(self, condition_dim=32, base_channels=64):
         super().__init__()
@@ -52,15 +54,15 @@ class SplitterCNN(nn.Module):
         return proportions
     
 
-class HierarchicalSplitter(nn.Module):
-    def __init__(self, conditioner, sequence_length=24, condition_dim=32):
-        super().__init__()
+class HierarchicalSplitter(BaseModel):
+    def __init__(self, conditioner, sequence_length=24, condition_dim=32, base_channels=64, phased_mode=True):
+        super().__init__(phased_mode=phased_mode, sequence_length=sequence_length)
         self.conditioner = conditioner
         self.sequence_length = sequence_length
         self.num_features = 3
         self.condition_dim = int(condition_dim)
         
-        self.model = SplitterCNN(condition_dim=condition_dim)
+        self.model = SplitterCNN(condition_dim=condition_dim, base_channels=base_channels)
         
         # The 6 possible ways to assign 3 anonymous slots to 3 physical wires
         self.permutations = [
@@ -72,11 +74,7 @@ class HierarchicalSplitter(nn.Module):
     def get_optimizer(self, lr=1e-3, weight_decay=1e-4):
         return torch.optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
 
-    def get_tag(self):
-        time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"{self.__class__.__name__}_{self.model.__class__.__name__}_{time_stamp}"
-
-    def train_core(self, batch, optim, condition_dropout=False, **_):
+    def train_core(self, batch, optim, condition_dropout = False, **_):
         self.train()
 
         # 1. Unpack Real Data
@@ -87,7 +85,11 @@ class HierarchicalSplitter(nn.Module):
         x_agg = x_true_phases.sum(dim=1, keepdim=True) # [B, 1, 24]
 
         # 3. Get Conditions
-        if provided_conditions is not None:
+        if (
+            torch.is_tensor(provided_conditions)
+            and provided_conditions.dim() == 2
+            and provided_conditions.shape[-1] == self.condition_dim
+        ):
             c = self.move_to_device(provided_conditions, device=x_raw.device).float()
             if c.dim() == 1:
                 c = c.unsqueeze(0)
@@ -127,7 +129,11 @@ class HierarchicalSplitter(nn.Module):
             x_true_phases = self._to_phase_first(x_raw).float()
             x_agg = x_true_phases.sum(dim=1, keepdim=True)
 
-            if provided_conditions is not None:
+            if (
+                torch.is_tensor(provided_conditions)
+                and provided_conditions.dim() == 2
+                and provided_conditions.shape[-1] == self.condition_dim
+            ):
                 c = self.move_to_device(provided_conditions, device=device).float()
                 if c.dim() == 1:
                     c = c.unsqueeze(0)
@@ -185,7 +191,11 @@ class HierarchicalSplitter(nn.Module):
             x_true = self._to_phase_first(x_raw).float()  # [B, 3, L]
             x_agg = x_true.sum(dim=1, keepdim=True)
 
-            if provided_conditions is not None:
+            if (
+                torch.is_tensor(provided_conditions)
+                and provided_conditions.dim() == 2
+                and provided_conditions.shape[-1] == self.condition_dim
+            ):
                 c = self.move_to_device(provided_conditions, device=device).float()
                 if c.dim() == 1:
                     c = c.unsqueeze(0)
@@ -384,58 +394,6 @@ class HierarchicalSplitter(nn.Module):
         x_final_phases = proportions * x_agg
         
         return x_final_phases
-    
-    def _build_condition_input(self, x_phase_first: torch.Tensor) -> torch.Tensor:
-        """Convert [B, F, L] -> [B, L, F] for conditioner compatibility."""
-        return x_phase_first.transpose(1, 2)
-
-    def _unpack_batch(self, batch):
-        """Support (x, meter_id, timestamps), (x, cond), (x, meter_id), and (x, c, meter_id, timestamps)."""
-        provided_conditions = None
-        expected_cond_dim = self.condition_dim
-
-        if isinstance(batch, (list, tuple)) and len(batch) == 4:
-            x, second, third, fourth = batch
-            # Regular CSV explicit tuple: (x, c, meter_id, timestamps)
-            if (
-                torch.is_tensor(second)
-                and second.dim() >= 2
-                and expected_cond_dim is not None
-                and int(expected_cond_dim) > 0
-                and second.shape[-1] == int(expected_cond_dim)
-            ):
-                return x, third, fourth, second
-            # Extended eval tuple: (x, meter_id, timestamps, agg)
-            return x, second, third, None
-
-        if isinstance(batch, (list, tuple)) and len(batch) == 3:
-            x, second, third = batch
-            if torch.is_tensor(second) and second.dim() == 3 and second.shape[1] >= 2:
-                meter_id = second[:, 0, 0].long()
-                timestamps = second[:, 1, 0].long()
-                return x, meter_id, timestamps, None
-            return x, second, third, None
-
-        if not isinstance(batch, (list, tuple)) or len(batch) != 2:
-            raise ValueError(
-                "HierarchicalSplitter expects batches as (x, meter_id, timestamps), (x, meter_id), (x, cond), or (x, c, meter_id, timestamps)."
-            )
-
-        x, second = batch
-        meter_id = second
-        timestamps = None
-
-        if torch.is_tensor(second) and second.dim() == 3 and second.shape[1] >= 2:
-            meter_id = second[:, 0, 0].long()
-            timestamps = second[:, 1, 0].long()
-        elif torch.is_tensor(second) and second.dim() == 2:
-            if second.shape[1] >= 2 and not torch.is_floating_point(second):
-                meter_id = second[:, 0].long()
-                timestamps = second[:, 1].long()
-            elif expected_cond_dim is not None and second.shape[1] == expected_cond_dim:
-                provided_conditions = second
-
-        return x, meter_id, timestamps, provided_conditions
 
     def save_model(self, save_path=None, model_name="trained_model", device="cpu", normalizer=None):
         if save_path is None:
@@ -483,43 +441,25 @@ class HierarchicalSplitter(nn.Module):
         num_params = sum(p.numel() for p in self.parameters())
         print(f"Model with {num_params} parameters saved to {model_path}")
 
-    def move_to_device(self, batch, device):
-        if torch.is_tensor(batch):
-            return batch.to(device, non_blocking=True)
-        if isinstance(batch, (list, tuple)):
-            return type(batch)(
-                b.to(device, non_blocking=True) if torch.is_tensor(b) else b
-                for b in batch
-            )
-        if isinstance(batch, dict):
-            return {
-                k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
-                for k, v in batch.items()
-            }
-        return batch
-
-    def _to_phase_first(self, x: torch.Tensor) -> torch.Tensor:
-        """Return `x` as [B, F, L], supporting [B, D], [B, F, L], or [B, L, F]."""
-        if x.dim() == 2:
-            if x.shape[1] != self.sequence_length * self.num_features:
-                raise ValueError(
-                    f"Expected flattened input dim {self.sequence_length * self.num_features}, got {x.shape[1]}"
-                )
-            return x.reshape(x.shape[0], self.num_features, self.sequence_length)
-
-        if x.dim() != 3:
-            raise ValueError(f"Expected 2D/3D input, got shape {tuple(x.shape)}")
-
-        # [B, F, L]
-        if x.shape[1] == self.num_features and x.shape[2] == self.sequence_length:
-            return x
-
-        # [B, L, F] -> [B, F, L]
-        if x.shape[1] == self.sequence_length and x.shape[2] == self.num_features:
-            return x.transpose(1, 2)
-
-        raise ValueError(
-            f"Could not infer phase/time axes for input shape {tuple(x.shape)} with "
-            f"num_features={self.num_features}, sequence_length={self.sequence_length}"
-        ) 
+    def reconstruct(self, *args, **kwargs):
+        return super().reconstruct(*args, **kwargs)
     
+    def load_model(self, model_path, device="cpu"):
+        checkpoint = torch.load(model_path, map_location=device)
+        constructor_args = checkpoint.get("constructor_args", {})
+        self.__init__(**constructor_args)
+        self.load_state_dict(checkpoint["model_state_dict"])
+        self.to(device)
+
+        normalizer_state = checkpoint.get("normalizer_state", None)
+        if normalizer_state is not None:
+            print("Loaded normalizer state from checkpoint:")
+            for k, v in normalizer_state.items():
+                print(f"  {k}: {v}")
+        else:
+            print("No normalizer state found in checkpoint.")
+
+        num_params = sum(p.numel() for p in self.parameters())
+        print(f"Model with {num_params} parameters loaded from {model_path}")
+
+        

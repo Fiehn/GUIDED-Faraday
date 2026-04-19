@@ -1,182 +1,10 @@
 import os
 from typing import Optional
 import numpy as np
-import pandas as pd
 import torch
-import torch.nn as nn
-import json
 import pyarrow.parquet as pq
 from tqdm import tqdm
-import os
-
-def compute_normalization_stats(sm_files,
-                                feature_cols,
-                                save_path="normalization_stats.json",
-                                valid_ids_json_path=None,
-                                use_cache=True,
-                                hourly_aggregation: bool = False,
-                                aggregation_divisor: float = 1.0):
-    """Compute the mean and standard deviation for normalization across all Parquet files."""
-    if use_cache and os.path.exists(save_path):
-        with open(save_path, 'r') as f:
-            stats = json.load(f)
-            mean = np.array(stats['log_mean'])
-            std = np.array(stats['log_std'])
-            return mean, std
-        
-    if sm_files is None:
-        # Portable defaults for local project layouts
-        cwd = os.getcwd()
-        candidate_dirs = [
-            os.path.join(cwd, 'data', 'raw_profiles'),
-            os.path.join(cwd, 'data', 'cleaned_profiles'),
-            os.path.join(cwd, 'data'),
-        ]
-        sm_files = []
-        for data_dir in candidate_dirs:
-            if os.path.isdir(data_dir):
-                for root, _, files in os.walk(data_dir):
-                    for f in files:
-                        if f.endswith('.parquet'):
-                            sm_files.append(os.path.join(root, f))
-                if sm_files:
-                    break
-    
-    if not sm_files:
-        raise ValueError("No Parquet files found for normalization stats computation.")
-    
-    if not feature_cols:
-        raise ValueError("No feature columns specified for normalization stats computation.")
-
-    # === Optional filter by Timeseries_info JSON ===
-    filtered_sm_files = list(sm_files)
-    if valid_ids_json_path is not None and os.path.exists(valid_ids_json_path):
-        print("Loading valid IDs...")
-        with open(valid_ids_json_path, 'r') as f:
-            valid_data = json.load(f)
-            valid_ids = set(valid_data.get('id_list_of_sms_with_data', []))
-
-        filtered_sm_files = []
-        for file in sm_files:
-            basename = os.path.basename(file)
-            file_id = basename.replace('sm_', '').replace('.parquet', '')
-            if file_id in valid_ids:
-                filtered_sm_files.append(file)
-
-        print(f"Filtered files: Kept {len(filtered_sm_files)} out of {len(sm_files)} original files.")
-    else:
-        print(f"No valid_ids filter applied. Using {len(filtered_sm_files)} files.")
-
-
-    total_sum = np.zeros(len(feature_cols))
-    total_sq_sum = np.zeros(len(feature_cols))
-    total_count = np.zeros(len(feature_cols))
-
-    users_missing_columns = 0
-
-    for file in tqdm(filtered_sm_files, desc="Computing stats"):
-        dataset = pq.ParquetFile(file)
-        file_cols = dataset.schema.names
-        
-        cols_to_load = []
-        rename_map = {}
-        found_features = []
-        
-        for base_feat in feature_cols:
-            for actual_col in file_cols:
-                if actual_col.startswith(base_feat):
-                    cols_to_load.append(actual_col)
-                    rename_map[actual_col] = base_feat
-                    found_features.append(base_feat)
-                    break
-
-        time_col_name = next((col for col in file_cols if col.lower() in ('timestamp_dst', 'timestamp', 'timestamp_utc')), None)
-        if hourly_aggregation and time_col_name is not None and time_col_name not in cols_to_load:
-            cols_to_load.append(time_col_name)
-        
-        # Track how many users are missing at least one column
-        if len(cols_to_load) != len(feature_cols):
-            users_missing_columns += 1
-            
-        # If the file has literally none of the features, skip it entirely
-        if not cols_to_load:
-            continue
-
-        if hourly_aggregation:
-            # Compute stats on the same hourly scale used by phased aggregated training.
-            df = pq.read_table(file, columns=cols_to_load).to_pandas()
-            df = df.rename(columns=rename_map)
-            if time_col_name is not None and time_col_name in df.columns:
-                time_values = df[time_col_name]
-                df = df.drop(columns=[time_col_name])
-            else:
-                time_values = df.index
-
-            time_index = pd.to_datetime(time_values, errors='coerce', utc=True)
-            for feat in feature_cols:
-                if feat not in df.columns:
-                    df[feat] = np.nan
-            phase_df = df[feature_cols].apply(pd.to_numeric, errors='coerce')
-            phase_df.index = time_index
-            phase_df = phase_df[~phase_df.index.isna()]
-            phase_df = phase_df[~phase_df.index.duplicated(keep='last')]
-            phase_df = phase_df.sort_index()
-            phase_df = phase_df.resample('1h').sum(min_count=1)
-            if float(aggregation_divisor) > 0 and float(aggregation_divisor) != 1.0:
-                phase_df = phase_df / float(aggregation_divisor)
-
-            log_df = np.log1p(phase_df[found_features])
-            for i, feat in enumerate(feature_cols):
-                if feat in found_features:
-                    valid_data = log_df[feat].dropna()
-                    total_sum[i] += valid_data.sum()
-                    total_sq_sum[i] += (valid_data ** 2).sum()
-                    total_count[i] += len(valid_data)
-        else:
-            for batch in dataset.iter_batches(columns=cols_to_load, batch_size=10000):
-                df = batch.to_pandas()
-                df = df.rename(columns=rename_map)
-
-                # Apply log only to the features we actually found
-                log_df = np.log1p(df[found_features])
-
-                # Add to the sums independently based on what exists
-                for i, feat in enumerate(feature_cols):
-                    if feat in found_features:
-                        # Drop NaNs just in case there are internal empty rows
-                        valid_data = log_df[feat].dropna()
-                        total_sum[i] += valid_data.sum()
-                        total_sq_sum[i] += (valid_data ** 2).sum()
-                        total_count[i] += len(valid_data)
-
-
-    print(f"\n--- DATA QUALITY REPORT ---")
-    print(f"Total files processed: {len(filtered_sm_files)}")
-    print(f"Users missing one or more columns: {users_missing_columns}")
-    for i, feat in enumerate(feature_cols):
-        print(f"Valid rows found for {feat}: {int(total_count[i])}")
-    print(f"---------------------------\n")
-
-
-    mean = np.zeros(len(feature_cols))
-    std = np.ones(len(feature_cols)) 
-    
-    for i in range(len(feature_cols)):
-        if total_count[i] > 0:
-            mean[i] = total_sum[i] / total_count[i]
-            # max(0, ...) prevents math domain errors from floating point inaccuracies
-            var = max(0, (total_sq_sum[i] / total_count[i]) - (mean[i] ** 2))
-            std[i] = np.sqrt(var)
-            
-            # If standard deviation is exactly 0 (constant value), force to 1 to prevent division by zero during training
-            if std[i] == 0:
-                std[i] = 1.0
-
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-    with open(save_path, 'w') as f:
-        json.dump({'log_mean': mean.tolist(), 'log_std': std.tolist()}, f)
-
-    return mean, std
+import hashlib
 
 # === Normalizer class that will use the entire data ===
 class Normalizer:
@@ -208,6 +36,8 @@ class Normalizer:
         mean (torch.Tensor | None): Mean of the data (for 'standard' and 'log1p').
         std (torch.Tensor | None): Standard deviation of the data (for 'standard' and 'log1p').
     """
+    LOG_METHODS = {'log1p', 'log1p_phase'}
+
     def __init__(self, method: str = 'log1p'):
         self.method  = method
         self.fitted  = False
@@ -223,7 +53,8 @@ class Normalizer:
         # standard / log1p
         self.mean: Optional[torch.Tensor] = None
         self.std:  Optional[torch.Tensor] = None
-    
+
+        self.manifest = None  # Dict that stores metadata so the file can be reused
     # === Helpers ===
     def to(self, device: str | torch.device) -> 'Normalizer':
         """Move tensor stats to device."""
@@ -247,6 +78,59 @@ class Normalizer:
         if isinstance(X, np.ndarray):
             return torch.from_numpy(X.astype(np.float32)).to(self.device)
         return X.float().to(self.device)
+
+    def _feature_dim_hint(self) -> int | None:
+        for stat in (self.mean, self.std):
+            if stat is None:
+                continue
+            if isinstance(stat, torch.Tensor):
+                return int(stat.reshape(-1).numel())
+            return int(np.asarray(stat).reshape(-1).shape[0])
+        return 3 if self.method == 'log1p_phase' else None
+
+    def _flatten_feature_matrix(self, X, *, context: str) -> tuple[torch.Tensor, callable]:
+        """Normalize 1D/2D/3D input to [N, F] and return a restore closure."""
+        Xt = self._to_tensor(X)
+        if Xt.dim() not in (1, 2, 3):
+            raise ValueError(f"{context}: expected 1D, 2D, or 3D input. Got shape {tuple(Xt.shape)}")
+
+        if Xt.dim() == 1:
+            return Xt.reshape(-1, 1), lambda y: y.reshape_as(Xt)
+
+        feat_hint = self._feature_dim_hint()
+
+        if Xt.dim() == 2:
+            # Default: feature-last [N, F]. If stats suggest feature-first [F, N], transpose once.
+            if feat_hint is not None and Xt.shape[0] == feat_hint and Xt.shape[1] != feat_hint:
+                x_tf = Xt.transpose(0, 1).contiguous()
+                return x_tf.reshape(-1, x_tf.shape[-1]), lambda y: y.reshape_as(x_tf).transpose(0, 1).contiguous()
+            return Xt.reshape(-1, Xt.shape[-1]), lambda y: y.reshape_as(Xt)
+
+        # 3D: accept both [B, L, F] and [B, F, L]
+        if feat_hint is not None:
+            if Xt.shape[-1] == feat_hint:
+                x_lf = Xt
+                return x_lf.reshape(-1, x_lf.shape[-1]), lambda y: y.reshape_as(x_lf)
+            if Xt.shape[1] == feat_hint:
+                x_lf = Xt.transpose(1, 2).contiguous()
+                return x_lf.reshape(-1, x_lf.shape[-1]), lambda y: y.reshape_as(x_lf).transpose(1, 2).contiguous()
+            raise ValueError(
+                f"{context}: could not infer feature axis for shape {tuple(Xt.shape)} with expected feature dim {feat_hint}"
+            )
+
+        # No stats yet: treat smaller of axes 1/2 as feature axis.
+        if Xt.shape[-1] <= Xt.shape[1]:
+            x_lf = Xt
+            return x_lf.reshape(-1, x_lf.shape[-1]), lambda y: y.reshape_as(x_lf)
+        x_lf = Xt.transpose(1, 2).contiguous()
+        return x_lf.reshape(-1, x_lf.shape[-1]), lambda y: y.reshape_as(x_lf).transpose(1, 2).contiguous()
+
+    def _validate_feature_dim(self, X2d: torch.Tensor, *, context: str) -> None:
+        expected_f = self._feature_dim_hint()
+        if expected_f is not None and int(X2d.shape[1]) != int(expected_f):
+            raise ValueError(
+                f"{context}: input feature dim {int(X2d.shape[1])} does not match normalizer stats dim {int(expected_f)}"
+            )
 
     def fit(self, 
             X: np.ndarray | torch.Tensor, 
@@ -284,10 +168,10 @@ class Normalizer:
                 self.mean = torch.as_tensor(mean_np, dtype=torch.float32, device=self.device).reshape(1, -1)
                 self.std = torch.as_tensor(std_np, dtype=torch.float32, device=self.device).reshape(1, -1)
                 self.fitted = True
-                return
+                return self
             else:
                 raise ValueError("X cannot be None for methods other than 'log1p_phase'.")
-        Xt = self._to_tensor(X) # (N,F)
+        Xt, _ = self._flatten_feature_matrix(X, context='fit')
 
         if self.method == 'zero_preserved_log':
             nz = Xt[Xt != 0]
@@ -298,8 +182,8 @@ class Normalizer:
             self.mean = Xt.mean(dim=0, keepdim=True)
             self.std  = Xt.std(dim=0,  keepdim=True)
             self.std[self.std == 0] = 1.0
-        elif self.method == 'log1p':
-            log1p_values = torch.log1p(Xt)
+        elif self.method in self.LOG_METHODS:
+            log1p_values = torch.log1p(torch.clamp(Xt, min=0.0))
             self.mean = log1p_values.mean(dim=0, keepdim=True)
             self.std = log1p_values.std(dim=0, keepdim=True)
             self.std[self.std == 0] = 1.0 # Avoid division by zero
@@ -351,7 +235,9 @@ class Normalizer:
         Args:
             X_chunk (np.ndarray | torch.Tensor): A chunk of data to process. Shape (N, F).
         """
-        Xt = self._to_tensor(X_chunk)   # (N, F)
+        Xt, _ = self._flatten_feature_matrix(X_chunk, context='fit_incremental')
+        if Xt.numel() == 0:
+            return
         F  = Xt.shape[1]
 
         # Initialise accumulators on first call
@@ -360,7 +246,7 @@ class Normalizer:
             self._wf_mean = torch.zeros(1, F, device=self.device)
             self._wf_M2   = torch.zeros(1, F, device=self.device)
 
-        if self.method == 'log1p':
+        if self.method in self.LOG_METHODS:
             Xt = torch.log1p(Xt.clamp(min=0.0))
         elif self.method == 'zero_preserved_log':
             nz = Xt[Xt != 0]
@@ -388,7 +274,7 @@ class Normalizer:
             std[std == 0] = 1.0
             return std
 
-        if self.method in ('standard', 'log1p'):
+        if self.method == 'standard' or self.method in self.LOG_METHODS:
             self.mean  = self._wf_mean
             self.std   = _safe_std(self._wf_M2, self._wf_n)
         elif self.method == 'zero_preserved_log':
@@ -426,6 +312,7 @@ class Normalizer:
             # store tensors on CPU so the file is device-agnostic
             'mean': self.mean.cpu() if isinstance(self.mean, torch.Tensor) else self.mean,
             'std':  self.std.cpu()  if isinstance(self.std,  torch.Tensor) else self.std,
+            'manifest': self.manifest,
         }
         torch.save(state, path)
  
@@ -442,6 +329,7 @@ class Normalizer:
         norm.non_zero_std  = state['non_zero_std']
         norm.mean          = state['mean']
         norm.std           = state['std']
+        norm.manifest      = state['manifest']
         norm.to(device)
         return norm
 
@@ -474,27 +362,20 @@ class Normalizer:
         """
         if not self.fitted:
             raise RuntimeError("Normalizer not fitted. call fit() or finalise_fit() first.")
-        Xt = self._to_tensor(X)
+        x2d, restore = self._flatten_feature_matrix(X, context='transform')
+        self._validate_feature_dim(x2d, context='transform')
 
         if self.method == 'zero_preserved_log':
-            return self._zero_preserved_log_transform(Xt)
+            y2d = self._zero_preserved_log_transform(x2d)
         elif self.method == 'standard':
-            return (Xt - self.mean) / (self.std + self.epsilon)
-        elif self.method == 'log1p':
-            return (torch.log1p(Xt) - self.mean) / (self.std + self.epsilon)
-
-        elif self.method == 'online_log1p':
-            mk    = self._mk_to_tensor(month_key, Xt.shape[0])
-            return self._apply_online_log1p(Xt, mk, inverse=False)
-        
-        elif self.method == 'log1p_phase':
-            # For phase-aware log1p, we can just apply the standard log1p normalization using pre-computed mean/std from the entire dataset
-            if self.mean is None or self.std is None:
-                raise RuntimeError("log1p_phase normalization requires pre-computed mean and std. Call fit() with method='log1p_phase' first.")
-            return (torch.log1p(Xt) - self.mean) / (self.std + self.epsilon)
-        
+            y2d = (x2d - self.mean) / (self.std + self.epsilon)
+        elif self.method in self.LOG_METHODS:
+            x2d = torch.clamp(x2d, min=0.0)
+            y2d = (torch.log1p(x2d) - self.mean) / (self.std + self.epsilon)
         else:
             raise ValueError(f"Unknown normalisation method: '{self.method}'")
+
+        return restore(y2d)
 
     def inverse_transform(self, X) -> torch.Tensor:
         """
@@ -508,24 +389,110 @@ class Normalizer:
         """
         if not self.fitted:
             raise RuntimeError("Normalizer not fitted. call fit() or finalise_fit() first.")
-        Xt = self._to_tensor(X)
+        x2d, restore = self._flatten_feature_matrix(X, context='inverse_transform')
+        self._validate_feature_dim(x2d, context='inverse_transform')
 
         if self.method == 'zero_preserved_log':
-            return self._zero_preserved_log_inverse(Xt)
+            y2d = self._zero_preserved_log_inverse(x2d)
         elif self.method == 'standard':
-            return Xt * self.std + self.mean
-        elif self.method == 'log1p':
-            return torch.clamp(torch.expm1(Xt * (self.std + self.epsilon) + self.mean), min=0.0)
-
-        elif self.method == 'online_log1p':
-            mk  = self._mk_to_tensor(month_key, Xt.shape[0])
-            out = self._apply_online_log1p(Xt, mk, inverse=True)
-            return out.clamp(min=0.0)
-
-        elif self.method == 'log1p_phase':
-            if self.mean is None or self.std is None:
-                raise RuntimeError("log1p_phase normalization requires pre-computed mean and std. Call fit() with method='log1p_phase' first.")
-            return torch.clamp(torch.expm1(Xt * (self.std + self.epsilon) + self.mean), min=0.0)
-        
+            y2d = x2d * self.std + self.mean
+        elif self.method in self.LOG_METHODS:
+            y2d = torch.clamp(torch.expm1(x2d * (self.std + self.epsilon) + self.mean), min=0.0)
         else:
             raise ValueError(f"Unknown normalisation method: '{self.method}'")
+
+        return restore(y2d)
+    
+    def fit_normalizer_on_files(
+            self,
+            filenames: list[str],
+            window_spec,
+            phased: bool = False,
+            aggregation_divisor: float = 1.0,
+            hourly_aggregation: bool = False,
+            meter_col: str = 'meter_number',
+            nan_as_zero: bool = False,
+            force_recompute: bool = False,
+            feature_cols: list[str] | None = None,
+            save_path: str | None = None,
+            data_dir: str | None = None,
+    ):
+        if data_dir is None:
+            data_dir = 'data'
+        if save_path is None: 
+            save_path = os.path.join(data_dir,f"normalization_stats_{self.method}.json")
+
+        # === Try Cache ===
+        window_spec_dict = {
+            'input_len': window_spec.input_len,
+            'stride': window_spec.stride,
+        }
+        canonical_files = tuple(
+            sorted(os.path.normcase(os.path.normpath(str(p))) for p in filenames)
+        )
+        file_hash = hashlib.sha256("\n".join(canonical_files).encode("utf-8")).hexdigest()
+        normalizer_manifest = {
+            'method': self.method,
+            'phased': phased,
+            'aggregation_divisor': aggregation_divisor,
+            'meter_col': meter_col,
+            'nan_as_zero': nan_as_zero,
+            'feature_cols': feature_cols,
+            'hourly_aggregation': hourly_aggregation,
+            'window_spec': window_spec_dict,
+            'file_hash': file_hash,
+        }
+        if not force_recompute and os.path.exists(save_path):
+            try:
+                saved = self.load(save_path, device='cpu')
+                saved_manifest = getattr(saved, 'manifest', None)
+                if normalizer_manifest == saved_manifest:
+                    print(f"Loading normalization stats from cache at {save_path}...")
+                    self.mean = saved.mean
+                    self.std = saved.std
+                    self.non_zero_mean = saved.non_zero_mean
+                    self.non_zero_std = saved.non_zero_std
+                    self.epsilon = saved.epsilon
+                    self.zero_id = saved.zero_id
+                    self.shift = saved.shift
+                    self.fitted = bool(saved.fitted)
+                    self.manifest = saved_manifest
+                    self.to(self.device)
+                    return
+                else:
+                    print(f"Cache manifest does not match current configuration. Recomputing stats.")
+            except Exception as e:
+                print(f"Failed to load normalization stats from cache: {e}. Recomputing stats.")
+        
+        # === Compute Stats ===
+        from data.dataloader_phased import StreamingParquetBuffer
+        from torch.utils.data import DataLoader
+        phased_ds = StreamingParquetBuffer(
+            sm_files=filenames, 
+            replay_buffer_capacity=10000, 
+            min_buffer_size=0,
+            window_spec=window_spec,
+            num_workers=0,
+            feature_cols=feature_cols,
+            hourly_aggregation=hourly_aggregation,
+            aggregation_divisor=aggregation_divisor,
+            phased_mode=phased,
+            meter_col=meter_col,
+            nan_as_zero=nan_as_zero,
+        )
+        train_loader = DataLoader(phased_ds, batch_size=64, num_workers=0)
+        
+        for X_batch in tqdm(train_loader, desc="Fitting normalizer"):
+            self.fit_incremental(X_batch[0])
+        self.finalise_fit()
+        print(f"Fitted normalizer with method '{self.method}' on {len(filenames)} files.")
+
+        # === Save Stats ===
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        self.manifest = normalizer_manifest
+        self.save(save_path)
+
+        print(f"Saved normalization stats to {save_path}.")
+
+
+            
