@@ -322,6 +322,11 @@ class EvalFramework:
         self.verbose = bool(verbose)
         self.include_mean_baseline = bool(include_mean_baseline)
         self.baseline_reference_data = baseline_reference_data
+        if self.baseline_reference_data is None and isinstance(prepared_data, dict):
+            # Prefer explicit training reference data when provided by caller.
+            train_ref = prepared_data.get('train_data', None)
+            if train_ref is not None:
+                self.baseline_reference_data = train_ref
         
         # Metrics storage 
         self.reconstruction_metrics: Dict[str, ReconstructionMetric] = {}

@@ -634,30 +634,134 @@ class TestSolarPanelConditioner:
 
 
 # =====================================================================
-#  10. ElectricVehicleConditioner (stub)
+#  10. ElectricVehicleConditioner
 # =====================================================================
 
 
+def _make_ev_detection_csv(tmp_path):
+    """Create a minimal EV detection CSV for testing EV phase conditioning."""
+    import pandas as pd
+
+    rows = [
+        {
+            "SM_ID": "sm_1.parquet",
+            "platos_detected": "No",
+            "First_plato_detection": "",
+            "3ph_platos_count": 0,
+            "2ph_platos_count": 0,
+            "1ph_platos_count": 0,
+            "3ph_platos": "No",
+            "2ph_platos": "No",
+            "1ph_platos": "No",
+            "3ph_plato_datetime": "[]",
+            "2ph_plato_datetime": "[]",
+            "1ph_plato_datetime": "[]",
+            "EV_behaviour": "no",
+            "Type": "None",
+        },
+        {
+            "SM_ID": "sm_2.parquet",
+            "platos_detected": "Yes",
+            "First_plato_detection": "2024-01-01 00:00:00+00:00",
+            "3ph_platos_count": 0,
+            "2ph_platos_count": 0,
+            "1ph_platos_count": 3,
+            "3ph_platos": "No",
+            "2ph_platos": "No",
+            "1ph_platos": "Yes",
+            "3ph_plato_datetime": "[]",
+            "2ph_plato_datetime": "[]",
+            "1ph_plato_datetime": "[]",
+            "EV_behaviour": "detected",
+            "Type": "1ph",
+        },
+        {
+            "SM_ID": "sm_3.parquet",
+            "platos_detected": "Yes",
+            "First_plato_detection": "2024-01-01 00:00:00+00:00",
+            "3ph_platos_count": 0,
+            "2ph_platos_count": 4,
+            "1ph_platos_count": 0,
+            "3ph_platos": "No",
+            "2ph_platos": "Yes",
+            "1ph_platos": "No",
+            "3ph_plato_datetime": "[]",
+            "2ph_plato_datetime": "[]",
+            "1ph_plato_datetime": "[]",
+            "EV_behaviour": "detected",
+            "Type": "2ph",
+        },
+        {
+            "SM_ID": "sm_4.parquet",
+            "platos_detected": "Yes",
+            "First_plato_detection": "2024-01-01 00:00:00+00:00",
+            "3ph_platos_count": 5,
+            "2ph_platos_count": 0,
+            "1ph_platos_count": 0,
+            "3ph_platos": "Yes",
+            "2ph_platos": "No",
+            "1ph_platos": "No",
+            "3ph_plato_datetime": "[]",
+            "2ph_plato_datetime": "[]",
+            "1ph_plato_datetime": "[]",
+            "EV_behaviour": "detected",
+            "Type": "3ph",
+        },
+    ]
+
+    df = pd.DataFrame(rows)
+    path = str(tmp_path / "ev_detection.csv")
+    df.to_csv(path, index=False)
+    return path
+
+
 class TestElectricVehicleConditioner:
-    """ElectricVehicleConditioner is a stub — condition_dim=0, returns None."""
+    """ElectricVehicleConditioner should produce [B, 4] one-hot vectors."""
 
-    def test_condition_dim_zero(self):
-        ev = ElectricVehicleConditioner.__new__(ElectricVehicleConditioner)
-        ev.condition_dim = 0
-        assert ev.condition_dim == 0
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        self.csv_path = _make_ev_detection_csv(tmp_path)
+        self.cond = ElectricVehicleConditioner(topology_path=self.csv_path)
 
-    def test_get_conditions_returns_none(self):
-        ev = ElectricVehicleConditioner.__new__(ElectricVehicleConditioner)
-        ev.condition_dim = 0
-        x = _make_dummy_x()
-        meter_id = _make_meter_ids()
-        ts = _make_unix_timestamps()
-        assert ev.get_conditions(x, meter_id=meter_id, timestamps=ts) is None
+    def test_condition_dim(self):
+        assert self.cond.condition_dim == 4
 
-    def test_get_random_conditions_returns_none(self):
-        ev = ElectricVehicleConditioner.__new__(ElectricVehicleConditioner)
-        ev.condition_dim = 0
-        assert ev.get_random_conditions(8) is None
+    def test_output_shape(self):
+        x = _make_dummy_x(4)
+        meter_id = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+        ts = _make_unix_timestamps(4)
+        out = self.cond.get_conditions(x, meter_id=meter_id, timestamps=ts)
+        assert out.shape == (4, 4)
+
+    def test_known_values(self):
+        x = _make_dummy_x(4)
+        meter_id = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+        ts = _make_unix_timestamps(4)
+        out = self.cond.get_conditions(x, meter_id=meter_id, timestamps=ts)
+
+        # [No EV, 1-phase EV, 2-phase EV, 3-phase EV]
+        expected = torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        )
+        assert torch.equal(out, expected)
+
+    def test_unknown_meter_defaults_to_no_ev(self):
+        x = _make_dummy_x(1)
+        meter_id = torch.tensor([999], dtype=torch.long)
+        ts = _make_unix_timestamps(1)
+        out = self.cond.get_conditions(x, meter_id=meter_id, timestamps=ts)
+        assert torch.equal(out, torch.tensor([[1.0, 0.0, 0.0, 0.0]]))
+
+    def test_get_random_conditions_shape_and_one_hot(self):
+        rc = self.cond.get_random_conditions(32)
+        assert rc.shape == (32, 4)
+        assert torch.allclose(rc.sum(dim=1), torch.ones(32), atol=1e-6)
+
 
 
 # =====================================================================

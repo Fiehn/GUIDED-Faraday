@@ -367,6 +367,10 @@ def train(config, train_only_user_profile: bool = False):
                 conditioner.add_condition_item("nr_phases_active", ActivePhaseCountConditioner())
             elif condition_tag == "heatpump_phase":
                 conditioner.add_condition_item("heatpump_phase", HeatpumpPhaseConditioner())
+            elif condition_tag in {"ev_phase", "electric_vehicle_phase"}:
+                ev_cfg = getattr(config.conditioning, "ev_phase", SimpleNamespace())
+                ev_path = getattr(ev_cfg, "path", "data/EV_detection_6000_SM.csv")
+                conditioner.add_condition_item("ev_phase", ElectricVehicleConditioner(topology_path=ev_path))
             else:
                 print(f"Warning: Unknown condition tag '{condition_tag}' in config. Skipping this conditioner.")
         

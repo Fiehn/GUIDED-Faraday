@@ -29,6 +29,7 @@ from data.conditioner import (  # noqa: E402
 	ActivePhaseCountConditioner,
 	Conditioner,
 	DayOfWeekConditioner,
+	ElectricVehicleConditioner,
 	HeatpumpPhaseConditioner,
 	HolidayConditioner,
 	MonthOfYearConditioner,
@@ -193,6 +194,14 @@ def _build_conditioner(config) -> Conditioner:
 				conditioner,
 				"heatpump_phase",
 				lambda: HeatpumpPhaseConditioner(topology_path=hp_path),
+				fallback_dim=4,
+			)
+		elif tag in {"ev_phase", "electric_vehicle_phase"}:
+			ev_path = str(getattr(getattr(cond_cfg, "ev_phase", SimpleNamespace()), "path", "data/EV_detection_6000_SM.csv"))
+			_safe_add_condition(
+				conditioner,
+				"ev_phase",
+				lambda: ElectricVehicleConditioner(topology_path=ev_path),
 				fallback_dim=4,
 			)
 		elif tag == "user_profile":

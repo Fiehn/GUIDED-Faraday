@@ -161,7 +161,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "user_profile", "holiday", "heatpump_phase"]
+  tags: ["day_of_week", "month_of_year", "user_profile", "holiday", "heatpump_phase", "ev_phase"]
   # ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  
   
   # User profiling (based on LDA)
@@ -176,6 +176,9 @@ conditioning:
   # Online user profiling (for OnlineCVAE)
   online_user_profile:
     decay: 0.95
+
+  ev_phase:
+    path: "data/EV_detection_6000_SM.csv"
 
 # ============================================================================
 # HIERARCHICAL LATENT SPACE

@@ -1094,19 +1094,147 @@ class SolarPanelConditioner(BaseConditioner):
         random_status = torch.randint(0,2,(batch_size,1)).float()
         return random_status
 
-class ElectricVehicleConditioner():
-    # TODO: WAIT FOR EV data to arrive
-    def __init__(self, topology_path = '/media/fiehn/LaCie/Data/processed_data/second_batch/topology/cleaned_and_corrected/MeterAndCabinet.csv'):
-        self.condition_dim = 0
+class ElectricVehicleConditioner(BaseConditioner):
+    """
+    Conditions the model on EV class one-hot encoded as:
+    [No EV, 1-phase EV, 2-phase EV, 3-phase EV].
 
-    def get_conditions(self, x, meter_id, timestamps):
-        return None
-    
-    def get_random_conditions(self, batch_size):
-        return None
-    
+    Reads EV detector output from CSV (default: data/EV_detection_6000_SM.csv)
+    and maps base meter ids to an EV phase class.
+    """
+    def __init__(self, topology_path='data/EV_detection_6000_SM.csv'):
+        self.condition_dim = 4
+        self._meter_ids_cpu, self._phase_class_cpu = self._load_topology_df(topology_path)
+        self._lookup_by_device = {}
+
+    def _load_topology_df(self, topology_path):
+        topology_df = pd.read_csv(topology_path)
+
+        # Expected source id looks like: sm_12345.parquet
+        meter_col = None
+        if 'SM_ID' in topology_df.columns:
+            meter_col = topology_df['SM_ID']
+        elif 'meter_id' in topology_df.columns:
+            meter_col = topology_df['meter_id']
+        else:
+            meter_col = topology_df.iloc[:, 0]
+
+        meter_key = meter_col.astype(str).str.lower()
+        base_meter_id = pd.to_numeric(meter_key.str.extract(r'(\d+)', expand=False), errors='coerce')
+
+        ev_behaviour = topology_df.get('EV_behaviour', pd.Series(['no'] * len(topology_df))).astype(str).str.strip().str.lower()
+        platos_detected = topology_df.get('platos_detected', pd.Series(['no'] * len(topology_df))).astype(str).str.strip().str.lower()
+        is_ev = ev_behaviour.isin({'detected', 'yes', 'true', '1'}) | platos_detected.isin({'yes', 'true', '1'})
+
+        # Prefer explicit phase label from detector output (1ph/2ph/3ph).
+        type_series = topology_df.get('Type', pd.Series(['none'] * len(topology_df))).astype(str).str.strip().str.lower()
+        phase_from_type = pd.to_numeric(type_series.str.extract(r'([123])\s*ph', expand=False), errors='coerce')
+
+        # Fallback: infer phase from count columns if type is missing.
+        c1 = pd.to_numeric(topology_df.get('1ph_platos_count', 0), errors='coerce').fillna(0)
+        c2 = pd.to_numeric(topology_df.get('2ph_platos_count', 0), errors='coerce').fillna(0)
+        c3 = pd.to_numeric(topology_df.get('3ph_platos_count', 0), errors='coerce').fillna(0)
+        counts = np.vstack([c1.to_numpy(), c2.to_numpy(), c3.to_numpy()]).T
+        inferred_phase = np.argmax(counts, axis=1) + 1
+        has_any_count = counts.max(axis=1) > 0
+
+        phase_class = np.zeros(len(topology_df), dtype=np.int64)
+        known_type = phase_from_type.notna().to_numpy()
+        phase_class[known_type] = phase_from_type[known_type].astype(np.int64)
+
+        fallback_mask = (~known_type) & is_ev.to_numpy() & has_any_count
+        phase_class[fallback_mask] = inferred_phase[fallback_mask]
+
+        # Any detected EV with no phase evidence defaults to 1-phase.
+        undecided_detected = is_ev.to_numpy() & (phase_class == 0)
+        phase_class[undecided_detected] = 1
+
+        # Non-EV stays class 0 regardless of noisy phase values.
+        phase_class[~is_ev.to_numpy()] = 0
+        phase_class = np.clip(phase_class, 0, 3)
+
+        compact = pd.DataFrame(
+            {
+                'base_meter_id': base_meter_id,
+                'phase_class': phase_class,
+            }
+        ).dropna(subset=['base_meter_id'])
+
+        if compact.empty:
+            return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
+
+        # Keep strongest class per meter in case of duplicate rows.
+        compact['base_meter_id'] = compact['base_meter_id'].astype(np.int64)
+        compact = compact.groupby('base_meter_id', as_index=False)['phase_class'].max()
+
+        meter_ids_np = compact['base_meter_id'].to_numpy(dtype=np.int64)
+        phase_classes_np = compact['phase_class'].to_numpy(dtype=np.int64)
+
+        order = np.argsort(meter_ids_np)
+        return (
+            torch.from_numpy(meter_ids_np[order]),
+            torch.from_numpy(phase_classes_np[order]),
+        )
+
+    def _get_lookup(self, device: torch.device):
+        key = str(device)
+        cached = self._lookup_by_device.get(key)
+        if cached is None:
+            cached = (
+                self._meter_ids_cpu.to(device=device, dtype=torch.long),
+                self._phase_class_cpu.to(device=device, dtype=torch.long),
+            )
+            self._lookup_by_device[key] = cached
+        return cached
+
+    def get_conditions(
+            self,
+            x: torch.Tensor | np.ndarray | None,
+            meter_id: torch.Tensor | np.ndarray | None,
+            timestamps: torch.Tensor | list | None
+        ) -> torch.Tensor | None:
+        if meter_id is None:
+            if isinstance(timestamps, torch.Tensor):
+                zeros = torch.zeros(timestamps.shape[0], dtype=torch.long, device=timestamps.device)
+            elif isinstance(timestamps, np.ndarray):
+                zeros = torch.zeros(timestamps.shape[0], dtype=torch.long)
+            else:
+                zeros = torch.zeros(1, dtype=torch.long)
+            return F.one_hot(zeros, num_classes=self.condition_dim).float()
+
+        if isinstance(meter_id, torch.Tensor):
+            meter_ids = meter_id.to(dtype=torch.long)
+            device = meter_ids.device
+        else:
+            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)
+            device = meter_ids.device
+
+        lookup_ids, lookup_phase_class = self._get_lookup(device=device)
+        if lookup_ids.numel() == 0:
+            phase_class = torch.zeros_like(meter_ids, dtype=torch.long)
+            return F.one_hot(phase_class, num_classes=self.condition_dim).float()
+
+        meter_ids = meter_ids.contiguous()
+        lookup_ids = lookup_ids.contiguous()
+        idx = torch.searchsorted(lookup_ids, meter_ids)
+        idx_clamped = idx.clamp(max=lookup_ids.shape[0] - 1)
+        valid = (idx < lookup_ids.shape[0]) & (lookup_ids[idx_clamped] == meter_ids)
+
+        phase_class = torch.zeros_like(meter_ids, dtype=torch.long)
+        if valid.any():
+            phase_class[valid] = lookup_phase_class[idx_clamped[valid]]
+
+        return F.one_hot(phase_class, num_classes=self.condition_dim).float()
+
+    def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
+        # No EV: 70%, 1-phase: 15%, 2-phase: 10%, 3-phase: 5%
+        probs = torch.tensor([0.7, 0.15, 0.1, 0.05])
+        random_status = torch.multinomial(probs, batch_size, replacement=True)
+        return F.one_hot(random_status, num_classes=self.condition_dim).float()
+
     def get_conditions_no_data(self, meter_id, timestamps):
-        return None
+        # Backward-compatible helper used in some older call sites.
+        return self.get_conditions(x=None, meter_id=meter_id, timestamps=timestamps)
 
 
 class ActivePhaseCountConditioner(BaseConditioner):

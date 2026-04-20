@@ -36,6 +36,58 @@ class ModelComparator:
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         self.models_data = {}
+        self.models_metrics = {}
+
+    @staticmethod
+    def _canonical_metric_name(metric: str) -> str:
+        """Normalize metric labels across eval formats and model variants."""
+        m = str(metric).strip()
+        low = m.lower()
+
+        if 'set-mmd' in low or 'set mmd' in low or 'setmaximummeandiscrepancy' in low:
+            return 'Maximum Mean Discrepancy (MMD)'
+        if 'maximummeandiscrepancy' in low or 'maximum mean discrepancy' in low:
+            return 'Maximum Mean Discrepancy (MMD)'
+        if 'acfdistribution' in low and '(ks)' not in low:
+            return 'ACF Distribution Match (KS)'
+        if 'reconstructionloglikelihood' in low and 'log-likelihood' not in low:
+            return 'Reconstruction Log-Likelihood'
+
+        return m
+
+    def _extract_scalar_metrics(self, data: dict) -> dict:
+        """Extract scalar metrics from both standalone_metrics and top-level eval formats."""
+        metrics = {}
+        if not isinstance(data, dict):
+            return metrics
+
+        # Preferred format used by many runs.
+        standalone = data.get('standalone_metrics', {})
+        if isinstance(standalone, dict):
+            for metric, payload in standalone.items():
+                if isinstance(payload, dict):
+                    val = payload.get('value', None)
+                else:
+                    val = payload
+                if isinstance(val, (int, float)):
+                    metrics[self._canonical_metric_name(metric)] = float(val)
+
+        # Top-level scalar format (used by several HPC eval artifacts).
+        ignored = {'standalone_metrics', 'results', 'metadata', 'run_info'}
+        for key, val in data.items():
+            if key in ignored:
+                continue
+            if isinstance(val, (int, float)):
+                metrics[self._canonical_metric_name(key)] = float(val)
+
+        # Optional nested results fallback.
+        results = data.get('results', {})
+        if isinstance(results, dict):
+            for key, val in results.items():
+                if isinstance(val, (int, float)):
+                    metrics[self._canonical_metric_name(key)] = float(val)
+
+        return metrics
 
     def _get_metric_direction(self, metric: str) -> str:
         """Return the target direction for a given metric. 
@@ -45,9 +97,10 @@ class ModelComparator:
         Returns:            
             str: A string indicating the direction (e.g., '(↑)', '(↓)', '(1)', '(0)')
         """
-        is_max = any(term in metric for term in ['LogLikelihood', 'Accuracy', 'Score', 'R2'])
-        is_one = ('TSTR' in metric)
-        is_zero = ('MMD' in metric or 'MaximumMeanDiscrepancy' in metric)
+        metric_l = str(metric).lower()
+        is_max = any(term in metric_l for term in ['loglikelihood', 'log-likelihood', 'accuracy', 'score', 'r2'])
+        is_one = ('tstr' in metric_l)
+        is_zero = ('mmd' in metric_l or 'maximummeandiscrepancy' in metric_l)
         
         if is_one:
             return '(1)'
@@ -72,6 +125,7 @@ class ModelComparator:
             data = json.load(f)
             
         self.models_data[model_name] = data
+        self.models_metrics[model_name] = self._extract_scalar_metrics(data)
 
     def compare(self):
         """Generate comparison table and plots."""
@@ -88,17 +142,16 @@ class ModelComparator:
         
         # Collect all unique metric names
         all_metrics = set()
-        for data in self.models_data.values():
-            if 'standalone_metrics' in data:
-                all_metrics.update(data['standalone_metrics'].keys())
+        for metrics in self.models_metrics.values():
+            all_metrics.update(metrics.keys())
                 
         table_data = []
         for metric in sorted(all_metrics):
             direction_str = self._get_metric_direction(metric)
             row = [f"{metric} {direction_str}"]
-            for model_name, data in self.models_data.items():
-                val = data.get('standalone_metrics', {}).get(metric, {}).get('value', 'N/A')
-                if isinstance(val, float):
+            for model_name in self.models_data.keys():
+                val = self.models_metrics.get(model_name, {}).get(metric, 'N/A')
+                if isinstance(val, (int, float)):
                     val = f"{val:.4f}"
                 row.append(val)
             table_data.append(row)
@@ -115,16 +168,15 @@ class ModelComparator:
     def _generate_plots(self):
         """Generate bar charts for scalar metrics."""
         all_metrics = set()
-        for data in self.models_data.values():
-            if 'standalone_metrics' in data:
-                all_metrics.update(data['standalone_metrics'].keys())
+        for metrics in self.models_metrics.values():
+            all_metrics.update(metrics.keys())
                 
         scalar_metrics = []
         for metric in all_metrics:
             is_scalar = True
-            for model_name, data in self.models_data.items():
-                if 'standalone_metrics' in data and metric in data['standalone_metrics']:
-                    val = data['standalone_metrics'][metric].get('value', None)
+            for model_name in self.models_data.keys():
+                if metric in self.models_metrics.get(model_name, {}):
+                    val = self.models_metrics[model_name].get(metric, None)
                     if val is not None and not isinstance(val, (int, float)):
                         is_scalar = False
             
@@ -147,7 +199,7 @@ class ModelComparator:
             
             raw_vals = []
             for m in models:
-                v = self.models_data[m].get('standalone_metrics', {}).get(metric, {}).get('value', None)
+                v = self.models_metrics.get(m, {}).get(metric, None)
                 raw_vals.append((m, v))
                 
             mapped_vals = {}
@@ -173,6 +225,7 @@ class ModelComparator:
                         scores_dict[m][metric] = 1.0 - (val - vmin) / (vmax - vmin)
 
         recon_metrics = [m for m in scalar_metrics if 'Reconstruction' in m or 'FlexibilityDistance' in m]
+        recon_metrics += [m for m in scalar_metrics if 'Flexibility Distance' in m and m not in recon_metrics]
         synth_metrics = [m for m in scalar_metrics if m not in recon_metrics]
         
         for m in models:
@@ -181,9 +234,13 @@ class ModelComparator:
             
             self.models_data[m].setdefault('standalone_metrics', {})
             if recon_scores:
-                self.models_data[m]['standalone_metrics']['Avg MinMax Reconstruction Score (↑)'] = {'value': float(np.mean(recon_scores))}
+                score_val = float(np.mean(recon_scores))
+                self.models_data[m]['standalone_metrics']['Avg MinMax Reconstruction Score (↑)'] = {'value': score_val}
+                self.models_metrics[m]['Avg MinMax Reconstruction Score (↑)'] = score_val
             if synth_scores:
-                self.models_data[m]['standalone_metrics']['Avg MinMax Synthetic Score (↑)'] = {'value': float(np.mean(synth_scores))}
+                score_val = float(np.mean(synth_scores))
+                self.models_data[m]['standalone_metrics']['Avg MinMax Synthetic Score (↑)'] = {'value': score_val}
+                self.models_metrics[m]['Avg MinMax Synthetic Score (↑)'] = score_val
                 
         if any(recon_metrics) and 'Avg MinMax Reconstruction Score (↑)' not in scalar_metrics:
             scalar_metrics.append('Avg MinMax Reconstruction Score (↑)')
@@ -216,13 +273,14 @@ class ModelComparator:
             # By default, lower error/distance is better (needs to be closest to 0). 
             # Higher is better for LogLikelihood, Accuracy, etc.
             # TSTR should be closest to 1.
-            is_maximize = any(term in metric for term in ['LogLikelihood', 'Accuracy', 'Score', 'R2'])
-            is_closest_to_one = ('TSTR' in metric)
-            is_closest_to_zero = ('MMD' in metric or 'MaximumMeanDiscrepancy' in metric)
+            metric_l = str(metric).lower()
+            is_maximize = any(term in metric_l for term in ['loglikelihood', 'log-likelihood', 'accuracy', 'score', 'r2'])
+            is_closest_to_one = ('tstr' in metric_l)
+            is_closest_to_zero = ('mmd' in metric_l or 'maximummeandiscrepancy' in metric_l)
             
             m_values = []
             for model in models:
-                v = self.models_data[model].get('standalone_metrics', {}).get(metric, {}).get('value', None)
+                v = self.models_metrics.get(model, {}).get(metric, None)
                 m_values.append(v)
                 
             valid_vals = [v for v in m_values if isinstance(v, (int, float))]

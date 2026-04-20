@@ -19,7 +19,7 @@ data:
   # data_dir: "./data/raw_profiles"
   #data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
   #data_dir: "data/3p/"
-  data_dir: "data/"
+  data_dir: "data/parq_hourly"
 
   # CSV filename to load
   data_files: ["test_data_small.csv",] # "hourly_measurements_2023_11.csv",]
@@ -124,7 +124,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "holiday", "heatpump_phase"]  # List of conditioning tags to use ["day_of_week", "month_of_year", "user_profile", "holiday"]
+  tags: ["day_of_week", "month_of_year", "holiday", "heatpump_phase", "ev_phase"]  # List of conditioning tags to use ["day_of_week", "month_of_year", "user_profile", "holiday"]
   
   # User profiling (based on LDA)
   user_profile:
@@ -138,6 +138,9 @@ conditioning:
   # Online user profiling (for OnlineCVAE)
   online_user_profile:
     decay: 0.95
+
+  ev_phase:
+    path: "data/EV_detection_6000_SM.csv"
 
 # ============================================================================
 # HIERARCHICAL LATENT SPACE

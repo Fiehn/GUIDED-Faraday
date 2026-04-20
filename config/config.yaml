@@ -12,21 +12,22 @@ verbose: true
 # ============================================================================
 data:
   # Data mode: "csv" (SmartMeterDataModule) or "phased_parquet" (StreamingParquetBuffer)
-  mode: "csv"
+  mode: "phased_parquet"
   # CSV mode only: when true, SmartMeterCSV skips CSV parsing and reads only parquet cache files.
   parquet_only: true
 
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
   # data_dir: "./data/raw_profiles"
-  #data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+  # data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
   # data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
-  data_dir: "data/"
+  # data_dir: "data/raw_profiles"
+  data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
 
 
   # CSV filename to load
-  data_files: ["data/test_data_eval.csv"] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",]
+  data_files: [] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",] , "data/test_data_eval.csv"
   
   # CSV column specifications
   columns:
@@ -160,7 +161,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "user_profile", "holiday", "heatpump_phase"]
+  tags: ["day_of_week", "month_of_year", "user_profile", "holiday", "heatpump_phase", "ev_phase"]
   # ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  
   
   # User profiling (based on LDA)
@@ -175,6 +176,9 @@ conditioning:
   # Online user profiling (for OnlineCVAE)
   online_user_profile:
     decay: 0.95
+
+  ev_phase:
+    path: "data/EV_detection_6000_SM.csv"
 
 # ============================================================================
 # HIERARCHICAL LATENT SPACE

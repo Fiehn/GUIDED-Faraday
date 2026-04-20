@@ -65,7 +65,9 @@ model:
     deterministic_reconstruction: true
 
 conditioning:
-  tags: ["day_of_week", "month_of_year"]
+  tags: ["day_of_week", "month_of_year", "ev_phase"]
+  ev_phase:
+    path: "data/EV_detection_6000_SM.csv"
 
 hierarchy:
   enabled: false
