@@ -1,4 +1,5 @@
 import math
+import hashlib
 import torch
 import random
 import pyarrow as pa
@@ -7,10 +8,9 @@ import multiprocessing as mp
 from torch.utils.data import IterableDataset, DataLoader, get_worker_info, TensorDataset
 from typing import Optional
 import numpy as np
-import json
-from dataclasses import dataclass
 import os
 import pandas as pd
+from dataclasses import dataclass
 
 import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -20,9 +20,8 @@ from data.normalizer import Normalizer
 
 @dataclass(frozen=True)
 class WindowSpec:
-    input_len: int # length of input window (number of timesteps)
-    stride: int = 1 # number of timesteps to move the window each step
-
+    input_len: int # length of input window - how many past hours go into the model as x
+    stride: int = 1 # how many hours to move the window each step
 
 class StreamingParquetBuffer(IterableDataset):
     """An IterableDataset that reads data from a Parquet file in a streaming manner and uses a replay buffer to store and sample data for training."""
@@ -30,7 +29,7 @@ class StreamingParquetBuffer(IterableDataset):
                  sm_files, 
                  replay_buffer_capacity: int = 10000, 
                  min_buffer_size: int = 2000, 
-                 window_spec: Optional[WindowSpec] = None,
+                 window_spec = None,
                  normalizer: Optional[Normalizer] = None,
                  num_workers: int = 0,
                  hourly_aggregation: bool = False,
@@ -42,6 +41,10 @@ class StreamingParquetBuffer(IterableDataset):
                  max_skip_warnings: int = 20,
                  output_aggregate_stream: bool = False,
                  sample_random: bool = True,
+                 nan_as_zero: bool = False,
+                 phased_mode: bool = True,
+                 meter_col: str = "meter_number",
+                 feature_cols: list[str] | None = None,
                  ):
         self.sm_files = sm_files
         self.replay_buffer_capacity = replay_buffer_capacity
@@ -58,12 +61,22 @@ class StreamingParquetBuffer(IterableDataset):
         self.num_workers = num_workers
         self.aggregation = hourly_aggregation
         self.aggregation_divisor = float(aggregation_divisor) if float(aggregation_divisor) > 0 else 1.0
-        self.feature_cols = ['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3']
         self.time_col_candidates = ['timestamp_dst', 'timestamp', 'timestamp_utc']
+        self.meter_col = str(meter_col)
         if self.aggregation:
             self.base_frequency = '1h'
         else:
             self.base_frequency = '15min'
+
+        if phased_mode:
+            self.feature_cols = ['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3']
+        else:
+            if not feature_cols:
+                raise ValueError("feature_cols must be provided when phased_mode=False")
+            self.feature_cols = list(feature_cols)
+
+        self.nan_as_zero = bool(nan_as_zero)
+        self.phased_mode = bool(phased_mode)
 
         # Shared (manager-backed) maps to track file coverage across worker processes.
         self.file_seen_map = file_seen_map
@@ -147,15 +160,26 @@ class StreamingParquetBuffer(IterableDataset):
         return self.buffer[idx]
 
     def _extract_meter_id(self, file_path: str) -> int:
+        if not self.phased_mode:
+            raise ValueError("_extract_meter_id is only valid when phased_mode=True")
         basename = os.path.basename(file_path)
-        return int(basename.replace('sm_', '').replace('.parquet', ''))
+        stem = os.path.splitext(basename)[0].replace('sm_', '')
+        try:
+            return int(stem)
+        except ValueError as e:
+            raise ValueError(
+                f"Could not parse phased meter id from filename '{basename}'. "
+                "Expected pattern like 'sm_<id>.parquet' or '<id>.parquet'."
+            ) from e
 
     def _select_columns(self, file_cols):
         cols_to_load = []
         rename_map = {}
 
         for base_feat in self.feature_cols:
-            matched_col = next((actual_col for actual_col in file_cols if actual_col.startswith(base_feat)), None)
+            matched_col = next((actual_col for actual_col in file_cols if actual_col == base_feat), None)
+            if matched_col is None:
+                matched_col = next((actual_col for actual_col in file_cols if actual_col.startswith(base_feat)), None)
             if matched_col is not None:
                 cols_to_load.append(matched_col)
                 rename_map[matched_col] = base_feat
@@ -164,21 +188,39 @@ class StreamingParquetBuffer(IterableDataset):
         if time_col_name is not None and time_col_name not in cols_to_load:
             cols_to_load.append(time_col_name)
 
-        return cols_to_load, rename_map, time_col_name
+        meter_col_name = next((col for col in file_cols if col.lower() == self.meter_col.lower()), None)
+        if meter_col_name is not None and meter_col_name not in cols_to_load:
+            cols_to_load.append(meter_col_name)
 
-    def _prepare_time_index(self, df: pd.DataFrame, time_col_name: Optional[str]) -> pd.DataFrame:
+        return cols_to_load, rename_map, time_col_name, meter_col_name
+
+    def _prepare_time_index(self, df: pd.DataFrame, time_col_name: str | None, meter_col_name: str | None) -> pd.DataFrame:
         if time_col_name and time_col_name in df.columns:
-            time_values = df[time_col_name]
+            time_values = pd.to_datetime(df[time_col_name], errors='coerce', utc=True)
             df = df.drop(columns=[time_col_name])
         else:
-            time_values = df.index
+            time_values = pd.to_datetime(df.index, errors='coerce', utc=True)
 
-        time_index = pd.to_datetime(time_values, errors='coerce', utc=True)
         prepared = df.copy()
-        prepared.index = time_index
-        prepared = prepared[~prepared.index.isna()]
-        prepared = prepared[~prepared.index.duplicated(keep='last')]
-        prepared = prepared.sort_index()
+
+        if self.phased_mode:
+            prepared.index = time_values
+            prepared = prepared[~prepared.index.isna()]
+            prepared = prepared[~prepared.index.duplicated(keep='last')]
+            prepared = prepared.sort_index()
+            return prepared
+
+        prepared["_timestamp"] = time_values
+        prepared = prepared[~prepared["_timestamp"].isna()]
+
+        if meter_col_name is None or meter_col_name not in prepared.columns:
+            print(prepared.columns)
+            raise ValueError(
+                f"Unphased mode requires meter column '{self.meter_col}' in parquet data."
+            )
+
+        prepared = prepared[prepared[meter_col_name].notna()]
+        prepared = prepared.sort_values([meter_col_name, "_timestamp"])
         return prepared
 
     def _impute_to_base_frequency(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -189,7 +231,7 @@ class StreamingParquetBuffer(IterableDataset):
         # Building full_index before resampling can misalign (e.g., :45 vs :00)
         # and reindex would then wipe out all values as NaN.
         if self.aggregation:
-            df = df.resample(self.base_frequency).mean() # TODO: REMEMBER THIS MOTHERFUCKER! we are using kw not kwh on the 15 min scale
+            df = df.resample(self.base_frequency).mean() # TODO: REMEMBER THIS 'guy'! we are using kw not kwh on the 15 min scale
             if self.aggregation_divisor != 1.0:
                 df = df / self.aggregation_divisor
 
@@ -205,15 +247,42 @@ class StreamingParquetBuffer(IterableDataset):
     def _load_file_dataframe(self, file_path: str):
         parquet_file = pq.ParquetFile(file_path)
         file_cols = parquet_file.schema.names
-        cols_to_load, rename_map, time_col_name = self._select_columns(file_cols)
+        cols_to_load, rename_map, time_col_name, meter_col_name = self._select_columns(file_cols)
 
         if not cols_to_load:
-            return None, None
+            return None, None, None
 
-        df = pq.read_table(file_path, columns=cols_to_load).to_pandas()
+        if time_col_name is None:
+            raise ValueError(
+                f"No timestamp column found in {file_path}. "
+                f"Expected one of {self.time_col_candidates}."
+            )
+
+        if not self.phased_mode and meter_col_name is None:
+            raise ValueError(
+                f"No meter column '{self.meter_col}' found in {file_path}."
+            )
+
+        table = pq.read_table(file_path, columns=cols_to_load)
+        df = table.to_pandas(ignore_metadata=True)  
+        
         df = df.rename(columns=rename_map)
-        meter_id = self._extract_meter_id(file_path)
-        return self._prepare_time_index(df, time_col_name), meter_id
+        if meter_col_name not in df.columns and meter_col_name in list(getattr(df.index, "names", [])):
+            df = df.reset_index()
+            df = df.rename(columns={meter_col_name: self.meter_col})
+            meter_col_name = self.meter_col
+
+        prepared = self._prepare_time_index(df, time_col_name, meter_col_name)
+        meter_id = self._extract_meter_id(file_path) if self.phased_mode else None
+        return prepared, meter_id, meter_col_name
+
+    def _meter_value_to_int(self, meter_value) -> int:
+        try:
+            return int(meter_value)
+        except (TypeError, ValueError):
+            # Only if everything has gone wrong with parsing
+            digest = hashlib.sha1(str(meter_value).encode("utf-8")).hexdigest()
+            return int(digest[:8], 16)
     
     def __iter__(self):
         # === Multiprocessing traffic control ===
@@ -237,29 +306,29 @@ class StreamingParquetBuffer(IterableDataset):
         for file in files_for_this_worker:
             self._mark_file_seen(file)
             try:
-                file_df, meter_id = self._load_file_dataframe(file)
-                if file_df is None or meter_id is None:
+                file_df, meter_id, meter_col_name = self._load_file_dataframe(file)
+                if file_df is None:
                     continue
 
-                sequences = self._extract_sequences(file_df, meter_id)
+                sequences = self._extract_sequences(file_df, meter_id=meter_id, meter_col_name=meter_col_name)
 
-                for seq, cond in sequences:
+                for seq, meter_id_t, timestamp_t in sequences:
                     # Apply normalization if normalizer is provided
                     if self.normalizer is not None:
                         # seq shape is [24, 3], broadcasting with [3,]
                         seq = self.normalizer.transform(seq)
-                    agg = None
-                    if self.output_aggregate_stream:
-                        agg = seq.sum(dim=1, keepdim=True)
-                    seq = seq.T
-                    if agg is not None:
-                        agg = agg.T
 
-                    # Push the sample into the replay buffer
-                    if agg is not None:
-                        self._push_to_buffer((seq, cond, agg))
+                    # Keep model input as [F, L]
+                    seq = seq.T
+
+                    # Always emit aggregate tensor to keep tuple width fixed.
+                    if self.output_aggregate_stream:
+                        agg = seq.sum(dim=0, keepdim=True)
                     else:
-                        self._push_to_buffer((seq, cond))
+                        agg = torch.empty((0, seq.shape[-1]), dtype=seq.dtype, device=seq.device)
+
+                    # Push standardized sample tuple: (x, meter_id, timestamp, agg)
+                    self._push_to_buffer((seq, meter_id_t, timestamp_t, agg))
 
                     # Yield only when the buffer is adequately mixed
                     if self.current_size >= self.min_buffer_size:
@@ -275,48 +344,94 @@ class StreamingParquetBuffer(IterableDataset):
             finally:
                 self._mark_file_completed(file)
     
-    def _extract_sequences(self, df, meter_id):
+    def _extract_sequences_for_meter(self, meter_df: pd.DataFrame, meter_id: int):
         sequences = []
 
         if self.window_spec is None:
             raise ValueError("window_spec must be provided for phased parquet streaming.")
 
         for feat in self.feature_cols:
-            if feat not in df.columns:
-                df[feat] = np.nan
+            if feat not in meter_df.columns:
+                meter_df[feat] = np.nan
 
-        phase_df = df[self.feature_cols].apply(pd.to_numeric, errors='coerce')
+        phase_df = meter_df[self.feature_cols].apply(pd.to_numeric, errors='coerce')
         phase_df = self._impute_to_base_frequency(phase_df)
 
         if phase_df.empty:
             return sequences
 
+        if self.nan_as_zero:
+            phase_df = phase_df.fillna(0.0)
+        else:
+            finite_mask = phase_df.notna().all(axis=1)
+            phase_df = phase_df.loc[finite_mask]
+            if phase_df.empty:
+                return sequences
+
         timestamps = (phase_df.index.view('int64') // 10**9).astype(np.int64)
-        #values = phase_df.fillna(0.0).astype(np.float32).to_numpy()
-        values = phase_df.dropna().astype(np.float32).to_numpy() # TODO: FUck sommerhuse! 
+        values = phase_df.astype(np.float32).to_numpy()
+        if len(values) < self.window_spec.input_len:
+            return sequences
 
         for start in range(0, len(values) - self.window_spec.input_len + 1, self.window_spec.stride):
             end = start + self.window_spec.input_len
             
-            # Shape is [seq_len, 3] -> (24, 3). We will transpose to [3, seq_len] in the end to be consistent with the rest of the code and how the model expects it
+            # Window shape before transpose: [L, F]
             window = torch.tensor(values[start:end], dtype=torch.float32)
-            
-            meter_ids = torch.full((self.window_spec.input_len,), meter_id, dtype=torch.long)
-            window_timestamps = torch.tensor(timestamps[start:end], dtype=torch.long)
-            condition = torch.stack([meter_ids, window_timestamps], dim=0)  # [2, seq_len]
-            
-            sequences.append((window, condition))
+
+            # Per-window metadata (single values, not packed sequences)
+            meter_id_t = torch.tensor(int(meter_id), dtype=torch.long)
+            timestamp_t = torch.tensor(int(timestamps[start]), dtype=torch.long)
+
+            sequences.append((window, meter_id_t, timestamp_t))
         
         return sequences
 
+    def _extract_sequences(self, df, meter_id=None, meter_col_name: str | None = None):
+        if self.phased_mode:
+            if meter_id is None:
+                raise ValueError("phased_mode=True requires meter_id from filename parsing")
+            return self._extract_sequences_for_meter(df, meter_id=int(meter_id))
+
+        if meter_col_name is None or meter_col_name not in df.columns:
+            raise ValueError(
+                f"Unphased mode requires meter column '{self.meter_col}' in loaded data."
+            )
+        if "_timestamp" not in df.columns:
+            raise ValueError("Unphased mode expected '_timestamp' column after timestamp parsing.")
+
+        meter_series = df[meter_col_name]
+        valid = meter_series.notna()
+        if not valid.any():
+            return []
+
+        grouped = df.loc[valid].copy()
+        grouped["_meter_id_int"] = grouped[meter_col_name].apply(self._meter_value_to_int).astype(np.int64)
+
+        sequences = []
+        for meter_value, meter_df in grouped.groupby("_meter_id_int", sort=False):
+            meter_frame = meter_df.sort_values("_timestamp").set_index("_timestamp")
+            meter_frame = meter_frame[~meter_frame.index.duplicated(keep='last')]
+            sequences.extend(self._extract_sequences_for_meter(meter_frame, meter_id=int(meter_value)))
+        return sequences
 
 class PhasedReplayDataloaders:
-    """Builds train/eval DataLoaders from a shared replay stream with optional GPU eval caching."""
+    """Builds train/eval DataLoaders from a shared replay stream with optional GPU eval caching.
+
+    Standardized output contract for both train and eval loaders:
+        (x, meter_id, timestamps, agg)
+
+    where:
+        x:          [B, F, L]
+        meter_id:   [B]
+        timestamps: [B]
+        agg:        [B, 1, L] when available, else [B, 0, L]
+    """
     def __init__(
             self,
             *,
             sm_files,
-            window_spec: Optional[WindowSpec],
+            window_spec,
             batch_size: int,
             replay_buffer_capacity: int = 10000,
             min_buffer_size: int = 2000,
@@ -332,6 +447,10 @@ class PhasedReplayDataloaders:
             skip_corrupt_files: bool = True,
             max_skip_warnings: int = 20,
             sample_random: bool = True,
+            nan_as_zero: bool = False,
+            phased_mode: bool = True,
+            meter_col: str = "meter_number",
+            feature_cols: list[str] | None = None,
     ):
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
@@ -341,6 +460,7 @@ class PhasedReplayDataloaders:
         self.pin_memory = bool(pin_memory)
         self.output_aggregate_stream = bool(output_aggregate_stream)
         self.sample_random = bool(sample_random)
+        self.phased_mode = bool(phased_mode)
         self.total_files = len(set(sm_files))
 
         # Manager-backed maps are shared across DataLoader workers.
@@ -368,6 +488,10 @@ class PhasedReplayDataloaders:
             max_skip_warnings=max_skip_warnings,
             output_aggregate_stream=self.output_aggregate_stream,
             sample_random=self.sample_random,
+            nan_as_zero=nan_as_zero,
+            phased_mode=self.phased_mode,
+            meter_col=meter_col,
+            feature_cols=feature_cols,
         )
 
         self.eval_loader = None
@@ -416,10 +540,12 @@ class PhasedReplayDataloaders:
 
     def _collect_cache(self, target_train: int, target_eval: int):
         train_x = None
-        train_c = None
+        train_meter = None
+        train_timestamps = None
         train_agg = None
         eval_x = None
-        eval_c = None
+        eval_meter = None
+        eval_timestamps = None
         eval_agg = None
         train_samples = 0
         eval_samples = 0
@@ -428,34 +554,33 @@ class PhasedReplayDataloaders:
         target_eval = max(0, int(target_eval))
         total_batches = max(1, (target_train + target_eval + self.batch_size - 1) // self.batch_size)
         max_scan_batches = self.cache_scan_batches or max(30, total_batches * 40)
-
         for i in range(max_scan_batches):
             batch = self._next_stream_batch()
             if batch is None:
                 print("Warning: phased stream produced no data while collecting cache.")
                 break
 
-            has_agg = isinstance(batch, (list, tuple)) and len(batch) == 3
-            if has_agg:
-                x, cond, agg = batch
-            else:
-                x, cond = batch
-                agg = None
+            if not isinstance(batch, (list, tuple)) or len(batch) != 4:
+                raise ValueError(
+                    "Streaming replay batch must be a 4-tuple: (x, meter_id, timestamps, agg)."
+                )
+
+            x, meter_batch, ts_batch, agg_batch = batch
             x = x.float()
-            cond = cond.long()
-            if agg is not None:
-                agg = agg.float()
+            meter_batch = meter_batch.long()
+            ts_batch = ts_batch.long()
+            agg_batch = agg_batch.float()
 
             if train_x is None and target_train > 0:
                 train_x = torch.empty((target_train, *x.shape[1:]), dtype=x.dtype)
-                train_c = torch.empty((target_train, *cond.shape[1:]), dtype=cond.dtype)
-                if agg is not None:
-                    train_agg = torch.empty((target_train, *agg.shape[1:]), dtype=agg.dtype)
+                train_meter = torch.empty((target_train,), dtype=torch.long)
+                train_timestamps = torch.empty((target_train,), dtype=torch.long)
+                train_agg = torch.empty((target_train, *agg_batch.shape[1:]), dtype=agg_batch.dtype)
             if eval_x is None and target_eval > 0:
                 eval_x = torch.empty((target_eval, *x.shape[1:]), dtype=x.dtype)
-                eval_c = torch.empty((target_eval, *cond.shape[1:]), dtype=cond.dtype)
-                if agg is not None:
-                    eval_agg = torch.empty((target_eval, *agg.shape[1:]), dtype=agg.dtype)
+                eval_meter = torch.empty((target_eval,), dtype=torch.long)
+                eval_timestamps = torch.empty((target_eval,), dtype=torch.long)
+                eval_agg = torch.empty((target_eval, *agg_batch.shape[1:]), dtype=agg_batch.dtype)
 
             n = x.shape[0]
             remaining_train = max(0, target_train - train_samples)
@@ -476,30 +601,28 @@ class PhasedReplayDataloaders:
                 eval_mask = torch.zeros(n, dtype=torch.bool)
 
             x_eval = x[eval_mask]
-            c_eval = cond[eval_mask]
+            m_eval = meter_batch[eval_mask]
+            t_eval = ts_batch[eval_mask]
             x_train = x[~eval_mask]
-            c_train = cond[~eval_mask]
-            if agg is not None:
-                agg_eval = agg[eval_mask]
-                agg_train = agg[~eval_mask]
-            else:
-                agg_eval = None
-                agg_train = None
+            m_train = meter_batch[~eval_mask]
+            t_train = ts_batch[~eval_mask]
+            agg_eval = agg_batch[eval_mask]
+            agg_train = agg_batch[~eval_mask]
 
             if remaining_train > 0 and x_train.shape[0] > 0:
                 take_train = min(remaining_train, x_train.shape[0])
                 train_x[train_samples:train_samples + take_train].copy_(x_train[:take_train])
-                train_c[train_samples:train_samples + take_train].copy_(c_train[:take_train])
-                if train_agg is not None and agg_train is not None:
-                    train_agg[train_samples:train_samples + take_train].copy_(agg_train[:take_train])
+                train_meter[train_samples:train_samples + take_train].copy_(m_train[:take_train])
+                train_timestamps[train_samples:train_samples + take_train].copy_(t_train[:take_train])
+                train_agg[train_samples:train_samples + take_train].copy_(agg_train[:take_train])
                 train_samples += int(take_train)
 
             if remaining_eval > 0 and x_eval.shape[0] > 0:
                 take_eval = min(remaining_eval, x_eval.shape[0])
                 eval_x[eval_samples:eval_samples + take_eval].copy_(x_eval[:take_eval])
-                eval_c[eval_samples:eval_samples + take_eval].copy_(c_eval[:take_eval])
-                if eval_agg is not None and agg_eval is not None:
-                    eval_agg[eval_samples:eval_samples + take_eval].copy_(agg_eval[:take_eval])
+                eval_meter[eval_samples:eval_samples + take_eval].copy_(m_eval[:take_eval])
+                eval_timestamps[eval_samples:eval_samples + take_eval].copy_(t_eval[:take_eval])
+                eval_agg[eval_samples:eval_samples + take_eval].copy_(agg_eval[:take_eval])
                 eval_samples += int(take_eval)
 
             if train_samples >= target_train and eval_samples >= target_eval:
@@ -513,40 +636,41 @@ class PhasedReplayDataloaders:
             take = min(need, eval_samples)
             if take > 0:
                 train_x[train_samples:train_samples + take].copy_(eval_x[:take])
-                train_c[train_samples:train_samples + take].copy_(eval_c[:take])
-                if train_agg is not None and eval_agg is not None:
-                    train_agg[train_samples:train_samples + take].copy_(eval_agg[:take])
+                train_meter[train_samples:train_samples + take].copy_(eval_meter[:take])
+                train_timestamps[train_samples:train_samples + take].copy_(eval_timestamps[:take])
+                train_agg[train_samples:train_samples + take].copy_(eval_agg[:take])
                 train_samples += int(take)
 
         if train_x is not None:
             train_x = train_x[:train_samples]
-        if train_c is not None:
-            train_c = train_c[:train_samples]
+        if train_meter is not None:
+            train_meter = train_meter[:train_samples]
+        if train_timestamps is not None:
+            train_timestamps = train_timestamps[:train_samples]
         if train_agg is not None:
             train_agg = train_agg[:train_samples]
         if eval_x is not None:
             eval_x = eval_x[:eval_samples]
-        if eval_c is not None:
-            eval_c = eval_c[:eval_samples]
+        if eval_meter is not None:
+            eval_meter = eval_meter[:eval_samples]
+        if eval_timestamps is not None:
+            eval_timestamps = eval_timestamps[:eval_samples]
         if eval_agg is not None:
             eval_agg = eval_agg[:eval_samples]
+        return train_x, train_meter, train_timestamps, train_agg, eval_x, eval_meter, eval_timestamps, eval_agg
 
-        return train_x, train_c, train_agg, eval_x, eval_c, eval_agg
-
-    def _build_eval_loader(self, x_eval, c_eval, agg_eval=None):
-        if x_eval is None or c_eval is None or x_eval.shape[0] == 0:
+    def _build_eval_loader(self, x_eval, meter_eval, timestamps_eval, agg_eval=None):
+        if (
+            x_eval is None
+            or meter_eval is None
+            or timestamps_eval is None
+            or x_eval.shape[0] == 0
+        ):
             self.eval_loader = None
             return
 
-        if torch.is_tensor(c_eval) and c_eval.dim() == 3 and c_eval.shape[1] >= 2:
-            meter_id = c_eval[:, 0, 0].long()
-            timestamps = c_eval[:, 1, 0].long()
-        elif torch.is_tensor(c_eval) and c_eval.dim() == 2 and c_eval.shape[1] >= 2:
-            meter_id = c_eval[:, 0].long()
-            timestamps = c_eval[:, 1].long()
-        else:
-            meter_id = torch.zeros(x_eval.shape[0], dtype=torch.long)
-            timestamps = torch.zeros(x_eval.shape[0], dtype=torch.long)
+        meter_id = meter_eval.long()
+        timestamps = timestamps_eval.long()
 
         if self.eval_cache_device is not None:
             try:
@@ -587,15 +711,11 @@ class PhasedReplayDataloaders:
                 eval_cache_batches = self.eval_cache_batches if self.eval_cache_batches is not None else eval_batches
                 target_eval = max(1, int(eval_cache_batches)) * self.batch_size
 
-        train_x, train_c, train_agg, eval_x, eval_c, eval_agg = self._collect_cache(target_train, target_eval)
-
-        if train_x is None or train_c is None or train_x.shape[0] == 0:
+        train_x, train_meter, train_timestamps, train_agg, eval_x, eval_meter, eval_timestamps, eval_agg = self._collect_cache(target_train, target_eval)
+        if train_x is None or train_meter is None or train_timestamps is None or train_x.shape[0] == 0:
             return None, self.eval_loader
 
-        if train_agg is not None:
-            train_ds = TensorDataset(train_x, train_c, train_agg)
-        else:
-            train_ds = TensorDataset(train_x, train_c)
+        train_ds = TensorDataset(train_x, train_meter, train_timestamps, train_agg)
         pin_train_memory = self.pin_memory and train_x.device.type == "cpu"
         train_loader = DataLoader(
             train_ds,
@@ -606,14 +726,14 @@ class PhasedReplayDataloaders:
         )
 
         if target_eval > 0:
-            self._build_eval_loader(eval_x, eval_c, eval_agg)
+            self._build_eval_loader(eval_x, eval_meter, eval_timestamps, eval_agg)
 
         return train_loader, self.eval_loader
 
     def refresh_eval_cache(self, eval_batches: int):
         target_eval = max(1, int(eval_batches)) * self.batch_size
-        _, _, _, eval_x, eval_c, eval_agg = self._collect_cache(0, target_eval)
-        self._build_eval_loader(eval_x, eval_c, eval_agg)
+        _, _, _, _, eval_x, eval_meter, eval_timestamps, eval_agg = self._collect_cache(0, target_eval)
+        self._build_eval_loader(eval_x, eval_meter, eval_timestamps, eval_agg)
 
     def get_eval_loader(self):
         return self.eval_loader

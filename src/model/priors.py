@@ -289,6 +289,19 @@ class VampPrior(BasePrior):
         """Return mean parameters expanded to batch_size for compatibility."""
         params = self.get_params()
         return {k: v.expand(batch_size, -1) for k, v in params.items()}
+    
+    def initialize_pseudo_inputs(self, z, noise_scale=0.1):
+        """Initialize pseudo-inputs
+        by accepting a batch of encoded data points z
+        and setting pseudo-inputs to them with added noise."""
+        with torch.no_grad():
+            # Randomly select K data points from z to initialize pseudo-inputs
+            indices = torch.randperm(z.size(0))[:self.num_components]
+            selected_z = z[indices]  # [K, D]
+
+            # Add small noise to break symmetry
+            noise = torch.randn_like(selected_z) * noise_scale
+            self.pseudo_inputs.copy_(selected_z + noise)
 
 def get_prior(prior_type, latent_dim, device="cpu", **kwargs):
     """ Function to get priors based on type string 

@@ -21,6 +21,8 @@ from src.model.hierarchical.core import HierarchicalLatentModule
 
 from src.model.model_utils import CyclicalBetaScheduler, EarlyStopping
 
+from model.model import BaseModel
+
 
 # https://arxiv.org/pdf/2411.03936
 # GuideVAE model implementation
@@ -32,7 +34,7 @@ from src.model.model_utils import CyclicalBetaScheduler, EarlyStopping
 #   - should be the base that contains all core aspects
 #   - encoder and decoder are modular and can be swapped out
 # ==============
-class VAE(nn.Module):
+class VAE(BaseModel):
     """Base VAE class with modular encoder, decoder, prior and hierarchical latent space.
     """
     def __init__(self,
@@ -49,8 +51,10 @@ class VAE(nn.Module):
                  encoder_dropout=None,
                  decoder_dropout=None,
                  hierarchy_config: HierarchicalConfig = None,
+                 phased_mode: bool = False,
+                 sequence_length: int = 24,
                  **_):
-        super(VAE, self).__init__()
+        super(VAE, self).__init__(phased_mode=phased_mode, sequence_length=sequence_length)
 
         # === Argument Handling ===
         # Capture all local variables in kwargs
@@ -248,34 +252,13 @@ class VAE(nn.Module):
         # TODO: MMD (mean maximum discrepancy) has been shown to be useful for smart meter data by one of the papers
         return {"loss": loss, "recon_loglikelihood": recon_loglikelihood, "kl_divergence": kl_div}
 
-    def train_core(self, x, optim, gradient_clip=None, gradient_clip_kwargs=None, beta=1.0, weighted_loss =0.0, **_):
+    def train_core(self, batch, optim, gradient_clip=None, gradient_clip_kwargs=None, beta=1.0, weighted_loss =0.0, **_):
         # batch can be x OR (x, meter_id, timeStamp)
         self.train()  # Set model to training mode
 
-        if isinstance(x, tuple) or isinstance(x, list):
-            # Unpack if dataloader returns (x, meter_id, timestamps)
-            if len(x) == 3:
-                x_data, meter_id, timestamps = x
-            elif len(x) == 2:
-                x_data, meter_id = x
-                timestamps = None
-            else:
-                x_data = x[0]
-                meter_id = None
-                timestamps = None
-        else:
-            x_data = x
-            meter_id = None
-            timestamps = None
+        x, meter_id, timestamps, agg = self._unpack_batch(batch)
+        x_flat = self._prep_inputs(x.to(self.device))  # Flatten if needed and move to device
 
-       # Flatten x if needed
-        if x_data.dim() == 3:  # [B, L, F]
-            x_flat = x_data.reshape(x_data.shape[0], -1)
-        else:
-            x_flat = x_data
-
-        x_flat = x_flat.to(self.device)
-        
         # Forward pass
         recon_params_dict, posterior_params_dict = self.forward(x_flat, num_samples=1)
 
@@ -298,24 +281,16 @@ class VAE(nn.Module):
         with torch.no_grad():
             # Iterate over validation data
             for batch in valloader:
-                if isinstance(batch, (list, tuple)):
-                    batch = batch[0]
-                batch = batch.to(device)
-                if batch.dim() == 3:
-                    batch = batch.reshape(batch.shape[0], -1)
-                batch = batch.to(device)
-                # Flatten if needed
-                if batch.dim() == 3:
-                    batch = batch.reshape(batch.shape[0], -1)
-
+                x, meter_id, timestamps, agg = self._unpack_batch(batch)
+                x_flat = self._prep_inputs(x.to(device))  # Flatten if needed and move to device
                 # Forward pass
-                recon_params_dict, posterior_params_dict = self.forward(batch, num_samples=num_samples)
+                recon_params_dict, posterior_params_dict = self.forward(x_flat, num_samples=num_samples)
                 # Get prior params
                 prior_params = self.prior.get_params()
-                batch_size = batch.shape[0]
+                batch_size = x_flat.shape[0]
                 prior_params = {k: v.expand(batch_size, -1).to(device) for k, v in prior_params.items()}
                 # Get loss
-                loss_dict = self.loss(batch, recon_params_dict, posterior_params_dict, beta=beta, prior_params=prior_params)
+                loss_dict = self.loss(x_flat, recon_params_dict, posterior_params_dict, beta=beta, prior_params=prior_params)
                 # Accumulate losses
                 for key in val_loss:
                     val_loss[key] += loss_dict[key].item()
@@ -330,22 +305,6 @@ class VAE(nn.Module):
         # Return Adam optimizer for model parameters
         # TODO: Allow for different optimizers and parameter settings
         return torch.optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay) # TODO: Parameters should be inputted
-
-    def move_to_device(self, batch, device):
-        if torch.is_tensor(batch):
-            return batch.to(device, non_blocking=True)
-        if isinstance(batch, (list, tuple)):
-            return type(batch)(
-                b.to(device, non_blocking=True) if torch.is_tensor(b) else b
-                for b in batch
-            )
-        if isinstance(batch, dict):
-            return {
-                k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
-                for k, v in batch.items()
-            }
-        return batch
-
 
     def save_model(self, save_path=None, model_name="trained_model", device="cpu", normalizer=None):
         """
@@ -971,309 +930,6 @@ class VAE(nn.Module):
         
         normalizer = cls._load_normalizer_from_checkpoint(checkpoint=checkpoint, device=device)
         return model, normalizer
-    
-    def get_tag(self):
-        time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"{self.__class__.__name__}_{self.decoder.__class__.__name__}_{time_stamp}"
-
-    def fit(self,
-            trainloader,
-            valloader = None,
-            lr = 1e-3,
-            weight_decay = 1e-4,
-            gradient_clip = None,
-            gradient_clip_kwargs = {"max_norm": 1.0},
-            lr_scheduler = False,
-            lr_scheduler_kwargs = {"step_size": 10, "gamma": 0.9},
-            beta = 1.0,
-            beta_annealing = False,  # Enable cyclical beta annealing to avoid posterior collapse
-            beta_annealing_kwargs = {"n_cycles": 4, "ratio": 0.5},  # kwargs for CyclicalBetaScheduler
-            epochs = 1000,
-            validation_freq = 1,
-            validation_num_samples = 10,
-            device = "cpu", 
-            early_stopping = True,
-            early_stopping_kwargs = {"patience": 10, "min_delta": 0.001},
-            save_epoch_freq = 10,
-            writer = None,
-            log_dir = './models/',
-            model_name = None, # Optionally specify model name for saving
-            normalizer = None,
-            compile_model = False, # Whether to use torch.compile for faster training (PyTorch 2.0+)
-            weighted_loss = 0.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
-            **_):
-
-        # === Generate a model tag ===
-        if model_name is None:
-            model_tag = self.get_tag()
-        else:
-            model_tag = model_name
-        os.makedirs(log_dir, exist_ok=True)
-        model_save_path = os.path.join(log_dir, model_tag)
-
-        # === Take Kwarg Inputs ===
-        fit_kwargs = dict(locals())
-        for key in ["self", "trainloader", "valloader", "writer", "_"]:
-            fit_kwargs.pop(key, None)
-        self.model_kwargs.update(fit_kwargs)
-        self.model_kwargs['model_tag'] = model_tag
-        
-        # === Save training configuration ===
-        config_path = os.path.join(log_dir, "training_config.json")
-        config = {
-            'model_tag': model_tag,
-            'time_stamp': datetime.now().isoformat(),
-            'hyperparameters': {
-                'lr': lr,
-                'weight_decay': weight_decay,
-                'beta': beta,
-                'beta_annealing': beta_annealing,
-                'beta_annealing_kwargs': beta_annealing_kwargs if beta_annealing else None,
-                'epochs': epochs,
-                'batch_size': trainloader.batch_size,
-                'gradient_clip': gradient_clip,
-                'lr_scheduler': lr_scheduler,
-                'early_stopping': early_stopping,
-                'weighted_loss': weighted_loss,
-            },
-            'model_architecture': {
-                'class_name': self.__class__.__name__,
-                'input_dim': self.input_dim,
-                'num_parameters': self.num_parameters,
-                'encoder': self.encoder.__class__.__name__,
-                'decoder': self.decoder.__class__.__name__,
-            }
-        }
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=4)
-        print(f"Training configuration saved to: {config_path}")
-        log_dir_tagged = os.path.join(log_dir, model_tag)   # <-- move here
-        # === Initialize TensorBoard writer ===
-        if writer is None:
-            log_dir_tagged = os.path.join(log_dir, model_tag)
-            writer = Writer(log_dir=log_dir_tagged)
-            print(f"Writer logging to: {log_dir_tagged}")
-            # Log configuration to Writer
-            writer.add_text('Config/model_tag', model_tag, 0)
-            writer.add_text('Config/hyperparameters', json.dumps(config['hyperparameters'], indent=2), 0)
-
-        # === Setup Optimizer and Scheduler ===
-        optim = self.get_optimizer(lr=lr, weight_decay=weight_decay)
-        if lr_scheduler:
-            # TODO: Mostly for transformers
-            # 1. Grab total epochs from kwargs (default to 20 if not provided)
-            total_epochs = lr_scheduler_kwargs.get("total_epochs", 100)
-            warmup_epochs = 5 # Wake the transformer up gently over 5 epochs
-
-            # 2. Phase 1: Warmup (Start at 1% of max LR, linearly scale to 100%)
-            warmup_scheduler = LinearLR(
-                optim, 
-                start_factor=0.01, 
-                end_factor=1.0, 
-                total_iters=warmup_epochs
-            )
-
-            # 3. Phase 2: Cosine Decay (Smoothly curve the LR down to near zero for the remaining epochs)
-            decay_scheduler = CosineAnnealingLR(
-                optim, 
-                T_max=(total_epochs - warmup_epochs), 
-                eta_min=1e-6
-            )
-
-            # 4. Chain them together
-            scheduler = SequentialLR(
-                optim, 
-                schedulers=[warmup_scheduler, decay_scheduler], 
-                milestones=[warmup_epochs]
-            )
-        
-        if next(self.parameters()).device != torch.device(device):
-            self.to(device)
-        self.prior.to(device)
-
-        if early_stopping:
-            earlystopping = EarlyStopping(**early_stopping_kwargs)
-
-        # === Beta Annealing Scheduler ===
-        if beta_annealing:
-            total_steps = epochs * len(trainloader)
-            beta_scheduler = CyclicalBetaScheduler(
-                total_steps=total_steps,
-                beta_max=beta,  # use the provided beta as the ceiling
-                **beta_annealing_kwargs,
-            )
-            print(f"Cyclical beta annealing enabled: {beta_scheduler}")
-
-        # === Optional Model Compilation ===
-        if compile_model and hasattr(torch, 'compile'):
-            compile_mode = 'reduce-overhead' if str(device) != 'cpu' else None
-            try:
-                self.encoder = torch.compile(self.encoder, mode=compile_mode)
-                self.decoder = torch.compile(self.decoder, mode=compile_mode)
-                if self.hierarchy is not None:
-                    self.hierarchy = torch.compile(self.hierarchy, mode=compile_mode)
-                print(f"Model compiled with torch.compile (mode={compile_mode}).")
-            except Exception as e:
-                print(f"torch.compile skipped (not supported in this environment): {e}")
-                try:
-                    compile_mode = 'cudagraphs' if str(device) != 'cpu' else None
-                    self.encoder = torch.compile(self.encoder, mode=compile_mode)
-                    self.decoder = torch.compile(self.decoder, mode=compile_mode)
-                    if self.hierarchy is not None:
-                        self.hierarchy = torch.compile(self.hierarchy, mode=compile_mode)
-                    print(f"Model compiled with torch.compile (mode={compile_mode}).")
-                except Exception as e:
-                    print(f"torch.compile skipped with fallback mode as well: {e}")
-
-        # === Training Loop ===
-        self.train()
-        global_step = 0
-        best_val_loss = float('inf')
-        best_epoch = 0
-
-        for epoch in range(epochs):
-            epoch_train_loss = 0.0
-            epoch_train_recon = 0.0
-            epoch_train_kl = 0.0
-            num_batches = 0
-
-            for batch in trainloader:
-                global_step += 1
-
-                # Get current beta (annealed or fixed)
-                current_beta = beta_scheduler.step() if beta_annealing else beta
-
-                batch = self.move_to_device(batch, device)
-
-                loss_dict = self.train_core(
-                    batch, 
-                    optim, 
-                    beta=current_beta, 
-                    gradient_clip=gradient_clip, 
-                    gradient_clip_kwargs=gradient_clip_kwargs,
-                    weighted_loss=weighted_loss,
-                )
-                
-                # Accumulate epoch losses
-                epoch_train_loss += loss_dict["loss"].item()
-                epoch_train_recon += loss_dict["recon_loglikelihood"].item()
-                epoch_train_kl += loss_dict["kl_divergence"].item()
-                num_batches += 1
-                
-                # Log training metrics per iteration
-                writer.add_scalar('train_loss', loss_dict["loss"].item(), global_step)
-                writer.add_scalar('train_recon_loglikelihood', loss_dict["recon_loglikelihood"].item(), global_step)
-                writer.add_scalar('train_kl_divergence', loss_dict["kl_divergence"].item(), global_step)
-                writer.add_scalar('train_beta', current_beta, global_step)
-
-            # Compute average epoch losses
-            avg_train_loss = epoch_train_loss / num_batches
-            avg_train_recon = epoch_train_recon / num_batches
-            avg_train_kl = epoch_train_kl / num_batches
-            
-            # Log epoch-level training metrics
-            writer.add_scalar('train_loss_epoch', avg_train_loss, epoch)
-            writer.add_scalar('train_recon_loglikelihood_epoch', avg_train_recon, epoch)
-            writer.add_scalar('train_kl_divergence_epoch', avg_train_kl, epoch)
-            
-            # Log learning rate
-            current_lr = optim.param_groups[0]['lr']
-            writer.add_scalar('train_learning_rate', current_lr, epoch)
-
-            # === Validation Phase ===
-            val_loss_dict = None
-            if valloader is not None and ((epoch + 1) % validation_freq == 0):
-                val_loss_dict = self.validate(valloader, num_samples=validation_num_samples, device=device)
-                
-                # Log validation metrics
-                writer.add_scalar('val_loss_epoch', val_loss_dict["loss"], epoch)
-                writer.add_scalar('val_recon_loglikelihood_epoch', val_loss_dict["recon_loglikelihood"], epoch)
-                writer.add_scalar('val_kl_divergence_epoch', val_loss_dict["kl_divergence"], epoch)
-
-                
-                 # === Save Best Model ===
-                if val_loss_dict["loss"] < best_val_loss:
-                    best_val_loss = val_loss_dict["loss"]
-                    best_epoch = epoch
-                    best_model_path = os.path.join(log_dir_tagged, f"{model_tag}_best.pt")
-                    self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_best", device=device, normalizer=normalizer)
-                    print(f"    New best model saved (Val Loss: {best_val_loss:.4f})")
-
-                # Print progress
-                print(f"Epoch [{epoch+1:4d}/{epochs}] "
-                      f"Train Loss: {avg_train_loss:.4f} | "
-                      f"Val Loss: {val_loss_dict['loss']:.4f} | "
-                      f"LR: {current_lr:.2e} | "
-                      f"Best: {best_val_loss:.4f}@{best_epoch+1}")
-
-                # Early stopping check
-                if early_stopping:
-                    is_best = earlystopping(val_metric=val_loss_dict["loss"],train_metric=avg_train_loss, epoch=epoch)
-                    if earlystopping.early_stop:
-                        print(f"\n{'='*60}")
-                        print(f"Early stopping triggered at epoch {epoch+1}")
-                        print(f"Best model at epoch {best_epoch+1} with Val Loss: {best_val_loss:.4f}")
-                        print(f"{'='*60}\n")
-                        writer.add_text('Training/early_stop', 
-                                      f'Stopped at epoch {epoch+1}, Best: {best_epoch+1}', epoch)
-                        break
-            else:
-                # No validation - just print training progress
-                print(f"Epoch [{epoch+1:4d}/{epochs}] "
-                      f"Train Loss: {avg_train_loss:.4f} | "
-                      f"Recon: {avg_train_recon:.4f} | "
-                      f"KL: {avg_train_kl:.4f} | "
-                      f"LR: {current_lr:.2e}")
-                
-            # === Learning Rate Scheduler Step ===
-            if lr_scheduler:
-                scheduler.step()
-            
-            # Save Model Checkpoint
-            if (epoch + 1) % save_epoch_freq == 0:
-                checkpoint_path = os.path.join(log_dir_tagged, f"{model_tag}_epoch_{epoch+1}.pt")
-                self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_epoch_{epoch+1}", device=device, normalizer=normalizer)
-                print(f"    Checkpoint saved: epoch_{epoch+1}")
-        
-        # === Training Complete ===
-        print(f"\n{'='*60}")
-        print(f"Training complete: {model_tag}")
-        print(f"Best model: Epoch {best_epoch+1} with Val Loss: {best_val_loss:.4f}")
-        print(f"Model saved to: {os.path.join(log_dir_tagged, model_tag)}")
-        print(f"{'='*60}\n")
-
-        final_model_path = os.path.join(log_dir_tagged, f"{model_tag}_final.pt")
-        self.to("cpu")
-        self.prior.to("cpu")
-        self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_final", device="cpu", normalizer=normalizer)
-        # Restore model to the training device so it's ready for inference after fit() returns
-        self.to(device)
-        self.prior.to(device)
-
-        # Save training summary
-        summary = {
-            'model_tag': model_tag,
-            'total_epochs': epoch + 1,
-            'best_epoch': best_epoch + 1,
-            'best_val_loss': best_val_loss,
-            'final_train_loss': avg_train_loss,
-            'early_stopped': early_stopping and earlystopping.early_stop,
-        }
-        summary_path = os.path.join(log_dir_tagged, f"{model_tag}_summary.json")
-        with open(summary_path, 'w') as f:
-            json.dump(summary, f, indent=4)
-
-        # Log final summary to TensorBoard
-        summary_text = "\n".join([f"{k}: {v}" for k, v in summary.items()])
-        writer.add_text('Training/summary', summary_text, epoch)
-        
-        self.eval()
-        
-        # Close writer
-        if writer is not None:
-            writer.close()
-            print(f"Writter logs saved to: {log_dir_tagged}")
-        return model_tag, writer
     
     def get_SigmaMapper(self):
         return self.decoder.get_SigmaMapper()

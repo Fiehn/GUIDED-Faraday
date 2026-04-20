@@ -62,6 +62,21 @@ class Visualizer:
             return x if x.shape[2] >= x.shape[3] else x.transpose(2, 3)
 
         return x
+    def _unpack_batch(self, batch):
+        """Strict unpack contract: (x, meter_id, timestamps, agg)."""
+        if not isinstance(batch, (list, tuple)) or len(batch) != 4:
+            raise ValueError(
+                "Expected batch as a 4-tuple: (x, meter_id, timestamps, agg)."
+            )
+
+        x, meter_id, timestamps, agg = batch
+
+        if torch.is_tensor(meter_id):
+            meter_id = meter_id.long()
+        if torch.is_tensor(timestamps):
+            timestamps = timestamps.long()
+
+        return x, meter_id, timestamps, agg
 
     def _safe_inverse_transform(self, x: torch.Tensor) -> torch.Tensor:
         """Run inverse transform on feature-last tensors, preserving shape."""
@@ -124,24 +139,23 @@ class Visualizer:
             if not isinstance(batch, (tuple, list)):
                 continue
 
-            if len(batch) == 4:
-                # CSV mode: (x, conditions, meter_id, timestamps)
-                x, _, meter_id, timestamps = batch
-            elif len(batch) == 3:
-                # Common format: (x, meter_id, timestamps)
-                x, meter_id, timestamps = batch
-            elif len(batch) == 2:
-                # Phased format: (x, cond=[B,2,L]) where cond channels can carry ids/time
-                x, cond = batch
-                meter_id = cond[:, 0, 0].long() if torch.is_tensor(cond) and cond.dim() == 3 and cond.shape[1] >= 2 else None
-                timestamps = cond[:, 1, 0].long() if torch.is_tensor(cond) and cond.dim() == 3 and cond.shape[1] >= 2 else None
-            else:
+            x, meter_id, timestamps, _ = self._unpack_batch(batch)
+            if x is None:
                 continue
 
             if meter_id is None:
                 meter_id = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            elif not torch.is_tensor(meter_id):
+                meter_id = torch.as_tensor(np.asarray(meter_id), dtype=torch.long, device=x.device)
+            else:
+                meter_id = meter_id.to(device=x.device, dtype=torch.long)
+
             if timestamps is None:
                 timestamps = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            elif not torch.is_tensor(timestamps):
+                timestamps = torch.as_tensor(np.asarray(timestamps), dtype=torch.long, device=x.device)
+            else:
+                timestamps = timestamps.to(device=x.device, dtype=torch.long)
 
             if first_batch is None:
                 first_batch = (x, meter_id, timestamps)
@@ -473,19 +487,9 @@ class Visualizer:
         self.model.eval()
         with torch.no_grad():
             for batch in test_loader:
-                if isinstance(batch, (tuple, list)) and len(batch) == 4:
-                    x, _, meter_id, timestamps = batch
-                elif isinstance(batch, (tuple, list)) and len(batch) == 3:
-                    x, meter_id, timestamps = batch
-                elif isinstance(batch, (tuple, list)) and len(batch) == 2:
-                    # phased format (x, cond=[B,2,L])
-                    x, cond = batch
-                    meter_id = cond[:, 0, 0].long() if torch.is_tensor(cond) and cond.dim() == 3 and cond.shape[1] >= 2 else None
-                    timestamps = cond[:, 1, 0].long() if torch.is_tensor(cond) and cond.dim() == 3 and cond.shape[1] >= 2 else None
-                else:
-                    x = batch
-                    meter_id, timestamps = None, None
-
+                
+                x, meter_id, timestamps, agg = self._unpack_batch(batch)
+                
                 x = x.to(self.device)
 
                 if self._is_cvae():

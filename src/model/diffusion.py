@@ -11,6 +11,7 @@ import json
 from model.model_utils import *
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
+from model.model import BaseModel
 
 class NoiseScheduler:
     def __init__(
@@ -295,7 +296,7 @@ class ConditionalUNet1D(nn.Module):
         return self.out_conv(h)
 
 
-class DiffusionModel(nn.Module):
+class DiffusionModel(BaseModel):
     def __init__(
         self,
         noise_scheduler,
@@ -306,8 +307,9 @@ class DiffusionModel(nn.Module):
         condition_dropout_prob=0.0,
         reconstruction_noise_fraction=0.3,
         deterministic_reconstruction=True,
+        phased_mode=False,
     ):
-        super().__init__()
+        super().__init__(phased_mode=phased_mode, sequence_length=sequence_length)
         self.noise_scheduler = noise_scheduler
         self.model = model
         self.conditioner = conditioner
@@ -318,7 +320,6 @@ class DiffusionModel(nn.Module):
         self.deterministic_reconstruction = bool(deterministic_reconstruction)
         self.model_kwargs = {}
         self.prior = None
-        self._condition_dim_checked = False
 
         if self.conditioner is None or not hasattr(self.conditioner, "get_conditions"):
             raise ValueError("DiffusionModel requires a conditioner implementing get_conditions().")
@@ -339,30 +340,37 @@ class DiffusionModel(nn.Module):
     def get_optimizer(self, lr=1e-3, weight_decay=1e-4):
         return torch.optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
 
-    def get_tag(self):
-        time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"{self.__class__.__name__}_{self.model.__class__.__name__}_{time_stamp}"
+    def _prepare_provided_conditions(self, provided_conditions, batch_size: int, device: torch.device):
+        """Return valid precomputed conditions [B, C] or None.
 
-    def _validate_condition_dim(self, c: torch.Tensor) -> None:
-        if self._condition_dim_checked:
-            return
-        expected_dim = getattr(getattr(self.model, "cond_proj", None), "in_features", None)
-        if expected_dim is not None and c.shape[-1] != expected_dim:
-            raise ValueError(f"Condition dim mismatch: model expects {expected_dim}, got {c.shape[-1]}")
-        self._condition_dim_checked = True
+        Phased loaders emit 4-tuples as (x, meter_id, timestamps, agg). The
+        final element is aggregate stream data (often [B, 0, L] or [B, 1, L]),
+        not conditioner features. We therefore accept provided conditions only
+        when shape matches the model's expected condition width.
+        """
+        if provided_conditions is None:
+            return None
 
-    def _build_conditions(self, x_phase_first, meter_id=None, timestamps=None, device=None):
-        cond_input = self._build_condition_input(x_phase_first)
-        if meter_id is None and timestamps is None:
-            c = self.conditioner.get_conditions(cond_input)
+        if torch.is_tensor(provided_conditions):
+            c = provided_conditions.to(device=device, dtype=torch.float32, non_blocking=True)
         else:
-            c = self.conditioner.get_conditions(cond_input, meter_id=meter_id, timestamps=timestamps)
+            try:
+                c = torch.as_tensor(provided_conditions, dtype=torch.float32, device=device)
+            except Exception:
+                return None
 
-        c = self.move_to_device(c, device=device)
         if c.dim() == 1:
             c = c.unsqueeze(0)
-        c = c.float()
-        self._validate_condition_dim(c)
+
+        expected_dim = getattr(getattr(self.model, "cond_proj", None), "in_features", None)
+
+        if c.dim() != 2:
+            return None
+        if int(c.shape[0]) != int(batch_size):
+            return None
+        if expected_dim is not None and int(c.shape[1]) != int(expected_dim):
+            return None
+
         return c
 
     def _p_denoise(self, x, c, start_t, temperature=1.0, stochastic=True):
@@ -427,12 +435,14 @@ class DiffusionModel(nn.Module):
             perm = torch.randperm(x_phase_first.size(1), device=x_phase_first.device)
             x_phase_first = x_phase_first[:, perm, :]
 
-        if provided_conditions is not None:
-            c = self.move_to_device(provided_conditions, device=x_phase_first.device).float()
-            if c.dim() == 1:
-                c = c.unsqueeze(0)
-            self._validate_condition_dim(c)
-        else:
+        b_size = x_phase_first.size(0)
+        c = self._prepare_provided_conditions(
+            provided_conditions,
+            batch_size=b_size,
+            device=x_phase_first.device,
+        )
+
+        if c is None:
             c = self._build_conditions(
                 x_phase_first,
                 meter_id=meter_id,
@@ -446,7 +456,6 @@ class DiffusionModel(nn.Module):
         if dropout_prob > 0.0 and self.training and torch.rand(1).item() < dropout_prob:
             c = torch.zeros_like(c)
 
-        b_size = x_phase_first.size(0)
         t = torch.randint(0, self.noise_scheduler.num_timesteps, (b_size,), device=x_phase_first.device)
         noise = torch.randn_like(x_phase_first)
         x_noisy, noise = self.noise_scheduler.add_noise(x_phase_first, t, noise)
@@ -476,12 +485,14 @@ class DiffusionModel(nn.Module):
             x_raw = self.move_to_device(x_raw, device=device).float()
             x_phase_first = self._to_phase_first(x_raw)
 
-            if provided_conditions is not None:
-                c = self.move_to_device(provided_conditions, device=device).float()
-                if c.dim() == 1:
-                    c = c.unsqueeze(0)
-                self._validate_condition_dim(c)
-            else:
+            b_size = x_phase_first.size(0)
+            c = self._prepare_provided_conditions(
+                provided_conditions,
+                batch_size=b_size,
+                device=device,
+            )
+
+            if c is None:
                 c = self._build_conditions(
                     x_phase_first,
                     meter_id=meter_id,
@@ -489,7 +500,6 @@ class DiffusionModel(nn.Module):
                     device=device,
                 )
 
-            b_size = x_phase_first.size(0)
             t = torch.randint(0, self.noise_scheduler.num_timesteps, (b_size,), device=device)
             noise = torch.randn_like(x_phase_first)
 
@@ -692,348 +702,4 @@ class DiffusionModel(nn.Module):
             self.noise_scheduler.load_state_dict(checkpoint["noise_scheduler_state"])
             self.noise_scheduler.to(device)
         self.to(device)
-        return self._load_normalizer_from_checkpoint(checkpoint)
-
-    @staticmethod
-    def _load_normalizer_from_checkpoint(checkpoint):
-        normalizer_state = checkpoint.get("normalizer_state", None)
-        if normalizer_state is None:
-            return None
-        try:
-            from data.normalizer import Normalizer
-
-            normalizer = Normalizer(method=normalizer_state["method"])
-            if "epsilon" in normalizer_state:
-                normalizer.epsilon = normalizer_state["epsilon"]
-            normalizer.zero_id = normalizer_state["zero_id"]
-            normalizer.shift = normalizer_state["shift"]
-            normalizer.non_zero_mean = normalizer_state["non_zero_mean"]
-            normalizer.non_zero_std = normalizer_state["non_zero_std"]
-            normalizer.mean = normalizer_state["mean"]
-            normalizer.std = normalizer_state["std"]
-            normalizer.fitted = True
-            return normalizer
-        except Exception:
-            return None
-
-    def _to_phase_first(self, x: torch.Tensor) -> torch.Tensor:
-        """Return x as [B, F, L], supporting [B, D], [B, F, L], or [B, L, F]."""
-        if x.dim() == 2:
-            if x.shape[1] != self.sequence_length * self.num_features:
-                raise ValueError(
-                    f"Expected flattened input dim {self.sequence_length * self.num_features}, got {x.shape[1]}"
-                )
-            return x.reshape(x.shape[0], self.num_features, self.sequence_length)
-
-        if x.dim() != 3:
-            raise ValueError(f"Expected 2D/3D input, got shape {tuple(x.shape)}")
-
-        if x.shape[1] == self.num_features and x.shape[2] == self.sequence_length:
-            return x
-
-        if x.shape[1] == self.sequence_length and x.shape[2] == self.num_features:
-            return x.transpose(1, 2)
-
-        raise ValueError(
-            f"Could not infer phase/time axes for input shape {tuple(x.shape)} with "
-            f"num_features={self.num_features}, sequence_length={self.sequence_length}"
-        )
-
-    def _build_condition_input(self, x_phase_first: torch.Tensor) -> torch.Tensor:
-        """Convert [B, F, L] -> [B, L, F] for conditioner compatibility."""
-        return x_phase_first.transpose(1, 2)
-
-    def _unpack_batch(self, batch):
-        """Support (x, meter_id, timestamps), (x, cond), (x, meter_id), and (x, c, meter_id, timestamps)."""
-        provided_conditions = None
-        expected_cond_dim = getattr(getattr(self.model, "cond_proj", None), "in_features", None)
-
-        if isinstance(batch, (list, tuple)) and len(batch) == 4:
-            x, second, third, fourth = batch
-            # Regular CSV explicit tuple: (x, c, meter_id, timestamps)
-            if (
-                torch.is_tensor(second)
-                and second.dim() >= 2
-                and expected_cond_dim is not None
-                and int(expected_cond_dim) > 0
-                and second.shape[-1] == int(expected_cond_dim)
-            ):
-                return x, third, fourth, second
-            # Extended eval tuple: (x, meter_id, timestamps, agg)
-            return x, second, third, None
-
-        if isinstance(batch, (list, tuple)) and len(batch) == 3:
-            x, second, third = batch
-            if torch.is_tensor(second) and second.dim() == 3 and second.shape[1] >= 2:
-                meter_id = second[:, 0, 0].long()
-                timestamps = second[:, 1, 0].long()
-                return x, meter_id, timestamps, None
-            return x, second, third, None
-
-        if not isinstance(batch, (list, tuple)) or len(batch) != 2:
-            raise ValueError(
-                "DiffusionModel expects batches as (x, meter_id, timestamps), (x, meter_id), (x, cond), or (x, c, meter_id, timestamps)."
-            )
-
-        x, second = batch
-        meter_id = second
-        timestamps = None
-
-        if torch.is_tensor(second) and second.dim() == 3 and second.shape[1] >= 2:
-            meter_id = second[:, 0, 0].long()
-            timestamps = second[:, 1, 0].long()
-        elif torch.is_tensor(second) and second.dim() == 2:
-            if second.shape[1] >= 2 and not torch.is_floating_point(second):
-                meter_id = second[:, 0].long()
-                timestamps = second[:, 1].long()
-            elif expected_cond_dim is not None and second.shape[1] == expected_cond_dim:
-                provided_conditions = second
-
-        return x, meter_id, timestamps, provided_conditions
-
-    def move_to_device(self, batch, device):
-        if torch.is_tensor(batch):
-            return batch.to(device, non_blocking=True)
-        if isinstance(batch, (list, tuple)):
-            return type(batch)(
-                b.to(device, non_blocking=True) if torch.is_tensor(b) else b
-                for b in batch
-            )
-        if isinstance(batch, dict):
-            return {
-                k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
-                for k, v in batch.items()
-            }
-        return batch
-    
-    def fit(self,
-            trainloader,
-            valloader = None,
-            lr = 1e-3,
-            weight_decay = 1e-4,
-            gradient_clip = None,
-            gradient_clip_kwargs = {"max_norm": 1.0},
-            lr_scheduler = False,
-            lr_scheduler_kwargs = {"step_size": 10, "gamma": 0.9},
-            beta = 1.0,
-            beta_annealing = False,  # Enable cyclical beta annealing to avoid posterior collapse
-            beta_annealing_kwargs = {"n_cycles": 4, "ratio": 0.5},  # kwargs for CyclicalBetaScheduler
-            epochs = 1000,
-            validation_freq = 1,
-            validation_num_samples = 10,
-            device = "cpu", 
-            early_stopping = True,
-            early_stopping_kwargs = {"patience": 10, "min_delta": 0.001},
-            save_epoch_freq = 10,
-            writer = None,
-            log_dir = './models/',
-            model_name = None, # Optionally specify model name for saving
-            normalizer = None,
-            compile_model = False, # Whether to use torch.compile for faster training (PyTorch 2.0+)
-            weighted_loss = 0.0, # Set > 0 to give more weight to samples with higher absolute values, which should help with the sparsity issue in smart meter data
-            **_):
-
-        # === Generate a model tag ===
-        if model_name is None:
-            model_tag = self.get_tag()
-        else:
-            model_tag = model_name
-        os.makedirs(log_dir, exist_ok=True)
-        model_save_path = os.path.join(log_dir, model_tag)
-
-        # === Take Kwarg Inputs ===
-        fit_kwargs = dict(locals())
-        for key in ["self", "trainloader", "valloader", "writer", "_"]:
-            fit_kwargs.pop(key, None)
-        self.model_kwargs.update(fit_kwargs)
-        self.model_kwargs['model_tag'] = model_tag
-        
-        # === Save training configuration ===        
-       
-        log_dir_tagged = os.path.join(log_dir, model_tag)   # <-- move here
-        # === Initialize TensorBoard writer ===
-        if writer is None:
-            log_dir_tagged = os.path.join(log_dir, model_tag)
-            writer = Writer(log_dir=log_dir_tagged)
-            print(f"Writer logging to: {log_dir_tagged}")
-            # Log configuration to Writer
-            writer.add_text('Config/model_tag', model_tag, 0)
-        
-
-        # === Setup Optimizer and Scheduler ===
-        optim = self.get_optimizer(lr=lr, weight_decay=weight_decay)
-        if lr_scheduler:
-            # TODO: Mostly for transformers
-            # 1. Grab total epochs from kwargs (default to 20 if not provided)
-            total_epochs = lr_scheduler_kwargs.get("total_epochs", 100)
-            warmup_epochs = 5 # Wake the transformer up gently over 5 epochs
-
-            # 2. Phase 1: Warmup (Start at 1% of max LR, linearly scale to 100%)
-            warmup_scheduler = LinearLR(
-                optim, 
-                start_factor=0.01, 
-                end_factor=1.0, 
-                total_iters=warmup_epochs
-            )
-
-            # 3. Phase 2: Cosine Decay (Smoothly curve the LR down to near zero for the remaining epochs)
-            decay_scheduler = CosineAnnealingLR(
-                optim, 
-                T_max=(total_epochs - warmup_epochs), 
-                eta_min=1e-6
-            )
-
-            # 4. Chain them together
-            scheduler = SequentialLR(
-                optim, 
-                schedulers=[warmup_scheduler, decay_scheduler], 
-                milestones=[warmup_epochs]
-            )
-        
-        if next(self.parameters()).device != torch.device(device):
-            self.to(device)
-        
-        if early_stopping:
-            earlystopping = EarlyStopping(**early_stopping_kwargs)
-        
-        # === Training Loop ===
-        self.train()
-        global_step = 0
-        best_val_loss = float('inf')
-        best_epoch = 0
-
-        for epoch in range(epochs):
-            epoch_train_loss = 0.0
-            epoch_train_recon = 0.0
-            epoch_train_kl = 0.0
-            num_batches = 0
-
-            for batch in trainloader:
-                global_step += 1
-
-                batch = self.move_to_device(batch, device)
-
-                loss_dict = self.train_core(
-                    batch, 
-                    optim, 
-                    gradient_clip=gradient_clip, 
-                    gradient_clip_kwargs=gradient_clip_kwargs,
-                    weighted_loss=weighted_loss,
-                )
-                
-                # Accumulate epoch losses
-                epoch_train_loss += loss_dict["loss"].item()
-                epoch_train_recon += loss_dict["recon_loglikelihood"].item()
-                epoch_train_kl += loss_dict["kl_divergence"].item()
-                num_batches += 1
-                
-                # Log training metrics per iteration
-                writer.add_scalar('train_loss', loss_dict["loss"].item(), global_step)
-                writer.add_scalar('train_recon_loglikelihood', loss_dict["recon_loglikelihood"].item(), global_step)
-                writer.add_scalar('train_kl_divergence', loss_dict["kl_divergence"].item(), global_step)
-
-            # Compute average epoch losses
-            avg_train_loss = epoch_train_loss / num_batches
-            avg_train_recon = epoch_train_recon / num_batches
-            avg_train_kl = epoch_train_kl / num_batches
-            
-            # Log epoch-level training metrics
-            writer.add_scalar('train_loss_epoch', avg_train_loss, epoch)
-            writer.add_scalar('train_recon_loglikelihood_epoch', avg_train_recon, epoch)
-            writer.add_scalar('train_kl_divergence_epoch', avg_train_kl, epoch)
-            
-            # Log learning rate
-            current_lr = optim.param_groups[0]['lr']
-            writer.add_scalar('train_learning_rate', current_lr, epoch)
-
-            # === Validation Phase ===
-            val_loss_dict = None
-            if valloader is not None and ((epoch + 1) % validation_freq == 0):
-                val_loss_dict = self.validate(valloader, num_samples=validation_num_samples, device=device)
-                
-                # Log validation metrics
-                writer.add_scalar('val_loss_epoch', val_loss_dict["loss"], epoch)
-                writer.add_scalar('val_recon_loglikelihood_epoch', val_loss_dict["recon_loglikelihood"], epoch)
-                writer.add_scalar('val_kl_divergence_epoch', val_loss_dict["kl_divergence"], epoch)
-
-                
-                 # === Save Best Model ===
-                if val_loss_dict["loss"] < best_val_loss:
-                    best_val_loss = val_loss_dict["loss"]
-                    best_epoch = epoch
-                    best_model_path = os.path.join(log_dir_tagged, f"{model_tag}_best.pt")
-                    self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_best", device=device, normalizer=normalizer)
-                    print(f"    New best model saved (Val Loss: {best_val_loss:.4f})")
-
-                # Print progress
-                print(f"Epoch [{epoch+1:4d}/{epochs}] "
-                      f"Train Loss: {avg_train_loss:.4f} | "
-                      f"Val Loss: {val_loss_dict['loss']:.4f} | "
-                      f"LR: {current_lr:.2e} | "
-                      f"Best: {best_val_loss:.4f}@{best_epoch+1}")
-
-                # Early stopping check
-                if early_stopping:
-                    is_best = earlystopping(val_metric=val_loss_dict["loss"],train_metric=avg_train_loss, epoch=epoch)
-                    if earlystopping.early_stop:
-                        print(f"\n{'='*60}")
-                        print(f"Early stopping triggered at epoch {epoch+1}")
-                        print(f"Best model at epoch {best_epoch+1} with Val Loss: {best_val_loss:.4f}")
-                        print(f"{'='*60}\n")
-                        writer.add_text('Training/early_stop', 
-                                      f'Stopped at epoch {epoch+1}, Best: {best_epoch+1}', epoch)
-                        break
-            else:
-                # No validation - just print training progress
-                print(f"Epoch [{epoch+1:4d}/{epochs}] "
-                      f"Train Loss: {avg_train_loss:.4f} | "
-                      f"Recon: {avg_train_recon:.4f} | "
-                      f"KL: {avg_train_kl:.4f} | "
-                      f"LR: {current_lr:.2e}")
-                
-            # === Learning Rate Scheduler Step ===
-            if lr_scheduler:
-                scheduler.step()
-            
-            # Save Model Checkpoint
-            if (epoch + 1) % save_epoch_freq == 0:
-                checkpoint_path = os.path.join(log_dir_tagged, f"{model_tag}_epoch_{epoch+1}.pt")
-                self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_epoch_{epoch+1}", device=device, normalizer=normalizer)
-                print(f"    Checkpoint saved: epoch_{epoch+1}")
-        
-        # === Training Complete ===
-        print(f"\n{'='*60}")
-        print(f"Training complete: {model_tag}")
-        print(f"Best model: Epoch {best_epoch+1} with Val Loss: {best_val_loss:.4f}")
-        print(f"Model saved to: {os.path.join(log_dir_tagged, model_tag)}")
-        print(f"{'='*60}\n")
-
-        final_model_path = os.path.join(log_dir_tagged, f"{model_tag}_final.pt")
-        self.to("cpu")
-        self.save_model(save_path=log_dir_tagged, model_name=f"{model_tag}_final", device="cpu", normalizer=normalizer)
-        # Restore model to the training device so it's ready for inference after fit() returns
-        self.to(device)
-        # Save training summary
-        summary = {
-            'model_tag': model_tag,
-            'total_epochs': epoch + 1,
-            'best_epoch': best_epoch + 1,
-            'best_val_loss': best_val_loss,
-            'final_train_loss': avg_train_loss,
-            'early_stopped': early_stopping and earlystopping.early_stop,
-        }
-        summary_path = os.path.join(log_dir_tagged, f"{model_tag}_summary.json")
-        with open(summary_path, 'w') as f:
-            json.dump(summary, f, indent=4)
-
-        # Log final summary to TensorBoard
-        summary_text = "\n".join([f"{k}: {v}" for k, v in summary.items()])
-        writer.add_text('Training/summary', summary_text, epoch)
-        
-        self.eval()
-        
-        # Close writer
-        if writer is not None:
-            writer.close()
-            print(f"Writter logs saved to: {log_dir_tagged}")
-        return model_tag, writer
+        return checkpoint

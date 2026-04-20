@@ -55,6 +55,7 @@ class AutoRegressiveTransformerVAE(CVAE):
             distribution_dict=distribution_dict,
             prior_type=prior_type,
             hierarchy_config=hierarchy_config,
+            sequence_length=sequence_length,
             **kwargs,
         )
         self.sequence_length = int(sequence_length)
@@ -130,7 +131,7 @@ class AutoRegressiveTransformerVAE(CVAE):
                    **_):
         self.train()
 
-        x, meter_id, timestamps = self._unpack_batch(batch)
+        x, meter_id, timestamps, agg = self._unpack_batch(batch)
         x_phase_first = self._to_phase_first(x).float()
 
         # ==========================
@@ -331,68 +332,3 @@ class AutoRegressiveTransformerVAE(CVAE):
         samples = torch.stack(samples_per_prior, dim=1)
         self.to(original_device)
         return samples
-
-    def _to_phase_first(self, x: torch.Tensor) -> torch.Tensor:
-        """Return `x` as [B, F, L], supporting [B, D], [B, F, L], or [B, L, F]."""
-        if x.dim() == 2:
-            if x.shape[1] != self.sequence_length * self.num_features:
-                raise ValueError(
-                    f"Expected flattened input dim {self.sequence_length * self.num_features}, got {x.shape[1]}"
-                )
-            return x.reshape(x.shape[0], self.num_features, self.sequence_length)
-
-        if x.dim() != 3:
-            raise ValueError(f"Expected 2D/3D input, got shape {tuple(x.shape)}")
-
-        # [B, F, L]
-        if x.shape[1] == self.num_features and x.shape[2] == self.sequence_length:
-            return x
-
-        # [B, L, F] -> [B, F, L]
-        if x.shape[1] == self.sequence_length and x.shape[2] == self.num_features:
-            return x.transpose(1, 2)
-
-        raise ValueError(
-            f"Could not infer phase/time axes for input shape {tuple(x.shape)} with "
-            f"num_features={self.num_features}, sequence_length={self.sequence_length}"
-        ) 
-    def _build_condition_input(self, x_phase_first: torch.Tensor) -> torch.Tensor:
-        """Convert [B, F, L] -> [B, L, F] for conditioner compatibility."""
-        return x_phase_first.transpose(1, 2)
-    def _unpack_batch(self, batch):
-        """ Unpack batch supporting (x, meter_id, timestamps), (x, cond), or (x, meter_id) formats. """
-        if len(batch) == 4:
-            x, second, third, fourth = batch
-            # Regular CSV dataloader: (x, c, meter_id, timestamps)
-            if torch.is_tensor(second) and second.dim() >= 2:
-                return x, third, fourth
-            # Eval/extended tuple: (x, meter_id, timestamps, agg)
-            return x, second, third
-
-        if len(batch) == 3:
-            x, second, third = batch
-            if torch.is_tensor(second) and second.dim() == 3 and second.shape[1] >= 2:
-                meter_id = second[:, 0, 0].long()
-                timestamps = second[:, 1, 0].long()
-                return x, meter_id, timestamps
-
-            return x, second, third
-
-        if len(batch) != 2:
-            raise ValueError("ART expects batches as (x, meter_id, timestamps), (x, meter_id), or (x, cond)")
-
-        x, second = batch
-        meter_id = second
-        timestamps = None
-
-        if torch.is_tensor(second) and second.dim() == 3 and second.shape[1] >= 2:
-            # phased dataloader format: cond=[B, 2, L]
-            meter_id = second[:, 0, 0].long()
-            timestamps = second[:, 1, 0].long()
-        elif torch.is_tensor(second) and second.dim() == 2 and second.shape[1] >= 2:
-            # fallback packed format: [B, 2]
-            meter_id = second[:, 0].long()
-            timestamps = second[:, 1].long()
-
-        return x, meter_id, timestamps
-

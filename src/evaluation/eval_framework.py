@@ -369,7 +369,21 @@ class EvalFramework:
             except Exception:
                 return x
         return x
+    def _unpack_batch(self, batch):
+        """Strict unpack contract: (x, meter_id, timestamps, agg)."""
+        if not isinstance(batch, (list, tuple)) or len(batch) != 4:
+            raise ValueError(
+                "Expected batch as a 4-tuple: (x, meter_id, timestamps, agg)."
+            )
 
+        x, meter_id, timestamps, agg = batch
+
+        if torch.is_tensor(meter_id):
+            meter_id = meter_id.long()
+        if torch.is_tensor(timestamps):
+            timestamps = timestamps.long()
+
+        return x, meter_id, timestamps, agg
     def _flatten_for_metrics(self, x: torch.Tensor) -> torch.Tensor:
         """Flatten in the same order used during training when possible."""
         if x.dim() == 3:
@@ -449,26 +463,15 @@ class EvalFramework:
         self.model.eval()
         with torch.no_grad():
             for batch in self.dataloader:
-                if len(batch) == 4:
-                    data, c, meter_ids, timestamps = batch
-                elif len(batch) == 3:
-                    data, meter_ids, timestamps = batch
-                    c = None
-                elif len(batch) == 2:
-                    data, meter_ids = batch
-                    timestamps = None
-                    c = None
-                else:
-                    data = batch[0] if isinstance(batch, (list, tuple)) else batch
-                    meter_ids = None
-                    timestamps = None
-                    c = None
+                data, meter_ids, timestamps, agg = self._unpack_batch(batch)
                 
                 data = data.to(self.device)
                 if self._is_cvae():
                     cond_input = self._prepare_condition_input(data)
-                    if c is None or (hasattr(c, 'numel') and c.numel() == 0) or (hasattr(self.model, 'condition_dim') and c.shape[-1] != self.model.condition_dim):
-                        c = self.conditioner.get_conditions(cond_input, meter_id=meter_ids, timestamps=timestamps)
+                    
+                    c = self.conditioner.get_conditions(cond_input, meter_id=meter_ids, timestamps=timestamps)
+                    if isinstance(c, np.ndarray):
+                        c = torch.tensor(c, dtype=torch.float32)
                     c = c.to(self.device)
                     condition_batches.append(c.cpu())
 
@@ -479,11 +482,15 @@ class EvalFramework:
                 real_batches.append(x_flat.cpu().numpy())
 
                 if timestamps is not None:
-                    # timestamp_batches.append(timestamps.cpu().numpy())
-                    timestamp_batches.append(np.asarray(timestamps.cpu().numpy()).reshape(-1))
+                    if isinstance(timestamps, torch.Tensor):
+                        timestamp_batches.append(np.asarray(timestamps.detach().cpu().numpy()).reshape(-1))
+                    else:
+                        timestamp_batches.append(np.asarray(timestamps).reshape(-1))
                 if meter_ids is not None:
-                    # meter_id_batches.append(meter_ids.cpu().numpy())
-                    meter_id_batches.append(np.asarray(meter_ids.cpu().numpy()).reshape(-1))
+                    if isinstance(meter_ids, torch.Tensor):
+                        meter_id_batches.append(np.asarray(meter_ids.detach().cpu().numpy()).reshape(-1))
+                    else:
+                        meter_id_batches.append(np.asarray(meter_ids).reshape(-1))
 
                 recon = self._reconstruct(data, meter_id=meter_ids, timestamps=timestamps)
                 recon_batches.append(recon.cpu().numpy())
