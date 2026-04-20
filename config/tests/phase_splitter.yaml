@@ -20,7 +20,7 @@ data:
   #data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
   # data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
-  data_dir: "../../../../groups/3phaseinsight/code/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
+  data_dir: "../../SchoolLocal/"
 
 
   # CSV filename to load
