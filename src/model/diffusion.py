@@ -566,7 +566,6 @@ class DiffusionModel(BaseModel):
             )
 
         samples = torch.stack(samples_per_x, dim=1)
-        samples = torch.clamp(samples, 0.0, 8.0)
         self.to(original_device)
         if legacy_mode:
             return samples[:, 0]
