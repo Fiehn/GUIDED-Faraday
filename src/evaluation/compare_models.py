@@ -1,152 +1,80 @@
-import argparse
-import json
-import os
-import random
-import sys
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 
-# Add project root to path for imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+import os
+import sys
+import torch
+import random
+import json
+import numpy as np
+from pathlib import Path
+
+# Add project roots for imports
+CURRENT_DIR = Path(__file__).resolve().parent
+SRC_DIR = CURRENT_DIR.parent
+ROOT_DIR = SRC_DIR.parent
+
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from src.evaluation.load_model import load_model
+from src.train import _load_train_config
+from src.data.dataloader_phased import PhasedReplayDataloaders, WindowSpec
+from src.evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
 from src.visualization.plot_styling import PlotStyle
 
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 try:
     from tabulate import tabulate
 except ImportError:
+    # Fallback if tabulate is not installed
     def tabulate(data, headers="keys", **kwargs):
         return str(data)
 
-
-DEFAULT_EVAL_DIRS = [
-    "models/SetGuideVAE_DictionaryCoder_20260402_211036",
-    "models/SetGuideVAE_DictionaryCoder_20260402_220630",
-    "models/SetGuideVAE_DictionaryCoder_20260403_110047",
-    "models/SetGuideVAE_DictionaryCoder_20260403_120423",
-    "models/SetGuideVAE_DictionaryCoder_20260403_123341",
-    "models/SetGuideVAE_DictionaryCoder_20260403_134100",
-]
-
-DEFAULT_MODEL_NAMES = [
-    "Agg. loss (SAB) (CNN) (ABL)",
-    "Agg. loss (SAB) (CNN) (No ABL)",
-    "Agg. loss (SAB) (CNN) (No ABL) (VAMP)",
-    "Agg. loss (ISAB) (CNN) (No ABL)",
-    "Agg. loss (ISAB) (CNN) (ABL)",
-    "Agg. loss (ISAB) (CNN) (No ABL) (Condition Dropout)",
-    "Sanity check (ISAB) (CNN) (No ABL) (beta=0)",
-]
-
-DEFAULT_MODEL_CONFIG_FILE = "training_config_used.yaml"
-
-
-def _resolve_shared_eval_config_for_model(model_dir: str, shared_eval_config: str | None) -> str:
-    """Resolve config path for shared reruns."""
-    if shared_eval_config and shared_eval_config.lower() != "auto":
-        return shared_eval_config
-
-    model_config = os.path.join(model_dir, DEFAULT_MODEL_CONFIG_FILE)
-    if os.path.exists(model_config):
-        return model_config
-
-    raise FileNotFoundError(
-        f"Missing model config: {model_config}. "
-        "Pass --shared_eval_config to use a global fallback config path."
-    )
-
-
-def rerun_shared_evaluation(
-    eval_dirs,
-    *,
-    config_path: str | None,
-    device: str,
-    max_files: int | None,
-    seed: int,
-    output_subdir: str,
-    include_visualizations: bool,
-    continue_on_error: bool,
-):
-    """Re-run phased evaluation for each model on one strict shared data plan."""
-    import torch
-    from src.evaluation.load_checkpoint import run_checkpoint_evaluation, resolve_shared_eval_plan
-
-    if not eval_dirs:
-        return []
-
-    # Strict shared-data mode: one reference config defines the exact data pool and cache settings.
-    shared_config_path = _resolve_shared_eval_config_for_model(eval_dirs[0], config_path)
-    shared_plan = resolve_shared_eval_plan(
-        config_path=shared_config_path,
-        max_files=max_files,
-        seed=seed,
-    )
-    shared_parquet_paths = shared_plan["parquet_paths"]
-    print(
-        "Strict shared-data mode enabled: "
-        f"config={shared_plan['config_path']}, files={len(shared_parquet_paths)}, "
-        f"batch_size={shared_plan['batch_size']}, eval_batches={shared_plan['eval_batches']}"
-    )
-
-    refreshed_eval_dirs = []
-    for model_dir in eval_dirs:
-        target_eval_dir = os.path.join(model_dir, output_subdir)
-        print(
-            f"Running shared-data eval for {model_dir} -> {target_eval_dir} "
-            f"(config={shared_plan['config_path']}, seed={seed}, strict_shared_files={len(shared_parquet_paths)})"
-        )
-
-        # Keep randomization stable across models so all runs sample from the same slice policy.
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-
-        try:
-            run_checkpoint_evaluation(
-                checkpoint_path=model_dir,
-                config_path=shared_plan["config_path"],
-                device=device,
-                max_files=None,
-                include_visualization=include_visualizations,
-                output_dir=target_eval_dir,
-                shared_parquet_paths=shared_parquet_paths,
-                strict_shared_eval=True,
-                eval_seed=seed,
-                override_batch_size=shared_plan["batch_size"],
-                override_eval_batches=shared_plan["eval_batches"],
-                override_min_buffer_size=shared_plan["min_buffer_size"],
-                override_replay_buffer_capacity=shared_plan["replay_buffer_capacity"],
-            )
-            refreshed_eval_dirs.append(os.path.normpath(target_eval_dir))
-        except Exception as exc:
-            if continue_on_error:
-                print(f"Warning: shared-data eval failed for {model_dir}: {exc}")
-                continue
-            raise
-
-    return refreshed_eval_dirs
-
 class PhasedModelComparator:
-    """Class to compare evaluation results across multiple phased models."""
+    """Class to compare evaluation results across multiple phased and unphased models."""
 
-    def __init__(self, output_dir: str = "evaluation_comparison_phased"):
+    def __init__(self, output_dir: str = "evaluation_comparison"):
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         self.models_data = {}
-        self.phases = ['aggregated_phase', 'ranked_phase_1', 'ranked_phase_2', 'ranked_phase_3']
+        # We define a superset of possible phases.
+        self.phases = ['full_eval', 'aggregated_phase', 'ranked_phase_1', 'ranked_phase_2', 'ranked_phase_3']
 
     def add_model(self, model_name: str, model_eval_dir: str):
-        """Add a model's phased evaluation results to the comparator."""
+        """Add a model's evaluation results to the comparator, handling both phased and unphased output."""
         self.models_data[model_name] = {}
-        for phase in self.phases:
+        
+        # 1. Check for phased results in subdirectories
+        found_phased = False
+        for phase in ['aggregated_phase', 'ranked_phase_1', 'ranked_phase_2', 'ranked_phase_3']:
             eval_json_path = os.path.join(model_eval_dir, f"{phase}_eval", "eval_results.json")
-            if not os.path.exists(eval_json_path):
-                 print(f"File not found: {eval_json_path}")
-                 continue
-            
-            with open(eval_json_path, 'r') as f:
-                data = json.load(f)
-            
-            self.models_data[model_name][phase] = data
+            if os.path.exists(eval_json_path):
+                try:
+                    with open(eval_json_path, 'r') as f:
+                        data = json.load(f)
+                    self.models_data[model_name][phase] = data
+                    found_phased = True
+                except Exception as e:
+                    print(f"Error loading {eval_json_path}: {e}")
+        
+        # 2. Check for unphased results at root (either EvalFramework or PhasedEvaluationSuite summary)
+            root_eval_path = os.path.join(model_eval_dir, "eval_results.json")
+            if os.path.exists(root_eval_path):
+                try:
+                    with open(root_eval_path, 'r') as f:
+                        data = json.load(f)
+                    
+                    # If it's a simple flat dict (from EvalFramework), add it as 'full_eval'
+                    if not any(k in data for k in ['aggregated_phase', 'ranked_phases']):
+                        self.models_data[model_name]['full_eval'] = data
+                except Exception as e:
+                    print(f"Error loading {root_eval_path}: {e}")
+        
+        if not self.models_data[model_name]:
+            print(f"No valid evaluation results found in {model_eval_dir} for model {model_name}")
 
     def compare(self):
         """Generate comparison tables and plots for each phase."""
@@ -155,12 +83,18 @@ class PhasedModelComparator:
             return
 
         for phase in self.phases:
-            # Check if we have data for this phase
-            has_data = any(phase in self.models_data[m] for m in self.models_data)
-            if has_data:
+            # Only show a phase in the comparison if ALL loaded models have data for it.
+            # This prevents partial 'N/A' columns from appearing when one model ran in
+            # unphased mode and another in phased mode.
+            models_with_phase = [m for m in self.models_data if phase in self.models_data[m]]
+            if models_with_phase and len(models_with_phase) == len(self.models_data):
+                print(f"\n--- Comparing models for phase: {phase} ---")
                 self._compute_averages(phase)
                 self._generate_table(phase)
                 self._generate_plots(phase)
+            elif models_with_phase:
+                missing = [m for m in self.models_data if phase not in self.models_data[m]]
+                print(f"\n[Skipping phase '{phase}': missing for models {missing}]")
 
     def _compute_averages(self, phase: str):
         """Compute normalized min-max average scores for reconstruction and synthetic metrics."""
@@ -376,7 +310,7 @@ class PhasedModelComparator:
             ax.set_xticks([]) # Remove x-axis tick completely for cleaner look
             ax.grid(axis='y', linestyle='--', alpha=0.7)
             
-        # Create a custom legend so we can include the "Best Value" marker style
+        # Create a custom legend
         legend_handles = [mpatches.Patch(color=plot_style.get_color(i), label=model) for i, model in enumerate(models)]
         legend_handles.append(mpatches.Patch(facecolor='white', edgecolor='black', hatch='///', label='★ Best Value'))
         
@@ -397,105 +331,152 @@ class PhasedModelComparator:
         print(f"Plots saved to {plot_path}")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compare evaluations between different phased models.")
-    parser.add_argument("--eval_dirs", nargs='+', required=False, help="List of paths to directories containing phased eval results.")
-    parser.add_argument("--names", nargs='+', required=False, help="List of model names corresponding to the eval dirs.")
-    parser.add_argument("--output_dir", type=str, default="evaluation_comparison_phased", help="Directory to save the comparison plots and table.")
-    parser.add_argument(
-        "--rerun_shared_eval",
-        action="store_true",
-        help="Re-run phased evaluation for each model on shared data before comparison.",
-    )
-    parser.add_argument(
-        "--shared_eval_config",
-        type=str,
-        default="auto",
-        help=(
-            "Config used for shared-data reruns. "
-            "Default 'auto' uses training_config_used.yaml from the first model in --eval_dirs as the shared reference."
-        ),
-    )
-    parser.add_argument(
-        "--shared_eval_device",
-        type=str,
-        default="auto",
-        choices=["auto", "cpu", "cuda"],
-        help="Device used for shared-data reruns.",
-    )
-    parser.add_argument(
-        "--shared_eval_max_files",
-        type=int,
-        default=None,
-        help="Optional cap on number of parquet files used during shared-data reruns.",
-    )
-    parser.add_argument(
-        "--shared_eval_seed",
-        type=int,
-        default=42,
-        help="Random seed used before each shared-data rerun.",
-    )
-    parser.add_argument(
-        "--shared_eval_output_subdir",
-        type=str,
-        default="shared_eval",
-        help="Subdirectory inside each model dir where shared-data rerun outputs are written.",
-    )
-    parser.add_argument(
-        "--shared_eval_include_visualizations",
-        action="store_true",
-        help="Also run visualization generation during shared-data reruns.",
-    )
-    parser.add_argument(
-        "--continue_on_eval_error",
-        action="store_true",
-        help="Continue comparing remaining models when a shared-data rerun fails for one model.",
-    )
+def get_eval_files(data_dir: str, data_files: list[str] | None = None):
+    """
+    Simplified file discovery: if data_files is None, 
+    grab all .parquet files in data_dir that don't start with 'test_'.
+    """
+    if data_files is not None and len(data_files) > 0:
+        # Ensure absolute paths
+        return [os.path.join(data_dir, f) if not os.path.isabs(f) else f for f in data_files]
     
-    args = parser.parse_args()
+    if not os.path.exists(data_dir):
+        raise FileNotFoundError(f"Data directory {data_dir} does not exist.")
 
-    if not args.eval_dirs:
-        args.eval_dirs = list(DEFAULT_EVAL_DIRS)
-    if not args.names:
-        args.names = list(DEFAULT_MODEL_NAMES)
+    discovered = []
+    for root, _, files in os.walk(data_dir):
+        for f in files:
+            if f.endswith(".parquet") and not f.startswith("test_"):
+                discovered.append(os.path.join(root, f))
+    
+    if not discovered:
+        raise FileNotFoundError(f"No .parquet files (not starting with 'test_') found in {data_dir}")
+        
+    # randomly shuffle available files:
+    random.shuffle(discovered)
+    return discovered
 
-    if len(args.eval_dirs) != len(args.names):
-        print("Error: The number of evaluation directories must match the number of model names.")
-        exit(1)
+def compare_models(model_paths: list[str], 
+                   model_names: list[str], 
+                   secondary_model_paths: list[str] | None = None,
+                   data_dir: str = "data/_parquet_cache",
+                   data_files: list[str] | None = None,
+                   num_samples: int = 100,
+                   seed: int = 42,
+                   output_dir: str = "evaluation_comparison",
+                   phased: bool = False,
+                   agg_divisor = 1000.0,
+                   is_agg = True,
+                   ):
+    """
+    Run evaluation for multiple models and compare results.
+    Can handle both phased and unphased models.
+    """
 
-    eval_dirs_to_compare = list(args.eval_dirs)
-    if args.rerun_shared_eval:
-        eval_dirs_to_compare = rerun_shared_evaluation(
-            eval_dirs=eval_dirs_to_compare,
-            config_path=args.shared_eval_config,
-            device=args.shared_eval_device,
-            max_files=args.shared_eval_max_files,
-            seed=args.shared_eval_seed,
-            output_subdir=args.shared_eval_output_subdir,
-            include_visualizations=args.shared_eval_include_visualizations,
-            continue_on_error=args.continue_on_eval_error,
+    # 1. Prepare evaluation data
+    if data_files is None:
+        data_files = get_eval_files(data_dir)
+    
+    # 4. Loop through models and evaluate
+    for i, (path, name) in enumerate(zip(model_paths, model_names)):
+        print(f"\nEvaluating model: {name}")
+        model, normalizer, conditioner = load_model(path, device="cuda")
+        
+        # reloading with the same seed each model
+        random.seed(seed)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+        # 2. Load Data
+        window = WindowSpec(input_len=24, stride=24)
+        loader_obj = PhasedReplayDataloaders(
+            sm_files=data_files,
+            window_spec=window,
+            batch_size=32,
+            replay_buffer_capacity=1000,
+            min_buffer_size=0,
+            normalizer=normalizer,
+            num_workers=0,
+            phased_mode=phased,
+            sample_random=True,
+            feature_cols=["hourly_energy_consumption",],
+            meter_col = "meter_number",
+            aggregation_divisor=agg_divisor,
+            hourly_aggregation=True if agg_divisor > 1.0 else False
         )
+        
+        # 3. Grab a fixed number of samples for evaluation
+        n_batches = max(1, num_samples // 32)
+        loader_obj.refresh_eval_cache(n_batches)
+        test_loader = loader_obj.get_eval_loader()
+        
+        sec_model = None
+        if secondary_model_paths is not None and i < len(secondary_model_paths):
+            if secondary_model_paths[i] is not None:
+                sec_model, _, _ = load_model(secondary_model_paths[i], device="cuda")
+        
+        model_output_dir = os.path.join(output_dir, name)
+        os.makedirs(model_output_dir, exist_ok=True)
 
-        if len(eval_dirs_to_compare) != len(args.names):
-            if args.continue_on_eval_error:
-                successful_dirs = {os.path.normpath(p) for p in eval_dirs_to_compare}
-                successful_pairs = [
-                    (name, os.path.normpath(os.path.join(src_dir, args.shared_eval_output_subdir)))
-                    for name, src_dir in zip(args.names, args.eval_dirs)
-                    if os.path.normpath(os.path.join(src_dir, args.shared_eval_output_subdir)) in successful_dirs
-                ]
-                if not successful_pairs:
-                    print("Error: No shared-data reruns succeeded. Nothing to compare.")
-                    exit(1)
-                args.names = [name for name, _ in successful_pairs]
-                eval_dirs_to_compare = [path for _, path in successful_pairs]
-            else:
-                print("Error: Shared-data rerun failed for at least one model. Use --continue_on_eval_error to continue.")
-                exit(1)
-        
-    comparator = PhasedModelComparator(args.output_dir)
+        if phased:
+            # Phased models use PhasedEvaluationSuite which creates sub-phase directories
+            evaluator = PhasedEvaluationSuite(
+                model=model,
+                dataloader=test_loader,
+                normalizer=normalizer,
+                conditioner=conditioner,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                window_size=window.input_len,
+                output_path=model_output_dir,
+                secondary_model=sec_model
+            )
+            evaluator.evaluate()
+        else:
+            # Unphased models use EvalFramework directly
+            evaluator = EvalFramework(
+                model=model,
+                dataloader=test_loader,
+                normalizer=normalizer,
+                conditioner=conditioner,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                window_size=window.input_len,
+                output_path=os.path.join(model_output_dir, "eval_results.json"),
+                secondary_model=sec_model
+            )
+            evaluator.register_all(phased=False)
+            evaluator.evaluate()
+            evaluator.save_results(os.path.join(model_output_dir, "eval_results.json"))
     
-    for name, path in zip(args.names, eval_dirs_to_compare):
-        comparator.add_model(name, path)
-        
+    # 5. Use PhasedModelComparator to generate comparison tables and plots
+    print("\n" + "="*50)
+    print("GENERATING COMPARISON")
+    print("="*50)
+    
+    comparator = PhasedModelComparator(output_dir=output_dir)
+    for name in model_names:
+        comparator.add_model(name, os.path.join(output_dir, name))
+    
     comparator.compare()
+    
+    print("\nComparison complete. Results saved to:", output_dir)
+    return comparator.models_data
+
+if __name__ == "__main__":
+    model_paths = [
+        "models/SetGuideVAE_20260422_143202",
+        "models/DiffusionModel_20260422_162452"
+    ]
+    model_names = [
+        "Set-guide",
+        "Diffusion"
+    ]
+    secondary_model_paths = [
+        None,
+        None,
+    ]
+    data_dir = "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+    compare_models(model_paths, 
+                   model_names, 
+                   secondary_model_paths, 
+                   data_dir=data_dir, 
+                   phased=True)

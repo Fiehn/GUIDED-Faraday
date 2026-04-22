@@ -25,7 +25,4 @@ topology/
 output/
 slurmjobs/outputs/
 
-!src/data/
-!src/data/*.py
-!src/models/
-!src/models/*.py
+evaluation_comparison/*

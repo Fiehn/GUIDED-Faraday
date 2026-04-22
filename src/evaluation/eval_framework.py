@@ -296,6 +296,7 @@ class EvalFramework:
         verbose: bool = False,
         include_mean_baseline: bool = True,
         baseline_reference_data: np.ndarray = None,
+        secondary_model: nn.Module = None,
     ):
         """Initialize evaluation framework.
         
@@ -312,7 +313,7 @@ class EvalFramework:
         self.conditioner = conditioner
         self.device = device
 
-        self.generator = SyntheticGenerator(model, conditioner, normalizer, device)
+        self.generator = SyntheticGenerator(model, conditioner, normalizer, secondary_model, device)
 
         self.window_size = window_size
         self.n_synthetic_samples = n_synthetic_samples
@@ -422,24 +423,44 @@ class EvalFramework:
             return x
 
         inv = self.normalizer.inverse_transform
-        feature_dim = self._normalizer_feature_dim()
-
+        
+        # 1. Handle 2D tensors [B, D]
         if x.dim() == 2:
+            # For 2D tensors, we need to know if they are already flattened.
+            # If so, they must be unflattened to apply normalization correctly to phases.
+            seq_len = int(getattr(self.model, 'sequence_length', 0) or 0)
+            n_feat = int(getattr(self.model, 'num_features', 0) or 0)
+            
+            if seq_len > 0 and n_feat > 0 and x.shape[1] == seq_len * n_feat:
+                # Assume time-first flattening for unflattening [B, L, F]
+                # (This is consistent with how we handle recon in _reconstruct)
+                x_3d = x.reshape(-1, seq_len, n_feat)
+                y_3d = self._inverse_transform_for_metrics(x_3d)
+                return y_3d.reshape_as(x)
+            
+            # Fallback for other 2D tensors
             return inv(x)
 
+        # 2. Handle 3D tensors
         if x.dim() != 3:
             return inv(x)
 
-        if feature_dim is not None and x.shape[-1] == feature_dim:
+        feature_dim = self._normalizer_feature_dim()
+        if feature_dim is None:
+             return inv(x)
+
+        # Case [B, L, F]: Features are the last dimension
+        if x.shape[-1] == feature_dim and x.shape[1] != feature_dim:
             return inv(x.reshape(-1, feature_dim)).reshape_as(x)
 
-        if feature_dim is not None and x.shape[1] == feature_dim:
-            x_last = x.movedim(1, -1)
+        # Case [B, F, L]: Features are the second dimension (phased dataloader output)
+        if x.shape[1] == feature_dim:
+            x_last = x.movedim(1, -1).contiguous()
             y_last = inv(x_last.reshape(-1, feature_dim)).reshape_as(x_last)
-            return y_last.movedim(-1, 1)
+            return y_last.movedim(-1, 1).contiguous()
 
-        # Fallback: assume feature axis is the last axis.
-        return inv(x.reshape(-1, x.shape[-1])).reshape_as(x)
+        # Fallback: let the normalizer handle it or assume last axis
+        return inv(x)
     
     def _prepare_data(self) -> None:
         """Extract real data, reconstructed data, and synthetic data for metrics that need it."""
@@ -538,6 +559,13 @@ class EvalFramework:
         # If still time/feature shaped [B, L, F], flatten to [B, D].
         if recon.dim() == 3:
             recon = self._flatten_for_metrics(recon)
+        elif recon.dim() == 2:
+            # For 2D tensors, if they are time-first flattened, re-flatten to phase-first
+            seq_len = int(getattr(self.model, 'sequence_length', 0) or 0)
+            n_feat = int(getattr(self.model, 'num_features', 0) or 0)
+            if seq_len > 0 and n_feat > 0 and recon.shape[1] == seq_len * n_feat:
+                recon_3d = recon.reshape(recon.shape[0], seq_len, n_feat)
+                recon = self._flatten_for_metrics(recon_3d)
         elif recon.dim() != 2:
             raise ValueError(f"Unexpected reconstruction shape: {tuple(recon.shape)}")
 
@@ -571,11 +599,30 @@ class EvalFramework:
         if synthetic is None:
             raise ValueError("Generator returned None for synthetic samples")
 
-        # Flatten [N, L, F] -> [N, D] for downstream metrics.
-        if synthetic.dim() == 3:
-            synthetic = self._flatten_for_metrics(synthetic)
+        # Flatten samples and batches into a single sample dimension [Samples, Features]
+        if synthetic.dim() == 4:
+             # Handle [N, B, L, F] or [N, B, F, L]
+             N, B, S1, S2 = synthetic.shape
+             synthetic = synthetic.reshape(N * B, S1, S2)
+             synthetic = self._flatten_for_metrics(synthetic)
+        elif synthetic.dim() == 3:
+             # Check if it is [N, B, D] or [N, L, F]
+             n_feat = int(getattr(self.model, 'num_features', 0) or 3)
+             seq_len = int(getattr(self.model, 'sequence_length', 0) or 24)
+             
+             if synthetic.shape[-1] == n_feat and synthetic.shape[1] == seq_len:
+                 # It's [N, L, F]. Just flatten it to [N, D] phase-first.
+                 synthetic = self._flatten_for_metrics(synthetic)
+             else:
+                 # Assume [N, B, D]. Flatten to [N*B, D].
+                 synthetic = synthetic.reshape(-1, synthetic.shape[-1])
+                 # If the resulting 2D is time-first, re-flatten to phase-first
+                 if n_feat > 0 and seq_len > 0 and synthetic.shape[1] == seq_len * n_feat:
+                     synth_3d = synthetic.reshape(-1, seq_len, n_feat)
+                     synthetic = self._flatten_for_metrics(synth_3d)
 
-        return synthetic.cpu().numpy()
+        res = synthetic.cpu().numpy()
+        return res
 
     def _inject_data_into_metrics(self) -> None:
         """Inject prepared data into metrics that need it."""
@@ -947,8 +994,10 @@ class PhasedEvaluationSuite:
         window_size: int = 96,
         n_synthetic_samples: int = 1000,
         output_path: str = 'output',
+        secondary_model = None,
     ):
         self.model = model
+        self.secondary_model = secondary_model if secondary_model is not None else None
         self.dataloader = dataloader
         self.normalizer = normalizer
         self.conditioner = conditioner
@@ -969,14 +1018,24 @@ class PhasedEvaluationSuite:
             output_path=self.output_path,
             evaluation_title='PHASED DATA PREPARATION',
             verbose=False,
+            secondary_model=self.secondary_model,
         )
         framework._prepare_data()
         return framework
 
     def _extract_phase_first(self, flat_data: np.ndarray, label: str) -> np.ndarray:
         arr = np.asarray(flat_data)
+        if arr.ndim == 3:
+            # If already 3D, ensure it is [N, F, L]
+            if arr.shape[1] == 3 and arr.shape[2] == self.window_size:
+                return arr
+            if arr.shape[1] == self.window_size and arr.shape[2] == 3:
+                return arr.transpose(0, 2, 1)
+            raise ValueError(f"Unexpected 3D shape for {label}: {arr.shape}")
+            
         if arr.ndim != 2:
             raise ValueError(f"Expected 2D flattened array for {label}, got {arr.shape}")
+        
         if arr.shape[1] % self.window_size != 0:
             raise ValueError(
                 f"Flattened {label} dimension {arr.shape[1]} is not divisible by window_size {self.window_size}"

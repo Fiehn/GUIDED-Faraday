@@ -82,7 +82,7 @@ def _save_training_config_snapshot(config, log_path: str):
         print("Warning: could not resolve original config file path; skipping config snapshot save.")
 
 
-def _run_evaluation_and_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, phased_mode: bool):
+def _run_evaluation_and_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, phased_mode: bool, secondary_model = None):
     """Route evaluation by mode and run shared visualizations."""
     if test_loader is None:
         print("Warning: test_loader is None; skipping evaluation and visualization.")
@@ -114,6 +114,7 @@ def _run_evaluation_and_visualization(model, test_loader, normalizer, conditione
             window_size=config.window.input_len,
             n_synthetic_samples=n_synth_samples,
             output_path=log_path,
+            secondary_model=secondary_model,
         )
         try:
             phased_evaluator.evaluate()
@@ -164,6 +165,7 @@ def _run_evaluation_and_visualization(model, test_loader, normalizer, conditione
                     device="cpu",
                     n_synthetic_samples=n_synth_samples,
                     output_path=log_path,
+                    secondary_model=secondary_model,
                 )
                 evaluator.register_all()
                 evaluator.evaluate()
@@ -176,7 +178,8 @@ def _run_evaluation_and_visualization(model, test_loader, normalizer, conditione
                             log_dir=log_path,
                             device=device,
                             normalizer=normalizer,
-                            conditioner=conditioner)
+                            conditioner=conditioner,
+                            secondary_model=secondary_model)
     visualizer.visualize(test_loader=test_loader,
                          num_samples=config.visualize.num_samples,
                          num_recon_per=config.visualize.num_recon_per,
@@ -190,246 +193,14 @@ def train(config, train_only_user_profile: bool = False):
     # Up the recursion limit for deep models
     sys.setrecursionlimit(5000) # default seems to be 999
 
-    vamp_initialized = False
-
     data_mode = str(getattr(config.data, "mode", "csv")).lower()
     phased_mode = data_mode in {"phased", "phased_parquet"}
     
-    # === Hierarchical latent space setup ===
-    if config.hierarchy.enabled:
-        hierarchy_cfg = getattr(config, "hierarchy", SimpleNamespace())
-        levels = []
-        for level_type in config.hierarchy.levels:
-            input_dim = config.model.latent_dim if len(levels) == 0 else levels[-1].latent_dim
-            levels.append(LevelConfig(
-                name=f"Level {len(levels)+1}",
-                strategy=level_type,
-                input_dim=input_dim,
-                latent_dim=getattr(hierarchy_cfg, "latent_dims", SimpleNamespace())[len(levels)],
-                top_down=getattr(hierarchy_cfg,"top_down",SimpleNamespace)[len(levels)],
-                bottom_up=getattr(hierarchy_cfg,"bottom_up",SimpleNamespace)[len(levels)],
-                loss_weight=getattr(hierarchy_cfg,"loss_weights", SimpleNamespace())[len(levels)],
-            ))
-        hierarchy = HierarchicalConfig(
-            levels=levels,
-            aggregation=getattr(hierarchy_cfg, "aggregation", SimpleNamespace()),
-            bidirectional=getattr(hierarchy_cfg, "bidirectional", False),
-            residual_connections=getattr(hierarchy_cfg, "residual_connections", False),
-            kl_annealing=getattr(hierarchy_cfg, "kl_annealing", True),
-            kl_warmup_steps=getattr(hierarchy_cfg, "kl_warmup_steps", 1000),
-            free_bits=getattr(hierarchy_cfg, "free_bits", 0.1),
-        )
-    else:
-        hierarchy = None
-
-    # === Model Setup ===
-    model_type = str(config.model.type).lower()
-    conditioner = None
-    encoder_cfg = getattr(config.model, "encoder", SimpleNamespace())
-    decoder_cfg = getattr(config.model, "decoder", SimpleNamespace())
-    encoder_hidden_dims = getattr(encoder_cfg, "hidden_dims", None)
-    decoder_hidden_dims = getattr(decoder_cfg, "hidden_dims", None)
-    encoder_dropout = getattr(encoder_cfg, "dropout", None)
-    decoder_dropout = getattr(decoder_cfg, "dropout", None)
-
-    if (model_type == "phase_splitter" or model_type == "set_guide_vae") and not phased_mode:
-        print("You have indicated a phased only model type is currently supported only with data.mode='phased_parquet'. Forcing phased mode for this run.")
-        data_mode = "phased_parquet"
-        phased_mode = True
-
-    if model_type == "diffusion" and hierarchy is not None:
-        print("DiffusionModel currently does not support hierarchy.enabled=true. Ignoring hierarchical config.")
-
-    # === Conditioners ===
-    if model_type == "vae" or len(config.conditioning.tags) == 0:
-        print("No conditioning will be used for this run.")
-    else:
-        conditioner = Conditioner()
-        for condition_tag in config.conditioning.tags:
-            if condition_tag == "day_of_week":
-                conditioner.add_condition_item("day_of_week", DayOfWeekConditioner())
-            elif condition_tag == "user_profile":
-                if config.conditioning.user_profile.online:
-                    decay = config.conditioning.online_user_profile.decay
-                else:
-                    decay = 1.0
-
-                profiler = UserProfiler(n_topics=config.conditioning.user_profile.n_topics,
-                    num_clusters=config.conditioning.user_profile.num_clusters, 
-                    path=config.conditioning.user_profile.cache_path, 
-                    verbose=config.conditioning.user_profile.verbose, 
-                    decay=decay, 
-                    )
-                
-                conditioner.add_condition_item("user_profile", profiler)
-                    
-            elif condition_tag == "holiday":
-                conditioner.add_condition_item("holiday", HolidayConditioner(holiday_path='data/holidays/denmark_holidays.json'))
-            elif condition_tag == "month_of_year":
-                conditioner.add_condition_item("month_of_year", MonthOfYearConditioner())
-            elif condition_tag == "nr_phases_active":
-                conditioner.add_condition_item("nr_phases_active", ActivePhaseCountConditioner())
-            elif condition_tag == "heatpump_phase":
-                conditioner.add_condition_item("heatpump_phase", HeatpumpPhaseConditioner())
-            elif condition_tag in {"ev_phase", "electric_vehicle_phase"}:
-                ev_cfg = getattr(config.conditioning, "ev_phase", SimpleNamespace())
-                ev_path = getattr(ev_cfg, "path", "data/EV_detection_6000_SM.csv")
-                conditioner.add_condition_item("ev_phase", ElectricVehicleConditioner(topology_path=ev_path))
-            else:
-                print(f"Warning: Unknown condition tag '{condition_tag}' in config. Skipping this conditioner.")
-
-    # === Get number of features for model initialization ===
-    set_cfg = getattr(config.model, "set", SimpleNamespace(num_features=None))
-    csv_num_features = len(config.columns.value_cols)
-    if phased_mode:
-        phased_num_features = getattr(set_cfg, "num_features", None)
-        set_num_features = int(phased_num_features) if phased_num_features is not None else 3
-    else:
-        set_num_features = int(csv_num_features)
-    input_dim = config.window.input_len * int(set_num_features)
-
-    # === Model Initialization ===
-    model_cfg = getattr(config, "model", SimpleNamespace())
-    if model_type == "cvae":
-        model = CVAE(input_dim=input_dim, latent_dim=model_cfg.latent_dim, 
-                    conditioner=conditioner, dictionary_size=model_cfg.prior.dictionary_size, 
-                    vamp_num_components=model_cfg.prior.vamp_num_components,
-                    encoder_type=model_cfg.encoder.type,
-                    decoder_type=model_cfg.decoder.type,
-                    prior_type=model_cfg.prior.type,
-                    hierarchy_config=hierarchy,
-                    encoder_hidden_dims=encoder_hidden_dims,
-                    decoder_hidden_dims=decoder_hidden_dims,
-                    encoder_dropout=encoder_dropout,
-                    decoder_dropout=decoder_dropout,
-                    phased_mode=phased_mode,
-                    sequence_length=config.window.input_len,
-                    )
-        print(f"Initialized CVAE with input_dim={input_dim}, latent_dim={model_cfg.latent_dim}, encoder_type={model_cfg.encoder.type}, decoder_type={model_cfg.decoder.type}, prior_type={model_cfg.prior.type}, conditioner_tags={config.conditioning.tags}")
-    elif model_type == "set_guide_vae":
-        set_cfg = config.model.set
-        if phased_mode:
-            set_num_features = set_cfg.num_features if set_cfg.num_features is not None else int(set_num_features)
-        else:
-            set_num_features = len(config.columns.value_cols)
-        model = SetGuideVAE(
-            input_dim=input_dim,
-            latent_dim=model_cfg.latent_dim,
-            conditioner=conditioner,
-            dictionary_size=model_cfg.prior.dictionary_size,
-            vamp_num_components=model_cfg.prior.vamp_num_components,
-            encoder_type=model_cfg.encoder.type,
-            decoder_type=model_cfg.decoder.type,
-            prior_type=model_cfg.prior.type,
-            hierarchy_config=hierarchy,
-            sequence_length=config.window.input_len,
-            num_features=set_num_features,
-            set_hidden_dim=set_cfg.hidden_dim,
-            set_num_heads=set_cfg.num_heads,
-            set_num_inds=set_cfg.num_inds,
-            set_num_blocks=set_cfg.num_blocks,
-            is_isab=set_cfg.is_isab,
-            use_abl_pool=bool(getattr(set_cfg, "use_abl_pool", False)),
-            encoder_hidden_dims=encoder_hidden_dims,
-            decoder_hidden_dims=decoder_hidden_dims,
-            encoder_dropout=encoder_dropout,
-            decoder_dropout=decoder_dropout,
-            phased_mode=phased_mode,
-        )
-        print(f"Initialized SetGuideVAE with input_dim={input_dim}, latent_dim={model_cfg.latent_dim}, encoder_type={model_cfg.encoder.type}, decoder_type={model_cfg.decoder.type}, prior_type={model_cfg.prior.type}, conditioner_tags={config.conditioning.tags}")
-    elif model_type == "art":
-        art_cfg = getattr(model_cfg, "art", SimpleNamespace())
-        model = AutoRegressiveTransformerVAE(
-            input_dim=input_dim,
-            latent_dim=model_cfg.latent_dim,
-            conditioner=conditioner,
-            dictionary_size=model_cfg.prior.dictionary_size,
-            vamp_num_components=model_cfg.prior.vamp_num_components,
-            encoder_type=model_cfg.encoder.type,
-            decoder_type=model_cfg.decoder.type,
-            prior_type=model_cfg.prior.type,
-            hierarchy_config=hierarchy,
-            bin_size=art_cfg.num_bins,
-            nhead=art_cfg.transformer_num_heads,
-            num_layers=art_cfg.transformer_num_layers,
-            d_model=art_cfg.d_model,
-            sequence_length=config.window.input_len,
-            num_features=set_num_features,
-            encoder_hidden_dims=encoder_hidden_dims,
-            decoder_hidden_dims=decoder_hidden_dims,
-            encoder_dropout=encoder_dropout,
-            decoder_dropout=decoder_dropout,
-            phased_mode=phased_mode,
-        )
-    elif model_type == "diffusion":
-        diff_cfg = getattr(config.model, "diffusion", SimpleNamespace())
-        scheduler = NoiseScheduler(
-            num_timesteps=int(getattr(diff_cfg, "num_timesteps", 1000)),
-            beta_start=float(getattr(diff_cfg, "beta_start", 1e-4)),
-            beta_end=float(getattr(diff_cfg, "beta_end", 0.02)),
-            schedule_type=str(getattr(diff_cfg, "schedule_type", "linear")),
-            cosine_s=float(getattr(diff_cfg, "cosine_s", 0.008)),
-            max_beta=float(getattr(diff_cfg, "max_beta", 0.999)),
-            device=device,
-        )
-        denoiser = ConditionalUNet1D(
-            channels=int(set_num_features),
-            condition_dim=int(conditioner.get_condition_dim()),
-            time_dim=int(getattr(diff_cfg, "time_dim", 128)),
-            base_channels=int(getattr(diff_cfg, "base_channels", 128)),
-            num_blocks=int(getattr(diff_cfg, "num_blocks", 4)),
-            self_attention_heads=int(getattr(diff_cfg, "self_attention_heads", 4)),
-            use_condition_cross_attention=bool(getattr(diff_cfg, "use_condition_cross_attention", False)),
-            condition_attention_heads=int(getattr(diff_cfg, "condition_cross_attention_heads", 4)),
-            condition_tokens=int(getattr(diff_cfg, "condition_tokens", 4)),
-        )
-        model = DiffusionModel(
-            noise_scheduler=scheduler,
-            model=denoiser,
-            conditioner=conditioner,
-            sequence_length=config.window.input_len,
-            num_features=int(set_num_features),
-            condition_dropout_prob=float(getattr(diff_cfg, "condition_dropout_prob", 0.0)),
-            reconstruction_noise_fraction=float(getattr(diff_cfg, "reconstruction_noise_fraction", 0.3)),
-            deterministic_reconstruction=bool(getattr(diff_cfg, "deterministic_reconstruction", True)),
-            phased_mode=phased_mode,
-        )
-        print(
-            f"Initialized DiffusionModel with sequence_length={config.window.input_len}, "
-            f"num_features={int(set_num_features)}, condition_dim={conditioner.get_condition_dim()}, "
-            f"schedule={scheduler.schedule_type}, cross_attention={denoiser.use_condition_cross_attention}"
-        )
-    elif model_type == "phase_splitter":
-        phase_splitter_cfg = getattr(config.model, "phase_splitter", SimpleNamespace())
-        model = HierarchicalSplitter(
-            conditioner=conditioner,
-            sequence_length=config.window.input_len,
-            condition_dim=int(conditioner.get_condition_dim()),
-            base_channels=int(getattr(phase_splitter_cfg, "base_channels", 64)),
-            phased_mode=phased_mode,
-        )
-        print(
-            f"Initialized HierarchicalSplitter with sequence_length={config.window.input_len}, "
-            f"condition_dim={int(conditioner.get_condition_dim())}, conditioner_tags={config.conditioning.tags}"
-        )
-    elif model_type == "vae":
-        model = VAE(input_dim=input_dim, latent_dim=model_cfg.latent_dim,
-                    encoder_type=model_cfg.encoder.type,
-                    decoder_type=model_cfg.decoder.type,
-                    prior_type=model_cfg.prior.type,
-                    dictionary_size=model_cfg.prior.dictionary_size,
-                    vamp_num_components=model_cfg.prior.vamp_num_components,
-                    hierarchy_config=hierarchy,
-                    encoder_hidden_dims=encoder_hidden_dims,
-                    decoder_hidden_dims=decoder_hidden_dims,
-                    encoder_dropout=encoder_dropout,
-                    decoder_dropout=decoder_dropout,
-                    phased_mode=phased_mode,
-                    sequence_length=config.window.input_len,
-                    )
-        print(f"Initialized VAE with input_dim={input_dim}, latent_dim={config.model.latent_dim}, encoder_type={config.model.encoder.type}, decoder_type={config.model.decoder.type}, prior_type={config.model.prior.type}")
-    else:
-        raise ValueError(f"Unknown model type '{config.model.type}' specified in config.")
+    from src.model.factory import create_model_from_config
+    model = create_model_from_config(config, device)
+    conditioner = getattr(model, "conditioner", None)
+    
+    model_type = str(getattr(config.model, "type", "vae")).lower()
 
     # === Save config snapshot and generate Tag ===
     model_tag = model.get_tag()
@@ -503,7 +274,12 @@ def train(config, train_only_user_profile: bool = False):
     skip_corrupt_files = bool(getattr(data_cfg, "skip_corrupt_files", True))
     max_skip_warnings = int(getattr(data_cfg, "max_skip_warnings", 20))
     
-    norm_method = str(getattr(config.normalizer, "method", "log1p")).lower() if not phased_mode else "log1p_phase"
+    normalizer_cfg = getattr(config, "normalizer", SimpleNamespace())
+    norm_method = str(getattr(normalizer_cfg, "method", "log1p")).lower() if not phased_mode else "log1p_phase"
+    norm_cache_dir = getattr(normalizer_cfg, "cache_dir", None)
+    if isinstance(norm_cache_dir, str) and norm_cache_dir.strip() == "":
+        norm_cache_dir = None
+    norm_force_recompute = bool(getattr(normalizer_cfg, "force_recompute", False))
     normalizer = Normalizer(method=norm_method)
     normalizer.fit_normalizer_on_files(
         filenames=parquet_paths,
@@ -514,11 +290,14 @@ def train(config, train_only_user_profile: bool = False):
         aggregation_divisor=aggregation_divisor,
         nan_as_zero=nan_as_zero,
         phased=phased_mode,
+        force_recompute=norm_force_recompute,
+        save_path=norm_cache_dir,
+        device=device,
     )
     normalizer.save(os.path.join(log_path, "normalizer.pt"))
 
-    if model_type == "art" and normalizer is not None:
-        # We need to denormalize for tokenization in ART, so we must ensure the model has access to the normalizer.
+    if normalizer is not None:
+        # Attach the normalizer to the model so it can be automatically saved/loaded
         model.normalizer = copy.deepcopy(normalizer)
 
     if conditioner.condition_items.get("user_profile") is not None:
@@ -575,6 +354,7 @@ def train(config, train_only_user_profile: bool = False):
             config=config,
             phased_mode=True,
             conditioner=conditioner,
+            secondary_model=None,
         )
     elif model_type == "phase_splitter":
         if combined_test_loader is None:
@@ -613,76 +393,6 @@ def train(config, train_only_user_profile: bool = False):
         print(f"Writer logs saved to: {log_path}")
 
     return model
-
-    if phased_mode:
-
-        if norm_method == "log1p_phase":
-            normalizer = Normalizer(method="log1p_phase")
-            agg_tag = "hourly" if bool(config.window.aggregated) else "raw"
-            stats_name = (
-                f"normalization_stats_{os.path.basename(os.path.normpath(data_dir))}_"
-                f"{agg_tag}_{aggregation_energy_unit}.json"
-            )
-            stats_path = os.path.join(config.logging.log_dir, stats_name)
-            normalizer.fit(
-                X=None,
-                sm_files=parquet_paths,
-                stats_path=stats_path,
-                hourly_aggregation=bool(config.window.aggregated),
-                aggregation_divisor=aggregation_divisor,
-            )
-            print("Using phased normalizer: log1p_phase")
-        else:
-            print(f"Warning: phased_parquet mode currently expects normalization.method='log1p_phase'. Got '{norm_method}'. Continuing without normalization.")
-
-   
-        # Use cached eval loader (kept separate from training cache)
-    
-    
-    # === Fit Normalizer and User Profiler (if applicable) on all data files ===
-    normalizer = Normalizer(method=config.normalization.method)
-    fit_normalizer_on_files(
-        normalizer,
-        data_dir=data_dir,
-        filenames=data_files,
-        feature_cols=config.data.columns.value_cols,
-        meter_col=config.data.columns.meter_id,
-        timestamp_dst_col=config.data.columns.timestamp_dst,
-        train_frac=config.data.splits.train_ratio,
-        seed=config.data.splits.random_seed,
-        nan_as_zero=nan_as_zero,
-        parquet_only=parquet_only,
-    )
-    
-    if hasattr(model, "conditioner") and model.conditioner is not None:
-        user_profiler = model.conditioner.condition_items.get("user_profile")
-        if user_profiler is not None:
-            fitted = fit_userprofiler_on_files(
-                user_profiler=user_profiler,
-                data_dir=data_dir,
-                filenames=data_files,
-                feature_cols=config.data.columns.value_cols,
-                window=window,
-                meter_col=config.data.columns.meter_id,
-                timestamp_dst_col=config.data.columns.timestamp_dst,
-                timestamp_utc_col=config.data.columns.timestamp_utc,
-                batch_size=config.data.dataloader.batch_size,
-                num_workers=config.data.dataloader.num_workers,
-                seed=config.data.splits.random_seed,
-                train_frac=config.data.splits.train_ratio,
-                normalizer=normalizer,
-                nan_as_zero=nan_as_zero,
-                parquet_only=parquet_only,
-                device=device,
-            )
-            if train_only_user_profile:
-                # This is done because the user profiler is trained on the cpu..
-                # This means it needs a different node than the rest of the model, which is on the gpu.
-                # A different slurm job will be used to train just the user profiler, and then the rest of the model will be trained with the user profiler frozen.
-                print("train_only_user_profile is True, so exiting after fitting user profiler.")
-                return model
-            if not fitted:
-                return model
 
 
 

@@ -1,4 +1,7 @@
 import math
+import os
+import sys
+import pickle
 from abc import ABC, abstractmethod
 import time
 from datetime import datetime
@@ -45,20 +48,149 @@ class BaseModel(nn.Module, ABC):
         pass
 
     @abstractmethod
-    def save_model(self, *args, **kwargs):
-        pass
-
-    @abstractmethod
-    def load_model(self, *args, **kwargs):
-        pass
-
-    @abstractmethod
     def reconstruct(self, *args, **kwargs):
         pass
 
     @abstractmethod
     def get_optimizer(self, lr, weight_decay, *args, **kwargs):
         pass
+
+    # ------------------------------------------------------------------
+    # Unified save / load
+    # ------------------------------------------------------------------
+
+    def save_model(self, save_path=None, model_name="trained_model", device="cpu", normalizer=None):
+        """Save model checkpoint with atomic write.
+
+        Checkpoint format (v2)::
+
+            {
+                "format_version": 2,
+                "model_class":    "<ClassName>",
+                "model_state_dict": self.state_dict(),
+                "normalizer_state": {...} | None,
+                "conditioner_state": <pickle bytes> | None,
+            }
+
+        The conditioner (if present) is pickled because it is a plain
+        Python object (not an nn.Module).
+        state_dict() via registered buffers / submodules (nn.Module).
+        """
+        if save_path is None:
+            save_path = "./models/"
+
+        model_path = os.path.join(save_path, f"{model_name}.pt")
+        os.makedirs(save_path, exist_ok=True)
+
+        # Remember the original device so we can move back after saving.
+        try:
+            original_device = next(self.parameters()).device
+        except StopIteration:
+            original_device = "cpu"
+            
+        self.eval()
+        self.to("cpu")
+
+        # --- normalizer ---
+        normalizer_to_save = normalizer
+        if normalizer_to_save is None:
+            normalizer_to_save = getattr(self, "normalizer", None)
+            
+        normalizer_state = None
+        if normalizer_to_save is not None and getattr(normalizer_to_save, "fitted", False):
+            normalizer_state = {
+                "method": normalizer_to_save.method,
+                "epsilon": normalizer_to_save.epsilon,
+                "zero_id": normalizer_to_save.zero_id,
+                "shift": normalizer_to_save.shift,
+                "non_zero_mean": normalizer_to_save.non_zero_mean,
+                "non_zero_std": normalizer_to_save.non_zero_std,
+                "mean": normalizer_to_save.mean.cpu() if isinstance(normalizer_to_save.mean, torch.Tensor) else normalizer_to_save.mean,
+                "std": normalizer_to_save.std.cpu() if isinstance(normalizer_to_save.std, torch.Tensor) else normalizer_to_save.std,
+            }
+
+        # --- conditioner (pickle) ---
+        conditioner_state = None
+        conditioner = getattr(self, "conditioner", None)
+        if conditioner is not None:
+            conditioner_state = pickle.dumps(conditioner)
+
+        # --- build checkpoint ---
+        checkpoint = {
+            "format_version": 2,
+            "model_class": self.__class__.__name__,
+            "model_state_dict": self.state_dict(),
+            "normalizer_state": normalizer_state,
+            "conditioner_state": conditioner_state,
+        }
+
+        # --- atomic write ---
+        temp_path = model_path + ".tmp"
+        try:
+            torch.save(checkpoint, temp_path)
+
+            # Quick integrity check
+            test_load = torch.load(temp_path, map_location="cpu", weights_only=False)
+            assert "model_state_dict" in test_load, "Checkpoint missing model_state_dict"
+
+            if os.path.exists(model_path):
+                backup_path = model_path + ".backup"
+                os.replace(model_path, backup_path)
+            os.replace(temp_path, model_path)
+
+            num_params = sum(p.numel() for p in self.parameters())
+            print(f"Model saved: {model_path}  ({num_params:,} params)")
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            print(f"Save failed: {e}", file=sys.stderr)
+            raise
+        finally:
+            self.to(original_device)
+
+    def load_model(self, load_path, device="cpu"):
+        """Load a checkpoint saved by save_model().
+
+        Returns:
+            tuple: ``(normalizer_or_None, conditioner_or_None)``
+        """
+        checkpoint = torch.load(load_path, map_location=device, weights_only=False)
+
+        # --- model weights ---
+        self.load_state_dict(checkpoint["model_state_dict"])
+        self.to(device)
+
+        # --- normalizer ---
+        normalizer = None
+        ns = checkpoint.get("normalizer_state")
+        if ns is not None:
+            normalizer = self._restore_normalizer(ns, device=device)
+            self.normalizer = normalizer
+
+        # --- conditioner ---
+        conditioner = None
+        cs = checkpoint.get("conditioner_state")
+        if cs is not None:
+            conditioner = pickle.loads(cs)
+            self.conditioner = conditioner
+
+        return normalizer, conditioner
+
+    @staticmethod
+    def _restore_normalizer(state: dict, device="cpu"):
+        """Reconstruct a Normalizer from its serialized state dict."""
+        from data.normalizer import Normalizer
+        norm = Normalizer(method=state["method"])
+        norm.epsilon = state.get("epsilon", 1e-8)
+        norm.zero_id = state.get("zero_id", -3)
+        norm.shift = state.get("shift", 1.0)
+        norm.non_zero_mean = state.get("non_zero_mean")
+        norm.non_zero_std = state.get("non_zero_std")
+        norm.mean = state.get("mean")
+        norm.std = state.get("std")
+        norm.fitted = True
+        norm.to(device)
+        return norm
 
     def fit(
         self,
@@ -287,6 +419,7 @@ class BaseModel(nn.Module, ABC):
                             save_path=logging_dir,
                             model_name=f"best_model_{self.tag}_{epoch+1}",
                             device=device,
+                            normalizer=getattr(self, "normalizer", None)
                         )
                         save_time_s = time.perf_counter() - save_start_t
 
@@ -312,6 +445,7 @@ class BaseModel(nn.Module, ABC):
                     save_path=logging_dir,
                     model_name=f"{self.tag}_epoch_{epoch+1}",
                     device=device,
+                    normalizer=getattr(self, "normalizer", None)
                 )
 
             total_epoch_time_s = time.perf_counter() - epoch_start_t

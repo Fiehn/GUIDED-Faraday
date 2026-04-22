@@ -14,7 +14,7 @@ class Visualizer:
     
     def __init__(self, plot_style: PlotStyle, log_dir: str, 
                  model = None, normalizer = None,  writer = None, 
-                 device = "cpu", conditioner = None):
+                 device = "cpu", conditioner = None, secondary_model = None):
         self.plot_style = plot_style
         self.log_dir = log_dir
         self.model = model
@@ -23,7 +23,7 @@ class Visualizer:
         self.device = device
         self.conditioner = conditioner
 
-        self.generator = SyntheticGenerator(model=model, normalizer=normalizer, conditioner=conditioner, device=device)
+        self.generator = SyntheticGenerator(model=model, normalizer=normalizer, conditioner=conditioner, secondary_model=secondary_model, device=device)
     
     def _is_cvae(self) -> bool:
         """Check if model is a CVAE based on presence of conditioner on the model."""

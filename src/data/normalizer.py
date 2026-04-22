@@ -1,5 +1,7 @@
 import os
+import json
 from typing import Optional
+from datetime import datetime, timezone
 import numpy as np
 import torch
 import pyarrow.parquet as pq
@@ -333,6 +335,124 @@ class Normalizer:
         norm.to(device)
         return norm
 
+    @classmethod
+    def _manifest_value(cls, value):
+        if isinstance(value, dict):
+            return {str(k): cls._manifest_value(v) for k, v in sorted(value.items(), key=lambda item: str(item[0]))}
+        if isinstance(value, (list, tuple)):
+            return [cls._manifest_value(v) for v in value]
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    @classmethod
+    def _stable_json_dumps(cls, payload: dict) -> str:
+        canonical = cls._manifest_value(payload)
+        return json.dumps(canonical, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+
+    @classmethod
+    def _build_file_fingerprint(cls, filenames: list[str]) -> str:
+        file_meta = []
+        for original_path in filenames:
+            raw_path = str(original_path)
+            norm_path = os.path.normcase(os.path.normpath(raw_path))
+            abs_path = os.path.abspath(raw_path)
+            try:
+                stats = os.stat(abs_path)
+                size = int(stats.st_size)
+                mtime_ns = int(stats.st_mtime_ns)
+            except OSError:
+                size = None
+                mtime_ns = None
+            file_meta.append({
+                'path': norm_path,
+                'size': size,
+                'mtime_ns': mtime_ns,
+            })
+        file_meta.sort(key=lambda item: item['path'])
+        digest_input = {'files': file_meta}
+        return hashlib.sha256(cls._stable_json_dumps(digest_input).encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def _resolve_cache_target(save_path: str | None, manifest_hash: str) -> tuple[str, str | None]:
+        if save_path is None:
+            cache_dir = os.path.join('data', 'normalizations')
+            return (
+                os.path.join(cache_dir, f'normalizer_{manifest_hash}.pt'),
+                os.path.join(cache_dir, 'index.json'),
+            )
+
+        save_path_abs = os.path.abspath(save_path)
+        has_extension = os.path.splitext(save_path_abs)[1] != ''
+        if os.path.isdir(save_path_abs) or not has_extension:
+            return (
+                os.path.join(save_path_abs, f'normalizer_{manifest_hash}.pt'),
+                os.path.join(save_path_abs, 'index.json'),
+            )
+
+        # Explicit file path -> legacy single-artifact behavior.
+        return save_path_abs, None
+
+    @staticmethod
+    def _read_json_file(path: str) -> dict:
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, 'r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @classmethod
+    def _update_normalization_index(
+        cls,
+        *,
+        index_path: str,
+        manifest_hash: str,
+        artifact_path: str,
+        manifest: dict,
+    ) -> None:
+        index = cls._read_json_file(index_path)
+        entries = index.get('entries')
+        if not isinstance(entries, dict):
+            entries = {}
+
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        existing = entries.get(manifest_hash, {})
+        entries[manifest_hash] = {
+            'path': os.path.basename(artifact_path),
+            'method': manifest.get('method'),
+            'num_files': manifest.get('num_files'),
+            'created_at': existing.get('created_at', now),
+            'last_used_at': now,
+            'manifest': manifest,
+        }
+        index = {
+            'version': 1,
+            'entries': entries,
+        }
+
+        os.makedirs(os.path.dirname(os.path.abspath(index_path)), exist_ok=True)
+        tmp_path = f"{index_path}.tmp"
+        with open(tmp_path, 'w', encoding='utf-8') as handle:
+            json.dump(index, handle, indent=2, sort_keys=True)
+        os.replace(tmp_path, index_path)
+
+    def _apply_cached_state(self, cached: 'Normalizer') -> None:
+        self.mean = cached.mean
+        self.std = cached.std
+        self.non_zero_mean = cached.non_zero_mean
+        self.non_zero_std = cached.non_zero_std
+        self.epsilon = cached.epsilon
+        self.zero_id = cached.zero_id
+        self.shift = cached.shift
+        self.fitted = bool(cached.fitted)
+
     def _zero_preserved_log_transform(self, X: torch.Tensor) -> torch.Tensor:
         is_zero = X == 0
         Y = X.clone()
@@ -415,23 +535,16 @@ class Normalizer:
             force_recompute: bool = False,
             feature_cols: list[str] | None = None,
             save_path: str | None = None,
-            data_dir: str | None = None,
+            device: str | torch.device = 'cpu',
     ):
-        if data_dir is None:
-            data_dir = 'data'
-        if save_path is None: 
-            save_path = os.path.join(data_dir,f"normalization_stats_{self.method}.json")
-
         # === Try Cache ===
         window_spec_dict = {
             'input_len': window_spec.input_len,
             'stride': window_spec.stride,
         }
-        canonical_files = tuple(
-            sorted(os.path.normcase(os.path.normpath(str(p))) for p in filenames)
-        )
-        file_hash = hashlib.sha256("\n".join(canonical_files).encode("utf-8")).hexdigest()
+        file_fingerprint = self._build_file_fingerprint(filenames)
         normalizer_manifest = {
+            'manifest_version': 2,
             'method': self.method,
             'phased': phased,
             'aggregation_divisor': aggregation_divisor,
@@ -440,24 +553,31 @@ class Normalizer:
             'feature_cols': feature_cols,
             'hourly_aggregation': hourly_aggregation,
             'window_spec': window_spec_dict,
-            'file_hash': file_hash,
+            'num_files': len(filenames),
+            'file_fingerprint': file_fingerprint,
         }
-        if not force_recompute and os.path.exists(save_path):
+        manifest_hash = hashlib.sha256(self._stable_json_dumps(normalizer_manifest).encode('utf-8')).hexdigest()
+        cache_path, index_path = self._resolve_cache_target(
+            save_path=save_path,
+            manifest_hash=manifest_hash,
+        )
+
+        if not force_recompute and os.path.exists(cache_path):
             try:
-                saved = self.load(save_path, device='cpu')
+                saved = self.load(cache_path, device=device)
                 saved_manifest = getattr(saved, 'manifest', None)
                 if normalizer_manifest == saved_manifest:
-                    print(f"Loading normalization stats from cache at {save_path}...")
-                    self.mean = saved.mean
-                    self.std = saved.std
-                    self.non_zero_mean = saved.non_zero_mean
-                    self.non_zero_std = saved.non_zero_std
-                    self.epsilon = saved.epsilon
-                    self.zero_id = saved.zero_id
-                    self.shift = saved.shift
-                    self.fitted = bool(saved.fitted)
+                    print(f"Loading normalization stats from cache at {cache_path}...")
+                    self._apply_cached_state(saved)
                     self.manifest = saved_manifest
                     self.to(self.device)
+                    if index_path is not None:
+                        self._update_normalization_index(
+                            index_path=index_path,
+                            manifest_hash=manifest_hash,
+                            artifact_path=cache_path,
+                            manifest=normalizer_manifest,
+                        )
                     return
                 else:
                     print(f"Cache manifest does not match current configuration. Recomputing stats.")
@@ -488,11 +608,18 @@ class Normalizer:
         print(f"Fitted normalizer with method '{self.method}' on {len(filenames)} files.")
 
         # === Save Stats ===
-        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
         self.manifest = normalizer_manifest
-        self.save(save_path)
+        self.save(cache_path)
+        if index_path is not None:
+            self._update_normalization_index(
+                index_path=index_path,
+                manifest_hash=manifest_hash,
+                artifact_path=cache_path,
+                manifest=normalizer_manifest,
+            )
 
-        print(f"Saved normalization stats to {save_path}.")
+        print(f"Saved normalization stats to {cache_path}.")
 
 
             

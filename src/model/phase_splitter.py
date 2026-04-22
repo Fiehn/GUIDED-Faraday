@@ -10,10 +10,10 @@ import numpy as np
 from src.model.model import BaseModel
 
 class SplitterCNN(nn.Module):
-    def __init__(self, condition_dim=32, base_channels=64):
+    def __init__(self, condition_dim=32, base_channels=64, temperature=2.0):
         super().__init__()
+        self.temperature = temperature
         
-        # INCREASED INPUT CHANNELS: 1 (Aggregated) + condition_dim
         self.init_conv = nn.Conv1d(1 + condition_dim, base_channels, kernel_size=3, padding=1)
         
         self.blocks = nn.ModuleList([
@@ -48,21 +48,20 @@ class SplitterCNN(nn.Module):
         
         # Divide by a temperature (e.g., 2.0 to 5.0) to prevent logit explosion
         # This keeps the probabilities from snapping to 1.0/0.0 too early in training
-        temperature = 3.0 
-        proportions = F.softmax(logits / temperature, dim=1)
+        proportions = F.softmax(logits / self.temperature, dim=1)
         
         return proportions
     
 
 class HierarchicalSplitter(BaseModel):
-    def __init__(self, conditioner, sequence_length=24, condition_dim=32, base_channels=64, phased_mode=True):
+    def __init__(self, conditioner, sequence_length=24, condition_dim=32, base_channels=64, temperature=2.0, phased_mode=True):
         super().__init__(phased_mode=phased_mode, sequence_length=sequence_length)
         self.conditioner = conditioner
         self.sequence_length = sequence_length
         self.num_features = 3
         self.condition_dim = int(condition_dim)
         
-        self.model = SplitterCNN(condition_dim=condition_dim, base_channels=base_channels)
+        self.model = SplitterCNN(condition_dim=condition_dim, base_channels=base_channels, temperature=temperature)
         
         # The 6 possible ways to assign 3 anonymous slots to 3 physical wires
         self.permutations = [
@@ -219,24 +218,21 @@ class HierarchicalSplitter(BaseModel):
             best_mse, best_idx = per_perm_mse.min(dim=1)
             best_mae = per_perm_mae.gather(1, best_idx.unsqueeze(1)).squeeze(1)
 
-            aligned_pred = torch.empty_like(x_pred)
-            for i in range(x_pred.size(0)):
+            aligned_proportions = torch.empty_like(proportions).to(device)
+            for i in range(proportions.size(0)):
                 perm = self.permutations[int(best_idx[i].item())]
-                aligned_pred[i] = x_pred[i, perm, :]
+                aligned_proportions[i] = proportions[i, perm, :]
 
             x_true_eval = x_true
-            aligned_pred_eval = aligned_pred
             if normalizer is not None and hasattr(normalizer, "inverse_transform"):
-                # Normalizer expects feature-last input; convert [B, F, L] -> [B, L, F].
                 true_lf = x_true.transpose(1, 2)
-                pred_lf = aligned_pred.transpose(1, 2)
                 bsz, seq_len, n_feat = true_lf.shape
-
+                
                 true_denorm = normalizer.inverse_transform(true_lf.reshape(-1, n_feat)).reshape(bsz, seq_len, n_feat)
-                pred_denorm = normalizer.inverse_transform(pred_lf.reshape(-1, n_feat)).reshape(bsz, seq_len, n_feat)
-
+                true_denorm = true_denorm.to(device=x_true.device, dtype=x_true.dtype)
                 x_true_eval = true_denorm.transpose(1, 2)
-                aligned_pred_eval = pred_denorm.transpose(1, 2)
+            x_agg_eval = x_true_eval.sum(dim=1, keepdim=True)
+            aligned_pred_eval = aligned_proportions * x_agg_eval
 
             phase_energy_mae = (aligned_pred_eval.sum(dim=2) - x_true_eval.sum(dim=2)).abs().mean(dim=1)
             agg_mae = (
@@ -376,10 +372,9 @@ class HierarchicalSplitter(BaseModel):
         }
 
     @torch.no_grad()
-    def sample(self, x_agg_generated, conditions, device="cpu", **_):
+    def sample(self, x_agg_generated, conditions, normalizer = None, device="cpu", **_):
         """
-        Inference time! 
-        Pass your Aggregated Synthetic data (from your VAE/Diffusion model) into here.
+        Pass the Aggregated Synthetic data into here.
         """
         self.eval()
         self.to(device)
@@ -389,77 +384,29 @@ class HierarchicalSplitter(BaseModel):
         
         # Predict Proportions
         proportions = self.model(x_agg, c)
+
+        # If the normalizer does not exist then output proportions
+        if normalizer is None or not hasattr(normalizer, "inverse_transform"):
+            print("[Warning]: No normalizer with inverse_transform found. Returning proportions instead of actual phase values!")
+            return proportions
         
-        # Apply constraint
-        x_final_phases = proportions * x_agg
+        x_agg_lf = x_agg.transpose(1, 2)
+        bsz, seq_len, _ = x_agg_lf.shape
         
-        return x_final_phases
-
-    def save_model(self, save_path=None, model_name="trained_model", device="cpu", normalizer=None):
-        if save_path is None:
-            save_path = "./models/"
-
-        model_path = os.path.join(save_path, f"{model_name}.pt")
-        os.makedirs(save_path, exist_ok=True)
-
-        original_device = next(self.parameters()).device
-        self.eval()
-        self.to("cpu")
-
-        normalizer_state = None
-        if normalizer is not None and hasattr(normalizer, "fitted") and normalizer.fitted:
-            normalizer_state = {
-                "method": normalizer.method,
-                "epsilon": normalizer.epsilon,
-                "zero_id": normalizer.zero_id,
-                "shift": normalizer.shift,
-                "non_zero_mean": normalizer.non_zero_mean,
-                "non_zero_std": normalizer.non_zero_std,
-                "mean": normalizer.mean,
-                "std": normalizer.std,
-            }
-
-        checkpoint = {
-            "model_state_dict": self.state_dict(),
-            "constructor_args": {
-                "sequence_length": self.sequence_length,
-                "condition_dim": self.condition_dim,
-            },
-            "normalizer_state": normalizer_state,
-            "model_info": {
-                "model_class": self.__class__.__name__,
-                "save_format_version": 1,
-            },
-        }
-
-        temp_path = f"{model_path}.tmp"
-        torch.save(checkpoint, temp_path)
-        os.replace(temp_path, model_path)
-
-        self.to(device)
-        self.to(original_device)
-        num_params = sum(p.numel() for p in self.parameters())
-        print(f"Model with {num_params} parameters saved to {model_path}")
+        agg_denorm = normalizer.inverse_transform(x_agg_lf.reshape(-1, 1)).reshape(bsz, seq_len, 1)
+        agg_denorm = agg_denorm.to(device=x_agg.device, dtype=x_agg.dtype)
+        x_agg_linear = agg_denorm.transpose(1, 2)
+        
+        # Apply proportions in linear domain
+        x_final_linear = proportions * x_agg_linear
+        
+        # Re-normalize to return to the original scaled domain
+        x_final_lf = x_final_linear.transpose(1, 2)
+        final_norm = normalizer.transform(x_final_lf.reshape(-1, 3)).reshape(bsz, seq_len, 3)
+        final_norm = final_norm.to(device=x_agg.device, dtype=x_agg.dtype)
+        
+        return final_norm.transpose(1, 2)
 
     def reconstruct(self, *args, **kwargs):
-        return super().reconstruct(*args, **kwargs)
-    
-    def load_model(self, model_path, device="cpu"):
-        checkpoint = torch.load(model_path, map_location=device)
-        constructor_args = checkpoint.get("constructor_args", {})
-        self.__init__(**constructor_args)
-        self.load_state_dict(checkpoint["model_state_dict"])
-        self.to(device)
-
-        normalizer_state = checkpoint.get("normalizer_state", None)
-        if normalizer_state is not None:
-            print("Loaded normalizer state from checkpoint:")
-            for k, v in normalizer_state.items():
-                print(f"  {k}: {v}")
-        else:
-            print("No normalizer state found in checkpoint.")
-
-        num_params = sum(p.numel() for p in self.parameters())
-        print(f"Model with {num_params} parameters loaded from {model_path}")
-
-        
+        # TODO: Implement reconstruction for HierarchicalSplitter
+        raise NotImplementedError("HierarchicalSplitter does not support direct reconstruction.")

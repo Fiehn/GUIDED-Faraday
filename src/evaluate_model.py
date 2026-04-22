@@ -56,23 +56,9 @@ def evaluate_model(model_path, num_test_files=2, config_path="config/config.yaml
     print(f"Loading checkpoint from {model_path}")
     model_dir = os.path.dirname(model_path)
     
-    # conditioner is reconstructed from checkpoint
-    additional_kwargs = {
-        'sequence_length': getattr(config.window, 'input_len', 96),
-        'num_features': getattr(config.set, 'num_features', 3) if hasattr(config, 'set') else 3,
-        'set_hidden_dim': getattr(config.set, 'hidden_dim', 128) if hasattr(config, 'set') else 128,
-        'set_num_heads': getattr(config.set, 'num_heads', 4) if hasattr(config, 'set') else 4,
-        'set_num_inds': getattr(config.set, 'num_inds', 16) if hasattr(config, 'set') else 16,
-        'set_num_blocks': getattr(config.set, 'num_blocks', 2) if hasattr(config, 'set') else 2,
-        'dictionary_size': getattr(config.model.encoder, 'dictionary_size', 512) if hasattr(config.model, 'encoder') else 512,
-        'vamp_num_components': getattr(config.model.prior, 'vamp_num_components', 20) if hasattr(config.model, 'prior') else 20,
-    }
-    
-    model, normalizer = SetGuideVAE.load_from_checkpoint(
-        model_path, 
-        device=device, 
-        **additional_kwargs
-    )
+    from src.model.factory import create_model_from_config
+    model = create_model_from_config(config, device)
+    normalizer, _ = model.load_model(model_path, device=device)
     model.eval()
     
     conditioner = getattr(model, 'conditioner', None)

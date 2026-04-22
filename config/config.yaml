@@ -11,16 +11,16 @@ verbose: true
 # DATA LOADING CONFIGURATION
 # ============================================================================
 data:
-  # Data mode: "csv" (SmartMeterDataModule) or "phased" (StreamingParquetBuffer)
+  # Data mode: "csv" (Aggregated Hourly consumption) or "phased" (Individual SM meters 15-min phased)
   mode: "phased"
 
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
   # data_dir: "./data/raw_profiles"
-  # data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+  data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
   # data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
-  data_dir: "data/"
+  # data_dir: "data/_parquet_cache"
 
 
   # CSV filename to load
@@ -71,6 +71,13 @@ data:
 normalization:
   # Type of normalization: "log1p", "student_t", "zero_preserved_log", "log1p_phase"
   method: "log1p"
+
+  # Optional cache target for fitted normalization stats:
+  # - null/default: use data/normalizations with hashed filenames
+  # - directory: use that directory with hashed filenames
+  # - file path: single-file legacy mode (overwrites that file)
+  cache_dir: null
+  force_recompute: false
   
   # Log1p specific parameters
   log1p:
@@ -81,10 +88,10 @@ normalization:
 # ============================================================================
 model:
   # Model type: "vae", "cvae", "art", "set_guide_vae", "diffusion", "phase_splitter"
-  type: "cvae"
+  type: "diffusion"
   
   # Latent dimension (size of latent vector z)
-  latent_dim: 64
+  latent_dim: 128
 
   # Encoder configuration
   encoder:
@@ -94,13 +101,13 @@ model:
   
   # Decoder configuration
   decoder:
-    type: "dictionary_cnn"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
+    type: "dictionary"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
     hidden_dims: [64, 64, 32]
     dropout: 0.2
   
   # Prior configuration
   prior:
-    type: "vampprior"  # Options: "standard_gaussian", "standard_dictionary", 
+    type: "learnable_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
                                  # "learnable_gaussian", "learnable_dictionary", "vampprior"
     dictionary_size: 256         # Must be > input_dim (96 timesteps × 3 phases = 288)
     vamp_num_components: 40
@@ -109,6 +116,7 @@ model:
 
   phase_splitter:
     base_channels: 64
+    temperature: 2.0
 
   # SetGuideVAE set-encoder architecture configuration
   set:
@@ -208,7 +216,7 @@ training:
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 10
+  num_epochs: 2
   
   # Beta (KL weight) settings
   beta: 1.0 # 1.0
@@ -237,8 +245,6 @@ training:
     save_best_model: true
     save_best_after_fraction: 0.25 # start writing "best" checkpoint only after this fraction of total epochs
     save_final_model: true
-  
-  compile_model: false
 
 # ============================================================================
 # LOGGING AND MONITORING CONFIGURATION

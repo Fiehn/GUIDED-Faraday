@@ -29,10 +29,11 @@ class SyntheticGenerator:
         _is_cvae: Boolean flag indicating if the model is a CVAE (i.e., has a conditioner).
     """
 
-    def __init__(self, model, conditioner=None, normalizer = None, device = 'cpu'):
+    def __init__(self, model, conditioner=None, normalizer = None, secondary_model = None, device = 'cpu'):
         self.model = model
         self.conditioner = conditioner if conditioner is not None else getattr(model, 'conditioner', None)
         self.normalizer = normalizer
+        self.secondary_model = secondary_model
         self.device = device
         self._is_cvae = hasattr(model, 'conditioner') and model.conditioner is not None
         self._is_diffusion = self._is_diffusion_model()
@@ -138,6 +139,10 @@ class SyntheticGenerator:
             input_data = self._apply_normalizer(input_data, inverse=False)
             # Normalizers may return float64 tensors; align with model dtype for linear layers.
             input_data = input_data.to(self.device, dtype=model_dtype)
+        if self.secondary_model is not None:
+            # For phase-splitter models we run the first model on aggregated data, therefore we sum over phases to get the correct input shape for the first model.
+            phased_input_data = input_data.reshape(input_data.shape[0], 24, -1, self.model.num_features)  # [B, 24, num_phases, F]
+            input_data = input_data.sum(dim=1)  # Sum over phase dimension to get [B, 24, F_agg]
 
         if self._is_diffusion:
             flat_output = self.model.reconstruct(
@@ -279,6 +284,10 @@ class SyntheticGenerator:
         else:
             output = flat_output.reshape(-1, L, F)
 
+        if self.secondary_model is not None:
+            # If this is a phase-splitter type model, we run reconstruct on the secondary model to get the phases
+            return self.secondary_model.reconstruct(x_agg_generated=output, conditions=conditions, normalizer=self.normalizer, x_phased_real = phased_input_data)
+            
         # 2. Apply inverse transform so it's in actual kWh, not Z-scores
         if self.normalizer is not None and not is_denormalized and not self._is_art_model():
             output = self._apply_normalizer(output, inverse=True)
@@ -411,6 +420,10 @@ class SyntheticGenerator:
             output = flat.reshape(N, F, L).transpose(1, 2)
         else:
             output = flat.reshape(N, L, F)
+
+        if self.secondary_model is not None:
+            # If this is a phase-splitter type model, we run sample on the secondary model to get the phases
+            return self.secondary_model.sample(x_agg_generated=output, conditions=conditions, normalizer=self.normalizer)
 
         if self.normalizer is not None and not self._is_art_model():
             output = self.normalizer.inverse_transform(output.reshape(-1, F)).reshape(N, L, F)
@@ -667,13 +680,22 @@ if __name__ == "__main__":
     sys.path.append(root_dir)
 
     # Test the candidate generator
-    from src.model.cvae import CVAE
     from src.data.conditioner import Conditioner
     from src.data.normalizer import Normalizer
+    from src.train import _load_train_config
+    from src.model.factory import create_model_from_config
     
-    model, normalizer = CVAE.load_from_checkpoint("models/CVAE_DictionaryCoder_20260304_130859/CVAE_DictionaryCoder_20260304_130859_final.pt", device="cpu")
+    config = _load_train_config(os.path.join(root_dir, "config", "config.yaml"))
+    model = create_model_from_config(config, device="cpu")
+    
+    ckpt_path = "models/CVAE_DictionaryCoder_20260304_130859/CVAE_DictionaryCoder_20260304_130859_final.pt"
+    if os.path.exists(ckpt_path):
+        normalizer, _ = model.load_model(ckpt_path, device="cpu")
+    else:
+        print(f"Warning: Test checkpoint {ckpt_path} not found. Generator will run with untrained weights.")
+        normalizer = None
 
-    if hasattr(model, 'conditioner'):
+    if hasattr(model, 'conditioner') and model.conditioner is not None:
         for tag, item in model.conditioner.condition_items.items():
             if hasattr(item, 'path') and hasattr(item, 'load'):
                 print(f"Loading fitted state for {tag} from {item.path}")

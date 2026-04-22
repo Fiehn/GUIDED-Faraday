@@ -13,7 +13,13 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 from model.model import BaseModel
 
-class NoiseScheduler:
+class NoiseScheduler(nn.Module):
+    """Noise schedule for diffusion models.
+
+    Inherits from nn.Module so that all schedule tensors are automatically
+    captured by the parent model's state_dict() via register_buffer().
+    """
+
     def __init__(
         self,
         num_timesteps=1000,
@@ -24,6 +30,7 @@ class NoiseScheduler:
         max_beta=0.999,
         device="cpu",
     ):
+        super().__init__()
         self.num_timesteps = int(num_timesteps)
         if self.num_timesteps < 1:
             raise ValueError(f"num_timesteps must be >= 1, got {self.num_timesteps}")
@@ -34,7 +41,7 @@ class NoiseScheduler:
             raise ValueError(f"Unsupported noise schedule '{self.schedule_type}'. Use 'linear' or 'cosine'.")
         self.cosine_s = float(cosine_s)
         self.max_beta = float(max_beta)
-        self._init_tensors(torch.device(device))
+        self._init_buffers(torch.device(device))
 
     def _build_betas(self, device: torch.device) -> torch.Tensor:
         if self.schedule_type == "linear":
@@ -47,86 +54,34 @@ class NoiseScheduler:
         betas = 1.0 - (alpha_bar[1:] / alpha_bar[:-1].clamp(min=1e-12))
         return betas.clamp(min=1e-8, max=self.max_beta)
 
-    def _init_tensors(self, device: torch.device) -> None:
-        self.betas = self._build_betas(device)
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+    def _init_buffers(self, device: torch.device) -> None:
+        betas = self._build_betas(device)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = torch.cat(
-            [torch.ones(1, device=device), self.alphas_cumprod[:-1]],
+            [torch.ones(1, device=device), alphas_cumprod[:-1]],
             dim=0,
         )
 
-        self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas)
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-        self.posterior_variance = self.betas * (1.0 - alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
-        self.posterior_variance = torch.clamp(self.posterior_variance, min=1e-20)
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alphas_cumprod", alphas_cumprod)
+        self.register_buffer("sqrt_recip_alphas", torch.sqrt(1.0 / alphas))
+        self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
+        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
 
-    def to(self, device: str | torch.device):
-        device = torch.device(device)
-        for name in (
-            "betas",
-            "alphas",
-            "alphas_cumprod",
-            "sqrt_recip_alphas",
-            "sqrt_alphas_cumprod",
-            "sqrt_one_minus_alphas_cumprod",
-            "posterior_variance",
-        ):
-            setattr(self, name, getattr(self, name).to(device))
-        return self
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        posterior_variance = torch.clamp(posterior_variance, min=1e-20)
+        self.register_buffer("posterior_variance", posterior_variance)
 
-    def state_dict(self):
-        return {
-            "num_timesteps": self.num_timesteps,
-            "beta_start": self.beta_start,
-            "beta_end": self.beta_end,
-            "schedule_type": self.schedule_type,
-            "cosine_s": self.cosine_s,
-            "max_beta": self.max_beta,
-            "betas": self.betas.detach().cpu(),
-            "alphas": self.alphas.detach().cpu(),
-            "alphas_cumprod": self.alphas_cumprod.detach().cpu(),
-            "sqrt_recip_alphas": self.sqrt_recip_alphas.detach().cpu(),
-            "sqrt_alphas_cumprod": self.sqrt_alphas_cumprod.detach().cpu(),
-            "sqrt_one_minus_alphas_cumprod": self.sqrt_one_minus_alphas_cumprod.detach().cpu(),
-            "posterior_variance": self.posterior_variance.detach().cpu(),
-        }
-
-    def load_state_dict(self, state_dict):
-        self.num_timesteps = int(state_dict["num_timesteps"])
-        self.beta_start = float(state_dict["beta_start"])
-        self.beta_end = float(state_dict["beta_end"])
-        self.schedule_type = str(state_dict.get("schedule_type", "linear")).lower()
-        self.cosine_s = float(state_dict.get("cosine_s", 0.008))
-        self.max_beta = float(state_dict.get("max_beta", 0.999))
-
-        if self.schedule_type not in {"linear", "cosine"}:
-            self.schedule_type = "linear"
-
-        for name in (
-            "betas",
-            "alphas",
-            "alphas_cumprod",
-            "sqrt_recip_alphas",
-            "sqrt_alphas_cumprod",
-            "sqrt_one_minus_alphas_cumprod",
-            "posterior_variance",
-        ):
-            if name in state_dict:
-                setattr(self, name, state_dict[name])
-
-        # Fallback for partial/legacy scheduler states.
-        if not all(hasattr(self, name) for name in (
-            "betas",
-            "alphas",
-            "alphas_cumprod",
-            "sqrt_recip_alphas",
-            "sqrt_alphas_cumprod",
-            "sqrt_one_minus_alphas_cumprod",
-            "posterior_variance",
-        )):
-            self._init_tensors(torch.device("cpu"))
+        self.register_buffer(
+            "posterior_mean_coef1",
+            (betas * torch.sqrt(alphas_cumprod_prev)) / (1.0 - alphas_cumprod),
+        )
+        self.register_buffer(
+            "posterior_mean_coef2",
+            (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod),
+        )
 
     def add_noise(self, x_start: torch.Tensor, t: torch.Tensor, noise: torch.Tensor | None = None):
         """Forward noising q(x_t | x_0). Inputs are expected in [B, F, L]."""
@@ -378,11 +333,19 @@ class DiffusionModel(BaseModel):
             t = torch.full((x.shape[0],), t_idx, device=x.device, dtype=torch.long)
             predicted_noise = self.model(x, t, c)
 
-            alpha_t = self.noise_scheduler.alphas[t].view(-1, 1, 1)
             alpha_t_bar = self.noise_scheduler.alphas_cumprod[t].view(-1, 1, 1)
-            beta_t = self.noise_scheduler.betas[t].view(-1, 1, 1)
-
-            mean = (x - (beta_t / torch.sqrt(1.0 - alpha_t_bar)) * predicted_noise) / torch.sqrt(alpha_t)
+            
+            # 1. Predict the clean signal (x_0) from the noise prediction
+            x_0_pred = (x - torch.sqrt(1.0 - alpha_t_bar) * predicted_noise) / torch.sqrt(alpha_t_bar)
+            
+            # 2. clamp x_0 to a reasonable range to prevent numerical issues in mean calculation
+            x_0_pred = torch.clamp(x_0_pred, min=-5.0, max=5.0)
+            
+            # 3. Calculate the stable mean using the clamped x_0
+            coef1 = self.noise_scheduler.posterior_mean_coef1[t].view(-1, 1, 1)
+            coef2 = self.noise_scheduler.posterior_mean_coef2[t].view(-1, 1, 1)
+            
+            mean = coef1 * x_0_pred + coef2 * x
 
             if t_idx > 0 and stochastic and temperature > 0.0:
                 posterior_var = self.noise_scheduler.posterior_variance[t].view(-1, 1, 1)
@@ -390,6 +353,7 @@ class DiffusionModel(BaseModel):
                 x = mean + torch.sqrt(posterior_var) * noise * float(temperature)
             else:
                 x = mean
+                
         return x
 
     def _sample_from_conditions(self, conditions, num_prior_samples=1, temperature=1.0):
@@ -637,69 +601,3 @@ class DiffusionModel(BaseModel):
         self.to(original_device)
         return out
 
-    def save_model(self, save_path=None, model_name="trained_model", device="cpu", normalizer=None):
-        if save_path is None:
-            save_path = "./models/"
-
-        model_path = os.path.join(save_path, f"{model_name}.pt")
-        os.makedirs(save_path, exist_ok=True)
-
-        original_device = next(self.parameters()).device
-        self.eval()
-        self.to("cpu")
-
-        normalizer_state = None
-        if normalizer is not None and hasattr(normalizer, "fitted") and normalizer.fitted:
-            normalizer_state = {
-                "method": normalizer.method,
-                "epsilon": normalizer.epsilon,
-                "zero_id": normalizer.zero_id,
-                "shift": normalizer.shift,
-                "non_zero_mean": normalizer.non_zero_mean,
-                "non_zero_std": normalizer.non_zero_std,
-                "mean": normalizer.mean,
-                "std": normalizer.std,
-            }
-
-        checkpoint = {
-            "model_state_dict": self.state_dict(),
-            "constructor_args": {
-                "sequence_length": self.sequence_length,
-                "num_features": self.num_features,
-                "condition_dropout_prob": self.condition_dropout_prob,
-                "reconstruction_noise_fraction": self.reconstruction_noise_fraction,
-                "deterministic_reconstruction": self.deterministic_reconstruction,
-                "condition_dim": getattr(self.model.cond_proj, "in_features", None),
-                "time_dim": int(getattr(self.model, "time_dim", 128)),
-                "base_channels": int(getattr(self.model, "base_channels", 64)),
-                "self_attention_heads": int(getattr(self.model, "self_attention_heads", 4)),
-                "use_condition_cross_attention": bool(getattr(self.model, "use_condition_cross_attention", False)),
-                "condition_attention_heads": int(getattr(self.model, "condition_attention_heads", 4)),
-                "condition_tokens": int(getattr(self.model, "condition_tokens", 4)),
-            },
-            "noise_scheduler_state": self.noise_scheduler.state_dict(),
-            "model_kwargs": self.model_kwargs,
-            "normalizer_state": normalizer_state,
-            "model_info": {
-                "model_class": self.__class__.__name__,
-                "save_format_version": 1,
-            },
-        }
-
-        temp_path = f"{model_path}.tmp"
-        torch.save(checkpoint, temp_path)
-        os.replace(temp_path, model_path)
-
-        self.to(device)
-        self.to(original_device)
-        num_params = sum(p.numel() for p in self.parameters())
-        print(f"Model with {num_params} parameters saved to {model_path}")
-
-    def load_model(self, load_path, device="cpu"):
-        checkpoint = torch.load(load_path, map_location=device, weights_only=False)
-        self.load_state_dict(checkpoint["model_state_dict"])
-        if "noise_scheduler_state" in checkpoint:
-            self.noise_scheduler.load_state_dict(checkpoint["noise_scheduler_state"])
-            self.noise_scheduler.to(device)
-        self.to(device)
-        return checkpoint

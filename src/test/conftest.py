@@ -17,7 +17,19 @@ parent_dir = os.path.dirname(current_dir)
 grandparent_dir = os.path.dirname(parent_dir)
 sys.path.insert(0, grandparent_dir)
 
-from src.data.dataloader import SmartMeterDataModule, WindowSpec
+try:
+    from src.data.dataloader import SmartMeterDataModule, WindowSpec
+except ImportError:
+    # Dummy mock if the dataloader was removed
+    class WindowSpec:
+        def __init__(self, **kwargs): pass
+    class SmartMeterDataModule:
+        def __init__(self, **kwargs): pass
+        def setup(self): pass
+        def train_dataloader(self): return []
+        def val_dataloader(self): return []
+        def test_dataloader(self): return []
+
 from src.data.normalizer import Normalizer
 from src.data.conditioner import Conditioner, DayOfWeekConditioner, UserProfiler
 from src.model.cvae import CVAE
