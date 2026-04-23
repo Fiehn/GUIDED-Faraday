@@ -17,8 +17,8 @@ data:
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
   # data_dir: "./data/raw_profiles"
-  data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
-  # data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
+  #data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+  data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
   # data_dir: "data/_parquet_cache"
 
@@ -35,6 +35,7 @@ data:
   
   # Data loading options
   nan_as_zero: false # Currently only for CSV data mode
+  max_value: 200.0 # Set to a positive number to filter out windows with any value above this threshold (e.g., 200 kWh for hourly data)
   
   # Train/val/test split (by meter ID)
   splits:

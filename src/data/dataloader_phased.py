@@ -48,6 +48,7 @@ class StreamingParquetBuffer(IterableDataset):
                  seed: int | None = None,
                  split: str | None = None,
                  split_ratios: dict | None = None,
+                 max_value: float | None = None,
                  ):
         self.sm_files = sm_files
         self.replay_buffer_capacity = replay_buffer_capacity
@@ -55,6 +56,7 @@ class StreamingParquetBuffer(IterableDataset):
         self.seed = None if seed is None else int(seed)
         self.split = None if split is None else str(split).lower()
         self.split_ratios = split_ratios or {}
+        self.max_value = float(max_value) if max_value is not None else None
 
         # The buffer exists per worker
         # if capacity is 500 and num_workers is 4, then the total effective buffer capacity is 2000
@@ -361,6 +363,8 @@ class StreamingParquetBuffer(IterableDataset):
                     # Window-level deterministic split
                     if not self._keep_window(int(meter_id_t.item()), int(timestamp_t.item())):
                         continue
+                    if self.max_value is not None and seq.abs().sum() > self.max_value:
+                        continue
                     # Apply normalization if normalizer is provided
                     if self.normalizer is not None:
                         # seq shape is [24, 3], broadcasting with [3,]
@@ -501,6 +505,7 @@ class PhasedReplayDataloaders:
             feature_cols: list[str] | None = None,
             split_seed: int | None = None,
             split_ratios: dict | None = None,
+            max_value: float | None = None,
     ):
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
@@ -549,6 +554,7 @@ class PhasedReplayDataloaders:
             seed=self.split_seed,
             split="train",
             split_ratios=self.split_ratios,
+            max_value=max_value,
         )
 
         self.eval_loader = None
@@ -584,6 +590,7 @@ class PhasedReplayDataloaders:
             seed=self.split_seed,
             split="val",
             split_ratios=self.split_ratios,
+            max_value=max_value,
         )
 
         # True test stream (never used during training unless explicitly requested).
@@ -610,6 +617,7 @@ class PhasedReplayDataloaders:
             seed=self.split_seed,
             split="test",
             split_ratios=self.split_ratios,
+            max_value=max_value,
         )
 
     def get_file_progress(self):

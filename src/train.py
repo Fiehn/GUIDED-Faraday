@@ -22,65 +22,7 @@ from src.visualization.visualizer import Visualizer
 from src.visualization.writer import Writer
 from evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
 from src.visualization.plot_styling import PlotStyle
-from src.model.art import AutoRegressiveTransformerVAE
-from src.model.diffusion import DiffusionModel, NoiseScheduler, ConditionalUNet1D
-from src.model.phase_splitter import HierarchicalSplitter
-
-
-def _to_namespace(obj):
-    if isinstance(obj, dict):
-        return SimpleNamespace(**{k: _to_namespace(v) for k, v in obj.items()})
-    if isinstance(obj, list):
-        return [_to_namespace(v) for v in obj]
-    return obj
-
-
-def _load_train_config(config_path: str = None):
-    """Load YAML config and add aliases expected by train()."""
-    if config_path is None:
-        config_path = os.path.join(parent_dir, "config", "config.yaml")
-
-    with open(config_path, "r") as f:
-        raw = yaml.safe_load(f) or {}
-
-    cfg = _to_namespace(raw)
-    cfg._config_path = os.path.abspath(config_path)
-
-    # Aliases expected by existing train() implementation
-    if not hasattr(cfg, "data"):
-        raise ValueError("Config must contain a top-level 'data' section")
-    cfg.window = cfg.data.window
-    cfg.columns = cfg.data.columns
-    cfg.splits = cfg.data.splits
-    cfg.data_dir = cfg.data.data_dir
-    cfg.data_files = getattr(cfg.data, "data_files", [])
-    cfg.model_type = str(cfg.model.type).lower() if hasattr(cfg, "model") and hasattr(cfg.model, "type") else "vae"
-
-    # Backward-compatible alias: train() expects config.normalizer.method
-    if hasattr(cfg, "normalization"):
-        cfg.normalizer = cfg.normalization
-    elif not hasattr(cfg, "normalizer"):
-        cfg.normalizer = SimpleNamespace(method="log1p")
-
-    # Runtime toggles used in train()
-    if not hasattr(cfg, "skip_validation"):
-        cfg.skip_validation = False
-    if not hasattr(cfg, "verbose"):
-        cfg.verbose = True
-
-    return cfg
-
-def _save_training_config_snapshot(config, log_path: str):
-    """Save the YAML config used for training into the run report directory."""
-    os.makedirs(log_path, exist_ok=True)
-    src_path = getattr(config, "_config_path", None)
-    dst_path = os.path.join(log_path, "training_config_used.yaml")
-
-    if src_path and os.path.exists(src_path):
-        shutil.copy2(src_path, dst_path)
-    else:
-        print("Warning: could not resolve original config file path; skipping config snapshot save.")
-
+from src.model.factory import *
 
 def _run_evaluation_and_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, phased_mode: bool, secondary_model = None):
     """Route evaluation by mode and run shared visualizations."""
@@ -326,12 +268,13 @@ def train(config, train_only_user_profile: bool = False):
             phased_mode=phased_mode,
             feature_cols=data_cfg.columns.value_cols,
             meter_col=data_cfg.columns.meter_id,
-            split_seed=int(getattr(getattr(config, "splits", SimpleNamespace()), "random_seed", 0)),
+            split_seed=int(getattr(data_cfg.splits, "random_seed", 0)),
             split_ratios={
-                "train_ratio": float(getattr(getattr(config, "splits", SimpleNamespace()), "train_ratio", 1.0)),
-                "val_ratio": float(getattr(getattr(config, "splits", SimpleNamespace()), "val_ratio", 0.0)),
-                "test_ratio": float(getattr(getattr(config, "splits", SimpleNamespace()), "test_ratio", 0.0)),
+                "train_ratio": float(getattr(data_cfg.splits, "train_ratio", 1.0)),
+                "val_ratio": float(getattr(data_cfg.splits, "val_ratio", 0.0)),
+                "test_ratio": float(getattr(data_cfg.splits, "test_ratio", 0.0)),
             },
+            max_value=float(getattr(data_cfg, "max_value", None)) or None,
         )
 
     model.fit(data_loader=data_loader,
