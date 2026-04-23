@@ -9,7 +9,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
-from src.train import _load_train_config
+from src.model.factory import _load_train_config
 from src.model.factory import create_model_from_config
 
 def load_model(model_path: str, device: str = "cpu"):

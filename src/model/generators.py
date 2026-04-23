@@ -682,7 +682,7 @@ if __name__ == "__main__":
     # Test the candidate generator
     from src.data.conditioner import Conditioner
     from src.data.normalizer import Normalizer
-    from src.train import _load_train_config
+    from src.model.factory import _load_train_config
     from src.model.factory import create_model_from_config
     
     config = _load_train_config(os.path.join(root_dir, "config", "config.yaml"))

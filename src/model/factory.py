@@ -14,6 +14,60 @@ from src.data.conditioner import (
     ActivePhaseCountConditioner, HeatpumpPhaseConditioner, ElectricVehicleConditioner
 )
 
+def _to_namespace(obj):
+    if isinstance(obj, dict):
+        return SimpleNamespace(**{k: _to_namespace(v) for k, v in obj.items()})
+    if isinstance(obj, list):
+        return [_to_namespace(v) for v in obj]
+    return obj
+
+
+def _load_train_config(config_path: str = None):
+    """Load YAML config and add aliases expected by train()."""
+    if config_path is None:
+        config_path = os.path.join(parent_dir, "config", "config.yaml")
+
+    with open(config_path, "r") as f:
+        raw = yaml.safe_load(f) or {}
+
+    cfg = _to_namespace(raw)
+    cfg._config_path = os.path.abspath(config_path)
+
+    # Aliases expected by existing train() implementation
+    if not hasattr(cfg, "data"):
+        raise ValueError("Config must contain a top-level 'data' section")
+    cfg.window = cfg.data.window
+    cfg.columns = cfg.data.columns
+    cfg.splits = cfg.data.splits
+    cfg.data_dir = cfg.data.data_dir
+    cfg.data_files = getattr(cfg.data, "data_files", [])
+    cfg.model_type = str(cfg.model.type).lower() if hasattr(cfg, "model") and hasattr(cfg.model, "type") else "vae"
+
+    # Backward-compatible alias: train() expects config.normalizer.method
+    if hasattr(cfg, "normalization"):
+        cfg.normalizer = cfg.normalization
+    elif not hasattr(cfg, "normalizer"):
+        cfg.normalizer = SimpleNamespace(method="log1p")
+
+    # Runtime toggles used in train()
+    if not hasattr(cfg, "skip_validation"):
+        cfg.skip_validation = False
+    if not hasattr(cfg, "verbose"):
+        cfg.verbose = True
+
+    return cfg
+
+def _save_training_config_snapshot(config, log_path: str):
+    """Save the YAML config used for training into the run report directory."""
+    os.makedirs(log_path, exist_ok=True)
+    src_path = getattr(config, "_config_path", None)
+    dst_path = os.path.join(log_path, "training_config_used.yaml")
+
+    if src_path and os.path.exists(src_path):
+        shutil.copy2(src_path, dst_path)
+    else:
+        print("Warning: could not resolve original config file path; skipping config snapshot save.")
+
 def create_model_from_config(config, device="cpu"):
     """
     Creates and returns a BaseModel subclass and its Conditioner based on the Hydra config.

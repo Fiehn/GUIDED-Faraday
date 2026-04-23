@@ -7,6 +7,7 @@ import random
 import json
 import numpy as np
 from pathlib import Path
+import argparse
 
 # Add project roots for imports
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -19,7 +20,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from src.evaluation.load_model import load_model
-from src.train import _load_train_config
+from src.model.factory import _load_train_config
 from src.data.dataloader_phased import PhasedReplayDataloaders, WindowSpec
 from src.evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
 from src.visualization.plot_styling import PlotStyle
@@ -352,9 +353,48 @@ def get_eval_files(data_dir: str, data_files: list[str] | None = None):
     if not discovered:
         raise FileNotFoundError(f"No .parquet files (not starting with 'test_') found in {data_dir}")
         
-    # randomly shuffle available files:
-    random.shuffle(discovered)
-    return discovered
+    # Deterministic ordering by default to avoid data variance across runs/models.
+    return sorted(discovered)
+
+def _find_model_config_path(model_dir: str) -> str | None:
+    """Return a config yaml path inside a trained model directory if present."""
+    if not os.path.isdir(model_dir):
+        return None
+    # Prefer the snapshot if training wrote it.
+    snap = os.path.join(model_dir, "training_config_used.yaml")
+    if os.path.exists(snap):
+        return snap
+    for f in os.listdir(model_dir):
+        if f.endswith(".yaml") or f.endswith(".yml"):
+            return os.path.join(model_dir, f)
+    return None
+
+def _infer_split_from_first_model(model_paths: list[str]) -> tuple[int, dict]:
+    """Infer split seed/ratios from the first model's config as a sensible default."""
+    if not model_paths:
+        return 0, {"train_ratio": 0.8, "val_ratio": 0.1, "test_ratio": 0.1}
+    cfg_path = _find_model_config_path(model_paths[0])
+    if cfg_path is None:
+        return 0, {"train_ratio": 0.8, "val_ratio": 0.1, "test_ratio": 0.1}
+    cfg = _load_train_config(cfg_path).data
+    seed = int(getattr(cfg.splits, "random_seed", 0))
+    ratios = {
+        "train_ratio": float(getattr(cfg.splits, "train_ratio", 0.8)),
+        "val_ratio": float(getattr(cfg.splits, "val_ratio", 0.1)),
+        "test_ratio": float(getattr(cfg.splits, "test_ratio", 0.1)),
+    }
+    return seed, ratios
+
+def _has_existing_eval_outputs(model_output_dir: str, phased: bool) -> bool:
+    """Return True if evaluation artifacts already exist on disk for this model output folder."""
+    if phased:
+        phases = ["aggregated_phase", "ranked_phase_1", "ranked_phase_2", "ranked_phase_3"]
+        for phase in phases:
+            p = os.path.join(model_output_dir, f"{phase}_eval", "eval_results.json")
+            if os.path.exists(p):
+                return True
+        return os.path.exists(os.path.join(model_output_dir, "eval_results.json"))
+    return os.path.exists(os.path.join(model_output_dir, "eval_results.json"))
 
 def compare_models(model_paths: list[str], 
                    model_names: list[str], 
@@ -362,11 +402,13 @@ def compare_models(model_paths: list[str],
                    data_dir: str = "data/_parquet_cache",
                    data_files: list[str] | None = None,
                    num_samples: int = 100,
-                   seed: int = 42,
                    output_dir: str = "evaluation_comparison",
                    phased: bool = False,
                    agg_divisor = 1000.0,
-                   is_agg = True,
+                   recompute: bool = False,
+                   split_seed: int | None = None,
+                   split_ratios: dict | None = None,
+                   max_value: float | None = 200.0,
                    ):
     """
     Run evaluation for multiple models and compare results.
@@ -376,16 +418,26 @@ def compare_models(model_paths: list[str],
     # 1. Prepare evaluation data
     if data_files is None:
         data_files = get_eval_files(data_dir)
+
+    # 2. Pick a single global test split definition so all models see identical windows.
+    if split_seed is None or split_ratios is None:
+        inferred_seed, inferred_ratios = _infer_split_from_first_model(model_paths)
+        split_seed = inferred_seed if split_seed is None else int(split_seed)
+        split_ratios = inferred_ratios if split_ratios is None else split_ratios
+    split_seed = int(split_seed)
+    split_ratios = dict(split_ratios)
     
     # 4. Loop through models and evaluate
     for i, (path, name) in enumerate(zip(model_paths, model_names)):
         print(f"\nEvaluating model: {name}")
+        model_output_dir = os.path.join(output_dir, name)
+        os.makedirs(model_output_dir, exist_ok=True)
+
+        if (not recompute) and _has_existing_eval_outputs(model_output_dir, phased=phased):
+            print(f"Found existing evaluation outputs in {model_output_dir}; skipping recompute.")
+            continue
+
         model, normalizer, conditioner = load_model(path, device="cuda")
-        
-        # reloading with the same seed each model
-        random.seed(seed)
-        torch.manual_seed(seed)
-        np.random.seed(seed)
 
         # 2. Load Data
         window = WindowSpec(input_len=24, stride=24)
@@ -398,26 +450,28 @@ def compare_models(model_paths: list[str],
             normalizer=normalizer,
             num_workers=0,
             phased_mode=phased,
-            sample_random=True,
+            # Deterministic test selection + ordering.
+            sample_random=False,
             feature_cols=["hourly_energy_consumption",],
             meter_col = "meter_number",
             aggregation_divisor=agg_divisor,
-            hourly_aggregation=True if agg_divisor > 1.0 else False
+            hourly_aggregation=True if agg_divisor > 1.0 else False,
+            split_seed=split_seed,
+            split_ratios=split_ratios,
+            max_value=max_value
         )
         
         # 3. Grab a fixed number of samples for evaluation
         n_batches = max(1, num_samples // 32)
-        loader_obj.refresh_eval_cache(n_batches)
-        test_loader = loader_obj.get_eval_loader()
+        # True held-out test split (not used during training).
+        loader_obj.refresh_test_cache(n_batches)
+        test_loader = loader_obj.get_test_loader()
         
         sec_model = None
         if secondary_model_paths is not None and i < len(secondary_model_paths):
             if secondary_model_paths[i] is not None:
                 sec_model, _, _ = load_model(secondary_model_paths[i], device="cuda")
         
-        model_output_dir = os.path.join(output_dir, name)
-        os.makedirs(model_output_dir, exist_ok=True)
-
         if phased:
             # Phased models use PhasedEvaluationSuite which creates sub-phase directories
             evaluator = PhasedEvaluationSuite(
@@ -462,21 +516,56 @@ def compare_models(model_paths: list[str],
     return comparator.models_data
 
 if __name__ == "__main__":
-    model_paths = [
-        "models/SetGuideVAE_20260422_143202",
-        "models/DiffusionModel_20260422_162452"
-    ]
-    model_names = [
-        "Set-guide",
-        "Diffusion"
-    ]
-    secondary_model_paths = [
-        None,
-        None,
-    ]
-    data_dir = "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
-    compare_models(model_paths, 
-                   model_names, 
-                   secondary_model_paths, 
-                   data_dir=data_dir, 
-                   phased=True)
+    parser = argparse.ArgumentParser(description="Compare model evaluation results (reuse outputs or recompute).")
+    parser.add_argument("--models", nargs="+", required=True, help="List of model directories (each contains config + checkpoint).")
+    parser.add_argument("--names", nargs="+", required=True, help="Display names for models (same length as --models).")
+    parser.add_argument("--secondary-models", nargs="*", default=None, help="Optional secondary model dirs aligned with --models. Use 'None' to skip.")
+    parser.add_argument("--data-dir", type=str, default="data/_parquet_cache", help="Directory with parquet files.")
+    parser.add_argument("--data-files", nargs="*", default=None, help="Optional explicit parquet files (relative to --data-dir unless absolute).")
+    parser.add_argument("--num-samples", type=int, default=100, help="Approx number of windows to evaluate per model.")
+    parser.add_argument("--output-dir", type=str, default="evaluation_comparison", help="Where to write/read evaluation outputs.")
+    parser.add_argument("--phased", action="store_true", help="Use phased evaluation suite.")
+    parser.add_argument("--recompute", action="store_true", help="Recompute evaluation even if outputs already exist.")
+    parser.add_argument("--split-seed", type=int, default=None, help="Seed used for deterministic window-level train/val/test split. Defaults to first model's training config.")
+    parser.add_argument("--train-ratio", type=float, default=None, help="Train ratio for split (defaults to first model's training config).")
+    parser.add_argument("--val-ratio", type=float, default=None, help="Val ratio for split (defaults to first model's training config).")
+    parser.add_argument("--test-ratio", type=float, default=None, help="Test ratio for split (defaults to first model's training config).")
+    parser.add_argument("--max-value", type=float, default=200.0, help="Maximum value for filtering windows.")
+    args = parser.parse_args()
+
+    if len(args.models) != len(args.names):
+        raise ValueError("--models and --names must have the same length.")
+
+    secondary_model_paths = None
+    if args.secondary_models is not None and len(args.secondary_models) > 0:
+        secondary_model_paths = []
+        for s in args.secondary_models:
+            if s is None or str(s).lower() == "none":
+                secondary_model_paths.append(None)
+            else:
+                secondary_model_paths.append(s)
+        if len(secondary_model_paths) < len(args.models):
+            secondary_model_paths.extend([None] * (len(args.models) - len(secondary_model_paths)))
+
+    split_ratios = None
+    if args.train_ratio is not None or args.val_ratio is not None or args.test_ratio is not None:
+        split_ratios = {
+            "train_ratio": 0.8 if args.train_ratio is None else float(args.train_ratio),
+            "val_ratio": 0.1 if args.val_ratio is None else float(args.val_ratio),
+            "test_ratio": 0.1 if args.test_ratio is None else float(args.test_ratio),
+        }
+
+    compare_models(
+        model_paths=args.models,
+        model_names=args.names,
+        secondary_model_paths=secondary_model_paths,
+        data_dir=args.data_dir,
+        data_files=args.data_files,
+        num_samples=int(args.num_samples),
+        output_dir=args.output_dir,
+        phased=bool(args.phased),
+        recompute=bool(args.recompute),
+        split_seed=args.split_seed,
+        split_ratios=split_ratios,
+        max_value=args.max_value
+    )
