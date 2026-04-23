@@ -45,10 +45,16 @@ class StreamingParquetBuffer(IterableDataset):
                  phased_mode: bool = True,
                  meter_col: str = "meter_number",
                  feature_cols: list[str] | None = None,
+                 seed: int | None = None,
+                 split: str | None = None,
+                 split_ratios: dict | None = None,
                  ):
         self.sm_files = sm_files
         self.replay_buffer_capacity = replay_buffer_capacity
         self.min_buffer_size = min_buffer_size
+        self.seed = None if seed is None else int(seed)
+        self.split = None if split is None else str(split).lower()
+        self.split_ratios = split_ratios or {}
 
         # The buffer exists per worker
         # if capacity is 500 and num_workers is 4, then the total effective buffer capacity is 2000
@@ -87,6 +93,39 @@ class StreamingParquetBuffer(IterableDataset):
         self._skip_warning_count = 0
         self.output_aggregate_stream = bool(output_aggregate_stream)
         self.sample_random = bool(sample_random)
+
+    def _split_bucket(self, meter_id: int, timestamp_s: int) -> str:
+        """Deterministically assign a window to train/val/test based on a seeded hash.
+
+        This splits at the WINDOW level (not file level), which is important when each
+        file corresponds to a condition and must be represented across splits.
+        """
+        train_ratio = float(self.split_ratios.get("train_ratio", 1.0))
+        val_ratio = float(self.split_ratios.get("val_ratio", 0.0))
+        test_ratio = float(self.split_ratios.get("test_ratio", 0.0))
+        total = train_ratio + val_ratio + test_ratio
+        if total <= 0:
+            return "train"
+        train_ratio /= total
+        val_ratio /= total
+        test_ratio /= total
+
+        # Stable uniform in [0,1) from sha1(seed|meter|timestamp)
+        seed_str = "0" if self.seed is None else str(int(self.seed))
+        key = f"{seed_str}|{int(meter_id)}|{int(timestamp_s)}".encode("utf-8")
+        digest = hashlib.sha1(key).digest()
+        u = int.from_bytes(digest[:8], "big") / float(2**64)
+
+        if u < train_ratio:
+            return "train"
+        if u < train_ratio + val_ratio:
+            return "val"
+        return "test"
+
+    def _keep_window(self, meter_id: int, timestamp_s: int) -> bool:
+        if self.split is None:
+            return True
+        return self._split_bucket(meter_id, timestamp_s) == self.split
 
     def _mark_file_seen(self, file_path: str):
         if self.file_seen_map is not None:
@@ -152,7 +191,8 @@ class StreamingParquetBuffer(IterableDataset):
         if self.current_size < self.min_buffer_size:
             raise ValueError(f"Buffer size {self.current_size} is less than the minimum required {self.min_buffer_size} for sampling.")
         if self.sample_random:
-            idx = random.randrange(self.current_size)
+            # Uses worker-local RNG for determinism across runs.
+            idx = self._rng.randrange(self.current_size)
             return self.buffer[idx]
 
         # Deterministic mode: always emit the newest inserted sample.
@@ -288,6 +328,11 @@ class StreamingParquetBuffer(IterableDataset):
         # === Multiprocessing traffic control ===
         worker_info = get_worker_info()
 
+        # Worker-local RNG so file order and buffer sampling are reproducible.
+        base_seed = 0 if self.seed is None else int(self.seed)
+        worker_id = 0 if worker_info is None else int(worker_info.id)
+        self._rng = random.Random(base_seed + 1009 * worker_id)
+
         if worker_info is None:
             # Single-process data loading
             files_for_this_worker = list(self.sm_files) # copy the list
@@ -300,7 +345,7 @@ class StreamingParquetBuffer(IterableDataset):
             files_for_this_worker = self.sm_files[start_idx:end_idx]
         
         if self.sample_random:
-            random.shuffle(files_for_this_worker)
+            self._rng.shuffle(files_for_this_worker)
 
         # === Lazy parquet streaming ===
         for file in files_for_this_worker:
@@ -313,6 +358,9 @@ class StreamingParquetBuffer(IterableDataset):
                 sequences = self._extract_sequences(file_df, meter_id=meter_id, meter_col_name=meter_col_name)
 
                 for seq, meter_id_t, timestamp_t in sequences:
+                    # Window-level deterministic split
+                    if not self._keep_window(int(meter_id_t.item()), int(timestamp_t.item())):
+                        continue
                     # Apply normalization if normalizer is provided
                     if self.normalizer is not None:
                         # seq shape is [24, 3], broadcasting with [3,]
@@ -451,6 +499,8 @@ class PhasedReplayDataloaders:
             phased_mode: bool = True,
             meter_col: str = "meter_number",
             feature_cols: list[str] | None = None,
+            split_seed: int | None = None,
+            split_ratios: dict | None = None,
     ):
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
@@ -461,6 +511,10 @@ class PhasedReplayDataloaders:
         self.output_aggregate_stream = bool(output_aggregate_stream)
         self.sample_random = bool(sample_random)
         self.phased_mode = bool(phased_mode)
+        self.split_seed = None if split_seed is None else int(split_seed)
+        self.split_ratios = split_ratios or {}
+
+        sm_files = list(sm_files)
         self.total_files = len(set(sm_files))
 
         # Manager-backed maps are shared across DataLoader workers.
@@ -472,7 +526,7 @@ class PhasedReplayDataloaders:
         self.files_seen = 0
         self.files_completed = 0
 
-        self.dataset = StreamingParquetBuffer(
+        self.train_dataset = StreamingParquetBuffer(
             sm_files=sm_files,
             replay_buffer_capacity=replay_buffer_capacity,
             min_buffer_size=min_buffer_size,
@@ -492,11 +546,71 @@ class PhasedReplayDataloaders:
             phased_mode=self.phased_mode,
             meter_col=meter_col,
             feature_cols=feature_cols,
+            seed=self.split_seed,
+            split="train",
+            split_ratios=self.split_ratios,
         )
 
         self.eval_loader = None
-        self._stream_loader = None
-        self._stream_iter = None
+        self.test_loader = None
+        self._train_stream_loader = None
+        self._train_stream_iter = None
+        self._val_stream_loader = None
+        self._val_stream_iter = None
+        self._test_stream_loader = None
+        self._test_stream_iter = None
+
+        # Validation stream (used during training): deterministic ordering and deterministic buffer sampling.
+        self.val_dataset = StreamingParquetBuffer(
+            sm_files=sm_files,
+            replay_buffer_capacity=replay_buffer_capacity,
+            min_buffer_size=min_buffer_size,
+            window_spec=window_spec,
+            normalizer=normalizer,
+            num_workers=0,  # keep eval deterministic / simple
+            hourly_aggregation=hourly_aggregation,
+            aggregation_divisor=aggregation_divisor,
+            file_seen_map=None,
+            file_completed_map=None,
+            file_skipped_map=None,
+            skip_corrupt_files=skip_corrupt_files,
+            max_skip_warnings=max_skip_warnings,
+            output_aggregate_stream=self.output_aggregate_stream,
+            sample_random=False,
+            nan_as_zero=nan_as_zero,
+            phased_mode=self.phased_mode,
+            meter_col=meter_col,
+            feature_cols=feature_cols,
+            seed=self.split_seed,
+            split="val",
+            split_ratios=self.split_ratios,
+        )
+
+        # True test stream (never used during training unless explicitly requested).
+        self.test_dataset = StreamingParquetBuffer(
+            sm_files=sm_files,
+            replay_buffer_capacity=replay_buffer_capacity,
+            min_buffer_size=min_buffer_size,
+            window_spec=window_spec,
+            normalizer=normalizer,
+            num_workers=0,
+            hourly_aggregation=hourly_aggregation,
+            aggregation_divisor=aggregation_divisor,
+            file_seen_map=None,
+            file_completed_map=None,
+            file_skipped_map=None,
+            skip_corrupt_files=skip_corrupt_files,
+            max_skip_warnings=max_skip_warnings,
+            output_aggregate_stream=self.output_aggregate_stream,
+            sample_random=False,
+            nan_as_zero=nan_as_zero,
+            phased_mode=self.phased_mode,
+            meter_col=meter_col,
+            feature_cols=feature_cols,
+            seed=self.split_seed,
+            split="test",
+            split_ratios=self.split_ratios,
+        )
 
     def get_file_progress(self):
         self.files_seen = len(self._file_seen_map)
@@ -508,7 +622,7 @@ class PhasedReplayDataloaders:
             "total": int(self.total_files),
         }
 
-    def _make_stream(self):
+    def _make_stream(self, dataset):
         loader_kwargs = {
             "batch_size": self.batch_size,
             "num_workers": self.num_workers,
@@ -517,49 +631,106 @@ class PhasedReplayDataloaders:
         if self.num_workers > 0:
             loader_kwargs["persistent_workers"] = True
             loader_kwargs["prefetch_factor"] = 2
-        return DataLoader(self.dataset, **loader_kwargs)
+        return DataLoader(dataset, **loader_kwargs)
 
-    def _get_stream_loader(self):
-        if self._stream_loader is None:
-            self._stream_loader = self._make_stream()
-        return self._stream_loader
+    def _get_train_stream_loader(self):
+        if self._train_stream_loader is None:
+            self._train_stream_loader = self._make_stream(self.train_dataset)
+        return self._train_stream_loader
 
-    def _next_stream_batch(self):
-        loader = self._get_stream_loader()
-        if self._stream_iter is None:
-            self._stream_iter = iter(loader)
+    def _get_eval_stream_loader(self):
+        # Backwards-compat alias: "eval" means validation during training.
+        return self._get_val_stream_loader()
+
+    def _get_val_stream_loader(self):
+        if self._val_stream_loader is None:
+            loader_kwargs = {
+                "batch_size": self.batch_size,
+                "num_workers": 0,
+                "pin_memory": self.pin_memory,
+            }
+            self._val_stream_loader = DataLoader(self.val_dataset, **loader_kwargs)
+        return self._val_stream_loader
+
+    def _get_test_stream_loader(self):
+        if self._test_stream_loader is None:
+            loader_kwargs = {
+                "batch_size": self.batch_size,
+                "num_workers": 0,
+                "pin_memory": self.pin_memory,
+            }
+            self._test_stream_loader = DataLoader(self.test_dataset, **loader_kwargs)
+        return self._test_stream_loader
+
+    def _next_train_stream_batch(self):
+        loader = self._get_train_stream_loader()
+        if self._train_stream_iter is None:
+            self._train_stream_iter = iter(loader)
 
         try:
-            return next(self._stream_iter)
+            return next(self._train_stream_iter)
         except StopIteration:
-            self._stream_iter = iter(loader)
+            self._train_stream_iter = iter(loader)
             try:
-                return next(self._stream_iter)
+                return next(self._train_stream_iter)
             except StopIteration:
                 return None
 
-    def _collect_cache(self, target_train: int, target_eval: int):
-        train_x = None
-        train_meter = None
-        train_timestamps = None
-        train_agg = None
-        eval_x = None
-        eval_meter = None
-        eval_timestamps = None
-        eval_agg = None
-        train_samples = 0
-        eval_samples = 0
+    def _next_val_stream_batch(self):
+        loader = self._get_val_stream_loader()
+        if self._val_stream_iter is None:
+            self._val_stream_iter = iter(loader)
 
-        target_train = max(0, int(target_train))
-        target_eval = max(0, int(target_eval))
-        total_batches = max(1, (target_train + target_eval + self.batch_size - 1) // self.batch_size)
+        try:
+            return next(self._val_stream_iter)
+        except StopIteration:
+            self._val_stream_iter = iter(loader)
+            try:
+                return next(self._val_stream_iter)
+            except StopIteration:
+                return None
+
+    def _next_test_stream_batch(self):
+        loader = self._get_test_stream_loader()
+        if self._test_stream_iter is None:
+            self._test_stream_iter = iter(loader)
+
+        try:
+            return next(self._test_stream_iter)
+        except StopIteration:
+            self._test_stream_iter = iter(loader)
+            try:
+                return next(self._test_stream_iter)
+            except StopIteration:
+                return None
+
+    def _collect_stream_cache(self, which: str, target: int):
+        target = max(0, int(target))
+        if target == 0:
+            return None, None, None, None
+
+        x_out = None
+        meter_out = None
+        ts_out = None
+        agg_out = None
+        samples = 0
+
+        total_batches = max(1, (target + self.batch_size - 1) // self.batch_size)
         max_scan_batches = self.cache_scan_batches or max(30, total_batches * 40)
-        for i in range(max_scan_batches):
-            batch = self._next_stream_batch()
-            if batch is None:
-                print("Warning: phased stream produced no data while collecting cache.")
-                break
 
+        if which == "train":
+            next_batch = self._next_train_stream_batch
+        elif which == "val":
+            next_batch = self._next_val_stream_batch
+        elif which == "test":
+            next_batch = self._next_test_stream_batch
+        else:
+            raise ValueError(f"Unknown stream selector: {which}")
+
+        for _ in range(max_scan_batches):
+            batch = next_batch()
+            if batch is None:
+                break
             if not isinstance(batch, (list, tuple)) or len(batch) != 4:
                 raise ValueError(
                     "Streaming replay batch must be a 4-tuple: (x, meter_id, timestamps, agg)."
@@ -571,92 +742,36 @@ class PhasedReplayDataloaders:
             ts_batch = ts_batch.long()
             agg_batch = agg_batch.float()
 
-            if train_x is None and target_train > 0:
-                train_x = torch.empty((target_train, *x.shape[1:]), dtype=x.dtype)
-                train_meter = torch.empty((target_train,), dtype=torch.long)
-                train_timestamps = torch.empty((target_train,), dtype=torch.long)
-                train_agg = torch.empty((target_train, *agg_batch.shape[1:]), dtype=agg_batch.dtype)
-            if eval_x is None and target_eval > 0:
-                eval_x = torch.empty((target_eval, *x.shape[1:]), dtype=x.dtype)
-                eval_meter = torch.empty((target_eval,), dtype=torch.long)
-                eval_timestamps = torch.empty((target_eval,), dtype=torch.long)
-                eval_agg = torch.empty((target_eval, *agg_batch.shape[1:]), dtype=agg_batch.dtype)
+            if x_out is None:
+                x_out = torch.empty((target, *x.shape[1:]), dtype=x.dtype)
+                meter_out = torch.empty((target,), dtype=torch.long)
+                ts_out = torch.empty((target,), dtype=torch.long)
+                agg_out = torch.empty((target, *agg_batch.shape[1:]), dtype=agg_batch.dtype)
 
-            n = x.shape[0]
-            remaining_train = max(0, target_train - train_samples)
-            remaining_eval = max(0, target_eval - eval_samples)
-            if remaining_train <= 0 and remaining_eval <= 0:
+            remaining = max(0, target - samples)
+            if remaining <= 0:
                 break
 
-            if remaining_eval > 0:
-                denom = max(1, remaining_train + remaining_eval)
-                p_eval = float(remaining_eval) / float(denom)
-                eval_mask = torch.rand(n) < p_eval
-
-                if eval_mask.sum().item() == 0 and remaining_eval > 0 and n > 1:
-                    eval_mask[torch.randint(0, n, (1,)).item()] = True
-                if (~eval_mask).sum().item() == 0 and remaining_train > 0 and n > 1:
-                    eval_mask[torch.randint(0, n, (1,)).item()] = False
-            else:
-                eval_mask = torch.zeros(n, dtype=torch.bool)
-
-            x_eval = x[eval_mask]
-            m_eval = meter_batch[eval_mask]
-            t_eval = ts_batch[eval_mask]
-            x_train = x[~eval_mask]
-            m_train = meter_batch[~eval_mask]
-            t_train = ts_batch[~eval_mask]
-            agg_eval = agg_batch[eval_mask]
-            agg_train = agg_batch[~eval_mask]
-
-            if remaining_train > 0 and x_train.shape[0] > 0:
-                take_train = min(remaining_train, x_train.shape[0])
-                train_x[train_samples:train_samples + take_train].copy_(x_train[:take_train])
-                train_meter[train_samples:train_samples + take_train].copy_(m_train[:take_train])
-                train_timestamps[train_samples:train_samples + take_train].copy_(t_train[:take_train])
-                train_agg[train_samples:train_samples + take_train].copy_(agg_train[:take_train])
-                train_samples += int(take_train)
-
-            if remaining_eval > 0 and x_eval.shape[0] > 0:
-                take_eval = min(remaining_eval, x_eval.shape[0])
-                eval_x[eval_samples:eval_samples + take_eval].copy_(x_eval[:take_eval])
-                eval_meter[eval_samples:eval_samples + take_eval].copy_(m_eval[:take_eval])
-                eval_timestamps[eval_samples:eval_samples + take_eval].copy_(t_eval[:take_eval])
-                eval_agg[eval_samples:eval_samples + take_eval].copy_(agg_eval[:take_eval])
-                eval_samples += int(take_eval)
-
-            if train_samples >= target_train and eval_samples >= target_eval:
-                break
-
-            if i == max_scan_batches - 1:
-                print(f"Warning: reached scan limit ({max_scan_batches} batches) while collecting phased cache.")
-
-        if train_samples < target_train and eval_x is not None and eval_samples > 0:
-            need = target_train - train_samples
-            take = min(need, eval_samples)
+            take = min(remaining, x.shape[0])
             if take > 0:
-                train_x[train_samples:train_samples + take].copy_(eval_x[:take])
-                train_meter[train_samples:train_samples + take].copy_(eval_meter[:take])
-                train_timestamps[train_samples:train_samples + take].copy_(eval_timestamps[:take])
-                train_agg[train_samples:train_samples + take].copy_(eval_agg[:take])
-                train_samples += int(take)
+                x_out[samples:samples + take].copy_(x[:take])
+                meter_out[samples:samples + take].copy_(meter_batch[:take])
+                ts_out[samples:samples + take].copy_(ts_batch[:take])
+                agg_out[samples:samples + take].copy_(agg_batch[:take])
+                samples += int(take)
 
-        if train_x is not None:
-            train_x = train_x[:train_samples]
-        if train_meter is not None:
-            train_meter = train_meter[:train_samples]
-        if train_timestamps is not None:
-            train_timestamps = train_timestamps[:train_samples]
-        if train_agg is not None:
-            train_agg = train_agg[:train_samples]
-        if eval_x is not None:
-            eval_x = eval_x[:eval_samples]
-        if eval_meter is not None:
-            eval_meter = eval_meter[:eval_samples]
-        if eval_timestamps is not None:
-            eval_timestamps = eval_timestamps[:eval_samples]
-        if eval_agg is not None:
-            eval_agg = eval_agg[:eval_samples]
+            if samples >= target:
+                break
+
+        if x_out is None or samples == 0:
+            return None, None, None, None
+
+        return x_out[:samples], meter_out[:samples], ts_out[:samples], agg_out[:samples]
+
+    def _collect_cache(self, target_train: int, target_eval: int):
+        train_x, train_meter, train_timestamps, train_agg = self._collect_stream_cache("train", target_train)
+        # Backwards-compat: "eval" here means validation during training.
+        eval_x, eval_meter, eval_timestamps, eval_agg = self._collect_stream_cache("val", target_eval)
         return train_x, train_meter, train_timestamps, train_agg, eval_x, eval_meter, eval_timestamps, eval_agg
 
     def _build_eval_loader(self, x_eval, meter_eval, timestamps_eval, agg_eval=None):
@@ -701,6 +816,45 @@ class PhasedReplayDataloaders:
             pin_memory=pin_eval_memory,
         )
 
+    def _build_test_loader(self, x_test, meter_test, timestamps_test, agg_test=None):
+        if (
+            x_test is None
+            or meter_test is None
+            or timestamps_test is None
+            or x_test.shape[0] == 0
+        ):
+            self.test_loader = None
+            return
+
+        meter_id = meter_test.long()
+        timestamps = timestamps_test.long()
+
+        if self.eval_cache_device is not None:
+            try:
+                x_test = x_test.to(self.eval_cache_device)
+                meter_id = meter_id.to(self.eval_cache_device)
+                timestamps = timestamps.to(self.eval_cache_device)
+                if agg_test is not None:
+                    agg_test = agg_test.to(self.eval_cache_device)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print("Warning: test cache GPU transfer OOM; falling back to CPU test cache.")
+                else:
+                    raise
+
+        if agg_test is not None:
+            test_ds = TensorDataset(x_test, meter_id, timestamps, agg_test)
+        else:
+            test_ds = TensorDataset(x_test, meter_id, timestamps)
+        pin_test_memory = self.pin_memory and x_test.device.type == "cpu"
+        self.test_loader = DataLoader(
+            test_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=pin_test_memory,
+        )
+
     def get_epoch_loaders(self, steps_per_epoch: int, eval_batches: int, refresh_eval: bool = False):
         target_train = max(1, int(steps_per_epoch)) * self.batch_size
         need_eval = int(eval_batches) > 0
@@ -717,12 +871,17 @@ class PhasedReplayDataloaders:
 
         train_ds = TensorDataset(train_x, train_meter, train_timestamps, train_agg)
         pin_train_memory = self.pin_memory and train_x.device.type == "cpu"
+        generator = None
+        if self.split_seed is not None:
+            generator = torch.Generator()
+            generator.manual_seed(int(self.split_seed))
         train_loader = DataLoader(
             train_ds,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=0,
             pin_memory=pin_train_memory,
+            generator=generator,
         )
 
         if target_eval > 0:
@@ -737,4 +896,13 @@ class PhasedReplayDataloaders:
 
     def get_eval_loader(self):
         return self.eval_loader
+
+    def refresh_test_cache(self, test_batches: int):
+        target_test = max(1, int(test_batches)) * self.batch_size
+        x_test, m_test, t_test, a_test = self._collect_stream_cache("test", target_test)
+        self._build_test_loader(x_test, m_test, t_test, a_test)
+
+    def get_test_loader(self):
+        return self.test_loader
+
 

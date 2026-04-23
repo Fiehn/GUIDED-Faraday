@@ -326,6 +326,12 @@ def train(config, train_only_user_profile: bool = False):
             phased_mode=phased_mode,
             feature_cols=data_cfg.columns.value_cols,
             meter_col=data_cfg.columns.meter_id,
+            split_seed=int(getattr(getattr(config, "splits", SimpleNamespace()), "random_seed", 0)),
+            split_ratios={
+                "train_ratio": float(getattr(getattr(config, "splits", SimpleNamespace()), "train_ratio", 1.0)),
+                "val_ratio": float(getattr(getattr(config, "splits", SimpleNamespace()), "val_ratio", 0.0)),
+                "test_ratio": float(getattr(getattr(config, "splits", SimpleNamespace()), "test_ratio", 0.0)),
+            },
         )
 
     model.fit(data_loader=data_loader,
@@ -338,10 +344,11 @@ def train(config, train_only_user_profile: bool = False):
                 prior_cfg = getattr(config.model, "prior", SimpleNamespace())
               )
     
-    combined_test_loader = data_loader.get_eval_loader()
+    # True held-out test set: never used during training.
+    combined_test_loader = data_loader.get_test_loader()
     if combined_test_loader is None and eval_batches > 0:
-        data_loader.refresh_eval_cache(eval_batches)
-        combined_test_loader = data_loader.get_eval_loader()
+        data_loader.refresh_test_cache(eval_batches)
+        combined_test_loader = data_loader.get_test_loader()
 
     if combined_test_loader is not None and model_type != "phase_splitter":
         _run_evaluation_and_visualization(
