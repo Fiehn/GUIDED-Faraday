@@ -1,5 +1,6 @@
 import os
-import torch
+import yaml
+import shutil
 from types import SimpleNamespace
 from src.model.cvae import CVAE
 from src.model.set import SetGuideVAE
@@ -13,7 +14,7 @@ from src.data.conditioner import (
     HolidayConditioner, MonthOfYearConditioner, 
     ActivePhaseCountConditioner, HeatpumpPhaseConditioner, ElectricVehicleConditioner
 )
-
+from src.model.baseline import AverageBaselineModel, QuantileBaselineModel, FlatMeanBaselineModel
 def _to_namespace(obj):
     if isinstance(obj, dict):
         return SimpleNamespace(**{k: _to_namespace(v) for k, v in obj.items()})
@@ -299,6 +300,22 @@ def create_model_from_config(config, device="cpu"):
                     phased_mode=phased_mode,
                     sequence_length=seq_len,
                     )
+    elif model_type == "baseline_average":
+        model = AverageBaselineModel(phased_mode=phased_mode, 
+                                     sequence_length=seq_len, 
+                                     device=device, 
+                                     )
+    elif model_type == "baseline_quantile":
+        model = QuantileBaselineModel(phased_mode=phased_mode, 
+                                     sequence_length=seq_len, 
+                                     device=device, 
+                                     reservoir_size=getattr(model_cfg, "reservoir_size", 5000)
+                                     )
+    elif model_type == "baseline_mean":
+        model = FlatMeanBaselineModel(phased_mode=phased_mode,
+                                        sequence_length=seq_len,
+                                        device=device,
+                                     )
     else:
         raise ValueError(f"Unknown model type '{model_type}' specified in config.")
 

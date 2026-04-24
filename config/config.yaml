@@ -4,7 +4,6 @@
 # This configuration file centralizes all parameters for model training,
 # data loading, and conditioning. 
 
-skip_validation: true
 verbose: true
 
 # ============================================================================
@@ -12,19 +11,19 @@ verbose: true
 # ============================================================================
 data:
   # Data mode: "csv" (Aggregated Hourly consumption) or "phased" (Individual SM meters 15-min phased)
-  mode: "phased"
+  mode: "csv"
 
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
   # data_dir: "./data/raw_profiles"
   #data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
-  data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
+  #data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
-  # data_dir: "data/_parquet_cache"
+  data_dir: "data/_parquet_cache"
 
 
   # CSV filename to load
-  data_files: [] #["hourly_measurements_2023_10.csv","hourly_measurements_2023_11.csv",] , "data/test_data_eval.csv"
+  data_files: ["hourly_subset.parquet"]
   
   # CSV column specifications
   columns:
@@ -70,7 +69,7 @@ data:
 # NORMALIZATION CONFIGURATION
 # ============================================================================
 normalization:
-  # Type of normalization: "log1p", "student_t", "zero_preserved_log", "log1p_phase"
+  # Type of normalization: "log1p", "student_t", "zero_preserved_log", "log1p_phase", 
   method: "log1p"
 
   # Optional cache target for fitted normalization stats:
@@ -88,8 +87,8 @@ normalization:
 # MODEL ARCHITECTURE CONFIGURATION
 # ============================================================================
 model:
-  # Model type: "vae", "cvae", "art", "set_guide_vae", "diffusion", "phase_splitter"
-  type: "diffusion"
+  # Model type: "vae", "cvae", "art", "set_guide_vae", "diffusion", "phase_splitter", "baseline_average", "baseline_quantile", "baseline_mean"
+  type: "art"
   
   # Latent dimension (size of latent vector z)
   latent_dim: 128
@@ -182,7 +181,7 @@ conditioning:
 # ============================================================================
 hierarchy:
   enabled: false
-  levels: ["linear", "linear", "linear"] # eg. ["linear", "StochasticLevel", "VQLevel"]
+  levels: ["linear", "linear", "linear"] # eg. ["linear", "stochastic", "vq", "information_bottleneck"]
   latent_dims: [64, 32, 16] # latent dimensions for each level
   top_down: [false, false, false] # whether to use top-down connections for each level
   bottom_up: [false, false, false] # whether to use bottom-up connections for each level
@@ -234,7 +233,7 @@ training:
   # Early stopping
   early_stopping:
     enabled: false
-    stop_on_all_files_used: true # for phased training: stop once replay stream has completed all files at least once
+    stop_on_all_files_used: true # stop once replay stream has completed all files at least once
     min_epochs_before_full_data_stop: 1
     patience: 7 # stop if no improvement for N validations
     min_delta: 0.001 # minimum improvement threshold

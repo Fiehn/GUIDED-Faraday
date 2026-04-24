@@ -1,57 +1,326 @@
 from model.model import BaseModel
 import torch
 
-class BaselineModel(BaseModel):
+class QuantileBaselineModel(BaseModel):
+    """A simple baseline model that maintains a global reservoir of observed sequences and computes quantiles from it.
+    This model does not learn any parameters and serves as a non-parametric baseline for comparison.
+    The reservoir is updated using reservoir sampling to ensure a representative sample of the data stream.
+    We cannot use exact quantiles of the entire dataset since we are in an online setting, so we maintain a fixed-size reservoir that is updated probabilistically as new data comes in.
+    """
     def __init__(self, phased_mode: bool = False, 
                  sequence_length: int = 24, 
-                 method: str = "quantile",
+                    reservoir_size: int = 5000,
+                    device: str = "cpu",
                  **kwargs):
         super().__init__(phased_mode=phased_mode, sequence_length=sequence_length, **kwargs)
-        self.method = method
+        self.reservoir_size = reservoir_size
+        self.device = device
+        self.tag = "baseline_quantile" + str("_phased" if phased_mode else "")
+        
+        # Initialize an empty reservoir
+        self.register_buffer("n_seen", torch.tensor(0, dtype=torch.long, device=device))
+        self.register_buffer(
+            "reservoir", 
+            torch.empty((reservoir_size, sequence_length, self.num_features), dtype=torch.float32, device=device)
+        )
+    
+    @torch.no_grad()
+    def update(self, batch: torch.Tensor):
+        """Processes a new batch and probabilistically updates the global reservoir."""
+        x, meter_id, timestamp, agg = self._unpack_batch(batch)
+        x = x.transpose(1, 2) # [B, F, L] -> [B, L, F]
+            
+        batch_size = x.shape[0]
+
+        # Phase 1: Fill the reservoir until it's full
+        if self.n_seen < self.reservoir_size:
+            fill_amount = min(batch_size, self.reservoir_size - self.n_seen)
+            self.reservoir[self.n_seen : self.n_seen + fill_amount] = x[:fill_amount]
+            self.n_seen += fill_amount
+            
+            # If the batch had leftovers, process them as a stream
+            remaining = batch_size - fill_amount
+            if remaining > 0:
+                self._stream_update(x[fill_amount:])
+        else:
+            # Phase 2: Reservoir is full, probabilistically replace items
+            self._stream_update(x)
+        
+    @torch.no_grad()
+    def _stream_update(self, batch: torch.Tensor):
+        batch_size = batch.shape[0]
+        
+        # For each incoming item i, the probability of keeping it is (reservoir_size / i)
+        # We calculate the "i" index for each item in the incoming batch
+        stream_indices = torch.arange(self.n_seen + 1, self.n_seen + batch_size + 1, device=self.device)
+        # Roll a random number between 0 and the current stream index
+        random_rolls = torch.rand(batch_size, device=self.device) * stream_indices
+        # Keep items where the roll falls within the reservoir size
+        keep_mask = random_rolls < self.reservoir_size
+        if keep_mask.any():
+            kept_items = batch[keep_mask]
+            num_kept = kept_items.shape[0]
+            
+            # Choose random locations in the reservoir to overwrite
+            replace_indices = torch.randint(0, self.reservoir_size, (num_kept,), device=self.device)
+            self.reservoir[replace_indices] = kept_items
+
+        self.n_seen += batch_size
+    
+    @torch.no_grad()
+    def get_global_quantiles(self, n_profiles: int = 100) -> torch.Tensor:
+        """Computes the quantiles on the globally representative reservoir."""
+        if self.n_seen == 0:
+            # Return zeros if evaluated before training starts to avoid crashes
+            return torch.zeros((n_profiles, self.sequence_length, self.num_features), device=self.device)
+            
+        qs = torch.linspace(1.0 / n_profiles, 1.0, n_profiles, device=self.device)
+        valid_reservoir = self.reservoir[:min(self.n_seen.item(), self.reservoir_size)]
+        
+        masked_res = valid_reservoir.clone()
+        invalid_mask = ~torch.isfinite(masked_res) | (masked_res == 0.0)
+        masked_res[invalid_mask] = torch.nan
+        
+        valid_counts = (~invalid_mask).sum(dim=0)
+        all_nan_mask = (valid_counts == 0)
+        masked_res[:, all_nan_mask] = 0.0
+        
+        out = torch.nanquantile(masked_res, qs, dim=0)
+        out[:, all_nan_mask] = 0.0
+        
+        return out
 
     def get_optimizer(self, lr, weight_decay, *args, **kwargs):
-        return super().get_optimizer(lr, weight_decay, *args, **kwargs)
+        # REturn a dummy optimizer since this model has no learnable parameters
+        dummy_param = torch.nn.Parameter(torch.zeros(1))
+        return torch.optim.Adam([dummy_param], lr=lr)
     
-    def get_tag(self):
-        return "baseline_" + self.method
-
-    def train_core(self, optim=None,
+    def train_core(self, batch,
+                   optim=None,
                     gradient_clip=0.0,
                     gradient_clip_max_norm=0.0,
                     beta=0.0,
                     weighted_loss=0.0):
-        pass
+        self.update(batch)
+        return {
+            "loss": torch.tensor(0.0, device=self.device),
+            "recon_loglikelihood": torch.tensor(0.0, device=self.device),
+            "kl_divergence": torch.tensor(0.0, device=self.device),
+        }
 
     def validate(self, valloader, num_samples = 1, beta=1, device = "cpu", **kwargs):
-        pass
+        return {"loss": torch.tensor(0.0, device=device), "recon_loglikelihood": torch.tensor(0.0, device=device), "kl_divergence": torch.tensor(0.0, device=device)}
 
-    def sample(self, num_samples_prior = 1, num_samples_posterior = 1, **kwargs):
-        pass
+    @torch.no_grad()
+    def sample(self, num_samples_prior=100, num_samples_posterior=1, **kwargs):
+        num_samples = kwargs.get('num_samples', num_samples_prior)
+        profiles = self.get_global_quantiles(n_profiles=100)
+        
+        # randomly sample from the quantiles to create a diverse set of samples
+        indices = torch.randint(0, profiles.shape[0], (num_samples,), device=self.device)
+        samples = profiles[indices] # [N, L, F]
+        
+        if self.phased_mode:
+            samples = samples.transpose(1, 2) # [N, F, L]
+            
+        # FIX: Explicitly define the flattened dimension to prevent the 0-element reshape crash
+        flattened_dim = self.sequence_length * self.num_features
+        
+        # Returns shape: [num_samples, 1, 1, flattened_dim]
+        return samples.reshape(num_samples, 1, 1, flattened_dim)
 
-    def reconstruct(self, inputs, num_samples=1, **kwargs):
-        pass
+    @torch.no_grad()
+    def reconstruct(self, x, meter_ids=None, timestamps=None, num_samples=1, **kwargs):
+        """Baseline reconstruction: predict the median profile for everything."""
+        profiles = self.get_global_quantiles(n_profiles=100)
+        median_profile = profiles[50] # 50th percentile is the median
+        
+        if self.phased_mode:
+            median_profile = median_profile.transpose(0, 1) # [F, L]
+            
+        batch_size = x.shape[0]
+        # Return shape [S, B, D]
+        reconstruction = median_profile.reshape(1, 1, -1).expand(num_samples, batch_size, -1)
+        return reconstruction
+
+class AverageBaselineModel(BaseModel):
+    def __init__(self, phased_mode: bool = False,
+                    sequence_length: int = 24, 
+                        device: str = "cpu",
+                    **kwargs):
+        super().__init__(phased_mode=phased_mode, sequence_length=sequence_length, **kwargs)
+        self.device = device
+        self.tag = "baseline_average" + str("_phased" if phased_mode else "")
 
 
- 
-def _build_quantile_profiles_per_feature(train_flat: np.ndarray, window_size: int, n_profiles: int = 100) -> np.ndarray:
-    """Build quantile profiles per feature, returns [n_profiles, window_size, n_features]."""
-    if n_profiles <= 0:
-        raise ValueError('n_profiles must be positive.')
- 
-    windows = _reshape_flat_to_windows(train_flat, window_size=window_size)
-    n_features = windows.shape[2]
-    qs = np.linspace(1.0 / n_profiles, 1.0, n_profiles)
-    out = np.zeros((n_profiles, window_size, n_features), dtype=np.float64)
- 
-    for f in range(n_features):
-        for t in range(window_size):
-            col = windows[:, t, f]
-            col = col[np.isfinite(col)]
-            non_zero = col[col != 0.0]
-            base = non_zero if non_zero.size > 0 else col
-            if base.size == 0:
-                out[:, t, f] = 0.0
-            else:
-                out[:, t, f] = np.quantile(base, qs, method='linear')
- 
-    return _sanitize_numeric_array(out)
+        self.register_buffer(
+            "running_sum",
+            torch.zeros((sequence_length, self.num_features), dtype=torch.float64, device=device)
+        )
+        self.register_buffer(
+            "running_count",
+            torch.zeros((sequence_length, self.num_features), dtype=torch.long, device=device)
+        )
+
+    @torch.no_grad()
+    def update(self, batch: torch.Tensor):
+        """Processes a new batch and updates the global sum and count."""
+        x, meter_id, timestamp, agg = self._unpack_batch(batch)
+        x = x.transpose(1, 2)  # (B, F, T) -> (B, T, F) 
+        
+        batch_sum = x.sum(dim=0)
+        batch_count = x.shape[0] * torch.ones_like(batch_sum, dtype=torch.long, device=self.device)
+        
+        # 4. Add to the global tracking buffers
+        self.running_sum += batch_sum
+        self.running_count += batch_count
+    
+    @torch.no_grad()
+    def get_global_mean(self) -> torch.Tensor:
+        """Computes the exact global average across the dataset."""
+        # Prevent division by zero by clamping the denominator to 1
+        safe_counts = torch.clamp(self.running_count, min=1)
+        mean = self.running_sum / safe_counts
+        
+        # If a feature/timestep was entirely unseen across all data, set to 0.0
+        mean[self.running_count == 0] = 0.0
+        
+        return mean.to(torch.float32)
+    
+    def get_optimizer(self, lr, weight_decay, *args, **kwargs):
+        # Dummy optimizer to prevent the PyTorch optimizer crash in fit()
+        dummy_param = torch.nn.Parameter(torch.zeros(1))
+        return torch.optim.Adam([dummy_param], lr=lr)
+    
+    def train_core(self, batch,
+                   optim=None,
+                   gradient_clip=0.0,
+                   gradient_clip_max_norm=0.0,
+                   beta=0.0,
+                   weighted_loss=0.0):
+        # Update the running global mean in a streaming fashion
+        self.update(batch)
+        return {
+            "loss": torch.tensor(0.0, device=self.device, requires_grad=False)  ,
+            "recon_loglikelihood": torch.tensor(0.0, device=self.device, requires_grad=False),
+            "kl_divergence": torch.tensor(0.0, device=self.device, requires_grad=False),
+        }
+
+    def validate(self, valloader, num_samples=1, beta=1, device="cpu", **kwargs):
+        return {"loss": torch.tensor(0.0, device=device, requires_grad=False), "recon_loglikelihood": torch.tensor(0.0, device=self.device, requires_grad=False), "kl_divergence": torch.tensor(0.0, device=self.device, requires_grad=False)}
+
+    @torch.no_grad()
+    def sample(self, num_samples_prior=1, num_samples_posterior=1, **kwargs):
+        # Sampling simply returns the mean profile expanded to the requested size
+        num_samples = kwargs.get('num_samples', num_samples_prior)
+        global_mean = self.get_global_mean() # [L, F]
+        
+        # Consistent with CVAE: return [S, num_x_samples, B, D]
+        if self.phased_mode:
+            global_mean = global_mean.transpose(0, 1) # [F, L]
+            
+        return global_mean.reshape(1, 1, 1, -1).expand(num_samples, -1, -1, -1)
+
+    @torch.no_grad()
+    def reconstruct(self, x, meter_ids=None, timestamps=None, num_samples=1, **kwargs):
+        # Reconstructions ignore the input values and return the dataset-wide mean
+        global_mean = self.get_global_mean() # [L, F]
+        
+        if self.phased_mode:
+            global_mean = global_mean.transpose(0, 1) # [F, L]
+            
+        batch_size = x.shape[0]
+        # Return shape [S, B, D]
+        reconstruction = global_mean.reshape(1, 1, -1).expand(num_samples, batch_size, -1)
+        return reconstruction
+
+class FlatMeanBaselineModel(BaseModel):
+    """
+    Predicts the mean of the dataset (at all timesteps at once. Just a pure mean over features) as a constant for every input. Uses train_core to update the mean.
+    """
+    def __init__(self, phased_mode: bool = False,
+                    sequence_length: int = 24, 
+                    device: str = "cpu",
+                    **kwargs):
+        super().__init__(phased_mode=phased_mode, sequence_length=sequence_length, **kwargs)
+        self.device = device
+        self.tag = "flat_mean_baseline" + str("_phased" if phased_mode else "")
+
+        self.register_buffer(
+            "running_sum",
+            torch.zeros((1, self.num_features), dtype=torch.float64, device=device)
+        )
+        self.register_buffer(
+            "running_count",
+            torch.zeros((1, self.num_features), dtype=torch.long, device=device)
+        )
+    
+    def train_core(self, batch,
+                   optim=None,
+                   gradient_clip=0.0,
+                   gradient_clip_max_norm=0.0,
+                   beta=0.0,
+                   weighted_loss=0.0):
+        # Update the running global mean in a streaming fashion
+        self.update(batch)
+        return {
+            "loss": torch.tensor(0.0, device=self.device, requires_grad=False)  ,
+            "recon_loglikelihood": torch.tensor(0.0, device=self.device, requires_grad=False),
+            "kl_divergence": torch.tensor(0.0, device=self.device, requires_grad=False),
+        }
+
+    def validate(self, valloader, num_samples=1, beta=1, device="cpu", **kwargs):
+        return {"loss": torch.tensor(0.0, device=device, requires_grad=False), "recon_loglikelihood": torch.tensor(0.0, device=self.device, requires_grad=False), "kl_divergence": torch.tensor(0.0, device=self.device, requires_grad=False)}
+    
+    @torch.no_grad()
+    def reconstruct(self, x, meter_ids=None, timestamps=None, num_samples=1, **kwargs):
+        # Reconstructions ignore the input values and return the dataset-wide mean
+        global_mean = self.get_global_mean() # [L, F]
+        
+        if self.phased_mode:
+            global_mean = global_mean.transpose(0, 1) # [F, L]
+            
+        batch_size = x.shape[0]
+        # Return shape [S, B, D]
+        reconstruction = global_mean.reshape(1, 1, -1).expand(num_samples, batch_size, -1)
+        return reconstruction
+    
+    def get_global_mean(self) -> torch.Tensor:
+        """Computes the exact global average across the dataset."""
+        # Prevent division by zero by clamping the denominator to 1
+        safe_counts = torch.clamp(self.running_count, min=1)
+        mean = self.running_sum / safe_counts
+        
+        # If a feature/timestep was entirely unseen across all data, set to 0.0
+        mean[self.running_count == 0] = 0.0
+
+        # expand the mean to the sequence length
+        mean = mean.repeat(self.sequence_length, 1)
+        
+        return mean.to(torch.float32)
+    
+    def update(self, batch: torch.Tensor):
+        """Processes a new batch and updates the global sum and count."""
+        x, meter_id, timestamp, agg = self._unpack_batch(batch)
+        # Sum over batch and sequence length to get total sum per feature
+        # x is [B, F, L], we want [1, F]
+        batch_sum = x.to(torch.float64).sum(dim=(0, 2)).unsqueeze(0)
+        batch_count = (x.shape[0] * x.shape[2]) * torch.ones_like(batch_sum, dtype=torch.long, device=self.device)
+        
+        self.running_sum += batch_sum
+        self.running_count += batch_count
+    
+    def sample(self, num_samples_prior=1, num_samples_posterior=1, **kwargs):
+        # Sampling simply returns the mean profile expanded to the requested size
+        num_samples = kwargs.get('num_samples', num_samples_prior)
+        global_mean = self.get_global_mean() # [L, F]
+        
+        if self.phased_mode:
+            global_mean = global_mean.transpose(0, 1) # [F, L]
+            
+        return global_mean.reshape(1, 1, 1, -1).expand(num_samples, -1, -1, -1)
+    
+    def get_optimizer(self, lr, weight_decay, *args, **kwargs):
+        # Dummy optimizer to prevent the PyTorch optimizer crash in fit()
+        dummy_param = torch.nn.Parameter(torch.zeros(1))
+        return torch.optim.Adam([dummy_param], lr=lr)

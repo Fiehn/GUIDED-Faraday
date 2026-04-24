@@ -81,29 +81,8 @@ class Visualizer:
     def _safe_inverse_transform(self, x: torch.Tensor) -> torch.Tensor:
         """Run inverse transform on feature-last tensors, preserving shape."""
         if self.normalizer is None:
-            return x
+            raise RuntimeError("The normalizer and god hates me.")
         x_cpu = x.detach().cpu()
-
-        # Robust path for phased log1p normalizers where stats may be numpy arrays.
-        # Expected layout: [..., L, F] with feature axis last.
-        method = getattr(self.normalizer, 'method', None)
-        if method in {'log1p_phase', 'log1p'}:
-            eps = float(getattr(self.normalizer, 'epsilon', 1e-8))
-            mean = torch.as_tensor(getattr(self.normalizer, 'mean'), dtype=x_cpu.dtype)
-            std = torch.as_tensor(getattr(self.normalizer, 'std'), dtype=x_cpu.dtype)
-
-            if mean.ndim == 2 and mean.shape[0] == 1:
-                mean = mean.squeeze(0)
-            if std.ndim == 2 and std.shape[0] == 1:
-                std = std.squeeze(0)
-
-            if mean.ndim == 1:
-                mean = mean.view(*([1] * (x_cpu.ndim - 1)), -1)
-            if std.ndim == 1:
-                std = std.view(*([1] * (x_cpu.ndim - 1)), -1)
-
-            restored = torch.expm1(x_cpu * (std + eps) + mean)
-            return torch.clamp(restored, min=0.0)
 
         return self.normalizer.inverse_transform(x_cpu)
 

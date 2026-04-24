@@ -22,7 +22,7 @@ from src.visualization.visualizer import Visualizer
 from src.visualization.writer import Writer
 from evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
 from src.visualization.plot_styling import PlotStyle
-from src.model.factory import *
+from src.model.factory import _load_train_config, _save_training_config_snapshot, create_model_from_config
 
 def _run_evaluation_and_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, phased_mode: bool, secondary_model = None):
     """Route evaluation by mode and run shared visualizations."""
@@ -138,7 +138,6 @@ def train(config, train_only_user_profile: bool = False):
     data_mode = str(getattr(config.data, "mode", "csv")).lower()
     phased_mode = data_mode in {"phased", "phased_parquet"}
     
-    from src.model.factory import create_model_from_config
     model = create_model_from_config(config, device)
     conditioner = getattr(model, "conditioner", None)
     
@@ -153,7 +152,6 @@ def train(config, train_only_user_profile: bool = False):
     # === Data Configuration === 
     data_dir = config.data_dir
     nan_as_zero = bool(getattr(config.data, "nan_as_zero", False))
-    parquet_only = bool(getattr(config.data, "parquet_only", False))
 
     if config.window.aggregated and config.window.input_len != 24:
         print(f"Warning: window.aggregated is True but window.input_len is {config.window.input_len}. For hourly aggregation, consider setting input_len to 24.")
@@ -242,9 +240,12 @@ def train(config, train_only_user_profile: bool = False):
         # Attach the normalizer to the model so it can be automatically saved/loaded
         model.normalizer = copy.deepcopy(normalizer)
 
-    if conditioner.condition_items.get("user_profile") is not None:
-        conditioner.condition_items.get("user_profile", None).fit_on_files(parquet_paths)
-        conditioner.condition_items.get("user_profile", None).save(os.path.join(log_path, "user_profiler.pt"))
+    if conditioner is not None:
+        if conditioner.condition_items.get("user_profile") is not None:
+            conditioner.condition_items.get("user_profile", None).fit_on_files(parquet_paths)
+            conditioner.condition_items.get("user_profile", None).save(os.path.join(log_path, "user_profiler.pt"))
+            if train_only_user_profile:
+                return
 
     eval_cache_device = device if eval_cache_on_gpu and str(device) != "cpu" else None
 

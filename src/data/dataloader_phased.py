@@ -494,7 +494,7 @@ class PhasedReplayDataloaders:
             eval_cache_device: Optional[torch.device] = None,
             eval_cache_batches: Optional[int] = None,
             cache_scan_batches: Optional[int] = None,
-            pin_memory: bool = False,
+            pin_memory: bool = True,
             output_aggregate_stream: bool = False,
             skip_corrupt_files: bool = True,
             max_skip_warnings: int = 20,

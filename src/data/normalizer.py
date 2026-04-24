@@ -515,7 +515,7 @@ class Normalizer:
         if self.method == 'zero_preserved_log':
             y2d = self._zero_preserved_log_inverse(x2d)
         elif self.method == 'standard':
-            y2d = x2d * self.std + self.mean
+            y2d = torch.clamp(x2d * self.std + self.mean, min=0.0)
         elif self.method in self.LOG_METHODS:
             y2d = torch.clamp(torch.expm1(x2d * (self.std + self.epsilon) + self.mean), min=0.0)
         else:
@@ -600,10 +600,11 @@ class Normalizer:
             meter_col=meter_col,
             nan_as_zero=nan_as_zero,
         )
-        train_loader = DataLoader(phased_ds, batch_size=64, num_workers=0)
+        train_loader = DataLoader(phased_ds, batch_size=256, num_workers=0, pin_memory=True)
         
         for X_batch in tqdm(train_loader, desc="Fitting normalizer"):
-            self.fit_incremental(X_batch[0])
+            x_gpu = X_batch[0].to(device)
+            self.fit_incremental(x_gpu)
         self.finalise_fit()
         print(f"Fitted normalizer with method '{self.method}' on {len(filenames)} files.")
 

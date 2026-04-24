@@ -30,6 +30,7 @@ class BaseModel(nn.Module, ABC):
     def __init__(self, phased_mode: bool = False, sequence_length: int = None, **kwargs):
         super(BaseModel, self).__init__()
         self.tag = self.get_tag()
+        self.phased_mode = phased_mode
         self.num_features = 3 if phased_mode else 1
         self.sequence_length = sequence_length
         self._condition_dim_checked = False

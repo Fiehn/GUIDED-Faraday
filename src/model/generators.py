@@ -47,6 +47,8 @@ class SyntheticGenerator:
             and getattr(self.model, 'num_features', None) is not None
             and getattr(self.model, 'sequence_length', None) is not None
         )
+    def _is_baseline_model(self) -> bool:
+        return hasattr(self.model, 'tag') and 'baseline' in self.model.tag
 
     def _is_art_model(self) -> bool:
         """Best-effort capability check for ART-style token decoders."""
@@ -132,7 +134,16 @@ class SyntheticGenerator:
         """
         self.model.eval()
         self.model.to(self.device)
-        model_dtype = next(self.model.parameters()).dtype
+        
+        # Robustly determine the model's dtype, handling models without parameters (like baselines)
+        try:
+            model_dtype = next(self.model.parameters()).dtype
+        except StopIteration:
+            try:
+                model_dtype = next(self.model.buffers()).dtype
+            except StopIteration:
+                model_dtype = torch.float32
+                
         input_data = input_data.to(self.device, dtype=model_dtype)
 
         if self.normalizer is not None and not is_denormalized:
@@ -144,7 +155,9 @@ class SyntheticGenerator:
             phased_input_data = input_data.reshape(input_data.shape[0], 24, -1, self.model.num_features)  # [B, 24, num_phases, F]
             input_data = input_data.sum(dim=1)  # Sum over phase dimension to get [B, 24, F_agg]
 
-        if self._is_diffusion:
+        if self._is_baseline_model():
+            flat_output = self.model.reconstruct(input_data)
+        elif self._is_diffusion:
             flat_output = self.model.reconstruct(
                 input_data,
                 meter_id=meter_id,
@@ -224,7 +237,7 @@ class SyntheticGenerator:
         else:
             recon_params, _ = self.model.reconstruct(input_data)
 
-        if (not self._is_diffusion) and not (self._is_cvae and meter_id is not None and timestamp is not None and self._is_art_model()):
+        if (not self._is_diffusion) and (not self._is_baseline_model()) and not (self._is_cvae and meter_id is not None and timestamp is not None and self._is_art_model()):
             # Normalize decoder param tensors to [S, B, D] to avoid accidental shape expansion.
             # Some model.reconstruct() implementations return [B, D] instead of [S, B, D].
             for k, v in recon_params.items():
@@ -329,7 +342,16 @@ class SyntheticGenerator:
         self.model.eval()
         self.model.to(self.device)
 
-        if self._is_art_model():
+        valid_samples = []
+        needed = num_samples
+
+        if self._is_baseline_model():
+            samples = self.model.sample(num_samples=num_samples)
+            # Baseline returns [N, 1, 1, D], already correctly laid out (F-first if phased)
+            final_samples = samples.reshape(num_samples, -1)
+            valid_samples.append(final_samples)
+            needed = 0
+        elif self._is_art_model():
             # ART tokens are already bounded in output space; latent rejection on x-scale is not meaningful.
             use_rejection = False
 
@@ -347,8 +369,6 @@ class SyntheticGenerator:
                 conditions = conditions.repeat(repeats, 1)
             conditions = conditions[:num_samples]
         
-        valid_samples = []
-        needed = num_samples
         
         # --- Batched Rejection Sampling ---
         for attempt in range(max_retries):
@@ -414,12 +434,7 @@ class SyntheticGenerator:
         L = getattr(self.model, 'sequence_length', 24)
         F = D // L
 
-        is_phase_first = self._is_phase_first_model()
-
-        if is_phase_first:
-            output = flat.reshape(N, F, L).transpose(1, 2)
-        else:
-            output = flat.reshape(N, L, F)
+        output = flat.reshape(N, L, F)
 
         if self.secondary_model is not None:
             # If this is a phase-splitter type model, we run sample on the secondary model to get the phases

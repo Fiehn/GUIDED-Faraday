@@ -1,0 +1,269 @@
+# ============================================================================
+# Configuration File
+# ============================================================================
+# This configuration file centralizes all parameters for model training,
+# data loading, and conditioning. 
+
+verbose: true
+
+# ============================================================================
+# DATA LOADING CONFIGURATION
+# ============================================================================
+data:
+  # Data mode: "csv" (Aggregated Hourly consumption) or "phased" (Individual SM meters 15-min phased)
+  mode: "csv"
+
+  # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
+  # data_dir: "./data/cleaned_profiles"
+  # data_dir: "./data/raw_profiles"
+  #data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+  #data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
+  # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
+  data_dir: "data/_parquet_cache"
+
+
+  # CSV filename to load
+  data_files: ["hourly_subset.parquet"]
+  
+  # CSV column specifications
+  columns:
+    meter_id: "meter_number"
+    timestamp_dst: "timestamp_dst"
+    timestamp_utc: "timestamp_utc"
+    value_cols: ["hourly_energy_consumption",]  # List of measurement columns
+  
+  # Data loading options
+  nan_as_zero: false # Currently only for CSV data mode
+  max_value: 200.0 # Set to a positive number to filter out windows with any value above this threshold (e.g., 200 kWh for hourly data)
+  
+  # Train/val/test split (by meter ID)
+  splits:
+    train_ratio: 0.8
+    val_ratio: 0.1
+    test_ratio: 0.1
+    random_seed: 42
+  
+  # Windowing configuration
+  window:
+    aggregated: true # whether to aggregate 15-min data to hourly (for phased parquet mode) change the following to 24 hours
+    input_len: 24  # 24-hour windows (24 hours * 4 readings per hour) (96)
+    stride: 24     # Non-overlapping windows (one per day)
+  
+  # DataLoader settings
+  batch_size: 256
+  shuffle: true
+  replay_buffer_capacity: 10000
+  min_buffer_size: 0
+  num_workers: 0
+  steps_per_epoch: 500
+  eval_batches: 5
+  eval_cache_on_gpu: true
+  eval_cache_refresh: false
+  cache_scan_batches: 0
+  skip_corrupt_files: true
+  max_skip_warnings: 20
+  aggregation_energy_unit: "kwh" # "wh" keeps raw hourly sum scale, "kwh" divides hourly sums by 1000
+  output_aggregate_stream: false # when true, phased loader emits (x, cond, agg) for splitter-model pipelines
+
+# ============================================================================
+# NORMALIZATION CONFIGURATION
+# ============================================================================
+normalization:
+  # Type of normalization: "log1p", "student_t", "zero_preserved_log", "log1p_phase", 
+  method: "log1p"
+
+  # Optional cache target for fitted normalization stats:
+  # - null/default: use data/normalizations with hashed filenames
+  # - directory: use that directory with hashed filenames
+  # - file path: single-file legacy mode (overwrites that file)
+  cache_dir: null
+  force_recompute: false
+  
+  # Log1p specific parameters
+  log1p:
+    epsilon: 1.0e-6
+
+# ============================================================================
+# MODEL ARCHITECTURE CONFIGURATION
+# ============================================================================
+model:
+  # Model type: "vae", "cvae", "art", "set_guide_vae", "diffusion", "phase_splitter", "baseline_average", "baseline_quantile", "baseline_mean"
+  type: "diffusion"
+  
+  # Latent dimension (size of latent vector z)
+  latent_dim: 64
+
+  # Encoder configuration
+  encoder:
+    type: "dictionary"  # Options: "dictionary", "mlp", "dictionary_cnn"
+    hidden_dims: [32, 64, 64]
+    dropout: 0.2
+  
+  # Decoder configuration
+  decoder:
+    type: "dictionary"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
+    hidden_dims: [64, 64, 32]
+    dropout: 0.2
+  
+  # Prior configuration
+  prior:
+    type: "learnable_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
+                                 # "learnable_gaussian", "learnable_dictionary", "vampprior"
+    dictionary_size: 256         # Must be > input_dim (96 timesteps × 3 phases = 288)
+    vamp_num_components: 40
+    init_from_data: true
+    init_noise_scale: 0.01
+
+  phase_splitter:
+    base_channels: 64
+    temperature: 2.0
+
+  # SetGuideVAE set-encoder architecture configuration
+  set:
+    hidden_dim: 256
+    num_heads: 4
+    num_inds: 16
+    num_blocks: 2
+    num_features: 3
+    is_isab: true
+    use_abl_pool: false
+
+  art:
+    num_bins: 64 # Amount of discrete bins to tokenize the data into
+    transformer_num_heads: 8 # Amount of heads in the transformer.
+    transformer_num_layers: 4 # Amount of hidden layers in the transformer structure.
+    d_model: 64
+
+  diffusion:
+    num_timesteps: 200
+    schedule_type: "cosine"
+    cosine_s: 0.008
+    max_beta: 0.999
+    beta_start: 1.0e-4
+    beta_end: 0.02
+    time_dim: 128
+    base_channels: 128
+    num_blocks: 16
+    self_attention_heads: 16
+    use_condition_cross_attention: true
+    condition_cross_attention_heads: 16
+    condition_tokens: 16
+    condition_dropout_prob: 0.10
+    reconstruction_noise_fraction: 0.30
+    deterministic_reconstruction: true
+# ============================================================================
+# CONDITIONING CONFIGURATION (for CVAE)
+# ============================================================================
+conditioning:
+  # Enable/disable conditioning
+
+  tags: ["day_of_week", "month_of_year", "user_profile", "holiday", "heatpump_phase", "ev_phase"]
+  # ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  
+  
+  # User profiling (based on LDA)
+  user_profile:
+    online: false
+    n_topics: 40 # number of LDA topics
+    num_clusters: 200 # number of KMeans clusters for "words"
+    random_state: 42
+    cache_path: "./models/UserProfiles/user_profiles.pkl"
+    verbose: false
+  
+  # Online user profiling (for OnlineCVAE)
+  online_user_profile:
+    decay: 0.95
+
+  ev_phase:
+    path: "data/EV_detection_6000_SM.csv"
+
+# ============================================================================
+# HIERARCHICAL LATENT SPACE
+# ============================================================================
+hierarchy:
+  enabled: false
+  levels: ["linear", "linear", "linear"] # eg. ["linear", "StochasticLevel", "VQLevel"]
+  latent_dims: [64, 32, 16] # latent dimensions for each level
+  top_down: [false, false, false] # whether to use top-down connections for each level
+  bottom_up: [false, false, false] # whether to use bottom-up connections for each level
+  loss_weights: [1.0, 1.0, 1.0] # weights for KL loss at each level
+  
+  aggregation: "concat"
+  bidirectional: false
+  residual_connections: false
+  kl_annealing: true
+  kl_warmup_steps: 1000
+  free_bits: 0.1
+
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+training:
+  # Optimization settings
+  optimizer: "adam"  # Options: "adam", "adamw", "sgd"
+  
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  
+  # Gradient clipping
+  gradient_clip: true
+  gradient_clip_max_norm: 1.0
+  
+  # Learning rate scheduler
+  lr_scheduler:
+    enabled: true
+    scheduler_type: "cosine"  # Options: "step", "exponential", "cosine", "seq"
+    step_size: 10
+    gamma: 0.9
+  
+  # Number of training epochs
+  num_epochs: 2
+  
+  # Beta (KL weight) settings
+  beta: 1.0 # 1.0
+  
+  # Cyclical beta annealing (prevents KL collapse)
+  beta_annealing:
+    enabled: true # true
+    n_cycles: 1   
+    ratio: 0.25 # fraction of each cycle for warmup (0-1)
+  
+  # Weighted loss 
+  weighted_loss: 0.2  # Set > 0 to enable (e.g., 0.1)
+  
+  # Early stopping
+  early_stopping:
+    enabled: false
+    stop_on_all_files_used: true # stop once replay stream has completed all files at least once
+    min_epochs_before_full_data_stop: 1
+    patience: 7 # stop if no improvement for N validations
+    min_delta: 0.001 # minimum improvement threshold
+  
+  # Model checkpointing
+  checkpointing:
+    save_freq: 5 # save checkpoint every N epochs
+    save_dir: "./models"
+    save_best_model: true
+    save_best_after_fraction: 0.25 # start writing "best" checkpoint only after this fraction of total epochs
+    save_final_model: true
+
+# ============================================================================
+# LOGGING AND MONITORING CONFIGURATION
+# ============================================================================
+logging:
+  # TensorBoard settings
+  
+  log_dir: "./models"
+  
+  # Save training configuration
+  save_config: true
+  config_save_dir: "./models"
+
+# ============================================================================
+# Visualization CONFIGURATION
+# ============================================================================
+visualize:
+  num_samples: 5
+  num_recon_per: 5
+  num_synthetic: 40
+  num_originals: 4
+  num_synthetic_per: 10
