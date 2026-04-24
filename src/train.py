@@ -242,7 +242,7 @@ def train(config, train_only_user_profile: bool = False):
 
     if conditioner is not None:
         if conditioner.condition_items.get("user_profile") is not None:
-            conditioner.condition_items.get("user_profile", None).fit_on_files(parquet_paths)
+            conditioner.condition_items.get("user_profile", None).fit_on_files(parquet_paths, phased=phased_mode)
             conditioner.condition_items.get("user_profile", None).save(os.path.join(log_path, "user_profiler.pt"))
             if train_only_user_profile:
                 return
