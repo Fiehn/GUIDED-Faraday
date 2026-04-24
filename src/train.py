@@ -240,13 +240,6 @@ def train(config, train_only_user_profile: bool = False):
         # Attach the normalizer to the model so it can be automatically saved/loaded
         model.normalizer = copy.deepcopy(normalizer)
 
-    if conditioner is not None:
-        if conditioner.condition_items.get("user_profile") is not None:
-            conditioner.condition_items.get("user_profile", None).fit_on_files(parquet_paths)
-            conditioner.condition_items.get("user_profile", None).save(os.path.join(log_path, "user_profiler.pt"))
-            if train_only_user_profile:
-                return
-
     eval_cache_device = device if eval_cache_on_gpu and str(device) != "cpu" else None
 
     data_loader = PhasedReplayDataloaders(
@@ -277,6 +270,19 @@ def train(config, train_only_user_profile: bool = False):
             },
             max_value=float(getattr(data_cfg, "max_value", None)) or None,
         )
+    
+    if conditioner is not None:
+        if conditioner.condition_items.get("user_profile") is not None:
+            conditioner.condition_items.get("user_profile", None).fit_on_files(parquet_paths, 
+                                                                               phased=phased_mode, 
+                                                                               feature_cols=data_cfg.columns.value_cols, 
+                                                                               hourly_aggregation=data_cfg.window.aggregated, 
+                                                                               aggregation_divisor=aggregation_divisor,
+                                                                               window_spec=window
+                                                                               )
+            conditioner.condition_items.get("user_profile", None).save(os.path.join(log_path, "user_profiler.pt"))
+            if train_only_user_profile:
+                return
 
     model.fit(data_loader=data_loader,
               device=device,

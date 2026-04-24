@@ -591,7 +591,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
     
     def fit_on_files(self, parquet_paths: list[str],
                      window_spec = None,
-                     feature_cols = None,
+                     feature_cols = ["hourly_energy_consumption",],
                      hourly_aggregation = False,
                      aggregation_divisor = 1,
                      phased = True
@@ -630,7 +630,8 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
             feature_cols=feature_cols,
             hourly_aggregation=hourly_aggregation,
             aggregation_divisor=aggregation_divisor,
-            phased_mode=phased
+            phased_mode=phased,
+            meter_col="meter_number",
         )
         
         loader = DataLoader(phased_ds, batch_size=1024, num_workers=0)
