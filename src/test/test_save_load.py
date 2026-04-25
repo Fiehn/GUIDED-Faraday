@@ -7,6 +7,7 @@ from src.model.vae import VAE
 from src.model.cvae import CVAE
 from src.model.diffusion import DiffusionModel, NoiseScheduler, ConditionalUNet1D
 from src.model.phase_splitter import HierarchicalSplitter
+from src.model.baseline import AverageBaselineModel
 from src.data.conditioner import Conditioner, DayOfWeekConditioner
 from src.data.normalizer import Normalizer
 
@@ -187,3 +188,21 @@ def test_hierarchical_splitter_serialization(dummy_conditioner):
         loaded_model.load_model(ckpt_path, device="cpu")
     for k, v in model.state_dict().items():
         assert torch.allclose(v, loaded_model.state_dict()[k])
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for baseline device-restore regression test")
+def test_parameterless_baseline_save_restores_cuda_device():
+    model = AverageBaselineModel(
+        phased_mode=False,
+        sequence_length=24,
+        device="cuda",
+    ).to("cuda")
+
+    before_device = model.running_sum.device
+    assert before_device.type == "cuda"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model.save_model(save_path=tmpdir, model_name="baseline_cuda", device="cuda")
+
+    # Baseline models have no parameters; this verifies save_model restored using buffer device.
+    assert model.running_sum.device == before_device
+    assert model.running_count.device == before_device
