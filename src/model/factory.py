@@ -125,7 +125,7 @@ def create_model_from_config(config, device="cpu"):
     # === Conditioners ===
     conditioning_cfg = getattr(config, "conditioning", SimpleNamespace())
     tags = getattr(conditioning_cfg, "tags", [])
-    if model_type == "vae" or len(tags) == 0:
+    if model_type == "vae":
         print("No conditioning will be used for this run.")
     else:
         conditioner = Conditioner()
