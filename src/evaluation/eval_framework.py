@@ -606,13 +606,16 @@ class EvalFramework:
              synthetic = synthetic.reshape(N * B, S1, S2)
              synthetic = self._flatten_for_metrics(synthetic)
         elif synthetic.dim() == 3:
-             # Check if it is [N, B, D] or [N, L, F]
-             n_feat = int(getattr(self.model, 'num_features', 0) or 3)
-             seq_len = int(getattr(self.model, 'sequence_length', 0) or 24)
-             
-             if synthetic.shape[-1] == n_feat and synthetic.shape[1] == seq_len:
-                 # It's [N, L, F]. Just flatten it to [N, D] phase-first.
-                 synthetic = self._flatten_for_metrics(synthetic)
+             # Check if it is [N, L, F], [N, F, L], or [N, B, D]
+             n_feat = int(getattr(self.model, 'num_features', 0) or 0)
+             seq_len = int(getattr(self.model, 'sequence_length', 0) or self.window_size or 0)
+
+             if seq_len > 0 and synthetic.shape[1] == seq_len:
+                 # [N, L, F] -> [N, F, L]
+                 synthetic = synthetic.transpose(1, 2).reshape(synthetic.shape[0], -1)
+             elif seq_len > 0 and synthetic.shape[2] == seq_len:
+                 # [N, F, L]
+                 synthetic = synthetic.reshape(synthetic.shape[0], -1)
              else:
                  # Assume [N, B, D]. Flatten to [N*B, D].
                  synthetic = synthetic.reshape(-1, synthetic.shape[-1])
@@ -891,6 +894,7 @@ class PhasedEvaluationSuite:
         if arr.shape[1] % self.window_size != 0:
             raise ValueError(
                 f"Flattened {label} dimension {arr.shape[1]} is not divisible by window_size {self.window_size}"
+                f"data shape: {arr.shape}, window_size: {self.window_size}"
             )
         n_features = arr.shape[1] // self.window_size
         return arr.reshape(arr.shape[0], n_features, self.window_size)

@@ -23,7 +23,7 @@ data:
 
 
   # CSV filename to load
-  data_files: ["hourly_subset.parquet"]
+  data_files: ["test_data_small.parquet"]
   
   # CSV column specifications
   columns:

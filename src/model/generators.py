@@ -155,6 +155,10 @@ class SyntheticGenerator:
             phased_input_data = input_data.reshape(input_data.shape[0], 24, -1, self.model.num_features)  # [B, 24, num_phases, F]
             input_data = input_data.sum(dim=1)  # Sum over phase dimension to get [B, 24, F_agg]
 
+        # Get conditions
+        cond_input = self.model._build_condition_input(self.model._to_phase_first(input_data))
+        conditions = self.conditioner.get_conditions(cond_input, meter_id, timestamp).to(self.device, dtype=model_dtype)
+
         if self._is_baseline_model():
             flat_output = self.model.reconstruct(input_data)
         elif self._is_diffusion:
@@ -173,12 +177,8 @@ class SyntheticGenerator:
                 flat_output = flat_output.unsqueeze(0)
             if flat_output.dim() != 3:
                 raise ValueError(f"Unexpected diffusion reconstruction shape: {tuple(flat_output.shape)}")
-
-        elif self._is_cvae and meter_id is not None and timestamp is not None:
-            # Conditions for the encoding are always based on the original meter_id and timestamp, to get the correct latent representation.
-            cond_input = self.model._build_condition_input(self.model._to_phase_first(input_data))
-            conditions = self.conditioner.get_conditions(cond_input, meter_id, timestamp).to(self.device, dtype=model_dtype)
-            
+        # Conditions for the encoding are always based on the original meter_id and timestamp, to get the correct latent representation.
+        elif self._is_cvae:
             # Ensure input_data is flattened appropriately
             if hasattr(self.model, '_set_encode'):
                 x_enc = self.model._set_encode(self.model._to_phase_first(input_data))
@@ -299,7 +299,11 @@ class SyntheticGenerator:
 
         if self.secondary_model is not None:
             # If this is a phase-splitter type model, we run reconstruct on the secondary model to get the phases
-            return self.secondary_model.reconstruct(x_agg_generated=output, conditions=conditions, normalizer=self.normalizer, x_phased_real = phased_input_data)
+            # Pass normalizer=None so it returns normalized phase estimates, which we inverse transform afterward!
+            output = self.secondary_model.reconstruct(x_agg_generated=output, conditions=conditions, normalizer=None, x_phased_real = phased_input_data)
+            # Secondary model returns [B, 3, 24] (i.e. [N*B, F_split, L]) where F_split is 3 (for our dataset).
+            # It replaces output, and we transpose it to [N*B, L, F_split] so apply_normalizer works (expects trailing feature dim).
+            output = output.transpose(1, 2)
             
         # 2. Apply inverse transform so it's in actual kWh, not Z-scores
         if self.normalizer is not None and not is_denormalized and not self._is_art_model():
@@ -355,13 +359,13 @@ class SyntheticGenerator:
             # ART tokens are already bounded in output space; latent rejection on x-scale is not meaningful.
             use_rejection = False
 
-        if self._is_cvae and conditions is None:
+        if conditions is None:
             random_cond = (date is None)
             if isinstance(date, (int, float)):
                 date = datetime.fromtimestamp(date)
             conditions = self._build_conditions(meter_id=meter_id, timestamp=date, random_condition=random_cond)
 
-        if self._is_cvae and conditions is not None:
+        if conditions is not None:
             conditions = conditions.to(self.device)
             # Ensure we have exactly one condition row per requested sample.
             if conditions.shape[0] < num_samples:
@@ -437,8 +441,13 @@ class SyntheticGenerator:
         output = flat.reshape(N, L, F)
 
         if self.secondary_model is not None:
-            # If this is a phase-splitter type model, we run sample on the secondary model to get the phases
-            return self.secondary_model.sample(x_agg_generated=output, conditions=conditions, normalizer=self.normalizer)
+            # Run without normalizer so we get normalized phase proportions
+            output = self.secondary_model.sample(x_agg_generated=output, conditions=conditions, normalizer=None)
+            split_cond = conditions
+            # Output is [N, F_split, L]. Transpose to [N, L, F_split]
+            output = output.transpose(1, 2)
+            F = output.shape[-1]
+            conditions = split_cond
 
         if self.normalizer is not None and not self._is_art_model():
             output = self.normalizer.inverse_transform(output.reshape(-1, F)).reshape(N, L, F)
