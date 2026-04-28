@@ -16,3 +16,11 @@ source .venv-cu12-py311/bin/activate
 
 # 1) run training
 python -u src/train.py --config "config/tests/day.yaml"
+python -u src/train.py --config "config/tests/ev.yaml"
+python -u src/train.py --config "config/tests/holiday.yaml"
+python -u src/train.py --config "config/tests/hp.yaml"
+python -u src/train.py --config "config/tests/month.yaml"
+python -u src/train.py --config "config/tests/userprofiles.yaml"
+python -u src/train.py --config "config/tests/pv.yaml"
+python -u src/train.py --config "config/tests/all.yaml"
+python -u src/train.py --config "config/tests/None.yaml"
