@@ -12,7 +12,7 @@ from src.model.hierarchical.config import HierarchicalConfig, LevelConfig
 from src.data.conditioner import (
     Conditioner, DayOfWeekConditioner, UserProfiler, 
     HolidayConditioner, MonthOfYearConditioner, 
-    ActivePhaseCountConditioner, HeatpumpPhaseConditioner, ElectricVehicleConditioner
+    ActivePhaseCountConditioner, HeatpumpPhaseConditioner, ElectricVehicleConditioner, SolarPanelConditioner
 )
 from src.model.baseline import AverageBaselineModel, QuantileBaselineModel, FlatMeanBaselineModel
 def _to_namespace(obj):
@@ -159,6 +159,10 @@ def create_model_from_config(config, device="cpu"):
                 ev_cfg = getattr(conditioning_cfg, "ev_phase", SimpleNamespace())
                 ev_path = getattr(ev_cfg, "path", "data/EV_detection_6000_SM.csv")
                 conditioner.add_condition_item("ev_phase", ElectricVehicleConditioner(topology_path=ev_path))
+            elif condition_tag == "pv" or condition_tag == "solar_panel":
+                pv_cfg = getattr(conditioning_cfg, "solar_panel", SimpleNamespace())
+                pv_path = getattr(pv_cfg, "path", "data/topology/cleaned/meter_cabinet_connection.csv")
+                conditioner.add_condition_item("solar_panel", SolarPanelConditioner(topology_path=pv_path))
             else:
                 print(f"Warning: Unknown condition tag '{condition_tag}' in config. Skipping this conditioner.")
 

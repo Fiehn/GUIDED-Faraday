@@ -96,13 +96,13 @@ model:
   # Encoder configuration
   encoder:
     type: "dictionary"  # Options: "dictionary", "mlp", "dictionary_cnn"
-    hidden_dims: [256, 512, 1024, 256, 128]
+    hidden_dims: [1024, 512, 256, 128]
     dropout: 0.2
   
   # Decoder configuration
   decoder:
     type: "dictionary"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
-    hidden_dims: [128, 256, 512, 1024, 256]
+    hidden_dims: [128, 256, 512, 1024]
     dropout: 0.2
   
   # Prior configuration
@@ -157,7 +157,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "user_profile", "holiday", "heatpump_phase", "ev_phase"]
+  tags: ["day_of_week"]
   # ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  
   
   # User profiling (based on LDA)
@@ -180,16 +180,16 @@ conditioning:
 # HIERARCHICAL LATENT SPACE
 # ============================================================================
 hierarchy:
-  enabled: false
-  levels: ["linear", "linear", "linear"] # eg. ["linear", "StochasticLevel", "VQLevel"]
-  latent_dims: [64, 32, 16] # latent dimensions for each level
-  top_down: [false, false, false] # whether to use top-down connections for each level
-  bottom_up: [false, false, false] # whether to use bottom-up connections for each level
+  enabled: true
+  levels: ["stochastic", "stochastic", "stochastic"] # eg. ["linear", "StochasticLevel", "VQLevel"]
+  latent_dims: [256, 128, 64] # latent dimensions for each level
+  top_down: [true, true, true] # whether to use top-down connections for each level
+  bottom_up: [true, true, true] # whether to use bottom-up connections for each level
   loss_weights: [1.0, 1.0, 1.0] # weights for KL loss at each level
   
   aggregation: "concat"
-  bidirectional: false
-  residual_connections: false
+  bidirectional: true
+  residual_connections: true
   kl_annealing: true
   kl_warmup_steps: 1000
   free_bits: 0.1
@@ -216,7 +216,7 @@ training:
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 2
+  num_epochs: 40
   
   # Beta (KL weight) settings
   beta: 1.0 # 1.0
