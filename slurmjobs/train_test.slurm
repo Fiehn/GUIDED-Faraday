@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --partition=gpuq
-#SBATCH --time 10:00:00
+#SBATCH --time 24:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=8
 #SBATCH --output=slurmjobs/outputs/train_test-%j.out
@@ -15,4 +15,14 @@ module load CUDA/12.0.0
 source .venv-cu12-py311/bin/activate
 
 # 1) run training
-python -u src/train.py --skip-validation --config "config/config_test.yaml"
+python -u src/train.py --skip-validation --config "config/tests/baseline_mean.yaml"
+python -u src/train.py --skip-validation --config "config/tests/baseline_quantile.yaml"
+python -u src/train.py --skip-validation --config "config/tests/cvae.yaml"
+python -u src/train.py --skip-validation --config "config/tests/guide.yaml"
+
+python -u src/train.py --skip-validation --config "config/tests/art.yaml"
+python -u src/train.py --skip-validation --config "config/tests/diffusion.yaml"
+
+python -u src/train.py --skip-validation --config "config/tests/guide_cnn.yaml"
+python -u src/train.py --skip-validation --config "config/tests/guide_hierarchy.yaml"
+python -u src/train.py --skip-validation --config "config/tests/guide_vamp.yaml"

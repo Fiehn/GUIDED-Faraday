@@ -182,8 +182,14 @@ class VAE(BaseModel):
         S, B, D = z.shape
         z_flat = z.reshape(S * B, D)
 
+        # Hierarchy
+        z_for_decoder = z_flat
+        if self.hierarchy is not None:
+            hierarchy_results = self.hierarchy.forward(z_flat)
+            z_for_decoder = hierarchy_results["z"]
+
         # Decode
-        recon_params_dict = self.decoder(z_flat)
+        recon_params_dict = self.decoder(z_for_decoder)
 
         # Reshape back: [S*B, output_dim] -> [S, B, output_dim]
         for k in recon_params_dict:

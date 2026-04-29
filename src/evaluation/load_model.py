@@ -40,10 +40,18 @@ def load_model(model_path: str, device: str = "cpu"):
 
     # 4. Load the checkpoint
     checkpoint_path = None
+    max_epoch = -1
     for file in os.listdir(model_path):
         if file.startswith("best_model_") and file.endswith(".pt"):
-            checkpoint_path = os.path.join(model_path, file)
-            break
+            try:
+                # Example: best_model_HierarchicalSplitter_20260426_182151_35.pt
+                epoch = int(file[:-3].split("_")[-1])
+                if epoch > max_epoch:
+                    max_epoch = epoch
+                    checkpoint_path = os.path.join(model_path, file)
+            except ValueError:
+                if checkpoint_path is None:
+                    checkpoint_path = os.path.join(model_path, file)
     
     if checkpoint_path is None:
         raise FileNotFoundError(f"No checkpoint file found in {model_path}")

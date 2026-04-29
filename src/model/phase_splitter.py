@@ -380,33 +380,24 @@ class HierarchicalSplitter(BaseModel):
         self.to(device)
         
         x_agg = self.move_to_device(x_agg_generated, device)
-        c = self.move_to_device(conditions, device).float()
+        if x_agg.dim() == 3 and x_agg.shape[2] == 1:
+            x_agg = x_agg.transpose(1, 2)
+        
+        c = self.move_to_device(conditions, device)
+        c = c.float()
         
         # Predict Proportions
         proportions = self.model(x_agg, c)
 
-        # If the normalizer does not exist then output proportions
-        if normalizer is None or not hasattr(normalizer, "inverse_transform"):
-            print("[Warning]: No normalizer with inverse_transform found. Returning proportions instead of actual phase values!")
-            return proportions
-        
-        x_agg_lf = x_agg.transpose(1, 2)
-        bsz, seq_len, _ = x_agg_lf.shape
-        
-        agg_denorm = normalizer.inverse_transform(x_agg_lf.reshape(-1, 1)).reshape(bsz, seq_len, 1)
-        agg_denorm = agg_denorm.to(device=x_agg.device, dtype=x_agg.dtype)
-        x_agg_linear = agg_denorm.transpose(1, 2)
-        
-        # Apply proportions in linear domain
-        x_final_linear = proportions * x_agg_linear
-        
-        # Re-normalize to return to the original scaled domain
-        x_final_lf = x_final_linear.transpose(1, 2)
-        final_norm = normalizer.transform(x_final_lf.reshape(-1, 3)).reshape(bsz, seq_len, 3)
-        final_norm = final_norm.to(device=x_agg.device, dtype=x_agg.dtype)
-        
-        return final_norm.transpose(1, 2)
+        # Always return phase values in the same scale as x_agg.
+        x_pred = proportions * x_agg
+        if normalizer is not None and hasattr(normalizer, "inverse_transform"):
+            try:
+                return normalizer.inverse_transform(x_pred)
+            except Exception:
+                print("[Warning]: Normalizer inverse_transform failed. Returning normalized phase values instead.")
 
-    def reconstruct(self, *args, **kwargs):
-        # TODO: Implement reconstruction for HierarchicalSplitter
-        raise NotImplementedError("HierarchicalSplitter does not support direct reconstruction.")
+        return x_pred
+
+    def reconstruct(self, x_agg_generated, conditions, normalizer=None, x_phased_real = None, device="cpu", **kwargs):
+        return self.sample(x_agg_generated, conditions, normalizer=normalizer, device=device, **kwargs)

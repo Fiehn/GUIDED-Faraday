@@ -28,14 +28,15 @@ class QuantileBaselineModel(BaseModel):
     def update(self, batch: torch.Tensor):
         """Processes a new batch and probabilistically updates the global reservoir."""
         x, meter_id, timestamp, agg = self._unpack_batch(batch)
-        x = x.transpose(1, 2) # [B, F, L] -> [B, L, F]
+        x = x.transpose(1, 2).to(device=self.reservoir.device, dtype=self.reservoir.dtype) # [B, F, L] -> [B, L, F]
             
         batch_size = x.shape[0]
+        seen_so_far = int(self.n_seen.item())
 
         # Phase 1: Fill the reservoir until it's full
-        if self.n_seen < self.reservoir_size:
-            fill_amount = min(batch_size, self.reservoir_size - self.n_seen)
-            self.reservoir[self.n_seen : self.n_seen + fill_amount] = x[:fill_amount]
+        if seen_so_far < self.reservoir_size:
+            fill_amount = min(batch_size, self.reservoir_size - seen_so_far)
+            self.reservoir[seen_so_far : seen_so_far + fill_amount] = x[:fill_amount]
             self.n_seen += fill_amount
             
             # If the batch had leftovers, process them as a stream
@@ -48,13 +49,16 @@ class QuantileBaselineModel(BaseModel):
         
     @torch.no_grad()
     def _stream_update(self, batch: torch.Tensor):
+        batch = batch.to(device=self.reservoir.device, dtype=self.reservoir.dtype)
         batch_size = batch.shape[0]
+        stream_start = int(self.n_seen.item()) + 1
+        stream_end = stream_start + batch_size
         
         # For each incoming item i, the probability of keeping it is (reservoir_size / i)
         # We calculate the "i" index for each item in the incoming batch
-        stream_indices = torch.arange(self.n_seen + 1, self.n_seen + batch_size + 1, device=self.device)
+        stream_indices = torch.arange(stream_start, stream_end, device=self.reservoir.device)
         # Roll a random number between 0 and the current stream index
-        random_rolls = torch.rand(batch_size, device=self.device) * stream_indices
+        random_rolls = torch.rand(batch_size, device=self.reservoir.device) * stream_indices
         # Keep items where the roll falls within the reservoir size
         keep_mask = random_rolls < self.reservoir_size
         if keep_mask.any():
@@ -62,7 +66,7 @@ class QuantileBaselineModel(BaseModel):
             num_kept = kept_items.shape[0]
             
             # Choose random locations in the reservoir to overwrite
-            replace_indices = torch.randint(0, self.reservoir_size, (num_kept,), device=self.device)
+            replace_indices = torch.randint(0, self.reservoir_size, (num_kept,), device=self.reservoir.device)
             self.reservoir[replace_indices] = kept_items
 
         self.n_seen += batch_size
@@ -70,11 +74,11 @@ class QuantileBaselineModel(BaseModel):
     @torch.no_grad()
     def get_global_quantiles(self, n_profiles: int = 100) -> torch.Tensor:
         """Computes the quantiles on the globally representative reservoir."""
-        if self.n_seen == 0:
+        if int(self.n_seen.item()) == 0:
             # Return zeros if evaluated before training starts to avoid crashes
-            return torch.zeros((n_profiles, self.sequence_length, self.num_features), device=self.device)
+            return torch.zeros((n_profiles, self.sequence_length, self.num_features), device=self.reservoir.device)
             
-        qs = torch.linspace(1.0 / n_profiles, 1.0, n_profiles, device=self.device)
+        qs = torch.linspace(1.0 / n_profiles, 1.0, n_profiles, device=self.reservoir.device)
         valid_reservoir = self.reservoir[:min(self.n_seen.item(), self.reservoir_size)]
         
         masked_res = valid_reservoir.clone()
@@ -103,9 +107,9 @@ class QuantileBaselineModel(BaseModel):
                     weighted_loss=0.0):
         self.update(batch)
         return {
-            "loss": torch.tensor(0.0, device=self.device),
-            "recon_loglikelihood": torch.tensor(0.0, device=self.device),
-            "kl_divergence": torch.tensor(0.0, device=self.device),
+            "loss": torch.tensor(0.0, device=self.reservoir.device),
+            "recon_loglikelihood": torch.tensor(0.0, device=self.reservoir.device),
+            "kl_divergence": torch.tensor(0.0, device=self.reservoir.device),
         }
 
     def validate(self, valloader, num_samples = 1, beta=1, device = "cpu", **kwargs):
@@ -117,7 +121,7 @@ class QuantileBaselineModel(BaseModel):
         profiles = self.get_global_quantiles(n_profiles=100)
         
         # randomly sample from the quantiles to create a diverse set of samples
-        indices = torch.randint(0, profiles.shape[0], (num_samples,), device=self.device)
+        indices = torch.randint(0, profiles.shape[0], (num_samples,), device=profiles.device)
         samples = profiles[indices] # [N, L, F]
         
         if self.phased_mode:
@@ -166,10 +170,10 @@ class AverageBaselineModel(BaseModel):
     def update(self, batch: torch.Tensor):
         """Processes a new batch and updates the global sum and count."""
         x, meter_id, timestamp, agg = self._unpack_batch(batch)
-        x = x.transpose(1, 2)  # (B, F, T) -> (B, T, F) 
+        x = x.transpose(1, 2).to(device=self.running_sum.device, dtype=self.running_sum.dtype)  # (B, F, T) -> (B, T, F)
         
         batch_sum = x.sum(dim=0)
-        batch_count = x.shape[0] * torch.ones_like(batch_sum, dtype=torch.long, device=self.device)
+        batch_count = x.shape[0] * torch.ones_like(batch_sum, dtype=self.running_count.dtype, device=self.running_count.device)
         
         # 4. Add to the global tracking buffers
         self.running_sum += batch_sum
@@ -201,13 +205,14 @@ class AverageBaselineModel(BaseModel):
         # Update the running global mean in a streaming fashion
         self.update(batch)
         return {
-            "loss": torch.tensor(0.0, device=self.device, requires_grad=False)  ,
-            "recon_loglikelihood": torch.tensor(0.0, device=self.device, requires_grad=False),
-            "kl_divergence": torch.tensor(0.0, device=self.device, requires_grad=False),
+            "loss": torch.tensor(0.0, device=self.running_sum.device, requires_grad=False),
+            "recon_loglikelihood": torch.tensor(0.0, device=self.running_sum.device, requires_grad=False),
+            "kl_divergence": torch.tensor(0.0, device=self.running_sum.device, requires_grad=False),
         }
 
     def validate(self, valloader, num_samples=1, beta=1, device="cpu", **kwargs):
-        return {"loss": torch.tensor(0.0, device=device, requires_grad=False), "recon_loglikelihood": torch.tensor(0.0, device=self.device, requires_grad=False), "kl_divergence": torch.tensor(0.0, device=self.device, requires_grad=False)}
+        buffer_device = self.running_sum.device
+        return {"loss": torch.tensor(0.0, device=device, requires_grad=False), "recon_loglikelihood": torch.tensor(0.0, device=buffer_device, requires_grad=False), "kl_divergence": torch.tensor(0.0, device=buffer_device, requires_grad=False)}
 
     @torch.no_grad()
     def sample(self, num_samples_prior=1, num_samples_posterior=1, **kwargs):
@@ -264,13 +269,14 @@ class FlatMeanBaselineModel(BaseModel):
         # Update the running global mean in a streaming fashion
         self.update(batch)
         return {
-            "loss": torch.tensor(0.0, device=self.device, requires_grad=False)  ,
-            "recon_loglikelihood": torch.tensor(0.0, device=self.device, requires_grad=False),
-            "kl_divergence": torch.tensor(0.0, device=self.device, requires_grad=False),
+            "loss": torch.tensor(0.0, device=self.running_sum.device, requires_grad=False),
+            "recon_loglikelihood": torch.tensor(0.0, device=self.running_sum.device, requires_grad=False),
+            "kl_divergence": torch.tensor(0.0, device=self.running_sum.device, requires_grad=False),
         }
 
     def validate(self, valloader, num_samples=1, beta=1, device="cpu", **kwargs):
-        return {"loss": torch.tensor(0.0, device=device, requires_grad=False), "recon_loglikelihood": torch.tensor(0.0, device=self.device, requires_grad=False), "kl_divergence": torch.tensor(0.0, device=self.device, requires_grad=False)}
+        buffer_device = self.running_sum.device
+        return {"loss": torch.tensor(0.0, device=device, requires_grad=False), "recon_loglikelihood": torch.tensor(0.0, device=buffer_device, requires_grad=False), "kl_divergence": torch.tensor(0.0, device=buffer_device, requires_grad=False)}
     
     @torch.no_grad()
     def reconstruct(self, x, meter_ids=None, timestamps=None, num_samples=1, **kwargs):
@@ -302,10 +308,11 @@ class FlatMeanBaselineModel(BaseModel):
     def update(self, batch: torch.Tensor):
         """Processes a new batch and updates the global sum and count."""
         x, meter_id, timestamp, agg = self._unpack_batch(batch)
+        x = x.to(device=self.running_sum.device, dtype=self.running_sum.dtype)
         # Sum over batch and sequence length to get total sum per feature
         # x is [B, F, L], we want [1, F]
-        batch_sum = x.to(torch.float64).sum(dim=(0, 2)).unsqueeze(0)
-        batch_count = (x.shape[0] * x.shape[2]) * torch.ones_like(batch_sum, dtype=torch.long, device=self.device)
+        batch_sum = x.sum(dim=(0, 2)).unsqueeze(0)
+        batch_count = (x.shape[0] * x.shape[2]) * torch.ones_like(batch_sum, dtype=self.running_count.dtype, device=self.running_count.device)
         
         self.running_sum += batch_sum
         self.running_count += batch_count

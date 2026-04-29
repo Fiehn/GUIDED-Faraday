@@ -84,10 +84,13 @@ class BaseModel(nn.Module, ABC):
         os.makedirs(save_path, exist_ok=True)
 
         # Remember the original device so we can move back after saving.
-        try:
-            original_device = next(self.parameters()).device
-        except StopIteration:
-            original_device = "cpu"
+        # Some baseline models are parameterless and keep all state in buffers.
+        first_param = next(self.parameters(), None)
+        if first_param is not None:
+            original_device = first_param.device
+        else:
+            first_buffer = next(self.buffers(), None)
+            original_device = first_buffer.device if first_buffer is not None else torch.device("cpu")
             
         self.eval()
         self.to("cpu")

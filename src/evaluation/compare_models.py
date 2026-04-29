@@ -631,16 +631,20 @@ def compare_models(model_paths: list[str],
     split_ratios = dict(split_ratios)
     
     # 4. Loop through models and evaluate
-    for i, (path, name) in enumerate(zip(model_paths, model_names)):
+    for i, (path, name, secondary) in enumerate(zip(model_paths, model_names, secondary_model_paths if secondary_model_paths is not None else [None]*len(model_paths))):
         print(f"\nEvaluating model: {name}")
         model_output_dir = os.path.join(output_dir, name)
         os.makedirs(model_output_dir, exist_ok=True)
 
-        if (not recompute) and _has_existing_eval_outputs(model_output_dir, phased=phased):
+        if (not recompute) and _has_existing_eval_outputs(model_output_dir, phased=phased) and secondary is not None:
             print(f"Found existing evaluation outputs in {model_output_dir}; skipping recompute.")
             continue
 
+
         model, normalizer, conditioner = load_model(path, device="cuda" if torch.cuda.is_available() else "cpu")
+        sec_model = None
+        if secondary is not None:
+            sec_model, normalizer, conditioner = load_model(secondary, device="cuda" if torch.cuda.is_available() else "cpu")
 
         # 2. Load Data
         window = WindowSpec(input_len=24, stride=24)
@@ -661,7 +665,8 @@ def compare_models(model_paths: list[str],
             hourly_aggregation=True if agg_divisor > 1.0 else False,
             split_seed=split_seed,
             split_ratios=split_ratios,
-            max_value=max_value
+            max_value=max_value,
+            pin_memory=False
         )
         
         # 3. Grab a fixed number of samples for evaluation
@@ -669,11 +674,6 @@ def compare_models(model_paths: list[str],
         # True held-out test split (not used during training).
         loader_obj.refresh_test_cache(n_batches)
         test_loader = loader_obj.get_test_loader()
-        
-        sec_model = None
-        if secondary_model_paths is not None and i < len(secondary_model_paths):
-            if secondary_model_paths[i] is not None:
-                sec_model, _, _ = load_model(secondary_model_paths[i], device="cuda" if torch.cuda.is_available() else "cpu")
         
         if phased:
             # Phased models use PhasedEvaluationSuite which creates sub-phase directories
@@ -738,7 +738,7 @@ if __name__ == "__main__":
 
     if len(args.models) != len(args.names):
         raise ValueError("--models and --names must have the same length.")
-
+    
     secondary_model_paths = None
     if args.secondary_models is not None and len(args.secondary_models) > 0:
         secondary_model_paths = []

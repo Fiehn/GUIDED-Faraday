@@ -1586,7 +1586,11 @@ class Conditioner():
             conditions.append(cond)
         
         if len(conditions) == 0:
-            return None
+            # return an empty tensor
+            if target_device is not None:
+                return torch.empty((x.shape[0] if x is not None else 1, 0), device=target_device)
+            else:
+                return torch.empty((x.shape[0] if x is not None else 1, 0))
         
         # Concatenate all conditions along feature dimension
         return torch.cat(conditions, dim=-1)            
@@ -1605,6 +1609,9 @@ class Conditioner():
         for tag in self.tags:
             item = self.condition_items[tag]
             conditions.append(item.get_random_conditions(batch_size))
+
+        if len(conditions) == 0:
+            return torch.empty((batch_size, 0))
         return torch.cat(conditions, dim=-1)
 
     def get_condition_dim(self):
