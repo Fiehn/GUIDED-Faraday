@@ -57,6 +57,7 @@ class Normalizer:
         self.std:  Optional[torch.Tensor] = None
 
         self.manifest = None  # Dict that stores metadata so the file can be reused
+    
     # === Helpers ===
     def to(self, device: str | torch.device) -> 'Normalizer':
         """Move tensor stats to device."""
@@ -157,12 +158,10 @@ class Normalizer:
         if X is None:
             # For log1p_phase, we can compute the stats from the entire dataset using the compute_normalization_stats function
             if self.method == 'log1p_phase':
-                mean_np, std_np = compute_normalization_stats(
-                    sm_files=sm_files,
-                    feature_cols=['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3'],
-                    save_path=stats_path,
-                    valid_ids_json_path=None,
-                    use_cache=True,
+                mean_np, std_np = fit_normalizer_on_files(
+                    filenames= sm_files,
+                    feature_cols = ['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3'],
+                    save_path= stats_path,
                     hourly_aggregation=hourly_aggregation,
                     aggregation_divisor=aggregation_divisor,
                 )

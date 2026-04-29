@@ -37,12 +37,172 @@ except ImportError:
 class PhasedModelComparator:
     """Class to compare evaluation results across multiple phased and unphased models."""
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     def __init__(self, output_dir: str = "evaluation_comparison"):
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         self.models_data = {}
         # We define a superset of possible phases.
         self.phases = ['full_eval', 'aggregated_phase', 'ranked_phase_1', 'ranked_phase_2', 'ranked_phase_3']
+
+    def _metric_target_label(self, metric: str) -> str:
+        """Return target direction/target value for plot titles."""
+        display_name = self._display_metric_name(metric)
+
+        if metric.startswith("Avg MinMax") or "BEST Overall" in display_name:
+            return "↑"
+
+        if "TSTR" in metric or "Train on Synthetic" in display_name:
+            return "target=1"
+
+        if "MMD" in metric or "MaximumMeanDiscrepancy" in metric or "Maximum Mean Discrepancy" in display_name:
+            return "target=0"
+
+        if any(term in metric for term in ["LogLikelihood", "Log-Likelihood", "Accuracy", "Score", "R2"]):
+            return "↑"
+
+        return "↓"
+
+    def _display_metric_title(self, metric: str) -> str:
+        return f"{self._display_metric_name(metric)} ({self._metric_target_label(metric)})"
+
+    def _display_metric_name(self, metric: str) -> str:
+
+        """Pretty metric names for tables and plots."""
+        rename_map = {
+            "Flexibility Distance": "Reconstruction Flexibility Distance (FD)",
+            "Avg MinMax Reconstruction Score": "BEST Overall Reconstruction Score",
+            "Avg MinMax Synthetic Score": "BEST Overall Synthetic Score",
+            "TSTR (Train on Synthetic, Test on Real)": "Train on Synthetic, Test on Real (TSTR)",
+            "Aggregated Profiles (Flexibility Distance)": "FD on Real & Synth Aggregated Profiles",
+            "Set-MMD (Permutation Invariant)": "Maximum Mean Discrepancy (MMD)",
+        }
+        return rename_map.get(metric, metric)
+    
+    def _include_metric(self, metric: str) -> bool:
+        excluded_metrics = {
+            "Classical Statistics",
+        }
+        return metric not in excluded_metrics
+
+    def _model_color(self, model_name: str, index: int, plot_style):
+        name = model_name.lower()
+
+        if "avg baseline" in name or "mean baseline" in name or "averagebaseline" in name:
+            return "0.55"   # medium grey
+
+        if "quantile baseline" in name or "quantilebaseline" in name:
+            return "0.25"   # dark grey
+
+        return plot_style.get_color(index)
+    
+
+    def _canonical_metric_key(self, metric: str) -> str:
+        """Normalize metric names for robust matching."""
+        return (
+            str(metric)
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+            .replace("(", "")
+            .replace(")", "")
+        )
+
+
+    def _metric_goal(self, metric: str) -> str:
+        """
+        Return one of:
+            'lower'     -> lower is better
+            'higher'    -> higher is better
+            'target_0'  -> closer to 0 is better
+            'target_1'  -> closer to 1 is better
+        """
+        key = self._canonical_metric_key(metric)
+
+        goal_map = {
+            # Reconstruction metrics
+            "flexibilitydistance": "lower",
+            "reconstructionflexibilitydistancefd": "lower",
+            "reconstructionloglikelihood": "higher",
+            "reconstructionloglikelihood": "higher",
+            "reconstructionrmse": "lower",
+
+            # Synthetic metrics
+            "aggregatedprofilesflexibilitydistance": "lower",
+            "perconditionevaluation": "lower",
+            "acfdistributionmatchks": "lower",
+            "tstrtrainonsynthetictestonreal": "target_1",
+            "trainonsynthetictestonrealtstr": "target_1",
+            "tstr": "target_1",
+            "maximummeandiscrepancymmd": "target_0",
+            "setmmdpermutationinvariant": "target_0",
+            "mmd": "target_0",
+
+            # Summary scores
+            "avgminmaxreconstructionscore": "higher",
+            "avgminmaxsyntheticscore": "higher",
+        }
+
+        return goal_map.get(key, "lower")
+
+
+    def _metric_group(self, metric: str) -> str | None:
+        """
+        Return:
+            'reconstruction'
+            'synthetic'
+            None -> excluded from AvgMinMax scores
+        """
+        key = self._canonical_metric_key(metric)
+
+        reconstruction_metrics = {
+            "flexibilitydistance",
+            "reconstructionflexibilitydistancefd",
+            "reconstructionloglikelihood",
+            "reconstructionrmse",
+        }
+
+        synthetic_metrics = {
+            "aggregatedprofilesflexibilitydistance",
+            "tstrtrainonsynthetictestonreal",
+            "trainonsynthetictestonrealtstr",
+            "tstr",
+            "maximummeandiscrepancymmd",
+            "setmmdpermutationinvariant",
+            "mmd",
+            "acfdistributionmatchks",
+        }
+
+        if key in reconstruction_metrics:
+            return "reconstruction"
+
+        if key in synthetic_metrics:
+            return "synthetic"
+
+        return None
+
+
+    def _metric_target_label(self, metric: str) -> str:
+        goal = self._metric_goal(metric)
+
+        if goal == "higher":
+            return "↑"
+        if goal == "lower":
+            return "↓"
+        if goal == "target_0":
+            return "target=0"
+        if goal == "target_1":
+            return "target=1"
+
+        return "↓"
+
+
+    def _display_metric_title(self, metric: str) -> str:
+        return f"{self._display_metric_name(metric)} ({self._metric_target_label(metric)})"
+
+
 
     def add_model(self, model_name: str, model_eval_dir: str):
         """Add a model's evaluation results to the comparator, handling both phased and unphased output."""
@@ -103,36 +263,46 @@ class PhasedModelComparator:
         for model_name, data in self.models_data.items():
             if phase in data:
                 for metric, val in data[phase].items():
-                    if isinstance(val, (int, float)):
+                    if isinstance(val, (int, float)) and self._include_metric(metric):
                         all_metrics.add(metric)
                         
         scalar_metrics = list(all_metrics)
         models = list(self.models_data.keys())
+
+        preferred_last = [
+            "Avg Baseline",
+            "Mean Baseline",
+            "Quantile Baseline",
+        ]
+        non_last = [m for m in models if m not in preferred_last]
+        last = [m for m in preferred_last if m in models]
+        models = non_last + last
         
         # --- Normalization for Average Plotting ---
         scores_dict = {m: {} for m in models}
         for metric in scalar_metrics:
-            is_max = any(term in metric for term in ['LogLikelihood', 'Accuracy', 'Score', 'R2'])
-            is_one = ('TSTR' in metric)
-            is_zero = ('MMD' in metric or 'MaximumMeanDiscrepancy' in metric)
-            
+            goal = self._metric_goal(metric)
+
             raw_vals = []
             for m in models:
                 v = self.models_data[m].get(phase, {}).get(metric, None)
                 raw_vals.append((m, v))
-                
+
             mapped_vals = {}
             for m, v in raw_vals:
                 if isinstance(v, (int, float)):
-                    if is_one:
+                    v = float(v)
+
+                    # Convert everything so lower is internally better
+                    if goal == "higher":
+                        mapped_vals[m] = -v
+                    elif goal == "target_1":
                         mapped_vals[m] = abs(v - 1.0)
-                    elif is_zero:
-                        mapped_vals[m] = abs(v)
-                    elif is_max:
-                        mapped_vals[m] = -v # invert max so lower is always better
-                    else:
-                        mapped_vals[m] = float(v)
-                        
+                    elif goal == "target_0":
+                        mapped_vals[m] = abs(v - 0.0)
+                    else:  # lower
+                        mapped_vals[m] = v
+                                
             if mapped_vals:
                 vmin = min(mapped_vals.values())
                 vmax = max(mapped_vals.values())
@@ -143,8 +313,8 @@ class PhasedModelComparator:
                         # 1.0 is the best score, 0.0 is the worst score
                         scores_dict[m][metric] = 1.0 - (val - vmin) / (vmax - vmin)
 
-        recon_metrics = [m for m in scalar_metrics if 'Reconstruction' in m or 'FlexibilityDistance' in m]
-        synth_metrics = [m for m in scalar_metrics if m not in recon_metrics]
+        recon_metrics = [m for m in scalar_metrics if self._metric_group(m) == "reconstruction"]
+        synth_metrics = [m for m in scalar_metrics if self._metric_group(m) == "synthetic"]
         
         for m in models:
             if phase not in self.models_data[m]:
@@ -166,10 +336,11 @@ class PhasedModelComparator:
         for model_name, data in self.models_data.items():
             if phase in data:
                 for metric, val in data[phase].items():
-                    if isinstance(val, (int, float)):
+                    if isinstance(val, (int, float)) and self._include_metric(metric):
                         all_metrics.add(metric)
                         
-        scalar_metrics = sorted(list(all_metrics))
+        # scalar_metrics = sorted(list(all_metrics))
+        scalar_metrics = sorted(all_metrics, key=lambda m: (0 if "Reconstruction" in m or "Flexibility" in m else 1, m))
         
         # Move averages to the end
         averages = [m for m in scalar_metrics if m.startswith('Avg MinMax')]
@@ -178,7 +349,8 @@ class PhasedModelComparator:
                 
         table_data = []
         for metric in scalar_metrics:
-            row = [metric]
+            # row = [metric]
+            row = [self._display_metric_name(metric)]
             for model_name, data in self.models_data.items():
                 if phase in data and metric in data[phase]:
                     val = data[phase][metric]
@@ -202,29 +374,57 @@ class PhasedModelComparator:
         print(f"\nTable saved to {table_path}")
 
     def _generate_plots(self, phase: str):
-        """Generate bar charts for scalar metrics for a given phase."""
+        """Generate bar charts for scalar metrics for a given phase, split by reconstruction and synthetic metrics."""
         all_metrics = set()
         for model_name, data in self.models_data.items():
             if phase in data:
                 for metric, val in data[phase].items():
-                    if isinstance(val, (int, float)):
+                    if isinstance(val, (int, float)) and self._include_metric(metric):
                         all_metrics.add(metric)
                 
         scalar_metrics = list(all_metrics)
         if not scalar_metrics:
             return
-            
-        scalar_metrics = sorted(scalar_metrics)
         
-        # Move averages to the end
-        averages = [m for m in scalar_metrics if m.startswith('Avg MinMax')]
-        non_averages = [m for m in scalar_metrics if not m.startswith('Avg MinMax')]
-        scalar_metrics = non_averages + averages
+        # Separate metrics by group
+        reconstruction_metrics = [m for m in scalar_metrics if self._metric_group(m) == "reconstruction"]
+        synthetic_metrics = [m for m in scalar_metrics if self._metric_group(m) == "synthetic"]
+        
+        # Add their respective BEST metrics at the end
+        reconstruction_best = "Avg MinMax Reconstruction Score"
+        synthetic_best = "Avg MinMax Synthetic Score"
+        
+        if reconstruction_best in scalar_metrics:
+            reconstruction_metrics.append(reconstruction_best)
+        if synthetic_best in scalar_metrics:
+            synthetic_metrics.append(synthetic_best)
+        
+        # Sort each group (BEST metrics come last)
+        reconstruction_metrics = sorted(reconstruction_metrics, key=lambda m: (1 if m == reconstruction_best else 0, m))
+        synthetic_metrics = sorted(synthetic_metrics, key=lambda m: (1 if m == synthetic_best else 0, m))
         
         models = list(self.models_data.keys())
+        preferred_last = [
+            "Avg Baseline",
+            "Mean Baseline",
+            "Quantile Baseline",
+        ]
+        non_last = [m for m in models if m not in preferred_last]
+        last = [m for m in preferred_last if m in models]
+        models = non_last + last
         
-        n_metrics = len(scalar_metrics)
-        n_cols = min(3, n_metrics)
+        # Generate plots for each metric group
+        plot_style = PlotStyle()
+        for metric_group, group_name in [(reconstruction_metrics, "Reconstruction"), (synthetic_metrics, "Synthetic")]:
+            if not metric_group:
+                continue
+            
+            self._generate_metric_group_plot(phase, metric_group, group_name, models, plot_style)
+    
+    def _generate_metric_group_plot(self, phase: str, metric_group: list, group_name: str, models: list, plot_style):
+        """Generate a single bar chart figure for a metric group."""
+        n_metrics = len(metric_group)
+        n_cols = 3
         n_rows = int(np.ceil(n_metrics / n_cols))
         
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
@@ -234,19 +434,21 @@ class PhasedModelComparator:
             axes = [axes]
         else:
             axes = axes.flatten()
+        
+        # Add header title to the figure
+        title_map = {
+            "Reconstruction": "Reconstruction Evaluation",
+            "Synthetic": "Synthetic Data Evaluation",
+        }
+        fig.suptitle(title_map.get(group_name, group_name), fontsize=16, fontweight='bold', y=0.995)
             
         width = 0.8 / len(models)
         
-        # Use centralized plot styling
-        plot_style = PlotStyle()
-        
-        for idx, metric in enumerate(scalar_metrics):
+        for idx, metric in enumerate(metric_group):
             ax = axes[idx]
             
             # Determine if we want to min/max this metric
-            is_maximize = any(term in metric for term in ['LogLikelihood', 'Accuracy', 'Score', 'R2'])
-            is_closest_to_one = ('TSTR' in metric)
-            is_closest_to_zero = ('MMD' in metric or 'MaximumMeanDiscrepancy' in metric)
+            goal = self._metric_goal(metric)
             
             m_values = []
             valid_models = []
@@ -270,14 +472,13 @@ class PhasedModelComparator:
             best_val = None
             if len(valid_models) > 0:
                 valid_vals = [m_values[i] for i in valid_models]
-                if is_closest_to_one:
+                if goal == "target_1":
                     best_val = min(valid_vals, key=lambda v: abs(v - 1.0))
-                elif is_closest_to_zero:
+                elif goal == "target_0":
                     best_val = min(valid_vals, key=lambda v: abs(v - 0.0))
-                elif is_maximize:
+                elif goal == "higher":
                     best_val = max(valid_vals)
                 else:
-                    # Default: lower is better
                     best_val = min(valid_vals)
                     
                 best_idx = valid_models[valid_vals.index(best_val)]
@@ -288,7 +489,7 @@ class PhasedModelComparator:
             for i in range(len(models)):
                 if not np.isnan(m_values[i]):
                     val = m_values[i]
-                    color = plot_style.get_color(i)
+                    color = self._model_color(models[i], i, plot_style)
                     is_best = (i == best_idx)
                     
                     ec = 'black' if is_best else 'none'
@@ -307,12 +508,15 @@ class PhasedModelComparator:
                                     textcoords='offset points', ha='center', va=va, 
                                     fontsize=12, color='black', alpha=0.8)
             
-            ax.set_title(metric, fontsize=11, fontweight='bold')
-            ax.set_xticks([]) # Remove x-axis tick completely for cleaner look
+            ax.set_title(self._display_metric_title(metric), fontsize=11, fontweight='bold')
+            ax.set_xticks([])
             ax.grid(axis='y', linestyle='--', alpha=0.7)
-            
+        
         # Create a custom legend
-        legend_handles = [mpatches.Patch(color=plot_style.get_color(i), label=model) for i, model in enumerate(models)]
+        legend_handles = [
+            mpatches.Patch(color=self._model_color(model, i, plot_style), label=model)
+            for i, model in enumerate(models)
+        ]
         legend_handles.append(mpatches.Patch(facecolor='white', edgecolor='black', hatch='///', label='★ Best Value'))
         
         # Position the legend above the plots
@@ -326,11 +530,10 @@ class PhasedModelComparator:
         
         phase_output_dir = os.path.join(self.output_dir, phase)
         os.makedirs(phase_output_dir, exist_ok=True)
-        plot_path = os.path.join(phase_output_dir, "metric_comparison.png")
+        plot_path = os.path.join(phase_output_dir, f"metric_comparison_{group_name}.png")
         plt.savefig(plot_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
         print(f"Plots saved to {plot_path}")
-
 
 def get_eval_files(data_dir: str, data_files: list[str] | None = None):
     """
@@ -437,7 +640,7 @@ def compare_models(model_paths: list[str],
             print(f"Found existing evaluation outputs in {model_output_dir}; skipping recompute.")
             continue
 
-        model, normalizer, conditioner = load_model(path, device="cuda")
+        model, normalizer, conditioner = load_model(path, device="cuda" if torch.cuda.is_available() else "cpu")
 
         # 2. Load Data
         window = WindowSpec(input_len=24, stride=24)
@@ -470,7 +673,7 @@ def compare_models(model_paths: list[str],
         sec_model = None
         if secondary_model_paths is not None and i < len(secondary_model_paths):
             if secondary_model_paths[i] is not None:
-                sec_model, _, _ = load_model(secondary_model_paths[i], device="cuda")
+                sec_model, _, _ = load_model(secondary_model_paths[i], device="cuda" if torch.cuda.is_available() else "cpu")
         
         if phased:
             # Phased models use PhasedEvaluationSuite which creates sub-phase directories

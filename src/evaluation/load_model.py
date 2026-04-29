@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 import os
+import torch
 CURRENT_DIR = Path(__file__).resolve().parent
 SRC_DIR = CURRENT_DIR.parent
 ROOT_DIR = SRC_DIR.parent
@@ -19,6 +20,7 @@ def load_model(model_path: str, device: str = "cpu"):
     Then we load the checkpoint file with starts with "best_model_" and ends in .pt
     We return the model, normalizer and conditioner
     """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 1. Find config file
     config_path = None

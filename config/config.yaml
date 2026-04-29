@@ -19,11 +19,12 @@ data:
   #data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
   #data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
-  data_dir: "data/_parquet_cache"
+  # data_dir: "data/_parquet_cache"
+  data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/parq_hourly"
 
 
   # CSV filename to load
-  data_files: ["hourly_subset.parquet"]
+  # data_files: ["hourly_subset.parquet"]
   
   # CSV column specifications
   columns:
@@ -88,7 +89,7 @@ normalization:
 # ============================================================================
 model:
   # Model type: "vae", "cvae", "art", "set_guide_vae", "diffusion", "phase_splitter", "baseline_average", "baseline_quantile", "baseline_mean"
-  type: "art"
+  type: "baseline_average"
   
   # Latent dimension (size of latent vector z)
   latent_dim: 128

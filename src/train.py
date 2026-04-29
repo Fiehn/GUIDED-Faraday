@@ -355,7 +355,7 @@ def train(config, train_only_user_profile: bool = False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train VAE/CVAE/SetGuideVAE/ART from YAML config")
-    parser.add_argument("--config", type=str, default=os.path.join(parent_dir, "config", "config.yaml"))
+    parser.add_argument("--config", type=str, default=os.path.join(parent_dir, "../config", "config.yaml"))
     parser.add_argument("--skip-validation", action="store_true", default=False)
     parser.add_argument("--quiet", action="store_true", default=False)
     parser.add_argument("--load_path_model", type=str, default=None, help="Path to a saved model to load and visualize without training")
