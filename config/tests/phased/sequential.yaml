@@ -174,7 +174,7 @@ training:
     gamma: 0.95
   
   # Number of training epochs
-  num_epochs: 3
+  num_epochs: 2
   
   # Beta (KL weight) settings
   beta: 1.0
