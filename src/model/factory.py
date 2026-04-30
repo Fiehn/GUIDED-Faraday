@@ -4,6 +4,7 @@ import shutil
 from types import SimpleNamespace
 from src.model.cvae import CVAE
 from src.model.set import SetGuideVAE
+from src.model.sequential import SequentialPhaseVAE
 from src.model.vae import VAE
 from src.model.art import AutoRegressiveTransformerVAE
 from src.model.diffusion import DiffusionModel, NoiseScheduler, ConditionalUNet1D
@@ -80,8 +81,8 @@ def create_model_from_config(config, device="cpu"):
     
     # === Hierarchical latent space setup ===
     hierarchy = None
-    if getattr(config, "hierarchy", SimpleNamespace()) and getattr(config.hierarchy, "enabled", False):
-        hierarchy_cfg = config.hierarchy
+    hierarchy_cfg = getattr(config, "hierarchy", SimpleNamespace())
+    if hierarchy_cfg and getattr(hierarchy_cfg, "enabled", False):
         levels = []
         for level_type in getattr(hierarchy_cfg, "levels", []):
             input_dim_k = config.model.latent_dim if len(levels) == 0 else levels[-1].latent_dim
@@ -114,7 +115,7 @@ def create_model_from_config(config, device="cpu"):
     encoder_dropout = getattr(encoder_cfg, "dropout", None)
     decoder_dropout = getattr(decoder_cfg, "dropout", None)
 
-    if (model_type == "phase_splitter" or model_type == "set_guide_vae") and not phased_mode:
+    if (model_type in ("phase_splitter", "set_guide_vae", "sequential_phase_vae")) and not phased_mode:
         print("You have indicated a phased only model type is currently supported only with data.mode='phased_parquet'. Forcing phased mode for this run.")
         phased_mode = True
 
@@ -216,6 +217,25 @@ def create_model_from_config(config, device="cpu"):
             set_num_blocks=getattr(set_cfg, "num_blocks", 2),
             is_isab=getattr(set_cfg, "is_isab", True),
             use_abl_pool=bool(getattr(set_cfg, "use_abl_pool", False)),
+            encoder_hidden_dims=encoder_hidden_dims,
+            decoder_hidden_dims=decoder_hidden_dims,
+            encoder_dropout=encoder_dropout,
+            decoder_dropout=decoder_dropout,
+            phased_mode=phased_mode,
+        )
+    elif model_type == "sequential_phase_vae":
+        model = SequentialPhaseVAE(
+            input_dim=input_dim,
+            latent_dim=model_cfg.latent_dim,
+            conditioner=conditioner,
+            distribution_dict=getattr(model_cfg, "distribution_dict", {}),
+            prior_type=prior_cfg.type,
+            hierarchy_config=hierarchy,
+            sequence_length=seq_len,
+            encoder_type=encoder_cfg.type,
+            decoder_type=decoder_cfg.type,
+            dictionary_size=getattr(prior_cfg, "dictionary_size", 512),
+            vamp_num_components=getattr(prior_cfg, "vamp_num_components", 20),
             encoder_hidden_dims=encoder_hidden_dims,
             decoder_hidden_dims=decoder_hidden_dims,
             encoder_dropout=encoder_dropout,

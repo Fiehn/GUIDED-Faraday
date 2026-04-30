@@ -159,6 +159,8 @@ class SyntheticGenerator:
         cond_input = self.model._build_condition_input(self.model._to_phase_first(input_data))
         conditions = self.conditioner.get_conditions(cond_input, meter_id, timestamp).to(self.device, dtype=model_dtype)
 
+        is_sequential_phase_vae = self.model.__class__.__name__ == 'SequentialPhaseVAE'
+        
         if self._is_baseline_model():
             flat_output = self.model.reconstruct(input_data)
         elif self._is_diffusion:
@@ -177,6 +179,28 @@ class SyntheticGenerator:
                 flat_output = flat_output.unsqueeze(0)
             if flat_output.dim() != 3:
                 raise ValueError(f"Unexpected diffusion reconstruction shape: {tuple(flat_output.shape)}")
+        elif is_sequential_phase_vae:
+            # For SequentialPhaseVAE, use its custom reconstruct method that handles phase concatenation
+            # Convert meter_id and timestamp to tensors if needed
+            B = input_data.shape[0]
+            if meter_id is not None and not isinstance(meter_id, torch.Tensor):
+                meter_ids_tensor = torch.full((B,), meter_id, dtype=torch.long, device=self.device)
+            else:
+                meter_ids_tensor = meter_id if isinstance(meter_id, torch.Tensor) else torch.zeros(B, dtype=torch.long, device=self.device)
+            
+            if timestamp is not None and isinstance(timestamp, torch.Tensor):
+                timestamps_tensor = timestamp
+            elif timestamp is not None:
+                # For datetime or other types, create a dummy tensor
+                timestamps_tensor = torch.zeros(B, dtype=torch.long, device=self.device)
+            else:
+                timestamps_tensor = torch.zeros(B, dtype=torch.long, device=self.device)
+            
+            phased_recon = self.model.reconstruct(input_data, meter_ids_tensor, timestamps_tensor)
+            # Shape: [B, 3, 24] or [B, 24, 3] depending on phase_first. Flatten to [B, 72]
+            flat_recon = phased_recon.reshape(phased_recon.shape[0], -1)
+            # Add reconstruction count dimension to get [1, B, 72]
+            flat_output = flat_recon.unsqueeze(0)
         # Conditions for the encoding are always based on the original meter_id and timestamp, to get the correct latent representation.
         elif self._is_cvae:
             # Ensure input_data is flattened appropriately
@@ -237,7 +261,8 @@ class SyntheticGenerator:
         else:
             recon_params, _ = self.model.reconstruct(input_data)
 
-        if (not self._is_diffusion) and (not self._is_baseline_model()) and not (self._is_cvae and meter_id is not None and timestamp is not None and self._is_art_model()):
+        # Skip recon_params processing if we already have flat_output from diffusion/baseline/phased models
+        if (not self._is_diffusion) and (not self._is_baseline_model()) and (not is_sequential_phase_vae) and not (self._is_cvae and meter_id is not None and timestamp is not None and self._is_art_model()):
             # Normalize decoder param tensors to [S, B, D] to avoid accidental shape expansion.
             # Some model.reconstruct() implementations return [B, D] instead of [S, B, D].
             for k, v in recon_params.items():
