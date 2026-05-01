@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 from typing import Dict, List, Any
 from abc import ABC, abstractmethod
@@ -350,6 +350,7 @@ class EvalFramework:
             ClassicalStatistics(),
             TSTR(),
             AggregatedProfiles(),
+            HourlyProfilesByMonth(),
             PerConditionEval()
         ])
         if phased:
@@ -2915,6 +2916,7 @@ class PerConditionEval(SyntheticMetric):
 
 
 class SetMaximumMeanDiscrepancy(SyntheticMetric):
+
     """Permutation-Invariant MMD for 3-Phase Set Data."""
     
     real_data: np.ndarray = None
@@ -3022,3 +3024,281 @@ class SetMaximumMeanDiscrepancy(SyntheticMetric):
 
         mmd_value = float(np.sqrt(np.maximum(mmd2, 0.0)))
         return mmd_value
+
+
+
+
+class HourlyProfilesByMonth(SyntheticMetric):
+    """Analyze hourly consumption profiles by month and compute flexibility distances.
+    
+    For each month, collects all 24-hour windows with timestamps in that month, then:
+    - For each hour position (0-23): Extract that hour's consumption from all windows
+    - Compute Wasserstein distance between real and synthetic distributions for each hour
+    - Visualize hourly profiles with means and percentile bands for each month
+    
+    Returns mean flexibility distance across all hours and months as the metric value.
+    
+    Args:
+        window_size (int): Hours per window (default: 24)
+        plot_filename (str): Name of plot file (default: hourly_profiles_by_month.png)
+    """
+    
+    real_data: np.ndarray = None
+    synthetic_data: np.ndarray = None
+    timestamps: np.ndarray = None
+    output_path: str = None
+    
+    def __init__(self, window_size: int = 24, plot_filename: str = 'hourly_profiles_by_month.png'):
+        self.window_size = window_size
+        self.plot_filename = plot_filename
+    
+    @property
+    def name(self) -> str:
+        return "Hourly Profiles by Month (Flexibility Distance)"
+    
+    def _uses_phase_first_flatten(self) -> bool:
+        """Check if model uses phase-first flattening for multi-phase data."""
+        return hasattr(self, 'model') and self.model is not None and hasattr(self.model, '_to_phase_first')
+    
+    def _extract_consumption_feature(self, data: np.ndarray) -> np.ndarray:
+        """Extract consumption feature (first feature) from potentially multi-phase flattened data.
+        
+        Handles:
+        - [N, 24] single-feature data
+        - [N, 24*F] multi-feature flattened data (phase-first or time-first)
+        
+        Returns:
+            np.ndarray: [N, 24] consumption feature array
+        """
+        arr = _sanitize_numeric_array(np.asarray(data))
+        if arr.ndim != 2:
+            raise ValueError(f"Expected 2D flattened array [N, D], got {arr.shape}")
+
+        if arr.shape[1] == self.window_size:
+            return arr  # Already consumption only
+
+        if arr.shape[1] % self.window_size != 0:
+            raise ValueError(
+                f"Flattened dimension {arr.shape[1]} is not divisible by window_size {self.window_size}"
+            )
+
+        n_features = arr.shape[1] // self.window_size
+        if n_features == 1:
+            return arr.reshape(-1, self.window_size)
+
+        # Extract first feature (consumption) depending on flatten order
+        if self._uses_phase_first_flatten():
+            # Phase-first: [f0_t0..f0_tL-1, f1_t0..], so feature 0 is contiguous
+            return arr.reshape(-1, n_features, self.window_size)[:, 0, :]
+        else:
+            # Time-first: [t0_f0, t0_f1, ..., t1_f0, ...]
+            return arr.reshape(-1, self.window_size, n_features)[:, :, 0]
+    
+    def compute(self) -> float:
+        """Compute hourly profiles by month and return mean flexibility distance."""
+        try:
+            # Validate inputs
+            if self.real_data is None or self.synthetic_data is None:
+                raise ValueError(f"Data not injected: real_data={self.real_data is not None}, synthetic_data={self.synthetic_data is not None}")
+            
+            # Extract consumption features
+            real_data = self._extract_consumption_feature(self.real_data)
+            synthetic_data = self._extract_consumption_feature(self.synthetic_data)
+            
+            # Equalize lengths between real and synthetic data
+            n = min(len(real_data), len(synthetic_data))
+            real_data = real_data[:n]
+            synthetic_data = synthetic_data[:n]
+            
+            # Handle timestamps
+            if self.timestamps is None:
+                # Fallback: generate dummy timestamps
+                self.timestamps = np.array([datetime(2023, 1, 1) + timedelta(hours=i) for i in range(n)])
+            else:
+                # Make sure timestamps match data length
+                self.timestamps = np.asarray(self.timestamps)[:n]
+            
+            # Extract month from timestamps (not hour - hour comes from position in window)
+            months = self._extract_months()
+            
+            # Verify all arrays have matching lengths
+            if len(months) != n:
+                raise ValueError(f"Array length mismatch: months={len(months)}, data={n}")
+            
+            # Group by month and compute flexibility distances
+            unique_months = sorted(np.unique(months[months > 0]))
+            if len(unique_months) == 0:
+                # If no valid months found, use month 1 for all
+                months = np.ones_like(months)
+                unique_months = [1]
+            
+            flexibility_distances_by_month = {}
+            
+            for month in unique_months:
+                month_mask = (months == month)
+                real_month = real_data[month_mask]  # All windows with timestamp in this month
+                synth_month = synthetic_data[month_mask]  # All windows with timestamp in this month
+                
+                if len(real_month) < 1 or len(synth_month) < 1:
+                    continue
+                
+                # Compute FD for each HOUR POSITION within the 24-hour window
+                # For each hour, extract that hour's value from ALL windows in the month
+                month_fds = []
+                for hour_position in range(self.window_size):
+                    # Extract hour_position column from all windows in this month
+                    real_hour_values = real_month[:, hour_position]  # All values at this hour across all windows
+                    synth_hour_values = synth_month[:, hour_position]  # All values at this hour across all windows
+                    
+                    # Compute Wasserstein distance between these two distributions
+                    try:
+                        fd = wasserstein_distance(real_hour_values, synth_hour_values)
+                        month_fds.append(fd)
+                    except Exception:
+                        month_fds.append(np.nan)
+                
+                flexibility_distances_by_month[month] = np.array(month_fds)
+            
+            if not flexibility_distances_by_month:
+                raise ValueError("No flexibility distances computed")
+            
+            # Compute mean FD
+            all_fds = np.concatenate([v for v in flexibility_distances_by_month.values()])
+            mean_fd = float(np.nanmean(all_fds))
+            
+            # Plot
+            self._plot_hourly_profiles(real_data, synthetic_data, months, flexibility_distances_by_month)
+            
+            # Save results
+            _save_standalone_metric_result(
+                metric_key='HourlyProfilesByMonth',
+                payload={
+                    'value': mean_fd,
+                    'unique_months': list(unique_months),
+                    'n_months': len(unique_months),
+                    'mean_fd': mean_fd,
+                    'n_hours_per_month': self.window_size,
+                    'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+                },
+                output_file=self.output_path or 'models/eval_results.json'
+            )
+            
+            return mean_fd
+        except Exception as e:
+            print(f"[ERROR] HourlyProfilesByMonth.compute() failed: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise  # Re-raise so framework sees the error
+    
+    
+    def _extract_months(self) -> np.ndarray:
+            """Extract month from timestamps."""
+            months = []
+            
+            if self.timestamps is None:
+                raise ValueError("Timestamps required for HourlyProfilesByMonth")
+            
+            for ts in self.timestamps:
+                try:
+                    if isinstance(ts, (int, float)):
+                        dt = datetime.fromtimestamp(ts)
+                    elif isinstance(ts, str):
+                        dt = datetime.fromisoformat(ts)
+                    elif isinstance(ts, datetime):
+                        dt = ts
+                    else:
+                        dt = datetime.fromtimestamp(int(ts))
+                    months.append(dt.month)
+                except Exception:
+                    months.append(0)
+            
+            return np.array(months)
+    
+    
+    def _plot_hourly_profiles(self, real_data, synthetic_data, months, 
+                             flexibility_distances_by_month):
+        """Plot hourly profiles by month.
+        
+        For each month, plots the hourly consumption profiles with means and percentile bands.
+        Each point represents the distribution of consumption values at that hour across all windows in the month.
+        """
+        try:
+            output_dir = _resolve_output_directory(self.output_path)
+            if not output_dir:
+                return
+            
+            unique_months = sorted(flexibility_distances_by_month.keys())
+            num_months = len(unique_months)
+            
+            fig, axes = plt.subplots(num_months, 1, figsize=(12, 4 * num_months))
+            if num_months == 1:
+                axes = [axes]
+            
+            month_names = {
+                1: 'January', 2: 'February', 3: 'March', 4: 'April',
+                5: 'May', 6: 'June', 7: 'July', 8: 'August',
+                9: 'September', 10: 'October', 11: 'November', 12: 'December'
+            }
+            
+            for month_idx, month in enumerate(unique_months):
+                ax = axes[month_idx]
+                month_mask = (months == month)
+                real_m = real_data[month_mask]
+                synth_m = synthetic_data[month_mask]
+                
+                # Compute means and percentiles for each hour position (0-23)
+                hours_list = np.arange(self.window_size)
+                real_means = []
+                real_p75 = []
+                real_p25 = []
+                synth_means = []
+                synth_p75 = []
+                synth_p25 = []
+                
+                for hour_pos in hours_list:
+                    # Extract values at this hour position from ALL windows in this month
+                    real_hour_vals = real_m[:, hour_pos]
+                    synth_hour_vals = synth_m[:, hour_pos]
+                    
+                    if len(real_hour_vals) > 0:
+                        real_means.append(np.mean(real_hour_vals))
+                        real_p75.append(np.percentile(real_hour_vals, 75))
+                        real_p25.append(np.percentile(real_hour_vals, 25))
+                    else:
+                        real_means.append(np.nan)
+                        real_p75.append(np.nan)
+                        real_p25.append(np.nan)
+                    
+                    if len(synth_hour_vals) > 0:
+                        synth_means.append(np.mean(synth_hour_vals))
+                        synth_p75.append(np.percentile(synth_hour_vals, 75))
+                        synth_p25.append(np.percentile(synth_hour_vals, 25))
+                    else:
+                        synth_means.append(np.nan)
+                        synth_p75.append(np.nan)
+                        synth_p25.append(np.nan)
+                
+                # Plot
+                ax.plot(hours_list, real_means, '-o', label='Real', color='#1f77b4', linewidth=2, markersize=6)
+                ax.fill_between(hours_list, real_p25, real_p75, alpha=0.2, color='#1f77b4', label='Real (25th-75th %ile)')
+                ax.plot(hours_list, synth_means, '-o', label='Synthetic', color='#ff7f0e', linewidth=2, markersize=6)
+                ax.fill_between(hours_list, synth_p25, synth_p75, alpha=0.2, color='#ff7f0e', label='Synthetic (25th-75th %ile)')
+                
+                month_name = month_names.get(month, f'Month {month}')
+                ax.set_title(f'{month_name} - Hourly Consumption Profiles ({len(real_m)} real windows, {len(synth_m)} synthetic windows)', fontsize=12, fontweight='bold')
+                ax.set_xlabel('Hour of Day', fontsize=11)
+                ax.set_ylabel('Consumption (kWh)', fontsize=11)
+                ax.set_xticks(hours_list)
+                ax.grid(True, alpha=0.3)
+                ax.legend(fontsize=10, loc='best')
+                ax.set_xlim(-0.5, 23.5)
+            
+            plt.tight_layout()
+            os.makedirs(output_dir, exist_ok=True)
+            plot_path = os.path.join(output_dir, self.plot_filename)
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
