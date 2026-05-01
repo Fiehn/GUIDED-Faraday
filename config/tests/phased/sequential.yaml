@@ -1,0 +1,258 @@
+# ============================================================================
+# Configuration File for SequentialPhaseVAE
+# ============================================================================
+# Autoregressive 3-phase model: 
+# - Phase 1: independent generation P(phase_1)
+# - Phase 2: conditioned on phase 1 P(phase_2 | phase_1)
+# - Phase 3: conditioned on phases 1&2 P(phase_3 | phase_1, phase_2)
+
+verbose: true
+
+# ============================================================================
+# DATA LOADING CONFIGURATION
+# ============================================================================
+data:
+  # Data mode for 3-phase: use "phased" 
+  mode: "phased"
+
+  # Directory with raw 3-phase profiles
+  data_dir: "data/raw_profiles"
+
+  # CSV filename to load (leave empty for phased mode)
+  data_files: []
+  
+  # CSV column specifications
+  columns:
+    meter_id: "meter_number"
+    timestamp_dst: "timestamp_dst"
+    timestamp_utc: "timestamp_utc"
+    value_cols: ["phase_1", "phase_2", "phase_3"]  # 3-phase measurements
+  
+  # Data loading options
+  nan_as_zero: false
+  max_value: 200.0  # Filter outliers
+  
+  # Train/val/test split (by meter ID)
+  splits:
+    train_ratio: 0.8
+    val_ratio: 0.1
+    test_ratio: 0.1
+    random_seed: 42
+  
+  # Windowing configuration for hourly aggregated data
+  window:
+    aggregated: true  # Aggregate 15-min to hourly
+    input_len: 24     # 24-hour windows
+    stride: 24        # Non-overlapping windows (one per day)
+  
+  # DataLoader settings
+  batch_size: 256
+  shuffle: true
+  replay_buffer_capacity: 10000
+  min_buffer_size: 0
+  num_workers: 0
+  steps_per_epoch: 500
+  eval_batches: 5
+  eval_cache_on_gpu: true
+  eval_cache_refresh: false
+  cache_scan_batches: 0
+  skip_corrupt_files: true
+  max_skip_warnings: 20
+  aggregation_energy_unit: "kwh"
+  output_aggregate_stream: false
+
+# ============================================================================
+# NORMALIZATION CONFIGURATION
+# ============================================================================
+normalization:
+  # Type of normalization
+  method: "log1p"
+
+  # Cache target for fitted normalization stats
+  cache_dir: null
+  force_recompute: false
+  
+  # Log1p specific parameters
+  log1p:
+    epsilon: 1.0e-6
+
+# ============================================================================
+# MODEL ARCHITECTURE CONFIGURATION
+# ============================================================================
+model:
+  # Model type: "sequential_phase_vae"
+  type: "sequential_phase_vae"
+  
+  # Latent dimension (per phase model)
+  latent_dim: 64
+
+  # Encoder configuration (used for each phase independently)
+  encoder:
+    type: "dictionary"
+    hidden_dims: [256, 512, 1024, 256, 128]
+    dropout: 0.2
+  
+  # Decoder configuration (used for each phase independently)
+  decoder:
+    type: "dictionary"
+    hidden_dims: [128, 256, 512, 1024]
+    dropout: 0.2
+  
+  # Prior configuration
+  prior:
+    type: "learnable_dictionary"
+    dictionary_size: 256
+    vamp_num_components: 40
+    init_from_data: true
+    init_noise_scale: 0.01
+
+# ============================================================================
+# CONDITIONING CONFIGURATION
+# ============================================================================
+conditioning:
+  # Active condition tags for all three phases
+  tags: ["day_of_week", "month_of_year", "user_profile", "holiday", "heatpump_phase"]
+  
+  # User profiling (LDA-based)
+  user_profile:
+    online: false
+    n_topics: 40
+    num_clusters: 200
+    random_state: 42
+    cache_path: "./models/UserProfiles/user_profiles.pkl"
+    verbose: false
+  
+  # Online user profiling for adaptive learning
+  online_user_profile:
+    decay: 0.95
+
+  # Heat pump phase detection
+  heatpump_phase:
+    path: "data/HP/label_propagation_predictions.csv"
+
+  # EV phase detection
+  ev_phase:
+    path: "data/EV_detection_6000_SM.csv"
+
+# ============================================================================
+# HIERARCHICAL LATENT SPACE (Optional)
+# ============================================================================
+# Uncomment to enable hierarchical latent space for each phase
+# hierarchy:
+#   enabled: true
+#   levels: ["stochastic", "stochastic"]
+#   latent_dims: [128, 64]
+#   top_down: [true, true]
+#   loss_weights: [1.0, 1.0]
+#   aggregation: "concat"
+#   bidirectional: true
+#   residual_connections: true
+#   kl_annealing: true
+#   kl_warmup_steps: 1000
+#   free_bits: 0.1
+
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+training:
+  # Optimization settings
+  optimizer: "adam"  # Options: "adam", "adamw", "sgd"
+  
+  # Learning rate settings
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  
+  # Gradient clipping
+  gradient_clip: true
+  gradient_clip_max_norm: 1.0
+  
+  # Learning rate scheduler
+  lr_scheduler:
+    enabled: true
+    scheduler_type: "exponential"  # Options: "step", "exponential", "cosine"
+    step_size: 10
+    gamma: 0.95
+  
+  # Number of training epochs
+  num_epochs: 2
+  
+  # Beta (KL weight) settings
+  beta: 1.0
+  
+  # Cyclical beta annealing (prevents KL collapse)
+  beta_annealing:
+    enabled: false
+    n_cycles: 1
+    ratio: 0.25
+  
+  # Weighted loss
+  weighted_loss: 0.0  # Set > 0 to enable (e.g., 0.1)
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    stop_on_all_files_used: false
+    min_epochs_before_full_data_stop: 1
+    patience: 20
+    min_delta: 0.001
+  
+  # Model checkpointing
+  checkpointing:
+    save_freq: 5
+    save_dir: "models"
+    save_best_model: true
+    save_best_after_fraction: 0.25
+    save_final_model: true
+
+# ============================================================================
+# EVALUATION CONFIGURATION
+# ============================================================================
+evaluation:
+  # Metrics to compute
+  metrics:
+    - "reconstruction_error"
+    - "mse"
+    - "mae"
+    - "kl_divergence"
+    - "r_squared"
+  
+  # Generation settings for evaluation
+  generation:
+    num_samples: 100  # Number of synthetic samples to generate
+    return_all_phases: true  # Return [B, 3, 24] tensor
+
+# ============================================================================
+# LOGGING AND OUTPUT
+# ============================================================================
+logging:
+  # Output directory for checkpoints and logs
+  log_dir: "models/sequential_phase_vae"
+  
+  # Save training configuration
+  save_config: true
+  config_save_dir: "models/sequential_phase_vae"
+  
+  # Logging level
+  log_level: "INFO"
+  
+  # Save frequency for logs
+  log_frequency: 100
+  
+  # Tensorboard logging
+  tensorboard: true
+  
+  # Weights & Biases logging (optional)
+  wandb:
+    enabled: false
+    project: "synthetic-data"
+    entity: "clara-research"
+
+# ============================================================================
+# VISUALIZATION CONFIGURATION
+# ============================================================================
+visualize:
+  num_samples: 5
+  num_recon_per: 5
+  num_synthetic: 40
+  num_originals: 4
+  num_synthetic_per: 10

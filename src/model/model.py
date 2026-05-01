@@ -117,6 +117,8 @@ class BaseModel(nn.Module, ABC):
         conditioner_state = None
         conditioner = getattr(self, "conditioner", None)
         if conditioner is not None:
+            if hasattr(conditioner, "to") and callable(getattr(conditioner, "to")):
+                conditioner.to("cpu")
             conditioner_state = pickle.dumps(conditioner)
 
         # --- build checkpoint ---
@@ -175,7 +177,19 @@ class BaseModel(nn.Module, ABC):
         conditioner = None
         cs = checkpoint.get("conditioner_state")
         if cs is not None:
-            conditioner = pickle.loads(cs)
+            # Custom Unpickler to correctly map GPU tensors in pickle to the target device
+            import io
+            class DeviceUnpickler(pickle.Unpickler):
+                def find_class(self, module, name):
+                    if module == 'torch.storage' and name in ('_load_from_bytes', '_legacy_load'):
+                        return lambda b: torch.load(io.BytesIO(b) if isinstance(b, bytes) else b, map_location=device, weights_only=False)
+                    return super().find_class(module, name)
+
+            try:
+                conditioner = DeviceUnpickler(io.BytesIO(cs)).load()
+            except Exception:
+                conditioner = pickle.loads(cs)
+            
             self.conditioner = conditioner
 
         return normalizer, conditioner
