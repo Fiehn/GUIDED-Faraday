@@ -365,6 +365,8 @@ class StreamingParquetBuffer(IterableDataset):
                         continue
                     if self.max_value is not None and seq.abs().sum() > self.max_value:
                         continue
+                    if seq.abs().sum() == 0:
+                        continue
                     # Apply normalization if normalizer is provided
                     if self.normalizer is not None:
                         # seq shape is [24, 3], broadcasting with [3,]

@@ -1162,28 +1162,16 @@ class ElectricVehicleConditioner(BaseConditioner):
         meter_key = meter_col.astype(str).str.lower()
         base_meter_id = pd.to_numeric(meter_key.str.extract(r'(\d+)', expand=False), errors='coerce')
 
-        ev_behaviour = topology_df.get('EV_behaviour', pd.Series(['no'] * len(topology_df))).astype(str).str.strip().str.lower()
-        platos_detected = topology_df.get('platos_detected', pd.Series(['no'] * len(topology_df))).astype(str).str.strip().str.lower()
-        is_ev = ev_behaviour.isin({'detected', 'yes', 'true', '1'}) | platos_detected.isin({'yes', 'true', '1'})
+        ev_detected = topology_df.get('EV_detected', pd.Series(['no'] * len(topology_df))).astype(str).str.strip().str.lower()
+        is_ev = ev_detected.isin({'yes', 'true', '1'})
 
         # Prefer explicit phase label from detector output (1ph/2ph/3ph).
         type_series = topology_df.get('Type', pd.Series(['none'] * len(topology_df))).astype(str).str.strip().str.lower()
         phase_from_type = pd.to_numeric(type_series.str.extract(r'([123])\s*ph', expand=False), errors='coerce')
 
-        # Fallback: infer phase from count columns if type is missing.
-        c1 = pd.to_numeric(topology_df.get('1ph_platos_count', 0), errors='coerce').fillna(0)
-        c2 = pd.to_numeric(topology_df.get('2ph_platos_count', 0), errors='coerce').fillna(0)
-        c3 = pd.to_numeric(topology_df.get('3ph_platos_count', 0), errors='coerce').fillna(0)
-        counts = np.vstack([c1.to_numpy(), c2.to_numpy(), c3.to_numpy()]).T
-        inferred_phase = np.argmax(counts, axis=1) + 1
-        has_any_count = counts.max(axis=1) > 0
-
         phase_class = np.zeros(len(topology_df), dtype=np.int64)
         known_type = phase_from_type.notna().to_numpy()
         phase_class[known_type] = phase_from_type[known_type].astype(np.int64)
-
-        fallback_mask = (~known_type) & is_ev.to_numpy() & has_any_count
-        phase_class[fallback_mask] = inferred_phase[fallback_mask]
 
         # Any detected EV with no phase evidence defaults to 1-phase.
         undecided_detected = is_ev.to_numpy() & (phase_class == 0)
