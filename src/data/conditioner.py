@@ -42,6 +42,22 @@ class BaseConditioner(ABC):
         """Generates random conditions for testing and validation"""
         pass
 
+    def to(self, device: str | torch.device):
+        """Moves all internal torch tensors to the specified device."""
+        for attr_name, attr_value in self.__dict__.items():
+            if isinstance(attr_value, torch.Tensor):
+                setattr(self, attr_name, attr_value.to(device))
+            elif isinstance(attr_value, dict):
+                for k, v in attr_value.items():
+                    if isinstance(v, torch.Tensor):
+                        attr_value[k] = v.to(device)
+            elif isinstance(attr_value, list):
+                for i, v in enumerate(attr_value):
+                    if isinstance(v, torch.Tensor):
+                        attr_value[i] = v.to(device)
+        return self
+
+
 
 class UserProfiler(LatentDirichletAllocation, BaseConditioner):
     """
@@ -1544,6 +1560,13 @@ class Conditioner():
         self.condition_items[tag] = item
         # Add the condition dimension to the total condition dimension
         self.condition_dim += item.condition_dim
+
+    def to(self, device: str | torch.device):
+        """Moves all internally registered Conditioners to the specified device."""
+        for item in self.condition_items.values():
+            if hasattr(item, "to") and callable(getattr(item, "to")):
+                item.to(device)
+        return self
 
     def get_conditions(self, x: torch.Tensor | np.ndarray | None = None, 
                        meter_id: torch.Tensor | np.ndarray | None = None, 
