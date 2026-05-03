@@ -3025,7 +3025,87 @@ class SetMaximumMeanDiscrepancy(SyntheticMetric):
         mmd_value = float(np.sqrt(np.maximum(mmd2, 0.0)))
         return mmd_value
 
+class PeakAnalysis(SyntheticMetric):
 
+    real_data: np.ndarray = None
+    synthetic_data: np.ndarray = None
+    output_path: str = None
+
+    def __init__(self):
+        super().__init__()
+        self.sorted_real_data = None
+        self.sorted_synthetic_data = None
+
+    @property
+    def name(self) -> str:
+        return "Peak Analysis"
+    
+    def plot_load_duration_curve(self) -> None:
+
+        if len(self.sort_real_data) != len(self.sorted_synthetic_data):
+            min_len = min(len(self.sorted_real_data), len(self.sorted_synthetic_data))
+            self.sorted_real_data = self.sorted_real_data[:min_len]
+            self.sorted_synthetic_data = self.sorted_synthetic_data[:min_len]
+        # Create the x-axis values (time steps)
+        x = np.arange(1, len(self.sort_real_data) + 1)
+        # Plotting the load duration curve
+        plt.figure(figsize=(10, 6))
+        plt.plot(x, self.sorted_real_data, label='Real Data', color='blue')
+        plt.plot(x, self.sorted_synthetic_data, label='Synthetic Data', color='orange')
+        plt.title('Load Duration Curve')
+        plt.xlabel('Time Steps')
+        plt.ylabel('Load')
+        plt.legend()
+        plt.grid()
+        save_path = self.output_path[:-17]
+        plt.savefig(f"{save_path}/load_duration_curve.png")
+        plt.close()
+
+    def _EMD1(self):
+        """ Will evaluate the magnitude difference of the peaks between the real and synthetic data.
+        Compute the Earth Mover's Distance (EMD) between the sorted real and synthetic data.
+        This is equivilant to Wasserstein 1 distance.
+        
+        PeakMagEMD = 1/N ∑ |P_real(i)↑​ - P_syn(i)↑|
+        We calculate it by sorting the real and synthetic peaks in descending order and then computing the average absolute difference between the corresponding values.
+        However, when we take the average we loose the information of which directions the peaks are wrong.
+        """
+        emd = np.mean(np.abs(self.sorted_real_data - self.sorted_synthetic_data))
+        return emd
+
+    def timing_analysis(self):
+        """ Will evaluate the timing difference of the peaks between the real and synthetic data.
+        The timings are cyclical (23:59 is close to 00:00) so we need to use a circular distance metric.
+        We convert peaks hours to angles (theta = 2 * pi * hour / 24)
+        Then we compute the circular mean for each dataset (vector averaging)
+        Then the measure is just the difference.
+        """
+        # Convert hours to angles
+        real_angles = 2 * np.pi * self.real_data.flatten() / 24
+        synthetic_angles = 2 * np.pi * self.synthetic_data.flatten() / 24
+
+        # Compute circular mean
+        real_mean_angle = np.arctan2(np.mean(np.sin(real_angles)), np.mean(np.cos(real_angles)))
+        synthetic_mean_angle = np.arctan2(np.mean(np.sin(synthetic_angles)), np.mean(np.cos(synthetic_angles)))
+
+        # Convert to hours
+        real_mean_hour = (real_mean_angle * 24) / (2 * np.pi)
+        synthetic_mean_hour = (synthetic_mean_angle * 24) / (2 * np.pi)
+        # Compute distance
+        circular_distance = np.abs(real_mean_hour - synthetic_mean_hour)
+        return circular_distance
+
+    def compute(self):
+        self.sorted_real_data = np.sort(self.real_data.flatten())[::-1]
+        self.sorted_synthetic_data = np.sort(self.synthetic_data.flatten())[::-1]
+
+        self.plot_load_duration_curve()
+        magnitude_metric = self._EMD1()
+        timing_metric = self.timing_analysis()
+        return {
+            "magnitude_metric": magnitude_metric,
+            "timing_metric": timing_metric
+        }
 
 
 class HourlyProfilesByMonth(SyntheticMetric):
