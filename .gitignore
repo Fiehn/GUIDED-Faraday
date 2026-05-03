@@ -26,3 +26,4 @@ output/
 slurmjobs/outputs/
 
 evaluation_comparison/*
+evaluation_comparison_*/*
