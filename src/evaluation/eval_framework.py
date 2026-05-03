@@ -351,6 +351,7 @@ class EvalFramework:
             TSTR(),
             AggregatedProfiles(),
             HourlyProfilesByMonth(),
+            HourlyProfilesByDayofWeek(),
             PerConditionEval()
         ])
         if phased:
@@ -3026,17 +3027,16 @@ class SetMaximumMeanDiscrepancy(SyntheticMetric):
         return mmd_value
 
 
-
-
 class HourlyProfilesByMonth(SyntheticMetric):
-    """Analyze hourly consumption profiles by month and compute flexibility distances.
+    """
+    Analyze hourly consumption profiles by month and compute flexibility distances.
     
-    For each month, collects all 24-hour windows with timestamps in that month, then:
-    - For each hour position (0-23): Extract that hour's consumption from all windows
-    - Compute Wasserstein distance between real and synthetic distributions for each hour
-    - Visualize hourly profiles with means and percentile bands for each month
+    For each month, computes the average hourly consumption profile (24-hour) for both real 
+    and synthetic data by averaging all windows within that month. Then computes the 
+    Flexibility Distance between the two average profiles (1-to-1 pairing). Visualizes both 
+    average profiles with 10th--90th percentile bands derived from all windows.
     
-    Returns mean flexibility distance across all hours and months as the metric value.
+    Returns mean flexibility distance across all months as the metric value.
     
     Args:
         window_size (int): Hours per window (default: 24)
@@ -3048,7 +3048,7 @@ class HourlyProfilesByMonth(SyntheticMetric):
     timestamps: np.ndarray = None
     output_path: str = None
     
-    def __init__(self, window_size: int = 24, plot_filename: str = 'hourly_profiles_by_month.png'):
+    def __init__(self, window_size: int = 24, plot_filename: str = 'hourly_profiles_by_month.pdf'):
         self.window_size = window_size
         self.plot_filename = plot_filename
     
@@ -3095,7 +3095,14 @@ class HourlyProfilesByMonth(SyntheticMetric):
             return arr.reshape(-1, self.window_size, n_features)[:, :, 0]
     
     def compute(self) -> float:
-        """Compute hourly profiles by month and return mean flexibility distance."""
+        """Compute hourly profiles by month and return mean flexibility distance.
+        
+        For each month:
+        1. Average all real windows in that month into one profile
+        2. Average all synthetic windows in that month into one profile
+        3. Compute FlexibilityDistance between the two average profiles
+        4. Visualize with percentile bands from all windows
+        """
         try:
             # Validate inputs
             if self.real_data is None or self.synthetic_data is None:
@@ -3118,7 +3125,7 @@ class HourlyProfilesByMonth(SyntheticMetric):
                 # Make sure timestamps match data length
                 self.timestamps = np.asarray(self.timestamps)[:n]
             
-            # Extract month from timestamps (not hour - hour comes from position in window)
+            # Extract month from timestamps
             months = self._extract_months()
             
             # Verify all arrays have matching lengths
@@ -3142,28 +3149,24 @@ class HourlyProfilesByMonth(SyntheticMetric):
                 if len(real_month) < 1 or len(synth_month) < 1:
                     continue
                 
-                # Compute FD for each HOUR POSITION within the 24-hour window
-                # For each hour, extract that hour's value from ALL windows in the month
-                month_fds = []
-                for hour_position in range(self.window_size):
-                    # Extract hour_position column from all windows in this month
-                    real_hour_values = real_month[:, hour_position]  # All values at this hour across all windows
-                    synth_hour_values = synth_month[:, hour_position]  # All values at this hour across all windows
-                    
-                    # Compute Wasserstein distance between these two distributions
-                    try:
-                        fd = wasserstein_distance(real_hour_values, synth_hour_values)
-                        month_fds.append(fd)
-                    except Exception:
-                        month_fds.append(np.nan)
+                # Average the windows into single profiles
+                real_avg = np.mean(real_month, axis=0)  # [24]
+                synth_avg = np.mean(synth_month, axis=0)  # [24]
                 
-                flexibility_distances_by_month[month] = np.array(month_fds)
+                # Compute FlexibilityDistance between the two average profiles (1-to-1)
+                try:
+                    fd = FlexibilityDistance.compute_fd_between_series(
+                        real_avg, synth_avg, tau='auto', normalize=True
+                    )
+                    flexibility_distances_by_month[month] = fd
+                except Exception:
+                    flexibility_distances_by_month[month] = np.nan
             
             if not flexibility_distances_by_month:
                 raise ValueError("No flexibility distances computed")
             
-            # Compute mean FD
-            all_fds = np.concatenate([v for v in flexibility_distances_by_month.values()])
+            # Compute mean FD across months
+            all_fds = np.array([v for v in flexibility_distances_by_month.values()])
             mean_fd = float(np.nanmean(all_fds))
             
             # Plot
@@ -3177,7 +3180,7 @@ class HourlyProfilesByMonth(SyntheticMetric):
                     'unique_months': list(unique_months),
                     'n_months': len(unique_months),
                     'mean_fd': mean_fd,
-                    'n_hours_per_month': self.window_size,
+                    'fd_by_month': {int(m): float(v) for m, v in flexibility_distances_by_month.items()},
                     'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
                 },
                 output_file=self.output_path or 'models/eval_results.json'
@@ -3214,13 +3217,15 @@ class HourlyProfilesByMonth(SyntheticMetric):
             
             return np.array(months)
     
-    
+
     def _plot_hourly_profiles(self, real_data, synthetic_data, months, 
                              flexibility_distances_by_month):
         """Plot hourly profiles by month.
         
-        For each month, plots the hourly consumption profiles with means and percentile bands.
-        Each point represents the distribution of consumption values at that hour across all windows in the month.
+        For each month:
+        - Compute average profile from all real windows
+        - Compute average profile from all synthetic windows
+        - Plot both with 10th-90th percentile bands from raw windows
         """
         try:
             output_dir = _resolve_output_directory(self.output_path)
@@ -3246,48 +3251,34 @@ class HourlyProfilesByMonth(SyntheticMetric):
                 real_m = real_data[month_mask]
                 synth_m = synthetic_data[month_mask]
                 
-                # Compute means and percentiles for each hour position (0-23)
+                # Compute average profiles (1-to-1)
+                real_avg = np.mean(real_m, axis=0)  # [24]
+                synth_avg = np.mean(synth_m, axis=0)  # [24]
+                
+                # Compute percentile bands from all windows
                 hours_list = np.arange(self.window_size)
-                real_means = []
-                real_p75 = []
-                real_p25 = []
-                synth_means = []
-                synth_p75 = []
-                synth_p25 = []
+                real_p10 = np.percentile(real_m, 10, axis=0)
+                real_p90 = np.percentile(real_m, 90, axis=0)
+                synth_p10 = np.percentile(synth_m, 10, axis=0)
+                synth_p90 = np.percentile(synth_m, 90, axis=0)
                 
-                for hour_pos in hours_list:
-                    # Extract values at this hour position from ALL windows in this month
-                    real_hour_vals = real_m[:, hour_pos]
-                    synth_hour_vals = synth_m[:, hour_pos]
-                    
-                    if len(real_hour_vals) > 0:
-                        real_means.append(np.mean(real_hour_vals))
-                        real_p75.append(np.percentile(real_hour_vals, 75))
-                        real_p25.append(np.percentile(real_hour_vals, 25))
-                    else:
-                        real_means.append(np.nan)
-                        real_p75.append(np.nan)
-                        real_p25.append(np.nan)
-                    
-                    if len(synth_hour_vals) > 0:
-                        synth_means.append(np.mean(synth_hour_vals))
-                        synth_p75.append(np.percentile(synth_hour_vals, 75))
-                        synth_p25.append(np.percentile(synth_hour_vals, 25))
-                    else:
-                        synth_means.append(np.nan)
-                        synth_p75.append(np.nan)
-                        synth_p25.append(np.nan)
+                # Plot percentile bands first (background)
+                ax.fill_between(hours_list, real_p10, real_p90, alpha=0.2, color='#1f77b4', label='Real (10th-90th %ile)')
+                ax.fill_between(hours_list, synth_p10, synth_p90, alpha=0.2, color='#ff7f0e', label='Synthetic (10th-90th %ile)')
                 
-                # Plot
-                ax.plot(hours_list, real_means, '-o', label='Real', color='#1f77b4', linewidth=2, markersize=6)
-                ax.fill_between(hours_list, real_p25, real_p75, alpha=0.2, color='#1f77b4', label='Real (25th-75th %ile)')
-                ax.plot(hours_list, synth_means, '-o', label='Synthetic', color='#ff7f0e', linewidth=2, markersize=6)
-                ax.fill_between(hours_list, synth_p25, synth_p75, alpha=0.2, color='#ff7f0e', label='Synthetic (25th-75th %ile)')
+                # Plot average profiles
+                ax.plot(hours_list, real_avg, '-o', label='Real (avg)', color='#1f77b4', linewidth=2, markersize=6)
+                ax.plot(hours_list, synth_avg, '-o', label='Synthetic (avg)', color='#ff7f0e', linewidth=2, markersize=6)
                 
+                # Add FD value to title
+                fd_value = flexibility_distances_by_month[month]
                 month_name = month_names.get(month, f'Month {month}')
-                ax.set_title(f'{month_name} - Hourly Consumption Profiles ({len(real_m)} real windows, {len(synth_m)} synthetic windows)', fontsize=12, fontweight='bold')
-                ax.set_xlabel('Hour of Day', fontsize=11)
-                ax.set_ylabel('Consumption (kWh)', fontsize=11)
+                ax.set_title(
+                    f'{month_name} - Hourly Consumption Profiles (FD={fd_value:.4f}, n_real={len(real_m)}, n_synthetic={len(synth_m)})',
+                    fontsize=12, fontweight='bold'
+                )
+                ax.set_xlabel('Hour of Day', fontsize=12, fontweight='bold')
+                ax.set_ylabel('Consumption (kWh)', fontsize=12, fontweight='bold')
                 ax.set_xticks(hours_list)
                 ax.grid(True, alpha=0.3)
                 ax.legend(fontsize=10, loc='best')
@@ -3296,7 +3287,271 @@ class HourlyProfilesByMonth(SyntheticMetric):
             plt.tight_layout()
             os.makedirs(output_dir, exist_ok=True)
             plot_path = os.path.join(output_dir, self.plot_filename)
-            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight', format='pdf')
+            plt.close(fig)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+
+class HourlyProfilesByDayofWeek(SyntheticMetric):
+    """
+    Analyze hourly consumption profiles by day of week and compute flexibility distances.
+    
+    For each day of week (Monday-Sunday), computes the average hourly consumption profile 
+    (24-hour) for both real and synthetic data by averaging all windows within that day. 
+    Then computes the Flexibility Distance between the two average profiles (1-to-1 pairing). 
+    Visualizes both average profiles with 10th--90th percentile bands derived from all windows.
+    
+    Returns mean flexibility distance across all days of week as the metric value.
+    
+    Args:
+        window_size (int): Hours per window (default: 24)
+        plot_filename (str): Name of plot file (default: hourly_profiles_by_dayofweek.pdf)
+    """
+    
+    real_data: np.ndarray = None
+    synthetic_data: np.ndarray = None
+    timestamps: np.ndarray = None
+    output_path: str = None
+    
+    def __init__(self, window_size: int = 24, plot_filename: str = 'hourly_profiles_by_dayofweek.pdf'):
+        self.window_size = window_size
+        self.plot_filename = plot_filename
+    
+    @property
+    def name(self) -> str:
+        return "Hourly Profiles by Day of Week (Flexibility Distance)"
+    
+    def _uses_phase_first_flatten(self) -> bool:
+        """Check if model uses phase-first flattening for multi-phase data."""
+        return hasattr(self, 'model') and self.model is not None and hasattr(self.model, '_to_phase_first')
+    
+    def _extract_consumption_feature(self, data: np.ndarray) -> np.ndarray:
+        """Extract consumption feature (first feature) from potentially multi-phase flattened data.
+        
+        Handles:
+        - [N, 24] single-feature data
+        - [N, 24*F] multi-feature flattened data (phase-first or time-first)
+        
+        Returns:
+            np.ndarray: [N, 24] consumption feature array
+        """
+        arr = _sanitize_numeric_array(np.asarray(data))
+        if arr.ndim != 2:
+            raise ValueError(f"Expected 2D flattened array [N, D], got {arr.shape}")
+
+        if arr.shape[1] == self.window_size:
+            return arr  # Already consumption only
+
+        if arr.shape[1] % self.window_size != 0:
+            raise ValueError(
+                f"Flattened dimension {arr.shape[1]} is not divisible by window_size {self.window_size}"
+            )
+
+        n_features = arr.shape[1] // self.window_size
+        if n_features == 1:
+            return arr.reshape(-1, self.window_size)
+
+        # Extract first feature (consumption) depending on flatten order
+        if self._uses_phase_first_flatten():
+            # Phase-first: [f0_t0..f0_tL-1, f1_t0..], so feature 0 is contiguous
+            return arr.reshape(-1, n_features, self.window_size)[:, 0, :]
+        else:
+            # Time-first: [t0_f0, t0_f1, ..., t1_f0, ...]
+            return arr.reshape(-1, self.window_size, n_features)[:, :, 0]
+    
+    def compute(self) -> float:
+        """Compute hourly profiles by day of week and return mean flexibility distance.
+        
+        For each day of week (0-6):
+        1. Average all real windows on that day into one profile
+        2. Average all synthetic windows on that day into one profile
+        3. Compute FlexibilityDistance between the two average profiles
+        4. Visualize with percentile bands from all windows
+        """
+        try:
+            # Validate inputs
+            if self.real_data is None or self.synthetic_data is None:
+                raise ValueError(f"Data not injected: real_data={self.real_data is not None}, synthetic_data={self.synthetic_data is not None}")
+            
+            # Extract consumption features
+            real_data = self._extract_consumption_feature(self.real_data)
+            synthetic_data = self._extract_consumption_feature(self.synthetic_data)
+            
+            # Equalize lengths between real and synthetic data
+            n = min(len(real_data), len(synthetic_data))
+            real_data = real_data[:n]
+            synthetic_data = synthetic_data[:n]
+            
+            # Handle timestamps
+            if self.timestamps is None:
+                # Fallback: generate dummy timestamps
+                self.timestamps = np.array([datetime(2023, 1, 1) + timedelta(hours=i) for i in range(n)])
+            else:
+                # Make sure timestamps match data length
+                self.timestamps = np.asarray(self.timestamps)[:n]
+            
+            # Extract day of week from timestamps
+            days_of_week = self._extract_days_of_week()
+            
+            # Verify all arrays have matching lengths
+            if len(days_of_week) != n:
+                raise ValueError(f"Array length mismatch: days_of_week={len(days_of_week)}, data={n}")
+            
+            # Group by day of week and compute flexibility distances
+            unique_days = sorted(np.unique(days_of_week[days_of_week >= 0]))
+            if len(unique_days) == 0:
+                # If no valid days found, use day 0 for all
+                days_of_week = np.zeros_like(days_of_week)
+                unique_days = [0]
+            
+            flexibility_distances_by_day = {}
+            
+            for day in unique_days:
+                day_mask = (days_of_week == day)
+                real_day = real_data[day_mask]  # All windows with timestamp on this day
+                synth_day = synthetic_data[day_mask]  # All windows with timestamp on this day
+                
+                if len(real_day) < 1 or len(synth_day) < 1:
+                    continue
+                
+                # Average the windows into single profiles
+                real_avg = np.mean(real_day, axis=0)  # [24]
+                synth_avg = np.mean(synth_day, axis=0)  # [24]
+                
+                # Compute FlexibilityDistance between the two average profiles (1-to-1)
+                try:
+                    fd = FlexibilityDistance.compute_fd_between_series(
+                        real_avg, synth_avg, tau='auto', normalize=True
+                    )
+                    flexibility_distances_by_day[day] = fd
+                except Exception:
+                    flexibility_distances_by_day[day] = np.nan
+            
+            if not flexibility_distances_by_day:
+                raise ValueError("No flexibility distances computed")
+            
+            # Compute mean FD across days
+            all_fds = np.array([v for v in flexibility_distances_by_day.values()])
+            mean_fd = float(np.nanmean(all_fds))
+            
+            # Plot
+            self._plot_hourly_profiles(real_data, synthetic_data, days_of_week, flexibility_distances_by_day)
+            
+            # Save results
+            _save_standalone_metric_result(
+                metric_key='HourlyProfilesByDayofWeek',
+                payload={
+                    'value': mean_fd,
+                    'unique_days': list(unique_days),
+                    'n_days': len(unique_days),
+                    'mean_fd': mean_fd,
+                    'fd_by_day': {int(d): float(v) for d, v in flexibility_distances_by_day.items()},
+                    'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+                },
+                output_file=self.output_path or 'models/eval_results.json'
+            )
+            
+            return mean_fd
+        except Exception as e:
+            print(f"[ERROR] HourlyProfilesByDayofWeek.compute() failed: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise  # Re-raise so framework sees the error
+    
+    def _extract_days_of_week(self) -> np.ndarray:
+        """Extract day of week from timestamps (0=Monday, 6=Sunday)."""
+        days = []
+        
+        if self.timestamps is None:
+            raise ValueError("Timestamps required for HourlyProfilesByDayofWeek")
+        
+        for ts in self.timestamps:
+            try:
+                if isinstance(ts, (int, float)):
+                    dt = datetime.fromtimestamp(ts)
+                elif isinstance(ts, str):
+                    dt = datetime.fromisoformat(ts)
+                elif isinstance(ts, datetime):
+                    dt = ts
+                else:
+                    dt = datetime.fromtimestamp(int(ts))
+                days.append(dt.weekday())  # 0=Monday, 6=Sunday
+            except Exception:
+                days.append(-1)
+        
+        return np.array(days)
+    
+    def _plot_hourly_profiles(self, real_data, synthetic_data, days_of_week, 
+                             flexibility_distances_by_day):
+        """Plot hourly profiles by day of week.
+        
+        For each day:
+        - Compute average profile from all real windows
+        - Compute average profile from all synthetic windows
+        - Plot both with 10th-90th percentile bands from raw windows
+        """
+        try:
+            output_dir = _resolve_output_directory(self.output_path)
+            if not output_dir:
+                return
+            
+            unique_days = sorted(flexibility_distances_by_day.keys())
+            num_days = len(unique_days)
+            
+            fig, axes = plt.subplots(num_days, 1, figsize=(12, 4 * num_days))
+            if num_days == 1:
+                axes = [axes]
+            
+            day_names = {
+                0: 'Monday', 1: 'Tuesday', 2: 'Wednesday', 3: 'Thursday',
+                4: 'Friday', 5: 'Saturday', 6: 'Sunday'
+            }
+            
+            for day_idx, day in enumerate(unique_days):
+                ax = axes[day_idx]
+                day_mask = (days_of_week == day)
+                real_d = real_data[day_mask]
+                synth_d = synthetic_data[day_mask]
+                
+                # Compute average profiles (1-to-1)
+                real_avg = np.mean(real_d, axis=0)  # [24]
+                synth_avg = np.mean(synth_d, axis=0)  # [24]
+                
+                # Compute percentile bands from all windows
+                hours_list = np.arange(self.window_size)
+                real_p10 = np.percentile(real_d, 10, axis=0)
+                real_p90 = np.percentile(real_d, 90, axis=0)
+                synth_p10 = np.percentile(synth_d, 10, axis=0)
+                synth_p90 = np.percentile(synth_d, 90, axis=0)
+                
+                # Plot percentile bands first (background)
+                ax.fill_between(hours_list, real_p10, real_p90, alpha=0.2, color='#1f77b4', label='Real (10th-90th %ile)')
+                ax.fill_between(hours_list, synth_p10, synth_p90, alpha=0.2, color='#ff7f0e', label='Synthetic (10th-90th %ile)')
+                
+                # Plot average profiles
+                ax.plot(hours_list, real_avg, '-o', label='Real (avg)', color='#1f77b4', linewidth=2, markersize=6)
+                ax.plot(hours_list, synth_avg, '-o', label='Synthetic (avg)', color='#ff7f0e', linewidth=2, markersize=6)
+                
+                # Add FD value to title
+                fd_value = flexibility_distances_by_day[day]
+                day_name = day_names.get(day, f'Day {day}')
+                ax.set_title(
+                    f'{day_name} - Hourly Consumption Profiles (FD={fd_value:.4f}, n_real={len(real_d)}, n_synthetic={len(synth_d)})',
+                    fontsize=12, fontweight='bold'
+                )
+                ax.set_xlabel('Hour of Day', fontsize=12, fontweight='bold')
+                ax.set_ylabel('Consumption (kWh)', fontsize=12, fontweight='bold')
+                ax.set_xticks(hours_list)
+                ax.grid(True, alpha=0.3)
+                ax.legend(fontsize=10, loc='best')
+                ax.set_xlim(-0.5, 23.5)
+            
+            plt.tight_layout()
+            os.makedirs(output_dir, exist_ok=True)
+            plot_path = os.path.join(output_dir, self.plot_filename)
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight', format='pdf')
             plt.close(fig)
         except Exception as e:
             import traceback
