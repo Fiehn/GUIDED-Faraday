@@ -16,7 +16,7 @@ class SyntheticGenerator:
     - Rejection sampling: Automatically discard and re-roll mathematically explosive samples.
 
     Args:
-        model: A trained generative model (e.g., CVAE) that has a .sample() method and optionally: [.conditioner, .encoder, .decoder, .hierarchy].
+        model: A trained generative model (e.g., CVAE) that has a .sample() and .reconstruct() method and optionally: [.conditioner, .encoder, .decoder, .hierarchy].
         conditioner: Optional Conditioner object to build conditions for generation. If None, it will try to use model.conditioner.
         normalizer: Optional Normalizer object to inverse-transform generated data back to original scale.
         device: Device to run generation on ('cpu' or 'cuda').
@@ -111,6 +111,7 @@ class SyntheticGenerator:
                     meter_id: int | None = None, 
                     timestamp: datetime | torch.Tensor | None = None,
                     new_conditions: torch.Tensor | None = None,
+                    encode_conditions: torch.Tensor | None = None,
                     is_denormalized: bool = False,
                     temperature: float = 1.0,
                     use_rejection: bool = False,
@@ -124,6 +125,8 @@ class SyntheticGenerator:
             input_data (torch.Tensor): Tensor of original timeseries data to reconstruct of shape `(batch_size, 24, num_features)`.
             new_conditions (Optional[torch.Tensor]): Tensor of new conditions to use for reconstruction of shape `(batch_size, num_conditions)`.
                             If None, original conditions from the model will be used.
+            encode_conditions (Optional[torch.Tensor]): Optional conditions to use for encoding only. If provided and
+                            new_conditions is None, these conditions are also used for decoding.
             is_denormalized (bool): Whether the input_data is already normalized. If False, it will be normalized using self.normalizer before reconstruction and inverse-transformed back to original scale at the end.
             temperature (float): Temperature scaling factor for sampling. Values < 1.0 will produce less variance (safer samples), while values > 1.0 will produce more variance.
             use_rejection (bool): Whether to use rejection sampling to discard and re-roll samples with extreme latent values that could lead to mathematically explosive reconstructions.
@@ -158,6 +161,11 @@ class SyntheticGenerator:
         # Get conditions
         cond_input = self.model._build_condition_input(self.model._to_phase_first(input_data))
         conditions = self.conditioner.get_conditions(cond_input, meter_id, timestamp).to(self.device, dtype=model_dtype)
+        enc_conditions = conditions
+        if encode_conditions is not None:
+            enc_conditions = encode_conditions.to(self.device, dtype=model_dtype)
+            if new_conditions is None:
+                conditions = enc_conditions
 
         is_sequential_phase_vae = self.model.__class__.__name__ == 'SequentialPhaseVAE'
         
@@ -206,10 +214,10 @@ class SyntheticGenerator:
             # Ensure input_data is flattened appropriately
             if hasattr(self.model, '_set_encode'):
                 x_enc = self.model._set_encode(self.model._to_phase_first(input_data))
-                enc_in = torch.cat([x_enc, conditions], dim=-1)
+                enc_in = torch.cat([x_enc, enc_conditions], dim=-1)
             else:
                 input_data_flat = input_data.reshape(input_data.shape[0], -1).to(self.device)
-                enc_in = torch.cat([input_data_flat, conditions], dim=-1)
+                enc_in = torch.cat([input_data_flat, enc_conditions], dim=-1)
                 
             q_params = self.model.encoder(enc_in) # dict of [B, latent_dim] params
 
@@ -728,44 +736,4 @@ if __name__ == "__main__":
     sys.path.append(parent_dir)
     sys.path.append(root_dir)
 
-    # Test the candidate generator
-    from src.data.conditioner import Conditioner
-    from src.data.normalizer import Normalizer
-    from src.model.factory import _load_train_config
-    from src.model.factory import create_model_from_config
     
-    config = _load_train_config(os.path.join(root_dir, "config", "config.yaml"))
-    model = create_model_from_config(config, device="cpu")
-    
-    ckpt_path = "models/CVAE_DictionaryCoder_20260304_130859/CVAE_DictionaryCoder_20260304_130859_final.pt"
-    if os.path.exists(ckpt_path):
-        normalizer, _ = model.load_model(ckpt_path, device="cpu")
-    else:
-        print(f"Warning: Test checkpoint {ckpt_path} not found. Generator will run with untrained weights.")
-        normalizer = None
-
-    if hasattr(model, 'conditioner') and model.conditioner is not None:
-        for tag, item in model.conditioner.condition_items.items():
-            if hasattr(item, 'path') and hasattr(item, 'load'):
-                print(f"Loading fitted state for {tag} from {item.path}")
-                item.load(item.path)
-
-    generator = SyntheticGenerator(model=model, conditioner=model.conditioner, normalizer=normalizer, device="cpu")
-
-    # plot the generated sequence to visually check continuity at day boundaries
-    from matplotlib import pyplot as plt
-    generated = generator.generate(
-        num_days=7,
-        meter_id=12345,
-        start_date=datetime(2024, 1, 1),
-        num_candidates=32,
-        continuity_weight=1.0
-    ).numpy()  # [num_days*24, F]
-
-    plt.figure(figsize=(12,6))
-    plt.plot(generated)
-    plt.title("Generated Sequence (Check for Continuity at Day Boundaries)")
-    plt.xlabel("Hour")
-    plt.ylabel("kWh")
-    plt.grid()
-    plt.savefig("generated_sequence.png")

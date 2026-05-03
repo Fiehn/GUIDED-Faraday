@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 import os
+from types import SimpleNamespace
 import torch
 CURRENT_DIR = Path(__file__).resolve().parent
 SRC_DIR = CURRENT_DIR.parent
@@ -13,7 +14,7 @@ if str(SRC_DIR) not in sys.path:
 from src.model.factory import _load_train_config
 from src.model.factory import create_model_from_config
 
-def load_model(model_path: str, device: str = "cpu"):
+def load_model(model_path: str, device: str = "cpu", ev_path: str | None = None):
     """
     The model_path is to the folder containing a config file and a few checkpoint files 
     We check first for .yaml files and use that config to construct the model. 
@@ -22,18 +23,30 @@ def load_model(model_path: str, device: str = "cpu"):
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 1. Find config file
+    # 1. Find config file (prefer training_config_used.yaml)
     config_path = None
-    for file in os.listdir(model_path):
-        if file.endswith(".yaml"):
-            config_path = os.path.join(model_path, file)
-            break
+    preferred = os.path.join(model_path, "training_config_used.yaml")
+    if os.path.exists(preferred):
+        config_path = preferred
+    else:
+        for file in os.listdir(model_path):
+            if file.endswith(".yaml"):
+                config_path = os.path.join(model_path, file)
+                break
     
     if config_path is None:
         raise FileNotFoundError(f"No config file found in {model_path}")
     
     # 2. Load config
     config = _load_train_config(config_path)
+    if ev_path is not None:
+        conditioning_cfg = getattr(config, "conditioning", None)
+        if conditioning_cfg is not None:
+            ev_cfg = getattr(conditioning_cfg, "ev_phase", None)
+            if ev_cfg is None:
+                setattr(conditioning_cfg, "ev_phase", SimpleNamespace(path=ev_path))
+            else:
+                setattr(ev_cfg, "path", ev_path)
 
     # 3. Load the model
     model = create_model_from_config(config, device)

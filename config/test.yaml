@@ -88,7 +88,7 @@ normalization:
 # ============================================================================
 model:
   # Model type: "vae", "cvae", "art", "set_guide_vae", "diffusion", "phase_splitter", "baseline_average", "baseline_quantile", "baseline_mean"
-  type: "art"
+  type: "cvae"
   
   # Latent dimension (size of latent vector z)
   latent_dim: 128
