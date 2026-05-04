@@ -175,8 +175,8 @@ class SyntheticGenerator:
         cond_input = self.model._build_condition_input(self.model._to_phase_first(input_data))
         if self.conditioner is None:
             self.conditioner = Conditioner() # Will return empty arrays if no condition keys are found, so it's safe to use even if the model wasn't trained with conditions.
-        else:
-            conditions = self.conditioner.get_conditions(cond_input, meter_id, timestamp).to(self.device, dtype=model_dtype)
+            
+        conditions = self.conditioner.get_conditions(cond_input, meter_id, timestamp).to(self.device, dtype=model_dtype)
         enc_conditions = conditions
         if encode_conditions is not None:
             enc_conditions = encode_conditions.to(self.device, dtype=model_dtype)
