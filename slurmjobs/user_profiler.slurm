@@ -14,4 +14,4 @@ module load Python/3.11.3-GCCcore-12.3.0
 source .venv-cu12-py311/bin/activate
 
 # 1) run training user profiler training
-python -u src/train.py --skip-validation --fit_user_profiler_only --config "config/config_test.yaml"
+python -u src/train.py --skip-validation --fit_user_profiler_only --config "config/tests/diffusion.yaml"

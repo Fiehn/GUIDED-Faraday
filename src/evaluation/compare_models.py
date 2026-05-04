@@ -747,7 +747,7 @@ if __name__ == "__main__":
                    "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/QuantileBaselineModel_20260424_163220",
                    ]
     args.names = ["art", "avg", "cvae", "cvae_guide", "cvae_guide_cnn", "cvae_hierarchical", "cvae_vamp", "diffusion", "quantile"]
-    args.data_files = "data/_parquet_cache/test_hourly_subset.parquet"
+    args.data_files = ["data/_parquet_cache/test_hourly_subset.parquet"]
     args.split_seed = 42
     if len(args.models) != len(args.names):
         raise ValueError("--models and --names must have the same length.")
