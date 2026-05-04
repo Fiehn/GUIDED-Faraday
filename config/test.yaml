@@ -157,7 +157,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: []
+  tags: ["ev_phase"]
   # ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  
   
   # User profiling (based on LDA)

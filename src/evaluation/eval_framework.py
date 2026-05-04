@@ -354,7 +354,8 @@ class EvalFramework:
             PeakAnalysis(),
             HourlyProfilesByMonth(),
             HourlyProfilesByDayofWeek(),
-            PerConditionEval()
+            PerConditionEval(),
+            EVConditionAccuracy(),
         ])
         if phased:
             self.register_metric(SetMaximumMeanDiscrepancy())
@@ -736,7 +737,7 @@ class EvalFramework:
                     self.results[name] = value
                 except Exception as e:
                     if self.verbose:
-                        print(f"Warning: metric '{name}' failed: {e}")
+                        import traceback; traceback.print_exc(); print(f"Warning: metric '{name}' failed: {e}")
                     self.results[name] = None
         
         # Run synthetic metrics
@@ -746,8 +747,8 @@ class EvalFramework:
                     value = metric.compute()
                     self.results[name] = value
                 except Exception as e:
-                    if self.verbose:
-                        print(f"Warning: metric '{name}' failed: {e}")
+                    
+                    import traceback; traceback.print_exc(); print(f"Warning: metric '{name}' failed: {e}")
                     self.results[name] = None
 
         self._print_results_table()
@@ -767,7 +768,7 @@ class EvalFramework:
                 self.results[name] = value
             except Exception as e:
                 if self.verbose:
-                    print(f"Warning: metric '{name}' failed: {e}")
+                    import traceback; traceback.print_exc(); print(f"Warning: metric '{name}' failed: {e}")
                 self.results[name] = None
 
         self.baseline_results = self._compute_mean_baseline_results(reconstruction_only=True) if self.include_mean_baseline else {}
@@ -789,7 +790,7 @@ class EvalFramework:
                 self.results[name] = value
             except Exception as e:
                 if self.verbose:
-                    print(f"Warning: metric '{name}' failed: {e}")
+                    import traceback; traceback.print_exc(); print(f"Warning: metric '{name}' failed: {e}")
                 self.results[name] = None
 
         self.baseline_results = self._compute_mean_baseline_results(synthetic_only=True) if self.include_mean_baseline else {}
@@ -3716,6 +3717,8 @@ class EVConditionAccuracy(SyntheticMetric):
         import pandas as pd
         import torch
         from src.evaluation.ev_detection import detect_platos_unified_dP2_std
+        from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+        import multiprocessing
         
         if self.synthetic_data is None or self.synthetic_conditions is None:
             return 0.0
@@ -3729,32 +3732,20 @@ class EVConditionAccuracy(SyntheticMetric):
         if n_samples == 0:
             return 0.0
 
-        # Adjust scale to Watts if data is likely in kW
-        # Max hourly consumption in houses > 500 is extremely rare, likely kW if < 100
         scale_factor = 1.0
         if np.max(self.synthetic_data[:100]) < 100.0:
             scale_factor = 1000.0
 
-        correct_count = 0
-
-        for i in range(n_samples):
-            # Conditions are [No EV, 1ph, 2ph, 3ph]
+        def process_sample(i):
             cond_idx = int(np.argmax(conds[i]))
-            if cond_idx == 0:
-                expected_label = 'no'
-            elif cond_idx == 1:
-                expected_label = '1ph'
-            elif cond_idx == 2:
-                expected_label = '2ph'
-            elif cond_idx == 3:
-                expected_label = '3ph'
-            else:
-                expected_label = 'no'
+            if cond_idx == 0: expected_label = 'no'
+            elif cond_idx == 1: expected_label = '1ph'
+            elif cond_idx == 2: expected_label = '2ph'
+            elif cond_idx == 3: expected_label = '3ph'
+            else: expected_label = 'no'
 
             try:
-                # Shape: [L, F]
                 phase_data = self._unpack_synthetic_profile(self.synthetic_data[i]) * scale_factor
-                
                 dates = pd.date_range(start='2024-01-01', periods=len(phase_data), freq=f"{self.interval_minutes}min")
                 df_profile = pd.DataFrame({
                     "active_power_p14_l1_test": phase_data[:, 0] if phase_data.shape[1] > 0 else 0,
@@ -3763,29 +3754,21 @@ class EVConditionAccuracy(SyntheticMetric):
                 }, index=dates)
 
                 events = detect_platos_unified_dP2_std(
-                    df_profile,
-                    "test",
-                    start_threshold_min=3000,
-                    start_threshold_max=7500,
-                    interval_minutes=self.interval_minutes
+                    df_profile, "test", start_threshold_min=3000, start_threshold_max=7500, interval_minutes=self.interval_minutes
                 )
-
-                if events is not None and not events.empty:
-                    detected_label = str(events.iloc[0]['phase_type']).lower()
-                else:
-                    detected_label = 'no'
-
+                detected_label = str(events.iloc[0]['phase_type']).lower() if events is not None and not events.empty else 'no'
             except Exception:
                 detected_label = 'no'
 
             if phase_data.shape[1] == 1:
-                # Relaxed match for aggregated (binary presence match)
-                is_expected_ev = expected_label in ['1ph', '2ph', '3ph']
-                is_detected_ev = detected_label != 'no'
-                if is_expected_ev == is_detected_ev:
-                    correct_count += 1
-            else:
-                if detected_label == expected_label:
-                    correct_count += 1
+                return (expected_label in ['1ph', '2ph', '3ph']) == (detected_label != 'no')
+            return detected_label == expected_label
+
+        correct_count = 0
+        n_workers = min(multiprocessing.cpu_count() - 1 or 1, 16)
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            results = list(executor.map(process_sample, range(n_samples), chunksize=max(1, n_samples // (n_workers * 4))))
+            
+        correct_count = sum(results)
                 
         return float(correct_count) / float(n_samples)

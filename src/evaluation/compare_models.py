@@ -736,6 +736,9 @@ if __name__ == "__main__":
     parser.add_argument("--max-value", type=float, default=200.0, help="Maximum value for filtering windows.")
     args = parser.parse_args()
 
+    args.models = ["models/CVAE_20260504_131842"]
+    args.names = ["CVAE_DictionaryCoder_20260415_152840"]
+
     if len(args.models) != len(args.names):
         raise ValueError("--models and --names must have the same length.")
     
