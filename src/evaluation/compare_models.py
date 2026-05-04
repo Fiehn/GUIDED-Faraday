@@ -783,5 +783,11 @@ if __name__ == "__main__":
         recompute=bool(args.recompute),
         split_seed=args.split_seed,
         split_ratios=split_ratios,
+<<<<<<< HEAD
         max_value=args.max_value
     )
+=======
+        max_value=args.max_value,
+        agg_divisor=1000.0 if args.phased else 1.0,
+    )
+>>>>>>> 32e6f20a59e2995e8eb1872be7712da1a0c9ff7c
