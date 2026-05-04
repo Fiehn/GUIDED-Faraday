@@ -1,6 +1,19 @@
 import torch
 import numpy as np
 from datetime import datetime, timedelta
+import sys
+from pathlib import Path
+# Add project roots for imports
+CURRENT_DIR = Path(__file__).resolve().parent
+SRC_DIR = CURRENT_DIR.parent
+ROOT_DIR = SRC_DIR.parent
+
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from src.data.conditioner import Conditioner
 
 class SyntheticGenerator:
     """Called to generate synthetic samples from a trained model.
@@ -161,7 +174,7 @@ class SyntheticGenerator:
         # Get conditions
         cond_input = self.model._build_condition_input(self.model._to_phase_first(input_data))
         if self.conditioner is None:
-            conditions = None
+            self.conditioner = Conditioner() # Will return empty arrays if no condition keys are found, so it's safe to use even if the model wasn't trained with conditions.
         else:
             conditions = self.conditioner.get_conditions(cond_input, meter_id, timestamp).to(self.device, dtype=model_dtype)
         enc_conditions = conditions
