@@ -720,8 +720,8 @@ def compare_models(model_paths: list[str],
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compare model evaluation results (reuse outputs or recompute).")
-    parser.add_argument("--models", nargs="+", required=True, help="List of model directories (each contains config + checkpoint).")
-    parser.add_argument("--names", nargs="+", required=True, help="Display names for models (same length as --models).")
+    parser.add_argument("--models", nargs="+", required=False, help="List of model directories (each contains config + checkpoint).")
+    parser.add_argument("--names", nargs="+", required=False, help="Display names for models (same length as --models).")
     parser.add_argument("--secondary-models", nargs="*", default=None, help="Optional secondary model dirs aligned with --models. Use 'None' to skip.")
     parser.add_argument("--data-dir", type=str, default="data/_parquet_cache", help="Directory with parquet files.")
     parser.add_argument("--data-files", nargs="*", default=None, help="Optional explicit parquet files (relative to --data-dir unless absolute).")
@@ -736,9 +736,19 @@ if __name__ == "__main__":
     parser.add_argument("--max-value", type=float, default=200.0, help="Maximum value for filtering windows.")
     args = parser.parse_args()
 
-    args.models = ["models/CVAE_20260504_131842"]
-    args.names = ["CVAE_DictionaryCoder_20260415_152840"]
-
+    args.models = ["/home/s204617/synthcode/rasmus-clara-synthetic-data/models/AutoRegressiveTransformerVAE_20260424_170101", 
+                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/AverageBaselineModel_20260425_192621",
+                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/CVAE_20260424_163736",
+                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/CVAE_20260424_164906_guide",
+                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/CVAE_20260424_173354_guide_cnn",
+                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/CVAE_20260424_174908_hierarcchy",
+                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/CVAE_20260424_180137_vamp",
+                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/DiffusionModel_20260424_171827",
+                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/QuantileBaselineModel_20260424_163220",
+                   ]
+    args.names = ["art", "avg", "cvae", "cvae_guide", "cvae_guide_cnn", "cvae_hierarchical", "cvae_vamp", "diffusion", "quantile"]
+    args.data_files = "data/_parquet_cache/test_hourly_subset.parquet"
+    args.split_seed = 42
     if len(args.models) != len(args.names):
         raise ValueError("--models and --names must have the same length.")
     
