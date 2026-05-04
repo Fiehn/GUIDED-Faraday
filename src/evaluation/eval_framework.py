@@ -351,6 +351,7 @@ class EvalFramework:
             ClassicalStatistics(),
             TSTR(),
             AggregatedProfiles(),
+            PeakAnalysis(),
             HourlyProfilesByMonth(),
             HourlyProfilesByDayofWeek(),
             PerConditionEval()
@@ -388,6 +389,7 @@ class EvalFramework:
             timestamps = timestamps.long()
 
         return x, meter_id, timestamps, agg
+    
     def _flatten_for_metrics(self, x: torch.Tensor) -> torch.Tensor:
         """Flatten in the same order used during training when possible."""
         if x.dim() == 3:
@@ -3029,6 +3031,7 @@ class SetMaximumMeanDiscrepancy(SyntheticMetric):
         mmd_value = float(np.sqrt(np.maximum(mmd2, 0.0)))
         return mmd_value
 
+
 class PeakAnalysis(SyntheticMetric):
 
     real_data: np.ndarray = None
@@ -3045,26 +3048,39 @@ class PeakAnalysis(SyntheticMetric):
         return "Peak Analysis"
     
     def plot_load_duration_curve(self) -> None:
-
-        if len(self.sort_real_data) != len(self.sorted_synthetic_data):
-            min_len = min(len(self.sorted_real_data), len(self.sorted_synthetic_data))
-            self.sorted_real_data = self.sorted_real_data[:min_len]
-            self.sorted_synthetic_data = self.sorted_synthetic_data[:min_len]
-        # Create the x-axis values (time steps)
-        x = np.arange(1, len(self.sort_real_data) + 1)
-        # Plotting the load duration curve
-        plt.figure(figsize=(10, 6))
-        plt.plot(x, self.sorted_real_data, label='Real Data', color='blue')
-        plt.plot(x, self.sorted_synthetic_data, label='Synthetic Data', color='orange')
-        plt.title('Load Duration Curve')
-        plt.xlabel('Time Steps')
-        plt.ylabel('Load')
-        plt.legend()
-        plt.grid()
-        save_path = self.output_path[:-17]
-        plt.savefig(f"{save_path}/load_duration_curve.png")
-        plt.close()
-
+        """Plot and save load duration curve."""
+        try:
+            output_dir = _resolve_output_directory(self.output_path)
+            if not output_dir:
+                return
+            
+            if len(self.sorted_real_data) != len(self.sorted_synthetic_data):
+                min_len = min(len(self.sorted_real_data), len(self.sorted_synthetic_data))
+                self.sorted_real_data = self.sorted_real_data[:min_len]
+                self.sorted_synthetic_data = self.sorted_synthetic_data[:min_len]
+            
+            # Create the x-axis values (percentage of 24h)
+            x = np.linspace(0, 100, len(self.sorted_real_data))
+            
+            # Plotting the load duration curve
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.plot(x, self.sorted_real_data, label='Real Data', color='blue', linewidth=2)
+            ax.plot(x, self.sorted_synthetic_data, label='Synthetic Data', color='orange', linewidth=2)
+            ax.set_title('Load Duration Curve (Sorted)', fontsize=14, fontweight='bold')
+            ax.set_xlabel('Percentage of 24h (%)', fontsize=12, fontweight='bold')
+            ax.set_ylabel('Load (kWh)', fontsize=12, fontweight='bold')
+            ax.legend(fontsize=11)
+            ax.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            os.makedirs(output_dir, exist_ok=True)
+            plot_path = os.path.join(output_dir, 'load_duration_curve.pdf')
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight', format='pdf')
+            plt.close(fig)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+        
     def _EMD1(self):
         """ Will evaluate the magnitude difference of the peaks between the real and synthetic data.
         Compute the Earth Mover's Distance (EMD) between the sorted real and synthetic data.
@@ -3099,17 +3115,36 @@ class PeakAnalysis(SyntheticMetric):
         circular_distance = np.abs(real_mean_hour - synthetic_mean_hour)
         return circular_distance
 
-    def compute(self):
-        self.sorted_real_data = np.sort(self.real_data.flatten())[::-1]
-        self.sorted_synthetic_data = np.sort(self.synthetic_data.flatten())[::-1]
+    def compute(self) -> float:
+        try:
+            if self.real_data is None or self.synthetic_data is None:
+                raise ValueError("PeakAnalysis requires injected real_data and synthetic_data before compute().")
+            
+            self.sorted_real_data = np.sort(self.real_data.flatten())[::-1]
+            self.sorted_synthetic_data = np.sort(self.synthetic_data.flatten())[::-1]
 
-        self.plot_load_duration_curve()
-        magnitude_metric = self._EMD1()
-        timing_metric = self.timing_analysis()
-        return {
-            "magnitude_metric": magnitude_metric,
-            "timing_metric": timing_metric
-        }
+            self.plot_load_duration_curve()
+            magnitude_metric = self._EMD1()
+            timing_metric = self.timing_analysis()
+            
+            # Save individual metrics
+            _save_standalone_metric_result(
+                metric_key='PeakAnalysis',
+                payload={
+                    'magnitude_metric': float(magnitude_metric),
+                    'timing_metric': float(timing_metric),
+                    'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+                },
+                output_file=self.output_path or 'models/eval_results.json'
+            )
+            
+            # Return average of both metrics as the main metric value
+            return float(np.mean([magnitude_metric, timing_metric]))
+        except Exception as e:
+            print(f"[ERROR] PeakAnalysis.compute() failed: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise  # Re-raise so framework sees the error
 
 
 class HourlyProfilesByMonth(SyntheticMetric):
