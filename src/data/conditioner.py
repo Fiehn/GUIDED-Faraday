@@ -922,7 +922,7 @@ class HolidayConditioner(BaseConditioner):
         if holidays.numel() == 0:
             return torch.zeros((day_numbers.shape[0], 1), dtype=torch.float32, device=device)
 
-        is_holiday = torch.isin(day_numbers, holidays).to(dtype=torch.float32)
+        is_holiday = torch.isin(day_numbers, holidays).to(dtype=torch.float32, device=device)
         return is_holiday.unsqueeze(1)
     
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
