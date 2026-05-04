@@ -339,6 +339,7 @@ class EvalFramework:
         self._reconstructed_data: np.ndarray = None  # Cache reconstructed data for metrics that need it
         self._synthetic_data: np.ndarray = None  # Cache synthetic data for metrics that need it
         self._timestamps: np.ndarray = None  # Cache timestamps for metrics that need it
+        self._meter_ids: np.ndarray = None
 
     def register_all(self, phased: bool = False) -> None:
         """Convenience method to register all default metrics."""
@@ -648,7 +649,9 @@ class EvalFramework:
             metric.normalizer = self.normalizer
             metric.output_path = self.output_path
             metric.timestamps = self._timestamps
-
+            metric.meter_ids = self._meter_ids
+            metric.synthetic_conditions = getattr(self, '_synthetic_conditions', None)
+            
             # PerConditionEval needs aligned timestamps and 24h windows (consumption feature only)
             if isinstance(metric, PerConditionEval):
                 n = min(len(self._real_data), len(self._synthetic_data))
@@ -3639,3 +3642,115 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
             import traceback
             traceback.print_exc()
 
+
+class EVConditionAccuracy(SyntheticMetric):
+    """Evaluate if synthetic profiles correctly represent their generation EV condition.
+    
+    This metric:
+    1. Reads the conditional tensor used for generation mapping to [No EV, 1ph, 2ph, 3ph]
+    2. Modifies scale (kW -> W) if needed so thresholds match original Jupyter notebooks
+    3. Runs detect_platos_unified_dP2_std on each profile
+    4. Computes accuracy of correct EV classification.
+    """
+    
+    synthetic_data: np.ndarray = None
+    synthetic_conditions: Any = None
+    
+    def __init__(self, window_size: int = 24, interval_minutes: int = 60):
+        self.window_size = window_size
+        self.interval_minutes = interval_minutes
+        
+    @property
+    def name(self) -> str:
+        return "EV Condition Accuracy"
+        
+    def _unpack_synthetic_profile(self, flat_profile: np.ndarray) -> np.ndarray:
+        n_features = len(flat_profile) // self.window_size
+        # Try to dynamically fetch Phase first property if model exists
+        phase_first = False
+        if hasattr(self, 'model') and self.model is not None:
+            phase_first = getattr(self.model, '_to_phase_first', False)
+            
+        if phase_first:
+            reshaped = flat_profile.reshape(n_features, self.window_size)
+            return reshaped.T 
+        else:
+            return flat_profile.reshape(self.window_size, n_features)
+            
+    def compute(self) -> float:
+        import pandas as pd
+        import torch
+        from src.evaluation.ev_detection import detect_platos_unified_dP2_std
+        
+        if self.synthetic_data is None or self.synthetic_conditions is None:
+            return 0.0
+            
+        if isinstance(self.synthetic_conditions, torch.Tensor):
+            conds = self.synthetic_conditions.cpu().numpy()
+        else:
+            conds = np.asarray(self.synthetic_conditions)
+            
+        n_samples = min(len(self.synthetic_data), len(conds))
+        if n_samples == 0:
+            return 0.0
+
+        # Adjust scale to Watts if data is likely in kW
+        # Max hourly consumption in houses > 500 is extremely rare, likely kW if < 100
+        scale_factor = 1.0
+        if np.max(self.synthetic_data[:100]) < 100.0:
+            scale_factor = 1000.0
+
+        correct_count = 0
+
+        for i in range(n_samples):
+            # Conditions are [No EV, 1ph, 2ph, 3ph]
+            cond_idx = int(np.argmax(conds[i]))
+            if cond_idx == 0:
+                expected_label = 'no'
+            elif cond_idx == 1:
+                expected_label = '1ph'
+            elif cond_idx == 2:
+                expected_label = '2ph'
+            elif cond_idx == 3:
+                expected_label = '3ph'
+            else:
+                expected_label = 'no'
+
+            try:
+                # Shape: [L, F]
+                phase_data = self._unpack_synthetic_profile(self.synthetic_data[i]) * scale_factor
+                
+                dates = pd.date_range(start='2024-01-01', periods=len(phase_data), freq=f"{self.interval_minutes}min")
+                df_profile = pd.DataFrame({
+                    "active_power_p14_l1_test": phase_data[:, 0] if phase_data.shape[1] > 0 else 0,
+                    "active_power_p14_l2_test": phase_data[:, 1] if phase_data.shape[1] > 1 else 0,
+                    "active_power_p14_l3_test": phase_data[:, 2] if phase_data.shape[1] > 2 else 0,
+                }, index=dates)
+
+                events = detect_platos_unified_dP2_std(
+                    df_profile,
+                    "test",
+                    start_threshold_min=3000,
+                    start_threshold_max=7500,
+                    interval_minutes=self.interval_minutes
+                )
+
+                if events is not None and not events.empty:
+                    detected_label = str(events.iloc[0]['phase_type']).lower()
+                else:
+                    detected_label = 'no'
+
+            except Exception:
+                detected_label = 'no'
+
+            if phase_data.shape[1] == 1:
+                # Relaxed match for aggregated (binary presence match)
+                is_expected_ev = expected_label in ['1ph', '2ph', '3ph']
+                is_detected_ev = detected_label != 'no'
+                if is_expected_ev == is_detected_ev:
+                    correct_count += 1
+            else:
+                if detected_label == expected_label:
+                    correct_count += 1
+                
+        return float(correct_count) / float(n_samples)
