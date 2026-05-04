@@ -907,14 +907,14 @@ class HolidayConditioner(BaseConditioner):
         Returns:
             torch.Tensor: Binary holiday indicators of shape `(batch_size, 1)`.
         """
+        device = timestamps.device if isinstance(timestamps, torch.Tensor) else torch.device('cpu')
         if timestamps is None:
             if isinstance(meter_id, torch.Tensor):
                 return torch.zeros((meter_id.shape[0], 1), dtype=torch.float32, device=meter_id.device)
             if isinstance(meter_id, np.ndarray):
-                return torch.zeros((meter_id.shape[0], 1), dtype=torch.float32)
-            return torch.zeros((1, 1), dtype=torch.float32)
+                return torch.zeros((meter_id.shape[0], 1), dtype=torch.float32, device=device)
+            return torch.zeros((1, 1), dtype=torch.float32, device=device)
 
-        device = timestamps.device if isinstance(timestamps, torch.Tensor) else torch.device('cpu')
         unix_seconds = self._timestamps_to_unix_seconds(timestamps, device=device)
         day_numbers = torch.div(unix_seconds, 86400, rounding_mode='floor')
 
