@@ -15,6 +15,7 @@ class CVAE(VAE):
         hierarchy_config: HierarchicalConfig = None,
         phased_mode: bool = False,
         sequence_length: int = 24,
+        extra_condition_dim: int = 0,
         **kwargs,
     ):
         if distribution_dict is None:
@@ -23,7 +24,7 @@ class CVAE(VAE):
         distribution_dict["latent_dim"] = latent_dim
 
         self.conditioner = conditioner
-        self.condition_dim = conditioner.get_condition_dim()
+        self.condition_dim = conditioner.get_condition_dim() + extra_condition_dim
         self.latent_dim = int(latent_dim)
 
         super().__init__(input_dim=input_dim, 

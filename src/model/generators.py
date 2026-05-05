@@ -1,6 +1,19 @@
 import torch
 import numpy as np
 from datetime import datetime, timedelta
+import sys
+from pathlib import Path
+# Add project roots for imports
+CURRENT_DIR = Path(__file__).resolve().parent
+SRC_DIR = CURRENT_DIR.parent
+ROOT_DIR = SRC_DIR.parent
+
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from src.data.conditioner import Conditioner
 
 class SyntheticGenerator:
     """Called to generate synthetic samples from a trained model.

@@ -23,7 +23,7 @@ data:
 
 
   # CSV filename to load
-  data_files: ["test_data_small.parquet"]
+  data_files: []
   
   # CSV column specifications
   columns:
@@ -53,9 +53,9 @@ data:
   batch_size: 256
   shuffle: true
   replay_buffer_capacity: 10000
-  min_buffer_size: 0
-  num_workers: 0
-  steps_per_epoch: 500
+  min_buffer_size: 3000
+  num_workers: 8
+  steps_per_epoch: 1000
   eval_batches: 5
   eval_cache_on_gpu: true
   eval_cache_refresh: false
@@ -157,7 +157,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "user_profile", "holiday", "heatpump_phase", "ev_phase"]
+  tags: ["day_of_week", "month_of_year", "user_profile", "heatpump_phase", "ev_phase"]
   # ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  
   
   # User profiling (based on LDA)
@@ -216,7 +216,7 @@ training:
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 40
+  num_epochs: 300
   
   # Beta (KL weight) settings
   beta: 1.0 # 1.0
