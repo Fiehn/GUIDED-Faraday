@@ -340,6 +340,25 @@ def create_model_from_config(config, device="cpu"):
                                         sequence_length=seq_len,
                                         device=device,
                                      )
+    elif model_type == "sequential_vae":
+        model = SequentialPhaseVAE(
+            input_dim=input_dim,
+            latent_dim=model_cfg.latent_dim,
+            conditioner=conditioner,
+            distribution_dict=getattr(model_cfg, "distribution_dict", {}),
+            prior_type=prior_cfg.type,
+            hierarchy_config=hierarchy,
+            sequence_length=seq_len,
+            encoder_type=encoder_cfg.type,
+            decoder_type=decoder_cfg.type,
+            dictionary_size=getattr(prior_cfg, "dictionary_size", 512),
+            vamp_num_components=getattr(prior_cfg, "vamp_num_components", 20),
+            encoder_hidden_dims=encoder_hidden_dims,
+            decoder_hidden_dims=decoder_hidden_dims,
+            encoder_dropout=encoder_dropout,
+            decoder_dropout=decoder_dropout,
+            phased_mode=phased_mode,
+        )
     else:
         raise ValueError(f"Unknown model type '{model_type}' specified in config.")
 

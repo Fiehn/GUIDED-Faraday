@@ -11,7 +11,7 @@ verbose: true
 # ============================================================================
 data:
   # Data mode: "csv" (Aggregated Hourly consumption) or "phased" (Individual SM meters 15-min phased)
-  mode: "csv"
+  mode: "phased"
 
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
@@ -20,7 +20,7 @@ data:
   #data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
   # data_dir: "data/_parquet_cache"
-  data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/parq_hourly"
+  data_dir: "data/raw_profiles_6000"
 
 
   # CSV filename to load
@@ -89,7 +89,7 @@ normalization:
 # ============================================================================
 model:
   # Model type: "vae", "cvae", "art", "set_guide_vae", "diffusion", "phase_splitter", "baseline_average", "baseline_quantile", "baseline_mean"
-  type: "baseline_average"
+  type: "sequential_vae"
   
   # Latent dimension (size of latent vector z)
   latent_dim: 128
@@ -158,7 +158,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "user_profile", "holiday", "heatpump_phase", "ev_phase"]
+  tags: ["day_of_week", "month_of_year", "user_profile", "heatpump_phase", "ev_phase"]
   # ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  
   
   # User profiling (based on LDA)

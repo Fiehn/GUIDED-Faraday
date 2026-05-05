@@ -64,7 +64,7 @@ class SequentialPhaseVAE(BaseModel):
         # Phase 2: Conditioned on Phase 1 (input_dim = 24 + 24 = 48)
         # Receives concatenated [phase_2, phase_1]
         self.phase_2_model = CVAE(
-            input_dim=input_dim_per_phase * 2,
+            input_dim=input_dim_per_phase,
             conditioner=conditioner,
             latent_dim=latent_dim,
             distribution_dict=distribution_dict,
@@ -72,13 +72,14 @@ class SequentialPhaseVAE(BaseModel):
             hierarchy_config=hierarchy_config,
             phased_mode=False,
             sequence_length=sequence_length,
+            extra_condition_dim=input_dim_per_phase,
             **cvae_kwargs,
         )
         
         # Phase 3: Conditioned on Phases 1 and 2 (input_dim = 24 + 24 + 24 = 72)
         # Receives concatenated [phase_3, phase_1, phase_2]
         self.phase_3_model = CVAE(
-            input_dim=input_dim_per_phase * 3,
+            input_dim=input_dim_per_phase,
             conditioner=conditioner,
             latent_dim=latent_dim,
             distribution_dict=distribution_dict,
@@ -86,6 +87,7 @@ class SequentialPhaseVAE(BaseModel):
             hierarchy_config=hierarchy_config,
             phased_mode=False,
             sequence_length=sequence_length,
+            extra_condition_dim=input_dim_per_phase * 2,
             **cvae_kwargs,
         )
         
@@ -126,12 +128,12 @@ class SequentialPhaseVAE(BaseModel):
         p1_out = self.phase_1_model(phase_1, c, num_samples=num_samples)
         
         # Concatenate phase_2 with phase_1 for phase_2 model input
-        p2_input = torch.cat([phase_2, phase_1], dim=-1)
-        p2_out = self.phase_2_model(p2_input, c, num_samples=num_samples)
+        p2_c = torch.cat([c, phase_1], dim=-1)
+        p2_out = self.phase_2_model(phase_2, p2_c, num_samples=num_samples)
         
         # Concatenate phase_3 with phases_1 and 2 for phase_3 model input
-        p3_input = torch.cat([phase_3, phase_1, phase_2], dim=-1)
-        p3_out = self.phase_3_model(p3_input, c, num_samples=num_samples)
+        p3_c = torch.cat([c, phase_1, phase_2], dim=-1)
+        p3_out = self.phase_3_model(phase_3, p3_c, num_samples=num_samples)
         
         recon_loss = (
             p1_out.get("recon_loss", 0) +
@@ -156,56 +158,41 @@ class SequentialPhaseVAE(BaseModel):
         conditions: torch.Tensor,
         num_samples: int = 1,
         return_all_phases: bool = False,
+        device: str = "cpu",
     ) -> torch.Tensor:
         """Generate 3-phase data autoregressively: Phase 1 → Phase 2|1 → Phase 3|1,2."""
         with torch.no_grad():
+            conditions = conditions.to(device)
             # Generate Phase 1 (independent) using CVAE.sample()
             # Returns [S=1, num_x_samples=num_samples, B, D]
-            phase_1_samples = self.phase_1_model.sample(conditions, num_prior_samples=1, num_x_samples=num_samples)
-            # Extract to [num_samples, B, D]
+            phase_1_samples = self.phase_1_model.sample(conditions, num_prior_samples=1, num_x_samples=num_samples, device=device)
+            
             phase_1 = phase_1_samples[0]  # [num_samples, B, D]
             
-            B = conditions.size(0)
-            if num_samples > 1:
-                conditions_exp = conditions.repeat_interleave(num_samples, dim=0)
-                phase_1_flat = phase_1.reshape(num_samples * B, -1)
-            else:
-                conditions_exp = conditions
-                phase_1_flat = phase_1.squeeze(0)  # [1, B, D] -> [B, D]
+            # Since conditions is [B, C], we need to expand it to [num_samples, B, C] for concatenation
+            B = conditions.shape[0]
+            cond_expanded = conditions.unsqueeze(0).expand(num_samples, B, -1)
             
-            # Generate Phase 2 conditioned on Phase 1
-            # Create input by concatenating phase_2_sample with phase_1
-            # For generation, we create a dummy phase_2 and concatenate with phase_1
-            dummy_phase_2 = torch.zeros_like(phase_1_flat)  # [num_samples*B, D]
-            p2_x_input = torch.cat([dummy_phase_2, phase_1_flat], dim=-1)  # [num_samples*B, 2*D]
+            phase_2_conditions = torch.cat([cond_expanded, phase_1], dim=-1)
             
-            # Sample from phase_2 model: this samples x given z and conditions
-            # The model will generate phase_2 data conditioned on phase_1
-            phase_2_samples = self.phase_2_model.sample(conditions_exp, num_prior_samples=1, num_x_samples=1)
-            # Extract [num_samples*B, D_combined=48]
-            phase_2_full = phase_2_samples[0, 0]  # [num_samples*B, 48]
-            # Extract phase_2 part (first self.input_dim = 24)
-            phase_2_flat = phase_2_full[:, :self.input_dim]  # [num_samples*B, D]
-            if num_samples > 1:
-                phase_2 = phase_2_flat.reshape(num_samples, B, -1)
-            else:
-                phase_2 = phase_2_flat  # [B, D]
+            # Since phase_2_model expects [B_eff, C_eff], we flatten num_samples and B
+            phase_2_conditions_flat = phase_2_conditions.reshape(num_samples * B, -1)
             
-            # Generate Phase 3 conditioned on Phases 1 and 2
-            # Phase 3 samples conditioned on concatenated phases 1 and 2
-            phase_3_samples = self.phase_3_model.sample(conditions_exp, num_prior_samples=1, num_x_samples=1)
-            # Extract [num_samples*B, D_combined=72]
-            phase_3_full = phase_3_samples[0, 0]  # [num_samples*B, 72]
-            # Extract phase_3 part (first self.input_dim = 24)
-            phase_3_flat = phase_3_full[:, :self.input_dim]  # [num_samples*B, D]
-            if num_samples > 1:
-                phase_3 = phase_3_flat.reshape(num_samples, B, -1)
-            else:
-                phase_3 = phase_3_flat  # [B, D]
+            phase_2_samples_flat = self.phase_2_model.sample(phase_2_conditions_flat, num_prior_samples=1, num_x_samples=1, device=device)
+            # phase_2_samples_flat is [1, 1, num_samples * B, D]
+            phase_2 = phase_2_samples_flat[0, 0].reshape(num_samples, B, -1) # [num_samples, B, D]
             
+            phase_3_conditions = torch.cat([cond_expanded, phase_1, phase_2], dim=-1)
+            phase_3_conditions_flat = phase_3_conditions.reshape(num_samples * B, -1)
+            
+            phase_3_samples_flat = self.phase_3_model.sample(phase_3_conditions_flat, num_prior_samples=1, num_x_samples=1, device=device)
+            phase_3 = phase_3_samples_flat[0, 0].reshape(num_samples, B, -1) # [num_samples, B, D]
+
             # Ensure consistent dimensions
             if num_samples == 1:
                 phase_1 = phase_1.squeeze(0)  # [1, B, D] -> [B, D]
+                phase_2 = phase_2.squeeze(0)
+                phase_3 = phase_3.squeeze(0)
         
         if return_all_phases:
             if num_samples > 1:
@@ -217,36 +204,6 @@ class SequentialPhaseVAE(BaseModel):
                 return torch.cat([phase_1, phase_2, phase_3], dim=2)  # [num_samples, B, 3*D]
             else:
                 return torch.cat([phase_1, phase_2, phase_3], dim=1)  # [B, 3*D]
-    
-    def to_dict(self) -> dict:
-        return {
-            "input_dim": self.input_dim,
-            "latent_dim": self.latent_dim,
-            "hierarchy_config": self.hierarchy_config.to_dict() if self.hierarchy_config else None,
-            "phased_mode": self.phased_mode,
-            "sequence_length": self.sequence_length,
-            "cvae_kwargs": self.cvae_kwargs,
-            "distribution_dict": self.distribution_dict,
-            "prior_type": self.prior_type,
-        }
-    
-    @classmethod
-    def from_dict(cls, config: dict, conditioner: Conditioner) -> "SequentialPhaseVAE":
-        hierarchy_config = None
-        if config.get("hierarchy_config"):
-            hierarchy_config = HierarchicalConfig.from_dict(config["hierarchy_config"])
-        
-        return cls(
-            input_dim=config["input_dim"],
-            conditioner=conditioner,
-            latent_dim=config["latent_dim"],
-            hierarchy_config=hierarchy_config,
-            phased_mode=config.get("phased_mode", False),
-            sequence_length=config.get("sequence_length", 24),
-            distribution_dict=config.get("distribution_dict"),
-            prior_type=config.get("prior_type"),
-            **config.get("cvae_kwargs", {}),
-        )
     
     def train_core(self, batch, optim, beta=1.0, weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
         """Train all three phase models with teacher forcing (ground truth phase conditioning)."""
@@ -279,14 +236,14 @@ class SequentialPhaseVAE(BaseModel):
         p1_loss_dict = self.phase_1_model.loss(phase_1_data, p1_recon, p1_q_params, beta=beta, weighted_loss=weighted_loss)
         
         # Train Phase 2 conditioned on Phase 1 (teacher forcing with ground truth phase_1)
-        p2_input = torch.cat([phase_2_data, phase_1_data], dim=-1)  # [B, 48]
-        p2_recon, p2_q_params = self.phase_2_model.forward(p2_input, c, num_samples=1)
-        p2_loss_dict = self.phase_2_model.loss(p2_input, p2_recon, p2_q_params, beta=beta, weighted_loss=weighted_loss)
+        p2_c = torch.cat([c, phase_1_data], dim=-1)
+        p2_recon, p2_q_params = self.phase_2_model.forward(phase_2_data, p2_c, num_samples=1)
+        p2_loss_dict = self.phase_2_model.loss(phase_2_data, p2_recon, p2_q_params, beta=beta, weighted_loss=weighted_loss)
         
         # Train Phase 3 conditioned on Phases 1 and 2 (teacher forcing with ground truth)
-        p3_input = torch.cat([phase_3_data, phase_1_data, phase_2_data], dim=-1)  # [B, 72]
-        p3_recon, p3_q_params = self.phase_3_model.forward(p3_input, c, num_samples=1)
-        p3_loss_dict = self.phase_3_model.loss(p3_input, p3_recon, p3_q_params, beta=beta, weighted_loss=weighted_loss)
+        p3_c = torch.cat([c, phase_1_data, phase_2_data], dim=-1)
+        p3_recon, p3_q_params = self.phase_3_model.forward(phase_3_data, p3_c, num_samples=1)
+        p3_loss_dict = self.phase_3_model.loss(phase_3_data, p3_recon, p3_q_params, beta=beta, weighted_loss=weighted_loss)
         
         # Aggregate losses
         total_loss = p1_loss_dict["loss"] + p2_loss_dict["loss"] + p3_loss_dict["loss"]
@@ -341,15 +298,13 @@ class SequentialPhaseVAE(BaseModel):
             p1_recon, p1_q_params = self.phase_1_model.forward(phase_1_data, c, num_samples=1)
             p1_loss_dict = self.phase_1_model.loss(phase_1_data, p1_recon, p1_q_params, beta=beta)
             
-            # Validate Phase 2 with ground truth Phase 1
-            p2_input = torch.cat([phase_2_data, phase_1_data], dim=-1)
-            p2_recon, p2_q_params = self.phase_2_model.forward(p2_input, c, num_samples=1)
-            p2_loss_dict = self.phase_2_model.loss(p2_input, p2_recon, p2_q_params, beta=beta)
+            p2_c = torch.cat([c, phase_1_data], dim=-1)
+            p2_recon, p2_q_params = self.phase_2_model.forward(phase_2_data, p2_c, num_samples=1)
+            p2_loss_dict = self.phase_2_model.loss(phase_2_data, p2_recon, p2_q_params, beta=beta)
             
-            # Validate Phase 3 with ground truth Phases 1 and 2
-            p3_input = torch.cat([phase_3_data, phase_1_data, phase_2_data], dim=-1)
-            p3_recon, p3_q_params = self.phase_3_model.forward(p3_input, c, num_samples=1)
-            p3_loss_dict = self.phase_3_model.loss(p3_input, p3_recon, p3_q_params, beta=beta)
+            p3_c = torch.cat([c, phase_1_data, phase_2_data], dim=-1)
+            p3_recon, p3_q_params = self.phase_3_model.forward(phase_3_data, p3_c, num_samples=1)
+            p3_loss_dict = self.phase_3_model.loss(phase_3_data, p3_recon, p3_q_params, beta=beta)
             
             # Aggregate
             metrics["loss"] += (p1_loss_dict["loss"] + p2_loss_dict["loss"] + p3_loss_dict["loss"]).item() / 3
@@ -379,8 +334,19 @@ class SequentialPhaseVAE(BaseModel):
         self.to(device)
         
         # Generate samples using the generate method
-        samples = self.generate(conditions, num_samples=num_prior_samples, return_all_phases=False)
+        # Usually num_prior_samples is used for generation count in this model context.
+        # If we need num_x_samples instead, it's configurable. We'll use num_prior_samples for backwards compat.
+        samples = self.generate(conditions, num_samples=num_prior_samples, return_all_phases=False, device=device)
         
+        # CVAE expects output format [S, num_x, B, D]. Our generate returns [B, D] or [S, B, D].
+        # We wrap it to match standard sample output [S, num_x, B, D]
+        if num_prior_samples == 1:
+            # samples is [B, 3*D]
+            samples = samples.unsqueeze(0).unsqueeze(0)
+        else:
+            # samples is [num_prior_samples, B, 3*D]
+            samples = samples.unsqueeze(1)
+            
         self.to(original_device)
         return samples
     
@@ -431,21 +397,19 @@ class SequentialPhaseVAE(BaseModel):
         p1_decoded = p1_recon_params['mu'][0]
         
         # Reconstruct Phase 2 (with ground truth Phase 1) - use mean reconstruction
-        p2_input = torch.cat([phase_2_data, phase_1_data], dim=-1)
-        p2_recon_params, _ = self.phase_2_model.forward(p2_input, c, num_samples=1)
+        p2_c = torch.cat([c, phase_1_data], dim=-1)
+        p2_recon_params, _ = self.phase_2_model.forward(phase_2_data, p2_c, num_samples=1)
         # Extract mean and get phase_2 part (first self.input_dim)
         p2_decoded_full = p2_recon_params['mu'][0]  # [B, D_combined=48]
         p2_decoded = p2_decoded_full[:, :self.input_dim]  # [B, D]
         
         # Reconstruct Phase 3 (with ground truth Phases 1 and 2) - use mean reconstruction
-        p3_input = torch.cat([phase_3_data, phase_1_data, phase_2_data], dim=-1)
-        p3_recon_params, _ = self.phase_3_model.forward(p3_input, c, num_samples=1)
+        p3_c = torch.cat([c, phase_1_data, phase_2_data], dim=-1)
+        p3_recon_params, _ = self.phase_3_model.forward(phase_3_data, p3_c, num_samples=1)
         # Extract mean and get phase_3 part (first self.input_dim)
         p3_decoded_full = p3_recon_params['mu'][0]  # [B, D_combined=72]
         p3_decoded = p3_decoded_full[:, :self.input_dim]  # [B, D]
         
-        # Stack reconstructions: return in same format as input
-        # If input was [B, 24, 3], return [B, 24, 3]; if [B, 3, 24], return [B, 3, 24]
         if x.shape[2] == 3:
             return torch.stack([p1_decoded, p2_decoded, p3_decoded], dim=2)  # [B, 24, 3]
         else:
