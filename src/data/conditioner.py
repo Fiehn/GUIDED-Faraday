@@ -916,7 +916,7 @@ class HolidayConditioner(BaseConditioner):
             return torch.zeros((1, 1), dtype=torch.float32, device=device)
 
         unix_seconds = self._timestamps_to_unix_seconds(timestamps, device=device)
-        day_numbers = torch.div(unix_seconds, 86400, rounding_mode='floor')
+        day_numbers = torch.div(unix_seconds, 86400, rounding_mode='floor').to(dtype=torch.long, device=device)
 
         holidays = self._get_holiday_days(device=device)
         if holidays.numel() == 0:
