@@ -157,7 +157,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "user_profile", "holiday", "heatpump_phase", "ev_phase"]
+  tags: ["day_of_week", "month_of_year", "user_profile",  "heatpump_phase", "ev_phase"]
   # ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  
   
   # User profiling (based on LDA)
@@ -216,7 +216,7 @@ training:
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 100
+  num_epochs: 300
   
   # Beta (KL weight) settings
   beta: 1.0 # 1.0
