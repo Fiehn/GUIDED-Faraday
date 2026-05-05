@@ -159,13 +159,21 @@ class SyntheticGenerator:
             input_data = input_data.sum(dim=1)  # Sum over phase dimension to get [B, 24, F_agg]
 
         # Get conditions
-        cond_input = self.model._build_condition_input(self.model._to_phase_first(input_data))
-        conditions = self.conditioner.get_conditions(cond_input, meter_id, timestamp).to(self.device, dtype=model_dtype)
-        enc_conditions = conditions
-        if encode_conditions is not None:
-            enc_conditions = encode_conditions.to(self.device, dtype=model_dtype)
-            if new_conditions is None:
-                conditions = enc_conditions
+        conditions = None
+        if self._is_cvae and self.conditioner is not None:
+            cond_input = self.model._build_condition_input(self.model._to_phase_first(input_data))
+            conditions = self.conditioner.get_conditions(cond_input, meter_id, timestamp).to(self.device, dtype=model_dtype)
+            enc_conditions = conditions
+            if encode_conditions is not None:
+                enc_conditions = encode_conditions.to(self.device, dtype=model_dtype)
+                if new_conditions is None:
+                    conditions = enc_conditions
+        elif encode_conditions is not None or new_conditions is not None:
+            # If conditions are provided but conditioner is None, use them directly
+            if new_conditions is not None:
+                conditions = new_conditions.to(self.device, dtype=model_dtype)
+            elif encode_conditions is not None:
+                conditions = encode_conditions.to(self.device, dtype=model_dtype)
 
         is_sequential_phase_vae = self.model.__class__.__name__ == 'SequentialPhaseVAE'
         
@@ -676,6 +684,8 @@ class SyntheticGenerator:
         Returns:
             torch.Tensor: Conditions tensor of shape `(1, num_conditions)`.
         """
+        if self.conditioner is None:
+            return None
         if random_condition:
             return self.conditioner.get_random_conditions(batch_size=1).to(self.device)
         meter_ids = torch.tensor([meter_id], device=self.device)

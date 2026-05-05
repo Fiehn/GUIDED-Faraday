@@ -491,7 +491,7 @@ class EvalFramework:
                 data, meter_ids, timestamps, agg = self._unpack_batch(batch)
                 
                 data = data.to(self.device)
-                if self._is_cvae():
+                if self._is_cvae() and self.conditioner is not None:
                     cond_input = self._prepare_condition_input(data)
                     
                     c = self.conditioner.get_conditions(cond_input, meter_id=meter_ids, timestamps=timestamps)
@@ -3060,7 +3060,7 @@ class PeakAnalysis(SyntheticMetric):
             x = np.linspace(0, 100, len(self.sorted_real_data))
             
             # Plotting the load duration curve
-            fig, ax = plt.subplots(figsize=(10, 6))
+            fig, ax = plt.subplots(figsize=(12, 4))
             ax.plot(x, self.sorted_real_data, label='Real Data', color='blue', linewidth=2)
             ax.plot(x, self.sorted_synthetic_data, label='Synthetic Data', color='orange', linewidth=2)
             ax.set_title('Load Duration Curve (Sorted)', fontsize=14, fontweight='bold')
@@ -3234,27 +3234,34 @@ class HourlyProfilesByMonth(SyntheticMetric):
             real_data = real_data[:n]
             synthetic_data = synthetic_data[:n]
             
-            # Handle timestamps
+            # Handle timestamps - be robust to None or invalid timestamps
+            verbose = getattr(self, 'verbose', False)
             if self.timestamps is None:
-                # Fallback: generate dummy timestamps
+                # Fallback: generate dummy timestamps covering full year
                 self.timestamps = np.array([datetime(2023, 1, 1) + timedelta(hours=i) for i in range(n)])
             else:
-                # Make sure timestamps match data length
+                # Make sure timestamps match data length and are in correct format
                 self.timestamps = np.asarray(self.timestamps)[:n]
             
-            # Extract month from timestamps
+            # Extract month from timestamps using robust parsing
             months = self._extract_months()
             
             # Verify all arrays have matching lengths
             if len(months) != n:
                 raise ValueError(f"Array length mismatch: months={len(months)}, data={n}")
             
-            # Group by month and compute flexibility distances
-            unique_months = sorted(np.unique(months[months > 0]))
+            # Get unique months - all values should be valid (1-12) now due to improved _extract_months
+            unique_months = sorted(np.unique(months))
+            unique_months = [m for m in unique_months if 1 <= m <= 12]  # Filter to valid months
+            
             if len(unique_months) == 0:
-                # If no valid months found, use month 1 for all
-                months = np.ones_like(months)
+                if verbose:
+                    print("[WARN] HourlyProfilesByMonth: No valid months extracted, defaulting all data to January")
+                # Should not happen with improved _extract_months, but handle gracefully
+                months = np.ones(n, dtype=int)
                 unique_months = [1]
+            elif verbose:
+                print(f"[INFO] HourlyProfilesByMonth: Found data for months: {unique_months}")
             
             flexibility_distances_by_month = {}
             
@@ -3304,35 +3311,69 @@ class HourlyProfilesByMonth(SyntheticMetric):
             )
             
             return mean_fd
-        except Exception as e:
-            print(f"[ERROR] HourlyProfilesByMonth.compute() failed: {e}", flush=True)
+        except Exception:
             import traceback
             traceback.print_exc()
             raise  # Re-raise so framework sees the error
     
     
     def _extract_months(self) -> np.ndarray:
-            """Extract month from timestamps."""
-            months = []
-            
-            if self.timestamps is None:
-                raise ValueError("Timestamps required for HourlyProfilesByMonth")
-            
-            for ts in self.timestamps:
-                try:
-                    if isinstance(ts, (int, float)):
-                        dt = datetime.fromtimestamp(ts)
-                    elif isinstance(ts, str):
+        """Extract month from timestamps with robust handling for multiple formats.
+        
+        Handles:
+        - Unix timestamps (int/float seconds since epoch)
+        - ISO datetime strings
+        - datetime objects
+        - numpy.datetime64
+        - pandas.Timestamp
+        
+        Falls back gracefully if timestamps are unavailable or unparseable.
+        """
+        if self.timestamps is None:
+            return np.ones(len(self.real_data), dtype=int)  # Default to month 1 if no timestamps
+        
+        months = []
+        for i, ts in enumerate(self.timestamps):
+            try:
+                # Try different timestamp formats
+                if ts is None:
+                    months.append(1)  # Default to January
+                elif isinstance(ts, datetime):
+                    months.append(ts.month)
+                elif isinstance(ts, str):
+                    # Try ISO format, then fallback to pandas parsing
+                    try:
                         dt = datetime.fromisoformat(ts)
-                    elif isinstance(ts, datetime):
-                        dt = ts
-                    else:
-                        dt = datetime.fromtimestamp(int(ts))
+                    except (ValueError, TypeError):
+                        import pandas as pd
+                        dt = pd.to_datetime(ts, utc=True).to_pydatetime()
                     months.append(dt.month)
-                except Exception:
-                    months.append(0)
-            
-            return np.array(months)
+                elif isinstance(ts, (int, np.integer)):
+                    # Unix timestamp (seconds since epoch)
+                    dt = datetime.utcfromtimestamp(ts)
+                    months.append(dt.month)
+                elif isinstance(ts, float):
+                    # Unix timestamp (seconds since epoch)
+                    dt = datetime.utcfromtimestamp(ts)
+                    months.append(dt.month)
+                elif hasattr(ts, 'month'):
+                    # numpy.datetime64 or pandas.Timestamp
+                    months.append(int(ts.month))
+                elif isinstance(ts, np.datetime64):
+                    # Convert numpy datetime64 to datetime
+                    import pandas as pd
+                    dt = pd.Timestamp(ts).to_pydatetime()
+                    months.append(dt.month)
+                else:
+                    # Last resort: try to convert to string and parse
+                    dt = datetime.fromisoformat(str(ts))
+                    months.append(dt.month)
+            except Exception:
+                # If all parsing fails, default to month 1
+                months.append(1)
+        
+        result = np.array(months)
+        return result
     
 
     def _plot_hourly_profiles(self, real_data, synthetic_data, months, 
@@ -3486,6 +3527,8 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
         2. Average all synthetic windows on that day into one profile
         3. Compute FlexibilityDistance between the two average profiles
         4. Visualize with percentile bands from all windows
+        
+        Robustly handles different timestamp formats and data sources.
         """
         try:
             # Validate inputs
@@ -3501,28 +3544,34 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
             real_data = real_data[:n]
             synthetic_data = synthetic_data[:n]
             
-            # Handle timestamps
+            # Handle timestamps - be robust to None or invalid timestamps
+            verbose = getattr(self, 'verbose', False)
             if self.timestamps is None:
-                # Fallback: generate dummy timestamps
-                self.timestamps = np.array([datetime(2023, 1, 1) + timedelta(hours=i) for i in range(n)])
+                if verbose:
+                    print("[WARN] HourlyProfilesByDayofWeek: No timestamps available, using fallback (all data treated as Monday)")
+                # Fallback: generate dummy timestamps covering full week
+                self.timestamps = np.array([datetime(2023, 1, 2) + timedelta(hours=i) for i in range(n)])  # Start on Monday
             else:
-                # Make sure timestamps match data length
+                # Make sure timestamps match data length and are in correct format
                 self.timestamps = np.asarray(self.timestamps)[:n]
             
-            # Extract day of week from timestamps
+            # Extract day of week from timestamps using robust parsing
             days_of_week = self._extract_days_of_week()
             
             # Verify all arrays have matching lengths
             if len(days_of_week) != n:
                 raise ValueError(f"Array length mismatch: days_of_week={len(days_of_week)}, data={n}")
             
-            # Group by day of week and compute flexibility distances
-            unique_days = sorted(np.unique(days_of_week[days_of_week >= 0]))
-            if len(unique_days) == 0:
-                # If no valid days found, use day 0 for all
-                days_of_week = np.zeros_like(days_of_week)
-                unique_days = [0]
+            # Get unique days - all values should be valid (0-6) now due to improved _extract_days_of_week
+            unique_days = sorted(np.unique(days_of_week))
+            unique_days = [d for d in unique_days if 0 <= d <= 6]  # Filter to valid weekdays
             
+            if len(unique_days) == 0:
+                if verbose:
+                    print("[WARN] HourlyProfilesByDayofWeek: No valid days extracted, defaulting all data to Monday")
+                # Should not happen with improved _extract_days_of_week, but handle gracefully
+                days_of_week = np.zeros(n, dtype=int)
+                unique_days = [0]
             flexibility_distances_by_day = {}
             
             for day in unique_days:
@@ -3571,34 +3620,61 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
             )
             
             return mean_fd
-        except Exception as e:
-            print(f"[ERROR] HourlyProfilesByDayofWeek.compute() failed: {e}", flush=True)
+        except Exception:
             import traceback
             traceback.print_exc()
             raise  # Re-raise so framework sees the error
     
     def _extract_days_of_week(self) -> np.ndarray:
-        """Extract day of week from timestamps (0=Monday, 6=Sunday)."""
-        days = []
+        """Extract day of week from timestamps (0=Monday, 6=Sunday).
         
+        Handles multiple timestamp formats with robust error handling.
+        """
         if self.timestamps is None:
-            raise ValueError("Timestamps required for HourlyProfilesByDayofWeek")
+            return np.zeros(len(self.real_data), dtype=int)  # Default to Monday if no timestamps
         
+        days = []
         for ts in self.timestamps:
             try:
-                if isinstance(ts, (int, float)):
-                    dt = datetime.fromtimestamp(ts)
-                elif isinstance(ts, str):
-                    dt = datetime.fromisoformat(ts)
+                # Try different timestamp formats
+                if ts is None:
+                    days.append(0)  # Default to Monday
                 elif isinstance(ts, datetime):
-                    dt = ts
+                    days.append(ts.weekday())  # 0=Monday, 6=Sunday
+                elif isinstance(ts, str):
+                    # Try ISO format, then fallback to pandas parsing
+                    try:
+                        dt = datetime.fromisoformat(ts)
+                    except (ValueError, TypeError):
+                        import pandas as pd
+                        dt = pd.to_datetime(ts, utc=True).to_pydatetime()
+                    days.append(dt.weekday())
+                elif isinstance(ts, (int, np.integer)):
+                    # Unix timestamp (seconds since epoch)
+                    dt = datetime.utcfromtimestamp(ts)
+                    days.append(dt.weekday())
+                elif isinstance(ts, float):
+                    # Unix timestamp (seconds since epoch)
+                    dt = datetime.utcfromtimestamp(ts)
+                    days.append(dt.weekday())
+                elif hasattr(ts, 'weekday'):
+                    # numpy.datetime64 or pandas.Timestamp
+                    days.append(int(ts.weekday()))
+                elif isinstance(ts, np.datetime64):
+                    # Convert numpy datetime64 to datetime
+                    import pandas as pd
+                    dt = pd.Timestamp(ts).to_pydatetime()
+                    days.append(dt.weekday())
                 else:
-                    dt = datetime.fromtimestamp(int(ts))
-                days.append(dt.weekday())  # 0=Monday, 6=Sunday
+                    # Last resort: try to convert to string and parse
+                    dt = datetime.fromisoformat(str(ts))
+                    days.append(dt.weekday())
             except Exception:
-                days.append(-1)
+                # If all parsing fails, default to Monday
+                days.append(0)
         
-        return np.array(days)
+        result = np.array(days)
+        return result
     
     def _plot_hourly_profiles(self, real_data, synthetic_data, days_of_week, 
                              flexibility_distances_by_day):

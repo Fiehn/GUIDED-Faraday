@@ -422,7 +422,31 @@ class StreamingParquetBuffer(IterableDataset):
             if phase_df.empty:
                 return sequences
 
-        timestamps = (phase_df.index.view('int64') // 10**9).astype(np.int64)
+        # Robust timestamp extraction: normalize the index to UTC datetimes first,
+        # then convert using the actual datetime resolution instead of assuming ns.
+        try:
+            dt_index = pd.DatetimeIndex(pd.to_datetime(phase_df.index, utc=True, errors='coerce'))
+            if dt_index.isna().any():
+                raise ValueError("Datetime conversion produced NaT values")
+
+            raw_values = dt_index.astype('int64')
+            unit = getattr(getattr(dt_index, 'dtype', None), 'unit', 'ns')
+            divisor_by_unit = {
+                's': 1,
+                'ms': 10**3,
+                'us': 10**6,
+                'ns': 10**9,
+            }
+            divisor = divisor_by_unit.get(unit, 10**9)
+            timestamps = (raw_values // divisor).astype(np.int64)
+        except Exception as e:
+            import sys
+            print(f"[ERROR] Failed to extract timestamps from meter {meter_id}: {e}", file=sys.stderr)
+            print(f"[DEBUG] Index type: {type(phase_df.index).__name__}", file=sys.stderr)
+            print(f"[DEBUG] Index dtype: {phase_df.index.dtype if hasattr(phase_df.index, 'dtype') else 'N/A'}", file=sys.stderr)
+            print(f"[DEBUG] First few index values: {phase_df.index[:5]}", file=sys.stderr)
+            raise
+        
         values = phase_df.astype(np.float32).to_numpy()
         if len(values) < self.window_spec.input_len:
             return sequences
@@ -912,7 +936,25 @@ class PhasedReplayDataloaders:
         x_test, m_test, t_test, a_test = self._collect_stream_cache("test", target_test)
         self._build_test_loader(x_test, m_test, t_test, a_test)
 
+    # def get_test_loader(self):
+    #     return self.test_loader
+
     def get_test_loader(self):
-        return self.test_loader
+        if self.test_loader is not None:
+            return self.test_loader
+
+        if hasattr(self, "test_dataset") and self.test_dataset is not None:
+            from torch.utils.data import DataLoader
+
+            self.test_loader = DataLoader(
+                self.test_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+            )
+            return self.test_loader
+
+        return None
 
 

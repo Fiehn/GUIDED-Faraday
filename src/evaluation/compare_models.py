@@ -139,6 +139,9 @@ class PhasedModelComparator:
             "maximummeandiscrepancymmd": "target_0",
             "setmmdpermutationinvariant": "target_0",
             "mmd": "target_0",
+            "hourlyconsumptionbymonth": "lower",
+            "hourlyconsumptionbyday": "lower",
+            "peakanalysis": "lower",
 
             # Summary scores
             "avgminmaxreconstructionscore": "higher",
@@ -173,6 +176,9 @@ class PhasedModelComparator:
             "setmmdpermutationinvariant",
             "mmd",
             "acfdistributionmatchks",
+            "hourlyconsumptionbymonth",
+            "hourlyconsumptionbyday",
+            "peakanalysis"
         }
 
         if key in reconstruction_metrics:
@@ -202,8 +208,6 @@ class PhasedModelComparator:
     def _display_metric_title(self, metric: str) -> str:
         return f"{self._display_metric_name(metric)} ({self._metric_target_label(metric)})"
 
-
-
     def add_model(self, model_name: str, model_eval_dir: str):
         """Add a model's evaluation results to the comparator, handling both phased and unphased output."""
         self.models_data[model_name] = {}
@@ -222,17 +226,17 @@ class PhasedModelComparator:
                     print(f"Error loading {eval_json_path}: {e}")
         
         # 2. Check for unphased results at root (either EvalFramework or PhasedEvaluationSuite summary)
-            root_eval_path = os.path.join(model_eval_dir, "eval_results.json")
-            if os.path.exists(root_eval_path):
-                try:
-                    with open(root_eval_path, 'r') as f:
-                        data = json.load(f)
-                    
-                    # If it's a simple flat dict (from EvalFramework), add it as 'full_eval'
-                    if not any(k in data for k in ['aggregated_phase', 'ranked_phases']):
-                        self.models_data[model_name]['full_eval'] = data
-                except Exception as e:
-                    print(f"Error loading {root_eval_path}: {e}")
+        root_eval_path = os.path.join(model_eval_dir, "eval_results.json")
+        if os.path.exists(root_eval_path):
+            try:
+                with open(root_eval_path, 'r') as f:
+                    data = json.load(f)
+                
+                # If it's a simple flat dict (from EvalFramework), add it as 'full_eval'
+                if not any(k in data for k in ['aggregated_phase', 'ranked_phases']):
+                    self.models_data[model_name]['full_eval'] = data
+            except Exception as e:
+                print(f"Error loading {root_eval_path}: {e}")
         
         if not self.models_data[model_name]:
             print(f"No valid evaluation results found in {model_eval_dir} for model {model_name}")
@@ -608,7 +612,7 @@ def compare_models(model_paths: list[str],
                    output_dir: str = "evaluation_comparison",
                    phased: bool = False,
                    agg_divisor = 1000.0,
-                   recompute: bool = False,
+                   recompute: bool = True,
                    split_seed: int | None = None,
                    split_ratios: dict | None = None,
                    max_value: float | None = 200.0,
@@ -674,7 +678,18 @@ def compare_models(model_paths: list[str],
         # True held-out test split (not used during training).
         loader_obj.refresh_test_cache(n_batches)
         test_loader = loader_obj.get_test_loader()
-        
+
+        if test_loader is None and hasattr(loader_obj, "test_dataset"):
+            print("[WARN] get_test_loader() returned None, constructing DataLoader from test_dataset directly.")
+            from torch.utils.data import DataLoader
+            test_loader = DataLoader(
+                loader_obj.test_dataset,
+                batch_size=32,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False,
+            )
+
         if phased:
             # Phased models use PhasedEvaluationSuite which creates sub-phase directories
             evaluator = PhasedEvaluationSuite(
@@ -689,6 +704,19 @@ def compare_models(model_paths: list[str],
             )
             evaluator.evaluate()
         else:
+            print("\nDEBUG BEFORE EVAL")
+            print("model_name:", name)
+            print("model_path:", path)
+            print("loaded_model_type:", type(model))
+            print("data_dir:", data_dir)
+            print("data_files:", data_files)
+            print("phased:", phased)
+            print("recompute:", recompute)
+            print("n_batches:", n_batches)
+            print("loader_obj_type:", type(loader_obj))
+            print("test_loader:", test_loader)
+            print("type(test_loader):", type(test_loader))
+
             # Unphased models use EvalFramework directly
             evaluator = EvalFramework(
                 model=model,
@@ -700,8 +728,54 @@ def compare_models(model_paths: list[str],
                 output_path=os.path.join(model_output_dir, "eval_results.json"),
                 secondary_model=sec_model
             )
+            # evaluator.register_all(phased=False)
+            # evaluator.evaluate()
+            # evaluator.save_results(os.path.join(model_output_dir, "eval_results.json"))
             evaluator.register_all(phased=False)
             evaluator.evaluate()
+
+            # ------------------------------------------------------------
+            # DEBUG: print example real / reconstructed / synthetic data
+            # ------------------------------------------------------------
+            print("\n" + "=" * 80)
+            print(f"DATA EXAMPLES USED IN EVALUATION: {name}")
+            print("=" * 80)
+
+            for attr in [
+                "_real_data",
+                "_reconstructed_data",
+                "_synthetic_data",
+                "real_data",
+                "reconstructed_data",
+                "synthetic_data",
+            ]:
+                if hasattr(evaluator, attr):
+                    arr = getattr(evaluator, attr)
+
+                    if arr is None:
+                        print(f"{attr}: None")
+                        continue
+
+                    try:
+                        print(f"\n{attr}")
+                        print("type:", type(arr))
+                        print("shape:", arr.shape)
+
+                        # Print first sample
+                        example = arr[0]
+                        print("first sample shape:", example.shape if hasattr(example, "shape") else type(example))
+                        print(example)
+
+                        # If it is long, also print only first 24 values flattened
+                        flat = np.asarray(example).reshape(-1)
+                        print("first sample flattened first 24 values:")
+                        print(flat[:24])
+
+                    except Exception as e:
+                        print(f"{attr}: could not print, error={e}")
+
+            print("=" * 80 + "\n")
+
             evaluator.save_results(os.path.join(model_output_dir, "eval_results.json"))
     
     # 5. Use PhasedModelComparator to generate comparison tables and plots
