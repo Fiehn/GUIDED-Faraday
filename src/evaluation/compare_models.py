@@ -208,25 +208,24 @@ class PhasedModelComparator:
     def _display_metric_title(self, metric: str) -> str:
         return f"{self._display_metric_name(metric)} ({self._metric_target_label(metric)})"
 
-    def add_model(self, model_name: str, model_eval_dir: str):
+    def add_model(self, model_name: str, model_dir: str):
         """Add a model's evaluation results to the comparator, handling both phased and unphased output."""
         self.models_data[model_name] = {}
         
         # 1. Check for phased results in subdirectories
-        found_phased = False
         for phase in ['aggregated_phase', 'ranked_phase_1', 'ranked_phase_2', 'ranked_phase_3']:
-            eval_json_path = os.path.join(model_eval_dir, f"{phase}_eval", "eval_results.json")
+            eval_json_path = os.path.join(model_dir, f"{phase}_eval", "eval_results.json")
+            
             if os.path.exists(eval_json_path):
                 try:
                     with open(eval_json_path, 'r') as f:
                         data = json.load(f)
                     self.models_data[model_name][phase] = data
-                    found_phased = True
                 except Exception as e:
                     print(f"Error loading {eval_json_path}: {e}")
         
         # 2. Check for unphased results at root (either EvalFramework or PhasedEvaluationSuite summary)
-        root_eval_path = os.path.join(model_eval_dir, "eval_results.json")
+        root_eval_path = os.path.join(model_dir, "eval_results.json")
         if os.path.exists(root_eval_path):
             try:
                 with open(root_eval_path, 'r') as f:
@@ -239,7 +238,7 @@ class PhasedModelComparator:
                 print(f"Error loading {root_eval_path}: {e}")
         
         if not self.models_data[model_name]:
-            print(f"No valid evaluation results found in {model_eval_dir} for model {model_name}")
+            print(f"No valid evaluation results found in {model_dir} for model {model_name}")
 
     def compare(self):
         """Generate comparison tables and plots for each phase."""
@@ -594,13 +593,12 @@ def _infer_split_from_first_model(model_paths: list[str]) -> tuple[int, dict]:
 
 def _has_existing_eval_outputs(model_output_dir: str, phased: bool) -> bool:
     """Return True if evaluation artifacts already exist on disk for this model output folder."""
-    if phased:
-        phases = ["aggregated_phase", "ranked_phase_1", "ranked_phase_2", "ranked_phase_3"]
-        for phase in phases:
-            p = os.path.join(model_output_dir, f"{phase}_eval", "eval_results.json")
-            if os.path.exists(p):
-                return True
-        return os.path.exists(os.path.join(model_output_dir, "eval_results.json"))
+
+    phases = ["aggregated_phase", "ranked_phase_1", "ranked_phase_2", "ranked_phase_3"]
+    for phase in phases:
+        p = os.path.join(model_output_dir, f"{phase}_eval", "eval_results.json")
+        if os.path.exists(p):
+            return True
     return os.path.exists(os.path.join(model_output_dir, "eval_results.json"))
 
 def compare_models(model_paths: list[str], 
@@ -639,11 +637,9 @@ def compare_models(model_paths: list[str],
         print(f"\nEvaluating model: {name}")
         model_output_dir = os.path.join(output_dir, name)
         os.makedirs(model_output_dir, exist_ok=True)
-
-        if (not recompute) and _has_existing_eval_outputs(model_output_dir, phased=phased) and secondary is not None:
+        if (not recompute) and _has_existing_eval_outputs(path, phased=phased) and secondary is None:
             print(f"Found existing evaluation outputs in {model_output_dir}; skipping recompute.")
             continue
-
 
         model, normalizer, conditioner = load_model(path, device="cuda" if torch.cuda.is_available() else "cpu")
         sec_model = None
@@ -784,8 +780,8 @@ def compare_models(model_paths: list[str],
     print("="*50)
     
     comparator = PhasedModelComparator(output_dir=output_dir)
-    for name in model_names:
-        comparator.add_model(name, os.path.join(output_dir, name))
+    for name, path in zip(model_names, model_paths):
+        comparator.add_model(name, path)
     
     comparator.compare()
     
@@ -810,17 +806,18 @@ if __name__ == "__main__":
     parser.add_argument("--max-value", type=float, default=200.0, help="Maximum value for filtering windows.")
     args = parser.parse_args()
 
-    args.models = ["/home/s204617/synthcode/rasmus-clara-synthetic-data/models/AutoRegressiveTransformerVAE_20260424_170101", 
-                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/AverageBaselineModel_20260425_192621",
-                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/CVAE_20260424_163736",
-                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/CVAE_20260424_164906_guide",
-                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/CVAE_20260424_173354_guide_cnn",
-                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/CVAE_20260424_174908_hierarcchy",
-                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/CVAE_20260424_180137_vamp",
-                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/DiffusionModel_20260424_171827",
-                   "/home/s204617/synthcode/rasmus-clara-synthetic-data/models/QuantileBaselineModel_20260424_163220",
+    args.models = ["/home/fiehn/Desktop/models/AutoRegressiveTransformerVAE_20260505_114353", 
+                   "/home/fiehn/Desktop/models/AverageBaselineModel_20260505_155153",
+                   "/home/fiehn/Desktop/models/CVAE_20260505_092750",
+                   "/home/fiehn/Desktop/models/CVAE_20260505_103329_guide",
+                   "/home/fiehn/Desktop/models/CVAE_20260505_171240_guide_cnn",
+                   "/home/fiehn/Desktop/models/CVAE_20260505_185825_guide_hier",
+                   "/home/fiehn/Desktop/models/CVAE_20260505_200949_vamp",
+                   "/home/fiehn/Desktop/models/DiffusionModel_20260505_141837",
+                   "/home/fiehn/Desktop/models/QuantileBaselineModel_20260505_163229"
                    ]
-    args.names = ["art", "avg", "cvae", "cvae_guide", "cvae_guide_cnn", "cvae_hierarchical", "cvae_vamp", "diffusion", "quantile"]
+    args.names = ["art", "avg", "cvae", "cvae_guide",
+                  "CVAE_cnn_guide", "CVAE_hierarchical_guide", "CVAE_vamp_guide", "diffusion", "quantile" ]
     args.data_files = ["data/_parquet_cache/test_hourly_subset.parquet"]
     args.split_seed = 42
     if len(args.models) != len(args.names):

@@ -859,7 +859,7 @@ class PhasedReplayDataloaders:
         ):
             self.test_loader = None
             return
-
+    
         meter_id = meter_test.long()
         timestamps = timestamps_test.long()
 
@@ -936,25 +936,12 @@ class PhasedReplayDataloaders:
         x_test, m_test, t_test, a_test = self._collect_stream_cache("test", target_test)
         self._build_test_loader(x_test, m_test, t_test, a_test)
 
-    # def get_test_loader(self):
-    #     return self.test_loader
-
     def get_test_loader(self):
         if self.test_loader is not None:
             return self.test_loader
 
-        if hasattr(self, "test_dataset") and self.test_dataset is not None:
-            from torch.utils.data import DataLoader
+        self.refresh_test_cache(test_batches=1000)  # default to caching 1000 batches for test if not already cached
 
-            self.test_loader = DataLoader(
-                self.test_dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                num_workers=self.num_workers,
-                pin_memory=self.pin_memory,
-            )
-            return self.test_loader
-
-        return None
+        return self.test_loader
 
 

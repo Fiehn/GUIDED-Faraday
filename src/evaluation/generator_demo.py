@@ -1,12 +1,24 @@
 import argparse
 import os
 from types import SimpleNamespace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
+import sys
+from pathlib import Path
+
+# Add project roots for imports
+CURRENT_DIR = Path(__file__).resolve().parent
+SRC_DIR = CURRENT_DIR.parent
+ROOT_DIR = SRC_DIR.parent
+
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from src.evaluation.load_model import load_model
 from src.model.factory import _load_train_config
@@ -26,7 +38,7 @@ def _resolve_config_path(model_path: str) -> str:
     return os.path.join("config", "config.yaml")
 
 
-def _plot_week(series: np.ndarray, seq_len: int, output_path: str, title: str):
+def _plot_week(series: np.ndarray, seq_len: int, output_path: str, title: str, conditions: dict = None):
     style = PlotStyle()
     total_steps, num_features = series.shape
     hours = np.arange(total_steps)
@@ -50,11 +62,34 @@ def _plot_week(series: np.ndarray, seq_len: int, output_path: str, title: str):
     for day in range(1, max(1, total_steps // seq_len)):
         ax.axvline(day * seq_len, color="#dddddd", linestyle="--", linewidth=1)
 
-    ax.set_title(title)
-    ax.set_xlabel("Hour Index")
+    # Set up primary x-axis (Hours of the day)
+    tick_step = max(1, seq_len // 4)
+    ax.set_xticks(np.arange(0, total_steps, tick_step))
+    ax.set_xticklabels([f"{h % seq_len:02d}:00" for h in np.arange(0, total_steps, tick_step)], rotation=45, ha="right")
+    ax.set_xlabel("Hour of Day")
+
+    # Set up secondary x-axis (Day number on top)
+    ax2 = ax.secondary_xaxis("top")
+    day_centers = np.arange(seq_len / 2, total_steps, seq_len)
+    ax2.set_xticks(day_centers)
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    ax2.set_xticklabels([day_names[int(d) % 7] for d in np.arange(len(day_centers))])
+    ax2.tick_params(length=0) 
+
+    ax.set_title(title, pad=30)  # Added padding to make room for the top axis
     ax.set_ylabel("Energy (kWh)")
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper right")
+    
+    handles, labels = ax.get_legend_handles_labels()
+    if conditions:
+        import matplotlib.patches as mpatches
+        handles.append(mpatches.Patch(color='none', label=' '))
+        labels.append('--- Conditions ---')
+        for k, v in conditions.items():
+            handles.append(mpatches.Patch(color='none', label=f'{k}: {v}'))
+            labels.append(f'{k}: {v}')
+            
+    ax.legend(handles, labels, loc="upper right")
     plt.tight_layout()
     plt.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -133,10 +168,13 @@ def main():
     data_mode = str(getattr(data_cfg, "mode", "csv")).lower()
 
     # --- Week generation ---
-    start_date = datetime.strptime(args.start_date, "%Y-%m-%d") if args.start_date else datetime.utcnow()
+    start_date = datetime.strptime(args.start_date, "%Y-%m-%d") if args.start_date else datetime.now(timezone.utc)
+    # Ensure generation starts on a Monday
+    start_date -= timedelta(days=start_date.weekday())
+    
     if args.meter_id is None:
         print("Warning: meter_id not provided; week generation will use random conditions.")
-        week_samples, _ = generator.generate_continous(
+        week_samples, used_conditions = generator.generate_continous(
             num_days=args.days,
             meter_id=0,
             start_date=start_date,
@@ -144,7 +182,7 @@ def main():
             temperature=args.temperature,
         )
     else:
-        week_samples, _ = generator.generate_continous(
+        week_samples, used_conditions = generator.generate_continous(
             num_days=args.days,
             meter_id=args.meter_id,
             start_date=start_date,
@@ -156,14 +194,47 @@ def main():
     if week_series.ndim == 1:
         week_series = week_series[:, None]
 
+    conditions_dict = {}
+    if conditioner is not None and hasattr(conditioner, "get_condition_tags"):
+        tags = conditioner.get_condition_tags()
+        if used_conditions is not None:
+            # Parse the conditions from the first generated day
+            first_cond = used_conditions[0].flatten().detach().cpu().numpy() if used_conditions.ndim > 1 else used_conditions.flatten().detach().cpu().numpy()
+            for tag in tags:
+                try:
+                    start, end = conditioner.get_condition_indexes(tag)
+                    val = first_cond[start:end]
+                    
+                    # Formatting based on tag types
+                    if tag in ["days", "day_of_week"]:
+                        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                        conditions_dict[tag] = day_names[int(np.argmax(val))]
+                    elif tag in ["months", "month_of_year"]:
+                        month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                        conditions_dict[tag] = month_names[int(np.argmax(val))]
+                    elif "user" in tag.lower() or "lda" in tag.lower():
+                        conditions_dict[tag] = f"Dom. Topic {np.argmax(val)}"
+                    elif len(val) == 1: # Binary/Scalar conditions
+                        conditions_dict[tag] = f"{val[0]:.2f}"
+                    else: # One-hot conditions (EV phase, HP phase, active phases, etc.)
+                        conditions_dict[tag] = f"Class {np.argmax(val)}"
+                except Exception:
+                    conditions_dict[tag] = "Active"
+        else:
+            for tag in tags:
+                conditions_dict[tag] = "Active"
+    else:
+        conditions_dict["Model"] = "Unconditioned"
+
     week_path = os.path.join(args.output_dir, "week_generation.png")
     _plot_week(
         week_series,
         seq_len=seq_len,
         output_path=week_path,
         title=f"Week Generation ({args.days} days)",
+        conditions=conditions_dict,
     )
-
+    
     # --- Reconstruction with EV toggle ---
     if conditioner is None or not hasattr(conditioner, "get_condition_tags"):
         raise RuntimeError("Model has no conditioner; EV-conditioned reconstruction is not available.")

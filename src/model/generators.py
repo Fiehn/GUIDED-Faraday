@@ -550,10 +550,27 @@ class SyntheticGenerator:
 
         all_windows = []
         prev_window = None
+        used_conds = []
+        base_conditions = None
 
         for day_idx in range(num_days):
             day_start = start_date + timedelta(days=day_idx)
             current_conditions = self._build_conditions(meter_id=meter_id, timestamp=day_start) if conditions is None else conditions
+            
+            if day_idx == 0:
+                base_conditions = current_conditions
+            
+            # Keep non-temporal conditions stable across all days
+            if self.conditioner is not None and base_conditions is not None and conditions is None:
+                stable_conditions = base_conditions.clone()
+                temporal_tags = ["days", "day_of_week", "months", "month_of_year", "holidays"]
+                for tag in temporal_tags:
+                    if tag in self.conditioner.get_condition_tags():
+                        start, end = self.conditioner.get_condition_indexes(tag)
+                        stable_conditions[:, start:end] = current_conditions[:, start:end]
+                current_conditions = stable_conditions
+
+            used_conds.append(current_conditions)
             
             if prev_window is None or num_candidates <= 1:
                 # Use generate() to get a single safe window
@@ -587,8 +604,10 @@ class SyntheticGenerator:
         output = torch.cat(all_windows, dim=0)  # [num_days * 24, F]
         if self.normalizer is not None:
             output = self.normalizer.inverse_transform(output)
+            
+        all_used_conditions = torch.cat(used_conds, dim=0) if used_conds else None
         
-        return output, conditions
+        return output, all_used_conditions
 
     def _sample_window(self, conditions: torch.Tensor) -> torch.Tensor:
         samples = self.model.sample(
