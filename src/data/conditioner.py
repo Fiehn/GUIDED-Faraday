@@ -1192,7 +1192,7 @@ class ElectricVehicleConditioner(BaseConditioner):
     Reads EV detector output from CSV (default: data/EV_detection_6000_SM.csv)
     and maps base meter ids to an EV phase class.
     """
-    def __init__(self, topology_path='data/EV_detection_6000_SM.csv'):
+    def __init__(self, topology_path='data/EV/EV_detection_reduced_60000_SM.csv'):
         self.condition_dim = 4
         self._meter_ids_cpu, self._phase_class_cpu = self._load_topology_df(topology_path)
         self._lookup_by_device = {}
