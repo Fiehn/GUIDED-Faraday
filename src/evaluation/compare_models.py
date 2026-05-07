@@ -3,7 +3,6 @@
 import os
 import sys
 import torch
-import random
 import json
 import numpy as np
 from pathlib import Path
@@ -806,19 +805,24 @@ if __name__ == "__main__":
     parser.add_argument("--max-value", type=float, default=200.0, help="Maximum value for filtering windows.")
     args = parser.parse_args()
 
-    args.models = ["/home/fiehn/Desktop/models/AutoRegressiveTransformerVAE_20260505_114353", 
-                   "/home/fiehn/Desktop/models/AverageBaselineModel_20260505_155153",
+    args.models = ["models/CVAE_20260430_145213"
+    ]
+    john= ["",
+        "/home/fiehn/Desktop/models/AutoRegressiveTransformerVAE_20260505_114353", 
                    "/home/fiehn/Desktop/models/CVAE_20260505_092750",
                    "/home/fiehn/Desktop/models/CVAE_20260505_103329_guide",
                    "/home/fiehn/Desktop/models/CVAE_20260505_171240_guide_cnn",
                    "/home/fiehn/Desktop/models/CVAE_20260505_185825_guide_hier",
                    "/home/fiehn/Desktop/models/CVAE_20260505_200949_vamp",
                    "/home/fiehn/Desktop/models/DiffusionModel_20260505_141837",
-                   "/home/fiehn/Desktop/models/QuantileBaselineModel_20260505_163229"
+                   "/home/fiehn/Desktop/models/QuantileBaselineModel_20260505_163229",
+                   "/home/fiehn/Desktop/models/AverageBaselineModel_20260505_155153"
                    ]
-    args.names = ["art", "avg", "cvae", "cvae_guide",
-                  "CVAE_cnn_guide", "CVAE_hierarchical_guide", "CVAE_vamp_guide", "diffusion", "quantile" ]
-    args.data_files = ["data/_parquet_cache/test_hourly_subset.parquet"]
+    
+    args.names = ["test1"]
+    john2 = ["","art", "cvae", "cvae_guide",
+                  "CVAE_cnn_guide", "CVAE_hierarchical_guide", "CVAE_vamp_guide", "diffusion", "baseline_quantile", "baseline_average" ]
+    
     args.split_seed = 42
     if len(args.models) != len(args.names):
         raise ValueError("--models and --names must have the same length.")
