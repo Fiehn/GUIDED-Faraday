@@ -62,6 +62,7 @@ class Visualizer:
             return x if x.shape[2] >= x.shape[3] else x.transpose(2, 3)
 
         return x
+
     def _unpack_batch(self, batch):
         """Strict unpack contract: (x, meter_id, timestamps, agg)."""
         if not isinstance(batch, (list, tuple)) or len(batch) != 4:
@@ -221,6 +222,12 @@ class Visualizer:
             print(f"Error visualizing latent space: {e}")
         
         self.visualize_synthetic_recreations(test_loader=test_loader, num_originals=num_originals, num_synthetic_per=num_synthetic_per)
+        
+        try:
+            print("Visualizing 5 real and 5 synthetic profiles with means.")
+            self.visualize_5synth_5real_and_mean(test_loader=test_loader)
+        except Exception as e:
+            print(f"Error visualizing 5 real and 5 synthetic profiles: {e}")
         
         try:
             print("Visualizing user profiles.")
@@ -698,6 +705,204 @@ class Visualizer:
             save_path = os.path.join(target_dir, f"synthetic_recreations_{view_name}.pdf")
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             plt.close(fig)
+
+
+    def visualize_5synth_5real_and_mean(self, test_loader, num_samples: int = 5):
+        """
+        Pick five real data test samples, generate five synthetic samples with the same conditions,
+        and create a single figure with three subplots:
+        (1) All 5 real profiles overlaid on top of each other
+        (2) All 5 synthetic profiles overlaid on top of each other
+        (3) Mean of 5 real and mean of 5 synthetic overlaid
+        
+        Args:
+            test_loader: The test data loader.
+        """
+        if not hasattr(self.model, 'conditioner'):
+            print("Model does not have a conditioner, skipping visualization.")
+            return
+        if "day_of_week" not in self.model.conditioner.get_condition_tags():
+            print("Model conditioner does not include 'day_of_week', skipping visualization.")
+            return
+        
+        # Collect 5 real test samples
+        x, meter_id, timestamps = self._collect_nonzero_samples(
+            test_loader,
+            min_samples=num_samples,
+            max_batches=100,
+        )
+        
+        x_tf = self._to_time_feature(x)
+        num_samples = min(num_samples, x_tf.shape[0])
+        x_selected_tf = x_tf[:num_samples]
+        x_selected_denorm = self._safe_inverse_transform(x_selected_tf)
+        meter_id_selected = meter_id[:num_samples]
+        timestamps_selected = timestamps[:num_samples]
+        
+        # Generate synthetic samples with same conditions (1 per real sample)
+        condition_labels = []
+        synthetic_per_original = []
+        for i in range(num_samples):
+            ts = timestamps_selected[i].cpu().item()
+            dt = pd.Timestamp(ts, unit='s')
+            day_name = self.plot_style.get_day_names(short=False)[dt.dayofweek]
+            date_str = dt.strftime("%Y-%m-%d")
+            m_id = meter_id_selected[i].item()
+            
+            synthetic_samples_i, _ = self.generator.generate(1, meter_id=m_id, date=dt)
+            synthetic_samples_i = self._to_time_feature(synthetic_samples_i)
+            synthetic_per_original.append(synthetic_samples_i)
+            condition_labels.append(f"Meter {m_id} | {day_name} ({date_str})")
+        
+        # Stack to [5, L, F]
+        synthetic_samples = torch.cat(synthetic_per_original, dim=0)
+        
+        L = x_selected_denorm.shape[1]
+        F = x_selected_denorm.shape[2] if x_selected_denorm.dim() == 3 else 1
+        
+        hours = np.arange(L)
+        
+        # Calculate means
+        mean_real = x_selected_denorm.mean(dim=0)  # [L, F]
+        mean_synthetic = synthetic_samples.mean(dim=0)  # [L, F]
+        
+        # Create view_specs for different feature views
+        view_specs = []
+        if F > 1:
+            ranked_real = self._rank_features_by_total(x_selected_denorm)
+            ranked_synth = self._rank_features_by_total(synthetic_samples)
+            ranked_mean_real = self._rank_features_by_total(mean_real.unsqueeze(0))
+            ranked_mean_synth = self._rank_features_by_total(mean_synthetic.unsqueeze(0))
+            
+            view_specs.append((
+                "aggregated",
+                x_selected_denorm.sum(dim=-1, keepdim=True),
+                synthetic_samples.sum(dim=-1, keepdim=True),
+                mean_real.sum(dim=-1, keepdim=True),
+                mean_synthetic.sum(dim=-1, keepdim=True),
+                "Aggregated 3-Phase",
+            ))
+            for phase_idx in range(F):
+                phase_no = phase_idx + 1
+                view_specs.append((
+                    f"ranked_phase_{phase_no}",
+                    ranked_real[..., phase_idx:phase_idx+1],
+                    ranked_synth[..., phase_idx:phase_idx+1],
+                    ranked_mean_real[0, ..., phase_idx:phase_idx+1],
+                    ranked_mean_synth[0, ..., phase_idx:phase_idx+1],
+                    f"Ranked Phase {phase_no}",
+                ))
+        else:
+            view_specs.append((
+                "single_phase",
+                x_selected_denorm,
+                synthetic_samples,
+                mean_real,
+                mean_synthetic,
+                "Single Phase"
+            ))
+        
+        for view_name, real_view, synth_view, mean_real_view, mean_synth_view, view_label in view_specs:
+            # Create single figure with 3 subplots
+            fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharex=True)
+            
+            # Subplot 1: All 5 real profiles overlaid
+            ax1 = axes[0]
+            for i in range(num_samples):
+                real_data = self._feature_series(real_view[i], 0)
+                ax1.plot(
+                    hours, real_data,
+                    color=self.plot_style.get_color(i),
+                    linewidth=self.plot_style.linewidth,
+                    label=f"Real {i+1}",
+                    marker=self.plot_style.marker,
+                    markersize=4,
+                    alpha=0.7
+                )
+            ax1.set_title(f"5 Real Profiles ({view_label})", fontsize=12, fontweight='bold')
+            ax1.set_xlabel("Hour", fontsize=10)
+            ax1.set_ylabel("Energy (kWh)", fontsize=10)
+            ax1.legend(loc='upper right', fontsize=8)
+            ax1.grid(True, alpha=0.3)
+            ax1.set_xlim(0, L - 1)
+            
+            # Subplot 2: All 5 synthetic profiles overlaid
+            ax2 = axes[1]
+            for i in range(num_samples):
+                synth_data = self._feature_series(synth_view[i], 0)
+                ax2.plot(
+                    hours, synth_data,
+                    color=self.plot_style.get_color(i),
+                    linewidth=self.plot_style.linewidth,
+                    label=f"Synth {i+1}",
+                    marker=self.plot_style.marker,
+                    markersize=4,
+                    alpha=0.7
+                )
+            ax2.set_title(f"5 Synthetic Profiles ({view_label})", fontsize=12, fontweight='bold')
+            ax2.set_xlabel("Hour", fontsize=10)
+            ax2.set_ylabel("Energy (kWh)", fontsize=10)
+            ax2.legend(loc='upper right', fontsize=8)
+            ax2.grid(True, alpha=0.3)
+            ax2.set_xlim(0, L - 1)
+            
+            # Subplot 3: Mean comparison
+            ax3 = axes[2]
+            mean_real_data = self._feature_series(mean_real_view, 0)
+            mean_synth_data = self._feature_series(mean_synth_view, 0)
+            
+            ax3.plot(
+                hours, mean_real_data,
+                color=self.plot_style.get_color_original(),
+                linewidth=self.plot_style.linewidth,
+                label='Mean Real',
+                marker=self.plot_style.marker,
+                markersize=5,
+                alpha=1.0
+            )
+            ax3.plot(
+                hours, mean_synth_data,
+                color=self.plot_style.get_color(0),
+                linewidth=self.plot_style.linewidth,
+                linestyle='--',
+                label='Mean Synthetic',
+                marker='s',
+                markersize=5,
+                alpha=0.8
+            )
+            
+            ax3.set_title(
+                f"Mean Comparison ({view_label})",
+                fontsize=12,
+                fontweight='bold'
+            )
+            ax3.set_xlabel("Hour", fontsize=10)
+            ax3.set_ylabel("Energy (kWh)", fontsize=10)
+            ax3.legend(loc='upper right', fontsize=9)
+            ax3.grid(True, alpha=0.3)
+            ax3.set_xlim(0, L - 1)
+            
+            # Overall title and layout
+            fig.suptitle(
+                f"5 Real vs 5 Synthetic Profiles ({view_label})",
+                fontsize=14,
+                fontweight='bold',
+                y=1.00
+            )
+            plt.tight_layout()
+            
+            if view_name == "aggregated":
+                target_dir = os.path.join(self.log_dir, "aggregated_phase_eval")
+            elif view_name.startswith("ranked_phase_"):
+                target_dir = os.path.join(self.log_dir, f"{view_name}_eval")
+            else:
+                target_dir = self.log_dir
+            os.makedirs(target_dir, exist_ok=True)
+            
+            save_path = os.path.join(target_dir, f"5real_5synth_comparison_{view_name}.pdf")
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
 
     def visualize_user_dict(self):
         """Plot the cached user profiles in the UserProfiler conditioner."""
