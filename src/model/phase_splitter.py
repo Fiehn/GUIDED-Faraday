@@ -77,7 +77,7 @@ class HierarchicalSplitter(BaseModel):
         self.train()
 
         # 1. Unpack Real Data
-        x_raw, meter_id, timestamps, provided_conditions = self._unpack_batch(batch)
+        x_raw, meter_id, timestamps, agg = self._unpack_batch(batch)
         x_true_phases = self._to_phase_first(x_raw).float() # [B, 3, 24]
         
         # 2. Create the Aggregated Input from the real data
@@ -85,11 +85,11 @@ class HierarchicalSplitter(BaseModel):
 
         # 3. Get Conditions
         if (
-            torch.is_tensor(provided_conditions)
-            and provided_conditions.dim() == 2
-            and provided_conditions.shape[-1] == self.condition_dim
+            torch.is_tensor(agg)
+            and agg.dim() == 2
+            and agg.shape[-1] == self.condition_dim
         ):
-            c = self.move_to_device(provided_conditions, device=x_raw.device).float()
+            c = self.move_to_device(agg, device=x_raw.device).float()
             if c.dim() == 1:
                 c = c.unsqueeze(0)
         else:
@@ -124,22 +124,12 @@ class HierarchicalSplitter(BaseModel):
         device = next(self.parameters()).device
         for batch in valloader:
             batch = self.move_to_device(batch, device)
-            x_raw, meter_id, timestamps, provided_conditions = self._unpack_batch(batch)
+            x_raw, meter_id, timestamps, x_agg = self._unpack_batch(batch)
             x_true_phases = self._to_phase_first(x_raw).float()
-            x_agg = x_true_phases.sum(dim=1, keepdim=True)
 
-            if (
-                torch.is_tensor(provided_conditions)
-                and provided_conditions.dim() == 2
-                and provided_conditions.shape[-1] == self.condition_dim
-            ):
-                c = self.move_to_device(provided_conditions, device=device).float()
-                if c.dim() == 1:
-                    c = c.unsqueeze(0)
-            else:
-                x_for_cond = self._build_condition_input(x_true_phases)
-                c = self.conditioner.get_conditions(x_for_cond, meter_id=meter_id, timestamps=timestamps)
-                c = self.move_to_device(c, device=device).float()
+            x_for_cond = self._build_condition_input(x_true_phases)
+            c = self.conditioner.get_conditions(x_for_cond, meter_id=meter_id, timestamps=timestamps)
+            c = self.move_to_device(c, device=device).float()
 
             proportions = self.model(x_agg, c)
             x_pred_phases = proportions * x_agg
@@ -186,16 +176,15 @@ class HierarchicalSplitter(BaseModel):
                 break
 
             batch = self.move_to_device(batch, device)
-            x_raw, meter_id, timestamps, provided_conditions = self._unpack_batch(batch)
+            x_raw, meter_id, timestamps, x_agg = self._unpack_batch(batch)
             x_true = self._to_phase_first(x_raw).float()  # [B, 3, L]
-            x_agg = x_true.sum(dim=1, keepdim=True)
 
             if (
-                torch.is_tensor(provided_conditions)
-                and provided_conditions.dim() == 2
-                and provided_conditions.shape[-1] == self.condition_dim
+                torch.is_tensor(agg)
+                and agg.dim() == 2
+                and agg.shape[-1] == self.condition_dim
             ):
-                c = self.move_to_device(provided_conditions, device=device).float()
+                c = self.move_to_device(agg, device=device).float()
                 if c.dim() == 1:
                     c = c.unsqueeze(0)
             else:

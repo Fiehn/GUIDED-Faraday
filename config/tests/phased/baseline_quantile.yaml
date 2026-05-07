@@ -16,7 +16,7 @@ data:
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
   # data_dir: "./data/raw_profiles"
-  #data_dir: "F:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+  data_dir: "E:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
   #data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
   data_dir: "data/raw_profiles_6000"
@@ -50,10 +50,10 @@ data:
     stride: 24     # Non-overlapping windows (one per day)
   
   # DataLoader settings
-  batch_size: 256
+  batch_size: 512
   shuffle: true
   replay_buffer_capacity: 10000
-  min_buffer_size: 0
+  min_buffer_size: 4000
   num_workers: 0
   steps_per_epoch: 500
   eval_batches: 5
@@ -157,7 +157,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "user_profile", "holiday", "heatpump_phase", "ev_phase"]
+  tags: ["day_of_week", "month_of_year", "user_profile", "heatpump_phase", "ev_phase"]
   # ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  
   
   # User profiling (based on LDA)
@@ -216,7 +216,7 @@ training:
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 40
+  num_epochs: 100
   
   # Beta (KL weight) settings
   beta: 1.0 # 1.0

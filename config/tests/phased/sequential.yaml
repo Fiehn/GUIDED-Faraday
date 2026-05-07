@@ -16,7 +16,7 @@ data:
   mode: "phased"
 
   # Directory with raw 3-phase profiles
-  data_dir: "data/raw_profiles"
+  data_dir: "E:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
 
   # CSV filename to load (leave empty for phased mode)
   data_files: []
@@ -46,10 +46,10 @@ data:
     stride: 24        # Non-overlapping windows (one per day)
   
   # DataLoader settings
-  batch_size: 256
+  batch_size: 512
   shuffle: true
   replay_buffer_capacity: 10000
-  min_buffer_size: 0
+  min_buffer_size: 4000
   num_workers: 0
   steps_per_epoch: 500
   eval_batches: 5
@@ -81,21 +81,21 @@ normalization:
 # ============================================================================
 model:
   # Model type: "sequential_phase_vae"
-  type: "sequential_phase_vae"
+  type: "sequential_vae"
   
   # Latent dimension (per phase model)
-  latent_dim: 64
+  latent_dim: 128
 
   # Encoder configuration (used for each phase independently)
   encoder:
     type: "dictionary"
-    hidden_dims: [256, 512, 1024, 256, 128]
+    hidden_dims: [256, 512, 256, 128]
     dropout: 0.2
   
   # Decoder configuration (used for each phase independently)
   decoder:
     type: "dictionary"
-    hidden_dims: [128, 256, 512, 1024]
+    hidden_dims: [128, 256, 512, 256]
     dropout: 0.2
   
   # Prior configuration
@@ -111,7 +111,7 @@ model:
 # ============================================================================
 conditioning:
   # Active condition tags for all three phases
-  tags: ["day_of_week", "month_of_year", "user_profile", "holiday", "heatpump_phase"]
+  tags: ["day_of_week", "month_of_year", "user_profile", "heatpump_phase", "ev_phase"]
   
   # User profiling (LDA-based)
   user_profile:
@@ -174,7 +174,7 @@ training:
     gamma: 0.95
   
   # Number of training epochs
-  num_epochs: 2
+  num_epochs: 100
   
   # Beta (KL weight) settings
   beta: 1.0
@@ -190,7 +190,7 @@ training:
   
   # Early stopping
   early_stopping:
-    enabled: true
+    enabled: false
     stop_on_all_files_used: false
     min_epochs_before_full_data_stop: 1
     patience: 20
