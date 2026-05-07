@@ -226,7 +226,13 @@ class StreamingParquetBuffer(IterableDataset):
                 cols_to_load.append(matched_col)
                 rename_map[matched_col] = base_feat
 
-        time_col_name = next((col for col in file_cols if col.lower() in self.time_col_candidates), None)
+        time_col_name = None
+        lower_cols = [c.lower() for c in file_cols]
+        for candidate in self.time_col_candidates:
+            if candidate in lower_cols:
+                time_col_name = next(c for c in file_cols if c.lower() == candidate)
+                break
+
         if time_col_name is not None and time_col_name not in cols_to_load:
             cols_to_load.append(time_col_name)
 
