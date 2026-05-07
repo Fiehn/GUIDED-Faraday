@@ -28,19 +28,42 @@ class PeakAnalysis(SyntheticMetric):
             if not output_dir:
                 return
             
+            # Record total available windows (number of rows) before truncation
+            def _n_windows(arr):
+                if arr is None:
+                    return 0
+                a = np.asarray(arr)
+                if a.ndim == 0:
+                    return 1
+                return int(a.shape[0])
+
+            n_real_total = _n_windows(self.real_data)
+            n_synth_total = _n_windows(self.synthetic_data)
+
             if len(self.sorted_real_data) != len(self.sorted_synthetic_data):
                 min_len = min(len(self.sorted_real_data), len(self.sorted_synthetic_data))
                 self.sorted_real_data = self.sorted_real_data[:min_len]
                 self.sorted_synthetic_data = self.sorted_synthetic_data[:min_len]
+
+            # Number of windows used for the plotted curves (after truncation)
+            n_used = min(n_real_total, n_synth_total)
             
             # Create the x-axis values (percentage of 24h)
             x = np.linspace(0, 100, len(self.sorted_real_data))
             
-            # Plotting the load duration curve
+            # Plotting the duration curve
             fig, ax = plt.subplots(figsize=(12, 4))
             ax.plot(x, self.sorted_real_data, label='Real Data', color='blue', linewidth=2)
             ax.plot(x, self.sorted_synthetic_data, label='Synthetic Data', color='orange', linewidth=2)
-            ax.set_title('Load Duration Curve (Sorted)', fontsize=14, fontweight='bold')
+            # Compute RMSE between the two sorted curves
+            try:
+                # use the same metric as reported by compute()
+                distance = self._EMD1()
+            except Exception:
+                distance = float(np.sqrt(np.mean((self.sorted_real_data - self.sorted_synthetic_data) ** 2)))
+
+            title = f"Duration Curve — RMSE={distance:.3f} kWh (n_real={n_used}, n_synth={n_used})"
+            ax.set_title(title, fontsize=14, fontweight='bold')
             ax.set_xlabel('Percentage of 24h (%)', fontsize=12, fontweight='bold')
             ax.set_ylabel('Load (kWh)', fontsize=12, fontweight='bold')
             ax.legend(fontsize=11)
@@ -48,7 +71,7 @@ class PeakAnalysis(SyntheticMetric):
             
             plt.tight_layout()
             os.makedirs(output_dir, exist_ok=True)
-            plot_path = os.path.join(output_dir, 'load_duration_curve.pdf')
+            plot_path = os.path.join(output_dir, 'duration_curve.pdf')
             plt.savefig(plot_path, dpi=150, bbox_inches='tight', format='pdf')
             plt.close(fig)
         except Exception as e:
@@ -56,16 +79,15 @@ class PeakAnalysis(SyntheticMetric):
             traceback.print_exc()
         
     def _EMD1(self):
-        """ Will evaluate the magnitude difference of the peaks between the real and synthetic data.
-        Compute the Earth Mover's Distance (EMD) between the sorted real and synthetic data.
-        This is equivilant to Wasserstein 1 distance.
-        
-        PeakMagEMD = 1/N ∑ |P_real(i)↑​ - P_syn(i)↑|
-        We calculate it by sorting the real and synthetic peaks in descending order and then computing the average absolute difference between the corresponding values.
-        However, when we take the average we loose the information of which directions the peaks are wrong.
+        """Return RMSE between the sorted real and synthetic curves.
+
+        Although historically this computed the mean absolute difference (EMD-like),
+        we now report root-mean-square error between the sorted curves as the
+        primary magnitude distance.
         """
-        emd = np.mean(np.abs(self.sorted_real_data - self.sorted_synthetic_data))
-        return emd
+        diff = self.sorted_real_data - self.sorted_synthetic_data
+        rmse = float(np.sqrt(np.mean(np.square(diff))))
+        return rmse
 
     def timing_analysis(self):
         """ Will evaluate the timing difference of the peaks between the real and synthetic data.
