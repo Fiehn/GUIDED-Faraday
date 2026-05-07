@@ -13,7 +13,6 @@ if str(ROOT_DIR) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from src.data.conditioner import Conditioner
 
 class SyntheticGenerator:
     """Called to generate synthetic samples from a trained model.

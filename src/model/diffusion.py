@@ -1,15 +1,9 @@
 import math
-import os
-from datetime import datetime
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from visualization.writer import Writer
-import json
 from model.model_utils import *
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 from model.model import BaseModel
 

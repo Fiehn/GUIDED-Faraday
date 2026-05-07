@@ -25,7 +25,7 @@ from src.model.factory import _load_train_config
 from src.model.generators import SyntheticGenerator
 from src.visualization.plot_styling import PlotStyle
 from src.data.dataloader_phased import StreamingParquetBuffer, WindowSpec
-from src.data.dataloader import load_csv_and_cache_as_parquet
+from data.usable.dataloader_caching import load_csv_and_cache_as_parquet
 
 
 def _resolve_config_path(model_path: str) -> str:
