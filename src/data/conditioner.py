@@ -753,19 +753,35 @@ class DayOfWeekConditioner(BaseConditioner):
             torch.Tensor: One-hot encoded days of shape `(batch_size, 7)`. Respects 
                 input tensor device if applicable.
         """
-        # Handle both tensor of floats and list of pandas Timestamps
+        if timestamps is None:
+            return None
+
+        # Exact calendar day-of-week extraction in UTC.
+        # The arithmetic shortcut is fast but can silently break if timestamp units change.
         if isinstance(timestamps, torch.Tensor):
             device = timestamps.device
-            # Convert Unix timestamps back to pandas Timestamps
-            days_of_week = ((timestamps / 86400 + 4) % 7).long()  # 1970-01-01 was a Thursday
+            ts_cpu = timestamps.detach().to("cpu")
+            if ts_cpu.is_floating_point():
+                ts_cpu = torch.floor(ts_cpu)
+            ts_cpu = ts_cpu.to(dtype=torch.long).numpy()
+            dt = pd.to_datetime(ts_cpu, unit="s", utc=True, errors="coerce")
+            dow = dt.dayofweek.astype("Int64").to_numpy()
+            valid = ~pd.isna(dow)
+            days_of_week = torch.from_numpy(dow[valid].astype(np.int64)).to(dtype=torch.long)
+            if days_of_week.numel() != len(ts_cpu):
+                # Pad invalid conversions with Monday (0) to keep shape consistent.
+                padded = torch.zeros((len(ts_cpu),), dtype=torch.long)
+                if valid.any():
+                    padded[torch.from_numpy(np.nonzero(valid)[0]).long()] = days_of_week
+                days_of_week = padded
         else:
-            days_of_week = []
+            days_list = []
             for ts in timestamps:
-                if isinstance(ts, (int, float)):
-                    ts = pd.Timestamp(ts, unit='s')
-                days_of_week.append(ts.dayofweek)  # 0=Monday, 6=Sunday
-            days_of_week = torch.tensor(days_of_week, dtype=torch.long)
-            device = 'cpu'
+                if isinstance(ts, (int, float, np.integer, np.floating)):
+                    ts = pd.Timestamp(ts, unit="s", tz="UTC")
+                days_list.append(ts.dayofweek)  # 0=Monday, 6=Sunday
+            days_of_week = torch.tensor(days_list, dtype=torch.long)
+            device = "cpu"
         
         dow_onehot = F.one_hot(days_of_week, num_classes=7).float().to(device)
         return dow_onehot
@@ -808,18 +824,36 @@ class MonthOfYearConditioner(BaseConditioner):
         Returns:
             torch.Tensor: One-hot encoded months of shape `(batch_size, 12)`.
         """
+        if timestamps is None:
+            return None
+
+        # Exact calendar month extraction. We accept CPU datetime conversion here
+        # because month boundaries cannot be computed correctly with a fixed-day approximation.
         if isinstance(timestamps, torch.Tensor):
             device = timestamps.device
-            # Convert Unix timestamps to months (0-11)
-            months = ((timestamps / 86400 / 30 + 1) % 12).long()  # Approximate month calculation
+            ts_cpu = timestamps.detach().to("cpu")
+            if ts_cpu.is_floating_point():
+                ts_cpu = torch.floor(ts_cpu)
+            ts_cpu = ts_cpu.to(dtype=torch.long).numpy()
+            dt = pd.to_datetime(ts_cpu, unit="s", utc=True, errors="coerce")
+            month_idx = (dt.month.astype("Int64") - 1).to_numpy()
+            valid = ~pd.isna(month_idx)
+            months = torch.from_numpy(month_idx[valid].astype(np.int64)).to(dtype=torch.long)
+            if months.numel() != len(ts_cpu):
+                # If any timestamps failed conversion, pad with 0 (Jan) to keep shape consistent.
+                padded = torch.zeros((len(ts_cpu),), dtype=torch.long)
+                if valid.any():
+                    padded[torch.from_numpy(np.nonzero(valid)[0]).long()] = months
+                months = padded
         else:
-            months = []
+            months_list = []
             for ts in timestamps:
-                if isinstance(ts, (int, float)):
-                    ts = pd.Timestamp(ts, unit='s')
-                months.append(ts.month - 1)  # pandas month is 1-12, we want 0-11
-            months = torch.tensor(months, dtype=torch.long)
-            device = 'cpu'
+                if isinstance(ts, (int, float, np.integer, np.floating)):
+                    ts = pd.Timestamp(ts, unit="s", tz="UTC")
+                if isinstance(ts, pd.Timestamp):
+                    months_list.append(ts.month - 1)  # pandas month is 1-12, we want 0-11
+            months = torch.tensor(months_list, dtype=torch.long)
+            device = "cpu"
         
         moy_onehot = F.one_hot(months, num_classes=12).float().to(device)
         return moy_onehot

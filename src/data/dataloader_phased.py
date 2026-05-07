@@ -49,6 +49,7 @@ class StreamingParquetBuffer(IterableDataset):
                  split: str | None = None,
                  split_ratios: dict | None = None,
                  max_value: float | None = None,
+                 max_hour_value: float | None = 20.0,
                  ):
         self.sm_files = sm_files
         self.replay_buffer_capacity = replay_buffer_capacity
@@ -57,6 +58,7 @@ class StreamingParquetBuffer(IterableDataset):
         self.split = None if split is None else str(split).lower()
         self.split_ratios = split_ratios or {}
         self.max_value = float(max_value) if max_value is not None else None
+        self.max_hour_value = float(max_hour_value) if max_hour_value is not None else None
 
         # The buffer exists per worker
         # if capacity is 500 and num_workers is 4, then the total effective buffer capacity is 2000
@@ -226,7 +228,13 @@ class StreamingParquetBuffer(IterableDataset):
                 cols_to_load.append(matched_col)
                 rename_map[matched_col] = base_feat
 
-        time_col_name = next((col for col in file_cols if col.lower() in self.time_col_candidates), None)
+        time_col_name = None
+        lower_cols = [c.lower() for c in file_cols]
+        for candidate in self.time_col_candidates:
+            if candidate in lower_cols:
+                time_col_name = next(c for c in file_cols if c.lower() == candidate)
+                break
+
         if time_col_name is not None and time_col_name not in cols_to_load:
             cols_to_load.append(time_col_name)
 
@@ -256,7 +264,6 @@ class StreamingParquetBuffer(IterableDataset):
         prepared = prepared[~prepared["_timestamp"].isna()]
 
         if meter_col_name is None or meter_col_name not in prepared.columns:
-            print(prepared.columns)
             raise ValueError(
                 f"Unphased mode requires meter column '{self.meter_col}' in parquet data."
             )
@@ -365,6 +372,17 @@ class StreamingParquetBuffer(IterableDataset):
                         continue
                     if self.max_value is not None and seq.abs().sum() > self.max_value:
                         continue
+                    # Drop entire window if any single hour (summed across features/phases)
+                    # exceeds the per-hour threshold.
+                    if self.max_hour_value is not None:
+                        # seq shape: [L, F] -> sum across F to get per-hour total
+                        try:
+                            hourly = seq.abs().sum(dim=1)
+                            if hourly.max().item() > float(self.max_hour_value):
+                                continue
+                        except Exception:
+                            # If tensor ops fail for any reason, skip this window conservatively.
+                            continue
                     if seq.abs().sum() == 0:
                         continue
                     # Apply normalization if normalizer is provided
@@ -441,10 +459,6 @@ class StreamingParquetBuffer(IterableDataset):
             timestamps = (raw_values // divisor).astype(np.int64)
         except Exception as e:
             import sys
-            print(f"[ERROR] Failed to extract timestamps from meter {meter_id}: {e}", file=sys.stderr)
-            print(f"[DEBUG] Index type: {type(phase_df.index).__name__}", file=sys.stderr)
-            print(f"[DEBUG] Index dtype: {phase_df.index.dtype if hasattr(phase_df.index, 'dtype') else 'N/A'}", file=sys.stderr)
-            print(f"[DEBUG] First few index values: {phase_df.index[:5]}", file=sys.stderr)
             raise
         
         values = phase_df.astype(np.float32).to_numpy()
@@ -531,7 +545,8 @@ class PhasedReplayDataloaders:
             feature_cols: list[str] | None = None,
             split_seed: int | None = None,
             split_ratios: dict | None = None,
-            max_value: float | None = None,
+                max_value: float | None = None,
+                max_hour_value: float | None = 20.0,
     ):
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
@@ -544,6 +559,7 @@ class PhasedReplayDataloaders:
         self.phased_mode = bool(phased_mode)
         self.split_seed = None if split_seed is None else int(split_seed)
         self.split_ratios = split_ratios or {}
+        self.max_hour_value = float(max_hour_value) if max_hour_value is not None else None
 
         sm_files = list(sm_files)
         self.total_files = len(set(sm_files))
@@ -581,6 +597,7 @@ class PhasedReplayDataloaders:
             split="train",
             split_ratios=self.split_ratios,
             max_value=max_value,
+            max_hour_value=self.max_hour_value,
         )
 
         self.eval_loader = None
@@ -617,6 +634,7 @@ class PhasedReplayDataloaders:
             split="val",
             split_ratios=self.split_ratios,
             max_value=max_value,
+            max_hour_value=self.max_hour_value,
         )
 
         # True test stream (never used during training unless explicitly requested).
@@ -644,6 +662,7 @@ class PhasedReplayDataloaders:
             split="test",
             split_ratios=self.split_ratios,
             max_value=max_value,
+            max_hour_value=self.max_hour_value,
         )
 
     def get_file_progress(self):
