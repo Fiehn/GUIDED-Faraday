@@ -603,6 +603,7 @@ def _has_existing_eval_outputs(model_output_dir: str, phased: bool) -> bool:
 def compare_models(model_paths: list[str], 
                    model_names: list[str], 
                    secondary_model_paths: list[str] | None = None,
+                   eval_result_dirs: list[str] | None = None,
                    data_dir: str = "data/_parquet_cache",
                    data_files: list[str] | None = None,
                    num_samples: int = 100,
@@ -617,7 +618,18 @@ def compare_models(model_paths: list[str],
     """
     Run evaluation for multiple models and compare results.
     Can handle both phased and unphased models.
+
+    Args:
+        model_paths: Paths to trained model folders (used for loading checkpoints).
+        model_names: Display names for comparison.
+        secondary_model_paths: Optional secondary model paths aligned with model_paths.
+        eval_result_dirs: Optional paths to existing evaluation result folders aligned with
+            model_paths. If provided and recompute=False, these folders are used as the
+            source for comparison (for example rerun_evaluation_YYYYMMDD_HHMMSS folders).
     """
+
+    if eval_result_dirs is not None and len(eval_result_dirs) < len(model_paths):
+        eval_result_dirs = list(eval_result_dirs) + [None] * (len(model_paths) - len(eval_result_dirs))
 
     # 1. Prepare evaluation data
     if data_files is None:
@@ -630,14 +642,23 @@ def compare_models(model_paths: list[str],
         split_ratios = inferred_ratios if split_ratios is None else split_ratios
     split_seed = int(split_seed)
     split_ratios = dict(split_ratios)
+
+    # Track which folders should be consumed by comparator for each model.
+    used_eval_dirs: list[str] = []
     
     # 4. Loop through models and evaluate
     for i, (path, name, secondary) in enumerate(zip(model_paths, model_names, secondary_model_paths if secondary_model_paths is not None else [None]*len(model_paths))):
         print(f"\nEvaluating model: {name}")
         model_output_dir = os.path.join(output_dir, name)
         os.makedirs(model_output_dir, exist_ok=True)
-        if (not recompute) and _has_existing_eval_outputs(path, phased=phased) and secondary is None:
-            print(f"Found existing evaluation outputs in {model_output_dir}; skipping recompute.")
+        requested_eval_dir = None
+        if eval_result_dirs is not None:
+            requested_eval_dir = eval_result_dirs[i]
+        eval_source_dir = requested_eval_dir if requested_eval_dir else path
+
+        if (not recompute) and _has_existing_eval_outputs(eval_source_dir, phased=phased) and secondary is None:
+            print(f"Found existing evaluation outputs in {eval_source_dir}; skipping recompute.")
+            used_eval_dirs.append(eval_source_dir)
             continue
 
         model, normalizer, conditioner = load_model(path, device="cuda" if torch.cuda.is_available() else "cpu")
@@ -772,6 +793,9 @@ def compare_models(model_paths: list[str],
             print("=" * 80 + "\n")
 
             evaluator.save_results(os.path.join(model_output_dir, "eval_results.json"))
+
+        # If we reached here, evaluation was recomputed into model_output_dir.
+        used_eval_dirs.append(model_output_dir)
     
     # 5. Use PhasedModelComparator to generate comparison tables and plots
     print("\n" + "="*50)
@@ -779,8 +803,12 @@ def compare_models(model_paths: list[str],
     print("="*50)
     
     comparator = PhasedModelComparator(output_dir=output_dir)
-    for name, path in zip(model_names, model_paths):
-        comparator.add_model(name, path)
+    if len(used_eval_dirs) != len(model_names):
+        raise ValueError(
+            f"Internal mismatch: have {len(used_eval_dirs)} eval dirs for {len(model_names)} model names."
+        )
+    for name, eval_dir in zip(model_names, used_eval_dirs):
+        comparator.add_model(name, eval_dir)
     
     comparator.compare()
     
@@ -792,6 +820,12 @@ if __name__ == "__main__":
     parser.add_argument("--models", nargs="+", required=False, help="List of model directories (each contains config + checkpoint).")
     parser.add_argument("--names", nargs="+", required=False, help="Display names for models (same length as --models).")
     parser.add_argument("--secondary-models", nargs="*", default=None, help="Optional secondary model dirs aligned with --models. Use 'None' to skip.")
+    parser.add_argument(
+        "--eval-dirs",
+        nargs="*",
+        default=None,
+        help="Optional existing evaluation result dirs aligned with --models (for example rerun_evaluation_* folders).",
+    )
     parser.add_argument("--data-dir", type=str, default="data/_parquet_cache", help="Directory with parquet files.")
     parser.add_argument("--data-files", nargs="*", default=None, help="Optional explicit parquet files (relative to --data-dir unless absolute).")
     parser.add_argument("--num-samples", type=int, default=100, help="Approx number of windows to evaluate per model.")
@@ -805,25 +839,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-value", type=float, default=200.0, help="Maximum value for filtering windows.")
     args = parser.parse_args()
 
-    args.models = ["models/CVAE_20260430_145213"
-    ]
-    john= ["",
-        "/home/fiehn/Desktop/models/AutoRegressiveTransformerVAE_20260505_114353", 
-                   "/home/fiehn/Desktop/models/CVAE_20260505_092750",
-                   "/home/fiehn/Desktop/models/CVAE_20260505_103329_guide",
-                   "/home/fiehn/Desktop/models/CVAE_20260505_171240_guide_cnn",
-                   "/home/fiehn/Desktop/models/CVAE_20260505_185825_guide_hier",
-                   "/home/fiehn/Desktop/models/CVAE_20260505_200949_vamp",
-                   "/home/fiehn/Desktop/models/DiffusionModel_20260505_141837",
-                   "/home/fiehn/Desktop/models/QuantileBaselineModel_20260505_163229",
-                   "/home/fiehn/Desktop/models/AverageBaselineModel_20260505_155153"
-                   ]
-    
-    args.names = ["test1"]
-    john2 = ["","art", "cvae", "cvae_guide",
-                  "CVAE_cnn_guide", "CVAE_hierarchical_guide", "CVAE_vamp_guide", "diffusion", "baseline_quantile", "baseline_average" ]
-    
-    args.split_seed = 42
+    if not args.models or not args.names:
+        raise ValueError("Provide --models and --names when running compare_models.py")
     if len(args.models) != len(args.names):
         raise ValueError("--models and --names must have the same length.")
     
@@ -838,6 +855,17 @@ if __name__ == "__main__":
         if len(secondary_model_paths) < len(args.models):
             secondary_model_paths.extend([None] * (len(args.models) - len(secondary_model_paths)))
 
+    eval_result_dirs = None
+    if args.eval_dirs is not None and len(args.eval_dirs) > 0:
+        eval_result_dirs = []
+        for d in args.eval_dirs:
+            if d is None or str(d).strip() == "" or str(d).lower() == "none":
+                eval_result_dirs.append(None)
+            else:
+                eval_result_dirs.append(d)
+        if len(eval_result_dirs) < len(args.models):
+            eval_result_dirs.extend([None] * (len(args.models) - len(eval_result_dirs)))
+
     split_ratios = None
     if args.train_ratio is not None or args.val_ratio is not None or args.test_ratio is not None:
         split_ratios = {
@@ -850,6 +878,7 @@ if __name__ == "__main__":
         model_paths=args.models,
         model_names=args.names,
         secondary_model_paths=secondary_model_paths,
+        eval_result_dirs=eval_result_dirs,
         data_dir=args.data_dir,
         data_files=args.data_files,
         num_samples=int(args.num_samples),
@@ -861,3 +890,10 @@ if __name__ == "__main__":
         max_value=args.max_value,
         agg_divisor=1000.0 if args.phased else 1.0,
     )
+
+# Example run in CLI: 
+# python src/evaluation/compare_models.py \
+#     --models models/hpc_runs/AutoRegressiveTransformerVAE_20260424_170101 \
+#     --names art \
+#     --eval-dirs models/hpc_runs/AutoRegressiveTransformerVAE_20260424_170101/rerun_evaluation_20260511_101040 \
+#     --phased
