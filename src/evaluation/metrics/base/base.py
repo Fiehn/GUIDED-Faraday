@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Dict
 import numpy as np
+from scipy.optimize import linear_sum_assignment
+
 
 
 def _to_json_serializable(obj: Any) -> Any:

@@ -226,7 +226,7 @@ class AutoRegressiveTransformerVAE(CVAE):
         num_batches = 0
         for batch in valloader:
             batch = self.move_to_device(batch, device=device)
-            x, meter_id, timestamps = self._unpack_batch(batch)
+            x, meter_id, timestamps, _agg = self._unpack_batch(batch)
             x_phase_first = self._to_phase_first(x).float()
             x_for_conditions = self._build_condition_input(x_phase_first)
 

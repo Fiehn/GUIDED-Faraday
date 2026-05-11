@@ -125,6 +125,25 @@ class HourlyProfilesByMonth(SyntheticMetric):
             elif verbose:
                 print(f"[INFO] HourlyProfilesByMonth: Found data for months: {unique_months}")
             
+            # First pass: count samples per month to find minimum
+            month_sample_counts = {}
+            for month in unique_months:
+                month_mask = (months == month)
+                real_month = real_data[month_mask]
+                synth_month = synthetic_data[month_mask]
+                min_count = min(len(real_month), len(synth_month))
+                month_sample_counts[month] = min_count
+            
+            # Find global minimum to equalize across all months
+            if month_sample_counts:
+                global_min = min(month_sample_counts.values())
+            else:
+                global_min = 0
+            
+            if verbose:
+                print(f"[INFO] HourlyProfilesByMonth: Equalizing samples across months to minimum={global_min}")
+                print(f"[INFO] HourlyProfilesByMonth: Sample counts before equalization: {month_sample_counts}")
+            
             flexibility_distances_by_month = {}
             
             for month in unique_months:
@@ -134,6 +153,10 @@ class HourlyProfilesByMonth(SyntheticMetric):
                 
                 if len(real_month) < 1 or len(synth_month) < 1:
                     continue
+                
+                # Equalize to global minimum
+                real_month = real_month[:global_min]
+                synth_month = synth_month[:global_min]
                 
                 # Average the windows into single profiles
                 real_avg = np.mean(real_month, axis=0)  # [24]
@@ -155,8 +178,8 @@ class HourlyProfilesByMonth(SyntheticMetric):
             all_fds = np.array([v for v in flexibility_distances_by_month.values()])
             mean_fd = float(np.nanmean(all_fds))
             
-            # Plot
-            self._plot_hourly_profiles(real_data, synthetic_data, months, flexibility_distances_by_month)
+            # Plot (pass global_min for consistent sample counts in visualization)
+            self._plot_hourly_profiles(real_data, synthetic_data, months, flexibility_distances_by_month, global_min=global_min)
             
             # Save results
             _save_standalone_metric_result(
@@ -239,13 +262,16 @@ class HourlyProfilesByMonth(SyntheticMetric):
     
 
     def _plot_hourly_profiles(self, real_data, synthetic_data, months, 
-                             flexibility_distances_by_month):
+                             flexibility_distances_by_month, global_min=None):
         """Plot hourly profiles by month.
         
         For each month:
         - Compute average profile from all real windows
         - Compute average profile from all synthetic windows
         - Plot both with 10th-90th percentile bands from raw windows
+        
+        Args:
+            global_min: If provided, use this as the sample count for all months (for consistency)
         """
         try:
             output_dir = _resolve_output_directory(self.output_path)
@@ -270,6 +296,14 @@ class HourlyProfilesByMonth(SyntheticMetric):
                 month_mask = (months == month)
                 real_m = real_data[month_mask]
                 synth_m = synthetic_data[month_mask]
+                
+                # Equalize sample counts: use global_min if provided, otherwise local min
+                if global_min is not None:
+                    sample_count = global_min
+                else:
+                    sample_count = min(len(real_m), len(synth_m))
+                real_m = real_m[:sample_count]
+                synth_m = synth_m[:sample_count]
                 
                 # Compute average profiles (1-to-1)
                 real_avg = np.mean(real_m, axis=0)  # [24]
@@ -434,6 +468,25 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
                 # Should not happen with improved _extract_days_of_week, but handle gracefully
                 days_of_week = np.zeros(n, dtype=int)
                 unique_days = [0]
+            # First pass: count samples per day to find minimum
+            day_sample_counts = {}
+            for day in unique_days:
+                day_mask = (days_of_week == day)
+                real_day = real_data[day_mask]
+                synth_day = synthetic_data[day_mask]
+                min_count = min(len(real_day), len(synth_day))
+                day_sample_counts[day] = min_count
+            
+            # Find global minimum to equalize across all days
+            if day_sample_counts:
+                global_min = min(day_sample_counts.values())
+            else:
+                global_min = 0
+            
+            if verbose:
+                print(f"[INFO] HourlyProfilesByDayofWeek: Equalizing samples across days to minimum={global_min}")
+                print(f"[INFO] HourlyProfilesByDayofWeek: Sample counts before equalization: {day_sample_counts}")
+            
             flexibility_distances_by_day = {}
             
             for day in unique_days:
@@ -443,6 +496,10 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
                 
                 if len(real_day) < 1 or len(synth_day) < 1:
                     continue
+                
+                # Equalize to global minimum
+                real_day = real_day[:global_min]
+                synth_day = synth_day[:global_min]
                 
                 # Average the windows into single profiles
                 real_avg = np.mean(real_day, axis=0)  # [24]
@@ -464,8 +521,8 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
             all_fds = np.array([v for v in flexibility_distances_by_day.values()])
             mean_fd = float(np.nanmean(all_fds))
             
-            # Plot
-            self._plot_hourly_profiles(real_data, synthetic_data, days_of_week, flexibility_distances_by_day)
+            # Plot (pass global_min for consistent sample counts in visualization)
+            self._plot_hourly_profiles(real_data, synthetic_data, days_of_week, flexibility_distances_by_day, global_min=global_min)
             
             # Save results
             _save_standalone_metric_result(
@@ -539,13 +596,16 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
         return result
     
     def _plot_hourly_profiles(self, real_data, synthetic_data, days_of_week, 
-                             flexibility_distances_by_day):
+                             flexibility_distances_by_day, global_min=None):
         """Plot hourly profiles by day of week.
         
         For each day:
         - Compute average profile from all real windows
         - Compute average profile from all synthetic windows
         - Plot both with 10th-90th percentile bands from raw windows
+        
+        Args:
+            global_min: If provided, use this as the sample count for all days (for consistency)
         """
         try:
             output_dir = _resolve_output_directory(self.output_path)
@@ -569,6 +629,14 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
                 day_mask = (days_of_week == day)
                 real_d = real_data[day_mask]
                 synth_d = synthetic_data[day_mask]
+                
+                # Equalize sample counts: use global_min if provided, otherwise local min
+                if global_min is not None:
+                    sample_count = global_min
+                else:
+                    sample_count = min(len(real_d), len(synth_d))
+                real_d = real_d[:sample_count]
+                synth_d = synth_d[:sample_count]
                 
                 # Compute average profiles (1-to-1)
                 real_avg = np.mean(real_d, axis=0)  # [24]

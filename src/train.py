@@ -269,6 +269,7 @@ def train(config, train_only_user_profile: bool = False):
                 "test_ratio": float(getattr(data_cfg.splits, "test_ratio", 0.0)),
             },
             max_value=float(getattr(data_cfg, "max_value", None)) or None,
+            max_hour_value=float(getattr(data_cfg, "max_hour_value", 20.0)) or None,
         )
     
     if conditioner is not None:

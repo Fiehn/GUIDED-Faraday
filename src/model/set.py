@@ -276,7 +276,7 @@ class SetGuideVAE(CVAE):
     def train_core(self, batch, optim, beta=1.0, weighted_loss=0.0, gradient_clip=None, gradient_clip_max_norm=None, condition_dropout=False, **_): # TODO: add condition_dropout argument
         self.train()
 
-        x, meter_id, timestamps = self._unpack_batch(batch)
+        x, meter_id, timestamps, agg = self._unpack_batch(batch)
 
         # prepare inputs: ensure phase-first format for encoder and conditioner
         x_phase_first = self._to_phase_first(x).float()
@@ -319,7 +319,7 @@ class SetGuideVAE(CVAE):
 
         for batch in valloader:
             batch = self.move_to_device(batch, device)
-            x, meter_id, timestamps = self._unpack_batch(batch)
+            x, meter_id, timestamps, _agg = self._unpack_batch(batch)
             x_phase_first = self._to_phase_first(x).float()
             x_for_conditions = self._build_condition_input(x_phase_first)
             x_flat = x_phase_first.reshape(x_phase_first.shape[0], -1)

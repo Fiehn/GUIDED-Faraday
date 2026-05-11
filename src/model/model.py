@@ -446,8 +446,10 @@ class BaseModel(nn.Module, ABC):
                         if early_stopper.early_stop:
                             break
                 except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     print(f"Error during evaluation at epoch {epoch+1}: {e}")
-                    eval_metrics = None
+                    raise e
                 finally:
                     eval_time_s = time.perf_counter() - eval_start_t
             if use_early_stopping and early_stopper is not None and early_stopper.early_stop:
