@@ -11,7 +11,7 @@ verbose: true
 # ============================================================================
 data:
   # Data mode: "csv" (Aggregated Hourly consumption) or "phased" (Individual SM meters 15-min phased)
-  mode: "phased"
+  mode: "csv"
 
   # Directory where CSV files are stored (../data or ../data/cleaned_profiles)
   # data_dir: "./data/cleaned_profiles"
@@ -20,11 +20,10 @@ data:
   #data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
   # data_dir: "data/_parquet_cache"
-  data_dir: "data/raw_profiles_6000"
-
+  data_dir: "data/_parquet_cache"
 
   # CSV filename to load
-  # data_files: ["hourly_subset.parquet"]
+  data_files: ["test_hourly_subset.parquet"]
   
   # CSV column specifications
   columns:
@@ -175,7 +174,7 @@ conditioning:
     decay: 0.95
 
   ev_phase:
-    path: "data/EV_detection_6000_SM.csv"
+    path: "data/EV/EV_detection_reduced_60000_SM.csv"
 
 # ============================================================================
 # HIERARCHICAL LATENT SPACE

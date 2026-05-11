@@ -132,7 +132,7 @@ conditioning:
 
   # EV phase detection
   ev_phase:
-    path: "data/EV_detection_6000_SM.csv"
+    path: "data/EV_detection_reduced_60000_SM.csv"
 
 # ============================================================================
 # HIERARCHICAL LATENT SPACE (Optional)
