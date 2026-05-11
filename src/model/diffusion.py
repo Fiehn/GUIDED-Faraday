@@ -386,7 +386,7 @@ class DiffusionModel(BaseModel):
     ):
         self.train()
 
-        x_raw, meter_id, timestamps, provided_conditions = self._unpack_batch(batch)
+        x_raw, meter_id, timestamps, agg = self._unpack_batch(batch)
         x_phase_first = self._to_phase_first(x_raw).float()
 
         if self.training:
@@ -395,7 +395,7 @@ class DiffusionModel(BaseModel):
 
         b_size = x_phase_first.size(0)
         c = self._prepare_provided_conditions(
-            provided_conditions,
+            agg,
             batch_size=b_size,
             device=x_phase_first.device,
         )
@@ -439,24 +439,18 @@ class DiffusionModel(BaseModel):
 
         device = next(self.parameters()).device
         for batch in valloader:
-            x_raw, meter_id, timestamps, provided_conditions = self._unpack_batch(batch)
+            x_raw, meter_id, timestamps, x_agg = self._unpack_batch(batch)
             x_raw = self.move_to_device(x_raw, device=device).float()
             x_phase_first = self._to_phase_first(x_raw)
 
             b_size = x_phase_first.size(0)
-            c = self._prepare_provided_conditions(
-                provided_conditions,
-                batch_size=b_size,
+
+            c = self._build_conditions(
+                x_phase_first,
+                meter_id=meter_id,
+                timestamps=timestamps,
                 device=device,
             )
-
-            if c is None:
-                c = self._build_conditions(
-                    x_phase_first,
-                    meter_id=meter_id,
-                    timestamps=timestamps,
-                    device=device,
-                )
 
             t = torch.randint(0, self.noise_scheduler.num_timesteps, (b_size,), device=device)
             noise = torch.randn_like(x_phase_first)
