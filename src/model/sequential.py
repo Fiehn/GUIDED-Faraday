@@ -6,7 +6,7 @@ Phase 3 conditioned on Phases 1 and 2. All three models share the same Condition
 """
 
 import torch
-import torch.nn as nn
+import torch.nn as nn   
 from typing import Dict
 from src.model.cvae import CVAE
 from src.model.vae import HierarchicalConfig
@@ -23,9 +23,9 @@ class SequentialPhaseVAE(BaseModel):
         *,
         conditioner: Conditioner,
         latent_dim: int = 32,
-        distribution_dict: dict = None,
-        prior_type: str = None,
-        hierarchy_config: HierarchicalConfig = None,
+        distribution_dict: dict | None = None,
+        prior_type: str | None = None,
+        hierarchy_config: HierarchicalConfig | None = None,
         phased_mode: bool = False,
         sequence_length: int = 24,
         **cvae_kwargs,
@@ -94,7 +94,11 @@ class SequentialPhaseVAE(BaseModel):
         self.phase_models = nn.ModuleList([
             self.phase_1_model, self.phase_2_model, self.phase_3_model
         ])
-        self.num_parameters = sum(m.num_parameters for m in self.phase_models)
+        self.num_parameters = (
+            self.phase_1_model.num_parameters
+            + self.phase_2_model.num_parameters
+            + self.phase_3_model.num_parameters
+        )
     
     @property
     def encoder(self):

@@ -1315,6 +1315,123 @@ class ElectricVehicleConditioner(BaseConditioner):
         return self.get_conditions(x=None, meter_id=meter_id, timestamps=timestamps)
 
 
+class ElectricVehicleConditionerBool(BaseConditioner):
+    """
+    Conditions the model on EV presence one-hot encoded as:
+    [No EV, Has EV].
+
+    Reads EV detector output from CSV (default: data/EV_detection_6000_SM.csv)
+    and maps base meter ids to an EV presence class.
+    """
+    def __init__(self, topology_path='data/EV/EV_detection_reduced_60000_SM.csv'):
+        self.condition_dim = 1
+        self._meter_ids_cpu, self._phase_class_cpu = self._load_topology_df(topology_path)
+        self._lookup_by_device = {}
+
+    def _load_topology_df(self, topology_path):
+        topology_df = pd.read_csv(topology_path)
+
+        # Expected source id looks like: sm_12345.parquet
+        meter_col = None
+        if 'SM_ID' in topology_df.columns:
+            meter_col = topology_df['SM_ID']
+        elif 'meter_id' in topology_df.columns:
+            meter_col = topology_df['meter_id']
+        else:
+            meter_col = topology_df.iloc[:, 0]
+
+        meter_key = meter_col.astype(str).str.lower()
+        base_meter_id = pd.to_numeric(meter_key.str.extract(r'(\d+)', expand=False), errors='coerce')
+
+        ev_detected = topology_df.get('EV_detected', pd.Series(['no'] * len(topology_df))).astype(str).str.strip().str.lower()
+        is_ev = ev_detected.isin({'yes', 'true', '1'})
+
+        ev_class = is_ev.astype(np.int64).to_numpy()
+
+        compact = pd.DataFrame(
+            {
+                'base_meter_id': base_meter_id,
+                'phase_class': ev_class,
+            }
+        ).dropna(subset=['base_meter_id'])
+
+        if compact.empty:
+            return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
+
+        # Keep strongest class per meter in case of duplicate rows.
+        compact['base_meter_id'] = compact['base_meter_id'].astype(np.int64)
+        compact = compact.groupby('base_meter_id', as_index=False)['phase_class'].max()
+
+        meter_ids_np = compact['base_meter_id'].to_numpy(dtype=np.int64)
+        phase_classes_np = compact['phase_class'].to_numpy(dtype=np.int64)
+
+        order = np.argsort(meter_ids_np)
+        return (
+            torch.from_numpy(meter_ids_np[order]),
+            torch.from_numpy(phase_classes_np[order]),
+        )
+
+    def _get_lookup(self, device: torch.device):
+        key = str(device)
+        cached = self._lookup_by_device.get(key)
+        if cached is None:
+            cached = (
+                self._meter_ids_cpu.to(device=device, dtype=torch.long),
+                self._phase_class_cpu.to(device=device, dtype=torch.long),
+            )
+            self._lookup_by_device[key] = cached
+        return cached
+
+    def get_conditions(
+            self,
+            x: torch.Tensor | np.ndarray | None,
+            meter_id: torch.Tensor | np.ndarray | None,
+            timestamps: torch.Tensor | list | None
+        ) -> torch.Tensor | None:
+        if meter_id is None:
+            if isinstance(timestamps, torch.Tensor):
+                zeros = torch.zeros(timestamps.shape[0], dtype=torch.float32, device=timestamps.device)
+            elif isinstance(timestamps, np.ndarray):
+                zeros = torch.zeros(timestamps.shape[0], dtype=torch.float32)
+            else:
+                zeros = torch.zeros(1, dtype=torch.float32)
+            return zeros.unsqueeze(1)
+
+        if isinstance(meter_id, torch.Tensor):
+            meter_ids = meter_id.to(dtype=torch.long)
+            device = meter_ids.device
+        else:
+            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)
+            device = meter_ids.device
+
+        lookup_ids, lookup_phase_class = self._get_lookup(device=device)
+        if lookup_ids.numel() == 0:
+            phase_class = torch.zeros_like(meter_ids, dtype=torch.float32)
+            return phase_class.unsqueeze(1)
+
+        meter_ids = meter_ids.contiguous()
+        lookup_ids = lookup_ids.contiguous()
+        idx = torch.searchsorted(lookup_ids, meter_ids)
+        idx_clamped = idx.clamp(max=lookup_ids.shape[0] - 1)
+        valid = (idx < lookup_ids.shape[0]) & (lookup_ids[idx_clamped] == meter_ids)
+
+        phase_class = torch.zeros_like(meter_ids, dtype=torch.float32)
+        if valid.any():
+            phase_class[valid] = lookup_phase_class[idx_clamped[valid]].to(dtype=torch.float32)
+
+        return phase_class.unsqueeze(1)
+
+    def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
+        # No EV: 86%, Has EV: 14%
+        probs = torch.tensor([0.86, 0.14])
+        random_status = torch.multinomial(probs, batch_size, replacement=True)
+        return random_status.unsqueeze(1).float()
+
+    def get_conditions_no_data(self, meter_id, timestamps):
+        # Backward-compatible helper used in some older call sites.
+        return self.get_conditions(x=None, meter_id=meter_id, timestamps=timestamps)
+
+
 class ActivePhaseCountConditioner(BaseConditioner):
     """
     Conditions the model on HOW MANY phases are active in the current window.

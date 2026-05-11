@@ -13,7 +13,7 @@ from src.model.hierarchical.config import HierarchicalConfig, LevelConfig
 from src.data.conditioner import (
     Conditioner, DayOfWeekConditioner, UserProfiler, 
     HolidayConditioner, MonthOfYearConditioner, 
-    ActivePhaseCountConditioner, HeatpumpPhaseConditioner, ElectricVehicleConditioner, SolarPanelConditioner
+    ActivePhaseCountConditioner, HeatpumpPhaseConditioner, ElectricVehicleConditioner, SolarPanelConditioner, ElectricVehicleConditionerBool
 )
 from src.model.baseline import AverageBaselineModel, QuantileBaselineModel, FlatMeanBaselineModel
 def _to_namespace(obj):
@@ -24,10 +24,10 @@ def _to_namespace(obj):
     return obj
 
 
-def _load_train_config(config_path: str = None):
+def _load_train_config(config_path: str | None = None):
     """Load YAML config and add aliases expected by train()."""
     if config_path is None:
-        config_path = os.path.join(parent_dir, "config", "config.yaml")
+        return None
 
     with open(config_path, "r") as f:
         raw = yaml.safe_load(f) or {}
@@ -160,6 +160,10 @@ def create_model_from_config(config, device="cpu"):
                 ev_cfg = getattr(conditioning_cfg, "ev_phase", SimpleNamespace())
                 ev_path = getattr(ev_cfg, "path", "data/EV_detection_6000_SM.csv")
                 conditioner.add_condition_item("ev_phase", ElectricVehicleConditioner(topology_path=ev_path))
+            elif condition_tag == "ev":
+                ev_cfg = getattr(conditioning_cfg, "ev_phase", SimpleNamespace())
+                ev_path = getattr(ev_cfg, "path", "data/EV_detection_6000_SM.csv")
+                conditioner.add_condition_item("ev_phase", ElectricVehicleConditionerBool(topology_path=ev_path))
             elif condition_tag == "pv" or condition_tag == "solar_panel":
                 pv_cfg = getattr(conditioning_cfg, "solar_panel", SimpleNamespace())
                 pv_path = getattr(pv_cfg, "path", "data/topology/cleaned/meter_cabinet_connection.csv")

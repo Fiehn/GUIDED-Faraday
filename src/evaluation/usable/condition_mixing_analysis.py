@@ -4,8 +4,6 @@ import argparse
 import numpy as np
 import pandas as pd
 import torch
-import json
-import yaml
 from pathlib import Path
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
@@ -94,14 +92,14 @@ def day_type_from_day(day_idx):
 
 def ev_from_idx(idx):
     if idx == 0: return 'No_EV'
-    return f'{idx}ph_EV'
+    return 'Yes_EV'
 
 def hp_from_idx(idx):
     if idx == 0: return 'No_HP'
-    return f'{idx}ph_HP'
+    return 'Yes_HP'
 
 
-def extract_real_data(dataloader_val, conditioners_dict, num_batches=0, max_samples=20000):
+def extract_real_data(dataloader_val, conditioners_dict, num_batches=0):
     all_x = []
     metadata = {k: [] for k in conditioners_dict.keys()}
     all_meters = []
@@ -158,13 +156,11 @@ def extract_real_data(dataloader_val, conditioners_dict, num_batches=0, max_samp
                 dows.append(int(t.dayofweek))
         return dows
     
-    max_samples = 0 if max_samples is None else int(max_samples)
+    
     if num_batches > 0:
         print(f"Extracting up to {num_batches} batches from streaming loader...")
     else:
         print("Extracting from streaming loader (no batch limit)...")
-    if max_samples > 0:
-        print(f"Capping at max_samples={max_samples} windows to avoid OOM.")
         
     for i, batch in enumerate(tqdm(dataloader_val)):
         if num_batches > 0 and i >= num_batches:
@@ -205,21 +201,16 @@ def extract_real_data(dataloader_val, conditioners_dict, num_batches=0, max_samp
             metadata[k].append(labels[k])
             
         all_meters.append(meter_id.cpu().numpy())
-        if max_samples > 0:
-            total = int(sum(arr.shape[0] for arr in all_x))
-            if total >= max_samples:
-                break
+        
 
-    all_x = np.concatenate(all_x, axis=0) # [N, 24]
-    if max_samples > 0 and all_x.shape[0] > max_samples:
-        all_x = all_x[:max_samples]
+    all_x = np.concatenate(all_x, axis=0) # [N, F, 24] or [N, 24]
+    if all_x.ndim == 3:
+        all_x = all_x.sum(axis=1) # Sum over phases to get [N, 24]
+
     for k in metadata.keys():
         metadata[k] = np.concatenate(metadata[k], axis=0)
-        if max_samples > 0 and metadata[k].shape[0] > max_samples:
-            metadata[k] = metadata[k][:max_samples]
     all_meters = np.concatenate(all_meters)
-    if max_samples > 0 and all_meters.shape[0] > max_samples:
-        all_meters = all_meters[:max_samples]
+    
 
     if len(months_in_timestamps) > 0 or len(months_in_condition) > 0:
         print("\n" + "=" * 50)
@@ -323,7 +314,7 @@ def run_pca_and_clustering(x_windows, metadata, k=None):
         
     print(f"Running GMM clustering with {k} clusters...")
     # GMM often works slightly better for overlapping behavioral archetypes
-    gmm = GaussianMixture(n_components=k, random_state=42, covariance_type='full')
+    gmm = GaussianMixture(n_components=k, random_state=42, covariance_type='full', reg_covar=1e-4)
     cluster_labels = gmm.fit_predict(features_pca)
     
     return cluster_labels, features_pca, pca, gmm
@@ -420,11 +411,62 @@ def plot_archetypes(x_windows, cluster_labels, k, output_dir):
     plt.savefig(os.path.join(output_dir, "cluster_archetypes.png"))
     plt.close()
 
+def plot_pca_scatters(features_pca, df, output_dir):
+    """Plot the top 2 PCA components colored by various metadata labels."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # We will only use top 2 components
+    pc1 = features_pca[:, 0]
+    pc2 = features_pca[:, 1]
+    
+    # Subsample if too large to avoid massive overplotting
+    max_pts = 10000
+    if len(pc1) > max_pts:
+        np.random.seed(42)
+        idx = np.random.choice(len(pc1), max_pts, replace=False)
+    else:
+        idx = np.arange(len(pc1))
+        
+    pc1_sub = pc1[idx]
+    pc2_sub = pc2[idx]
+    df_sub = df.iloc[idx].copy()
+    
+    df_sub['day_season'] = df_sub['day_type'].astype(str) + " - " + df_sub['season'].astype(str)
+    
+    color_configs = [
+        ("season", "Season"),
+        ("day_type", "Day Type"),
+        ("ev", "EV Presence"),
+        ("hp", "Heatpump Presence"),
+        ("day_season", "Day-Season Combinations")
+    ]
+    
+    for col, title in color_configs:
+        if col not in df_sub.columns:
+            continue
+            
+        plt.figure(figsize=(10, 8))
+        unique_vals = sorted(df_sub[col].unique())
+        
+        for val in unique_vals:
+            mask = (df_sub[col] == val)
+            plt.scatter(pc1_sub[mask], pc2_sub[mask], label=str(val), alpha=0.5, s=15)
+            
+        plt.title(f"PCA Top 2 Components - Colored by {title}")
+        plt.xlabel("Principal Component 1")
+        plt.ylabel("Principal Component 2")
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.tight_layout()
+        plt.grid(alpha=0.3)
+        
+        filename = f"pca_scatter_{col}.png"
+        plt.savefig(os.path.join(output_dir, filename), bbox_inches="tight")
+        plt.close()
+
 def main():
     parser = argparse.ArgumentParser(description="Condition mixing clustering & analysis")
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to config file")
     parser.add_argument("--num_batches", type=int, default=200, help="Number of batches to sample from the stream (0 = no limit)")
-    parser.add_argument("--max_samples", type=int, default=20000, help="Hard cap on number of windows kept in memory (0 = no cap)")
     parser.add_argument("--k", type=int, default=6, help="Preset number of clusters. Pass 0 to auto-determine.")
     args = parser.parse_args()
     
@@ -472,8 +514,8 @@ def main():
     # Use the underlying streaming dataset directly to avoid caching large tensors in RAM.
     # (get_epoch_loaders materializes a cache; this script should stay streaming-friendly.)
     from torch.utils.data import DataLoader as TorchDataLoader
-    val_loader = TorchDataLoader(
-        dataloaders.val_dataset,
+    train_loader = TorchDataLoader(
+        dataloaders.train_dataset,
         batch_size=cfg.data.batch_size * 2,
         num_workers=0,
         pin_memory=False,
@@ -491,10 +533,9 @@ def main():
     
     # 3. Extract real test/val data
     x_windows, metadata, meters = extract_real_data(
-        val_loader, 
+        train_loader, 
         conditioners_dict, 
         num_batches=args.num_batches,
-        max_samples=args.max_samples,
     )
     
     print(f"Extracted {x_windows.shape[0]} valid 24h windows.")
@@ -510,8 +551,12 @@ def main():
     out_dir = os.path.join(ROOT_DIR, "evaluation_comparison", "archetypes")
     plot_archetypes(x_windows, cluster_labels, df["cluster"].nunique(), out_dir)
     
+    # 7. Plot PCA scatters
+    pca_dir = os.path.join(ROOT_DIR, "evaluation_comparison", "pca_scatters")
+    plot_pca_scatters(features_pca, df, pca_dir)
+    
     print(f"\nArchetypes saved to {out_dir}")
-    print("Done! You can use these generated combos to prompt your synthetic model, and only evaluate against those targets.")
-
+    print(f"PCA Scatters saved to {pca_dir}")
+   
 if __name__ == "__main__":
     main()

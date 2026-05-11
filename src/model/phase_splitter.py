@@ -171,25 +171,16 @@ class HierarchicalSplitter(BaseModel):
 
         eps = 1e-8
         for batch_idx, batch in enumerate(dataloader):
-            if max_batches is not None and batch_idx >= int(max_batches):
+            if max_batches is not None and batch_idx >= max_batches:
                 break
 
             batch = self.move_to_device(batch, device)
             x_raw, meter_id, timestamps, x_agg = self._unpack_batch(batch)
             x_true = self._to_phase_first(x_raw).float()  # [B, 3, L]
 
-            if (
-                torch.is_tensor(agg)
-                and agg.dim() == 2
-                and agg.shape[-1] == self.condition_dim
-            ):
-                c = self.move_to_device(agg, device=device).float()
-                if c.dim() == 1:
-                    c = c.unsqueeze(0)
-            else:
-                x_for_cond = self._build_condition_input(x_true)
-                c = self.conditioner.get_conditions(x_for_cond, meter_id=meter_id, timestamps=timestamps)
-                c = self.move_to_device(c, device=device).float()
+            x_for_cond = self._build_condition_input(x_true)
+            c = self.conditioner.get_conditions(x_for_cond, meter_id=meter_id, timestamps=timestamps)
+            c = self.move_to_device(c, device=device).float()
 
             proportions = self.model(x_agg, c)
             x_pred = proportions * x_agg
@@ -238,7 +229,7 @@ class HierarchicalSplitter(BaseModel):
             ss_tot = ((flat_true - true_mean) ** 2).sum(dim=1).clamp_min(eps)
             r2 = 1.0 - (ss_res / ss_tot)
 
-            remaining = max(0, int(num_plot_samples) - len(plot_true))
+            remaining = max(0, num_plot_samples - len(plot_true))
             if remaining > 0:
                 take = min(remaining, x_true_eval.shape[0])
                 plot_true.extend([x_true_eval[i].detach().cpu() for i in range(take)])
@@ -295,7 +286,6 @@ class HierarchicalSplitter(BaseModel):
             plt.tight_layout()
             plt.savefig(plot_path, dpi=250, bbox_inches="tight")
             plt.close(fig)
-            metrics["examples_plot_path"] = plot_path
 
         if plot_dir is not None and len(phase_mae_samples) > 0:
             os.makedirs(plot_dir, exist_ok=True)
@@ -304,12 +294,12 @@ class HierarchicalSplitter(BaseModel):
             phase_mae_tensor = torch.cat(phase_mae_samples, dim=0)  # [N, F]
             agg_mae_tensor = torch.cat(agg_mae_samples, dim=0)      # [N]
 
-            n_phase = int(phase_mae_tensor.shape[1])
+            n_phase = phase_mae_tensor.shape[1]
             labels = [f"Phase L{i+1}" for i in range(n_phase)] + ["Aggregate"]
             box_data = [phase_mae_tensor[:, i].numpy() for i in range(n_phase)] + [agg_mae_tensor.numpy()]
 
             fig, ax = plt.subplots(figsize=(9, 4.5))
-            bp = ax.boxplot(box_data, labels=labels, patch_artist=True, showfliers=False)
+            bp = ax.boxplot(box_data, label=labels, patch_artist=True, showfliers=False)
             colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#444444"]
             for i, patch in enumerate(bp["boxes"]):
                 patch.set_facecolor(colors[min(i, len(colors) - 1)])
@@ -322,7 +312,6 @@ class HierarchicalSplitter(BaseModel):
             plt.savefig(boxplot_path, dpi=250, bbox_inches="tight")
             plt.close(fig)
 
-            metrics["phase_mae_boxplot_path"] = boxplot_path
             metrics["phase_mae_median"] = {
                 f"phase_{i+1}": float(torch.median(phase_mae_tensor[:, i]).item())
                 for i in range(n_phase)
