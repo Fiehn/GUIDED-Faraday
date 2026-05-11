@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import torch
 import copy
 from datetime import datetime
+from torch.utils.data import DataLoader
 
 CURRENT_DIR = Path(__file__).resolve().parent
 SRC_DIR = CURRENT_DIR.parent
@@ -26,258 +27,33 @@ if str(ROOT_DIR) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from src.model.factory import _load_train_config, create_model_from_config
+from src.model.factory import _load_train_config
 from src.data.dataloader_phased import PhasedReplayDataloaders, WindowSpec
-from src.data.normalizer import Normalizer
+from src.evaluation.load_model import load_model
 from src.evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
-import pandas as pd
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
-
-
-NON_PHASED_CONFIG_MAP = (
-    ("AutoRegressiveTransformerVAE_", "art.yaml"),
-    ("AverageBaselineModel_", "baseline_mean.yaml"),
-    ("CVAE_", "cvae.yaml"),
-    ("DiffusionModel_", "diffusion.yaml"),
-    ("guide_cnn_", "guide_cnn.yaml"),
-    ("hierarchy_", "guide_hierarchy.yaml"),
-    ("vamp_", "guide_vamp.yaml"),
-    ("guide_", "guide.yaml"),
-)
-
-PHASED_CONFIG_MAP = (
-    ("AutoRegressiveTransformerVAE_", "art.yaml"),
-    ("AverageBaselineModel_", "baseline_average.yaml"),
-    ("QuantileBaselineModel_", "baseline_quantile.yaml"),
-    ("DiffusionModel_", "diffusion.yaml"),
-    ("HierarchicalSplitter_", "phase_splitter.yaml"),
-    ("SetGuideVAE_", "set_guide.yaml"),
-)
-
-
-def _resolve_config_from_model_name(model_path: str) -> str | None:
-    """
-    Map a model folder name to its training config file.
-
-    The mapping is based on the naming conventions used in the hpc_runs
-    directories. For unknown names, return None so we can fall back to local
-    config discovery.
-    """
-    model_name = os.path.basename(os.path.normpath(model_path))
-    path_parts = Path(model_path).parts
-    is_phased_dir = "3-phase" in path_parts
-
-    mapping = PHASED_CONFIG_MAP if is_phased_dir else NON_PHASED_CONFIG_MAP
-    config_root = ROOT_DIR / "config" / "tests" / ("phased" if is_phased_dir else "")
-
-    for prefix, config_name in mapping:
-        if model_name.startswith(prefix):
-            candidate = config_root / config_name
-            if candidate.exists():
-                return str(candidate)
-
-    return None
-
-
-class SimpleWindowDataset(Dataset):
-    """Simple PyTorch dataset for windowed time series data."""
-    
-    def __init__(self, windows, meter_ids, timestamps, aggregates=None, normalizer=None):
-        """
-        Args:
-            windows: (n_windows, window_size, n_features) array
-            meter_ids: (n_windows,) meter ID for each window
-            timestamps: (n_windows,) start timestamp for each window
-            aggregates: (n_windows, n_features) optional aggregate values
-            normalizer: Optional normalizer to denormalize data
-        """
-        self.windows = torch.from_numpy(windows).float()
-        self.meter_ids = torch.from_numpy(meter_ids).long()
-        self.timestamps = torch.from_numpy(timestamps).long()
-        self.aggregates = torch.from_numpy(aggregates).float() if aggregates is not None else None
-        self.normalizer = normalizer
-    
-    def __len__(self):
-        return len(self.windows)
-    
-    def __getitem__(self, idx):
-        x = self.windows[idx]
-        m = self.meter_ids[idx]
-        t = self.timestamps[idx]
-        a = self.aggregates[idx] if self.aggregates is not None else torch.zeros(x.shape[-1])
-        return x, m, t, a
-
-
-def load_parquet_data_for_eval(parquet_files, window_size=24, stride=1, normalizer=None, 
-                               n_limit=None, meter_col="meter_id", value_cols=None):
-    """
-    Load parquet files and create windowed dataset for evaluation.
-    
-    Args:
-        parquet_files: List of parquet file paths
-        window_size: Size of sliding window
-        stride: Stride for sliding window
-        normalizer: Optional Normalizer to apply
-        n_limit: Limit number of windows (for smaller test sets)
-        meter_col: Name of meter ID column
-        value_cols: List of value columns (if None, uses all numeric except meter_col)
-    
-    Returns:
-        SimpleWindowDataset with all windows
-    """
-    import pandas as pd
-    
-    all_windows = []
-    all_meter_ids = []
-    all_timestamps = []
-    all_aggregates = []
-    
-    for pfile in parquet_files:
-        print(f"  Loading: {pfile}")
-        df = pd.read_parquet(pfile)
-        
-        if value_cols is None:
-            value_cols = [col for col in df.columns if col != meter_col and df[col].dtype in [np.float32, np.float64]]
-        
-        # Group by meter
-        for meter_id, group in df.groupby(meter_col, sort=False):
-            group = group.reset_index(drop=True)
-            values = group[value_cols].values.astype(np.float32)  # (n_samples, n_features)
-            
-            # Apply normalizer if provided
-            if normalizer is not None:
-                normalized_values = normalizer.transform(values)
-                # Convert back to numpy if it's a torch tensor
-                if torch.is_tensor(normalized_values):
-                    values = normalized_values.numpy()
-                else:
-                    values = normalized_values
-            
-            # Create sliding windows
-            for start_idx in range(0, len(values) - window_size + 1, stride):
-                end_idx = start_idx + window_size
-                window = values[start_idx:end_idx]  # (window_size, n_features)
-                
-                all_windows.append(window)
-                all_meter_ids.append(meter_id)
-                
-                # Use start timestamp
-                if "timestamp" in group.columns:
-                    ts = group.iloc[start_idx]["timestamp"]
-                else:
-                    ts = start_idx
-                all_timestamps.append(ts)
-                
-                # Aggregate: hourly sum (if window_size=24, this gives daily total)
-                hourly_totals = np.sum(window, axis=1)  # (window_size,)
-                all_aggregates.append(hourly_totals)
-                
-                if n_limit and len(all_windows) >= n_limit:
-                    break
-            
-            if n_limit and len(all_windows) >= n_limit:
-                break
-        
-        if n_limit and len(all_windows) >= n_limit:
-            break
-    
-    if not all_windows:
-        raise ValueError(f"No windows created from parquet files: {parquet_files}")
-    
-    windows_array = np.array(all_windows, dtype=np.float32)  # (n_windows, window_size, n_features)
-    meter_ids_array = np.array(all_meter_ids, dtype=np.int64)
-    timestamps_array = np.array(all_timestamps, dtype=np.int64)
-    aggregates_array = np.array(all_aggregates, dtype=np.float32)
-    
-    print(f"✓ Loaded {len(windows_array)} windows from {len(parquet_files)} files")
-    
-    return SimpleWindowDataset(windows_array, meter_ids_array, timestamps_array, aggregates_array, normalizer)
-
-
-def load_model(model_path: str, device: str = "cpu"):
-    """
-    Load a trained model from a folder.
-    
-    The model_path should point to a folder containing:
-    - A config file (*.yaml)
-    - Best model checkpoint (best_model_*.pt)
-    - Optionally: normalizer.pt, user_profiler.pt
-    
-    Args:
-        model_path: Path to model folder
-        device: Device to load model on ('cpu' or 'cuda')
-    
-    Returns:
-        tuple: (model, normalizer, conditioner, config)
-    """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model_path = str(model_path)
-
-    # 1. Find and load config file
-    # Prefer the exact config snapshot saved alongside the model run.
+ 
+def _load_config_for_model(model_path: str):
+    """Load config snapshot stored with a trained model folder."""
     preferred = os.path.join(model_path, "training_config_used.yaml")
     if os.path.exists(preferred):
-        config_path = preferred
-    else:
-        config_path = _resolve_config_from_model_name(model_path)
-        if config_path is None:
-            for file in os.listdir(model_path):
-                if file.endswith(".yaml"):
-                    config_path = os.path.join(model_path, file)
-                    break
-    
-    if config_path is None:
-        raise FileNotFoundError(f"No config file found in {model_path}")
-    
-    print(f"Loading config from: {config_path}")
-    config = _load_train_config(config_path)
+        print(f"Loading config from: {preferred}")
+        return _load_train_config(preferred)
 
-    # 2. Create model from config
-    model = create_model_from_config(config, device)
-    print(f"Created model: {model.__class__.__name__}")
-
-    # 3. Find and load best checkpoint
-    checkpoint_path = None
-    max_epoch = -1
     for file in os.listdir(model_path):
-        if file.startswith("best_model_") and file.endswith(".pt"):
-            try:
-                epoch = int(file[:-3].split("_")[-1])
-                if epoch > max_epoch:
-                    max_epoch = epoch
-                    checkpoint_path = os.path.join(model_path, file)
-            except ValueError:
-                if checkpoint_path is None:
-                    checkpoint_path = os.path.join(model_path, file)
-    
-    if checkpoint_path is None:
-        raise FileNotFoundError(f"No checkpoint file (best_model_*.pt) found in {model_path}")
-    
-    print(f"Loading checkpoint from: {checkpoint_path}")
-    normalizer, conditioner = model.load_model(checkpoint_path, device)
-    model.eval()
-    
-    return model, normalizer, conditioner, config
+        if file.endswith(".yaml") or file.endswith(".yml"):
+            config_path = os.path.join(model_path, file)
+            print(f"Loading config from: {config_path}")
+            return _load_train_config(config_path)
+
+    raise FileNotFoundError(f"No config file found in {model_path}")
 
 
 def setup_data_loader(config, normalizer, device="cpu"):
-    """
-    Set up a simple test data loader for evaluation.
-    For evaluation, we load data directly as a static dataset rather than
-    using the streaming mechanism from training.
-    
-    Args:
-        config: Training config loaded from YAML
-        normalizer: Normalizer object (to reuse stats from training)
-        device: Device to use
-    
-    Returns:
-        DataLoader instance with test data
-    """
+    """Build test loader using the phased replay dataloader implementation."""
     data_cfg = config.data
+    data_mode = str(getattr(data_cfg, "mode", "csv")).lower()
+    phased_mode = data_mode in {"phased", "phased_parquet"}
 
-    # Find data files
     data_dir = getattr(config, "data_dir", None) or getattr(data_cfg, "data_dir", None) or getattr(data_cfg, "path", "data/_parquet_cache")
     configured_files = list(getattr(config, "data_files", []) or getattr(data_cfg, "data_files", []))
 
@@ -311,31 +87,120 @@ def setup_data_loader(config, normalizer, device="cpu"):
     
     print(f"Found {len(parquet_files)} parquet files in {data_dir}")
 
-    # Load data as static dataset
-    print(f"Loading data for evaluation...")
-    window_size = int(data_cfg.window.input_len)
-    stride = int(getattr(data_cfg.window, "stride", 1))
-    batch_size = int(data_cfg.batch_size)
-    
-    dataset = load_parquet_data_for_eval(
-        parquet_files,
-        window_size=window_size,
-        stride=stride,
+    window = WindowSpec(
+        input_len=int(data_cfg.window.input_len),
+        stride=int(getattr(data_cfg.window, "stride", 1)),
+    )
+
+    replay_capacity = int(getattr(data_cfg, "replay_buffer_capacity", 10000))
+    min_buffer_size = int(getattr(data_cfg, "min_buffer_size", 2000))
+    workers = int(getattr(data_cfg, "num_workers", 0))
+    eval_batches = int(getattr(data_cfg, "eval_batches", 5))
+    skip_corrupt_files = bool(getattr(data_cfg, "skip_corrupt_files", True))
+    max_skip_warnings = int(getattr(data_cfg, "max_skip_warnings", 20))
+    output_aggregate_stream = bool(getattr(data_cfg, "output_aggregate_stream", False))
+    agg_divisor = float(getattr(data_cfg, "aggregation_divisor", 1.0))
+    hourly_aggregation = bool(getattr(data_cfg.window, "aggregated", False))
+
+    # Ensure test split exists for evaluation if training used test_ratio=0.
+    train_ratio = float(getattr(data_cfg.splits, "train_ratio", 1.0))
+    val_ratio = float(getattr(data_cfg.splits, "val_ratio", 0.0))
+    test_ratio = float(getattr(data_cfg.splits, "test_ratio", 0.0))
+    if test_ratio <= 0.0:
+        print("Warning: test_ratio<=0 in config; using 10% test split for evaluation.")
+        test_ratio = 0.1
+        total = train_ratio + val_ratio + test_ratio
+        train_ratio = train_ratio / total
+        val_ratio = val_ratio / total
+        test_ratio = test_ratio / total
+
+    loader_obj = PhasedReplayDataloaders(
+        sm_files=parquet_files,
+        replay_buffer_capacity=replay_capacity,
+        min_buffer_size=min_buffer_size,
+        window_spec=window,
         normalizer=normalizer,
-        n_limit=None,  # Use all data
-        meter_col=data_cfg.columns.meter_id,
-        value_cols=data_cfg.columns.value_cols,
-    )
-    
-    # Create DataLoader
-    test_loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,  # Use 0 workers for simplicity in evaluation
+        num_workers=workers,
+        hourly_aggregation=hourly_aggregation,
+        aggregation_divisor=agg_divisor,
+        batch_size=int(data_cfg.batch_size),
+        eval_cache_device=None,
+        eval_cache_batches=eval_batches,
+        cache_scan_batches=None,
         pin_memory=(str(device) != "cpu"),
+        output_aggregate_stream=output_aggregate_stream,
+        skip_corrupt_files=skip_corrupt_files,
+        max_skip_warnings=max_skip_warnings,
+        phased_mode=phased_mode,
+        feature_cols=data_cfg.columns.value_cols,
+        meter_col=data_cfg.columns.meter_id,
+        split_seed=int(getattr(data_cfg.splits, "random_seed", 0)),
+        split_ratios={
+            "train_ratio": train_ratio,
+            "val_ratio": val_ratio,
+            "test_ratio": test_ratio,
+        },
+        max_value=float(getattr(data_cfg, "max_value", None)) or None,
+        max_hour_value=float(getattr(data_cfg, "max_hour_value", 20.0)) or None,
     )
-    
+
+    n_batches = max(1, eval_batches)
+    loader_obj.refresh_test_cache(n_batches)
+    test_loader = loader_obj.get_test_loader()
+
+    # Fallback when streamed cache is empty but test dataset exists.
+    if test_loader is None and hasattr(loader_obj, "test_dataset"):
+        print("[WARN] get_test_loader() returned None; building DataLoader from test_dataset.")
+        test_loader = DataLoader(
+            loader_obj.test_dataset,
+            batch_size=int(data_cfg.batch_size),
+            shuffle=False,
+            num_workers=0,
+            pin_memory=(str(device) != "cpu"),
+        )
+
+    # If split-based test stream is empty, force all data into test split for rerun evaluation.
+    if test_loader is not None:
+        try:
+            _ = next(iter(test_loader))
+        except StopIteration:
+            print("[WARN] test split produced zero batches; retrying with forced test_ratio=1.0.")
+            loader_obj = PhasedReplayDataloaders(
+                sm_files=parquet_files,
+                replay_buffer_capacity=replay_capacity,
+                min_buffer_size=min_buffer_size,
+                window_spec=window,
+                normalizer=normalizer,
+                num_workers=workers,
+                hourly_aggregation=hourly_aggregation,
+                aggregation_divisor=agg_divisor,
+                batch_size=int(data_cfg.batch_size),
+                eval_cache_device=None,
+                eval_cache_batches=eval_batches,
+                cache_scan_batches=None,
+                pin_memory=(str(device) != "cpu"),
+                output_aggregate_stream=output_aggregate_stream,
+                skip_corrupt_files=skip_corrupt_files,
+                max_skip_warnings=max_skip_warnings,
+                phased_mode=phased_mode,
+                feature_cols=data_cfg.columns.value_cols,
+                meter_col=data_cfg.columns.meter_id,
+                split_seed=int(getattr(data_cfg.splits, "random_seed", 0)),
+                split_ratios={"train_ratio": 0.0, "val_ratio": 0.0, "test_ratio": 1.0},
+                max_value=float(getattr(data_cfg, "max_value", None)) or None,
+                max_hour_value=float(getattr(data_cfg, "max_hour_value", 20.0)) or None,
+            )
+            loader_obj.refresh_test_cache(n_batches)
+            test_loader = loader_obj.get_test_loader()
+            if test_loader is None and hasattr(loader_obj, "test_dataset"):
+                test_loader = DataLoader(
+                    loader_obj.test_dataset,
+                    batch_size=int(data_cfg.batch_size),
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=(str(device) != "cpu"),
+                )
+
     return test_loader
 
 
@@ -472,7 +337,8 @@ def main():
     
     # 1. Load model
     print("Step 1: Loading model...")
-    model, normalizer, conditioner, config = load_model(model_path, device=device)
+    model, normalizer, conditioner = load_model(model_path, device=device)
+    config = _load_config_for_model(model_path)
     
     # 2. Setup data loader
     print("\nStep 2: Setting up data loader...")
@@ -480,10 +346,18 @@ def main():
     
     # 3. Verify test loader is ready
     print("\nStep 3: Verifying test data...")
-    if test_loader is None or len(test_loader) == 0:
+    if test_loader is None:
         raise ValueError("Could not prepare test loader. No data available.")
-    
-    print(f"✓ Test loader ready with {len(test_loader.dataset)} windows")
+
+    try:
+        batch_probe = next(iter(test_loader))
+    except StopIteration:
+        raise ValueError("Could not prepare test loader. Test split produced zero batches.")
+
+    if not isinstance(batch_probe, (list, tuple)) or len(batch_probe) != 4:
+        raise ValueError("Unexpected batch format from test loader; expected 4-tuple.")
+
+    print("✓ Test loader ready")
     
     # 4. Create output folder with timestamp
     now = datetime.now()
