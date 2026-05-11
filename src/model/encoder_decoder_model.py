@@ -422,7 +422,7 @@ class AutoregressiveTransformerCoder(torch.nn.Module):
             dim_feedforward=d_model*4,
             batch_first=True, norm_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
 
         # 5. Output Head (Predicts probabilities for each bin at each time step)
         self.to_logits = nn.Linear(d_model, num_bins)
@@ -732,11 +732,13 @@ class TemporalCNNEncoder(nn.Module):
         # Parameter-specific heads (Outputting the latent z params)
         self.param_heads = nn.ModuleDict()
         for param in dist_parameters:
-            head_output_dim = int(self.param_output_dims.get(param, output_dim))
+            head_output_dim = self.param_output_dims.get(param)
+            if head_output_dim is None:
+                head_output_dim = output_dim
             self.param_heads[param] = nn.Sequential(
                 nn.Linear(flattened_size, 256),
                 nn.GELU(),
-                nn.Linear(256, head_output_dim)
+                nn.Linear(256, int(head_output_dim))
             )
 
     def forward(self, x):
@@ -823,6 +825,7 @@ class NNBlock(nn.Module):
     
     def _build_input_layer(self):
         start_n_neurons = self.hidden_dims[0]
+        layers: list[nn.Module]
         if self.layer_type == 'MLP':
             layers = [nn.Linear(self.input_dim, start_n_neurons), nn.ReLU()]
         elif self.layer_type == 'Conv1D':

@@ -2,6 +2,7 @@ import argparse
 import os
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -38,7 +39,53 @@ def _resolve_config_path(model_path: str) -> str:
     return os.path.join("config", "config.yaml")
 
 
-def _plot_week(series: np.ndarray, seq_len: int, output_path: str, title: str, conditions: dict = None):
+def _format_condition_slice(tag: str, values: np.ndarray) -> str:
+    values = np.asarray(values).reshape(-1)
+    if tag in {"day_of_week", "days"} and values.size >= 7:
+        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        active = [day_names[i] for i, value in enumerate(values[:7]) if value > 0.5]
+        return ", ".join(active) if active else day_names[int(np.argmax(values[:7]))]
+    if tag in {"month_of_year", "months"} and values.size >= 12:
+        month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        active = [month_names[i] for i, value in enumerate(values[:12]) if value > 0.5]
+        return ", ".join(active) if active else month_names[int(np.argmax(values[:12]))]
+    if "user" in tag.lower() or "lda" in tag.lower():
+        return f"Dom. Topic {int(np.argmax(values))}"
+    if values.size == 1:
+        return f"{float(values[0]):.2f}"
+    if np.all(values >= 0) and np.isclose(values.sum(), 1.0):
+        return f"Class {int(np.argmax(values))}"
+    return ", ".join(f"{float(value):.2f}" for value in values)
+
+
+def _summarize_used_conditions(used_conditions: torch.Tensor | None, conditioner) -> dict[str, str]:
+    if used_conditions is None or conditioner is None or not hasattr(conditioner, "get_condition_tags"):
+        return {}
+
+    if used_conditions.dim() == 1:
+        used_conditions = used_conditions.unsqueeze(0)
+
+    summary: dict[str, str] = {}
+    tags = conditioner.get_condition_tags()
+    for tag in tags:
+        try:
+            start, end = conditioner.get_condition_indexes(tag)
+            per_day = used_conditions[:, start:end].detach().cpu().numpy()
+            day_labels = [_format_condition_slice(tag, row) for row in per_day]
+
+            unique_labels: list[str] = []
+            for label in day_labels:
+                if label not in unique_labels:
+                    unique_labels.append(label)
+
+            summary[tag] = unique_labels[0] if len(unique_labels) == 1 else ", ".join(unique_labels)
+        except Exception:
+            summary[tag] = "Active"
+
+    return summary
+
+
+def _plot_week(series: np.ndarray, seq_len: int, output_path: str, title: str, conditions: dict[str, str] | None = None):
     style = PlotStyle()
     total_steps, num_features = series.shape
     hours = np.arange(total_steps)
@@ -55,12 +102,14 @@ def _plot_week(series: np.ndarray, seq_len: int, output_path: str, title: str, c
                 color=style.get_color(idx),
                 alpha=0.8,
                 linewidth=style.linewidth,
+                marker='o',
+                markersize=4,
             )
     else:
-        ax.plot(hours, series[:, 0], label="Generated", color=style.get_color(0), linewidth=2.0)
+        ax.plot(hours, series[:, 0], label="Generated", color=style.get_color(0), linewidth=2.0, marker='o', markersize=4)
 
     for day in range(1, max(1, total_steps // seq_len)):
-        ax.axvline(day * seq_len, color="#dddddd", linestyle="--", linewidth=1)
+        ax.axvline(day * seq_len, color="#9a9a9a", linestyle="--", linewidth=1.4, alpha=0.85)
 
     # Set up primary x-axis (Hours of the day)
     tick_step = max(1, seq_len // 4)
@@ -77,7 +126,7 @@ def _plot_week(series: np.ndarray, seq_len: int, output_path: str, title: str, c
     ax2.tick_params(length=0) 
 
     ax.set_title(title, pad=30)  # Added padding to make room for the top axis
-    ax.set_ylabel("Energy (kWh)")
+    ax.set_ylabel("Load (kWh)")
     ax.grid(True, alpha=0.3)
     
     handles, labels = ax.get_legend_handles_labels()
@@ -113,20 +162,20 @@ def _plot_reconstruction(original: np.ndarray, recon_a: np.ndarray, recon_b: np.
 
     axes[0].plot(hours, orig_series, label="Original", color=style.color_original, linewidth=2.0)
     for s in range(recon_a_series.shape[0]):
-        axes[0].plot(hours, recon_a_series[s], color=style.get_color(s), alpha=0.6, linewidth=1.5)
+        axes[0].plot(hours, recon_a_series[s], label=f"Reconstruction {s}", color=style.get_color(s), alpha=0.6, linewidth=1.5)
     axes[0].set_title(title_a)
-    axes[0].set_xlabel("Hour")
-    axes[0].set_ylabel("Energy (kWh)")
+    axes[0].set_xlabel("Hour of Day")
+    axes[0].set_ylabel("Load (kWh)")
     axes[0].grid(True, alpha=0.3)
 
     axes[1].plot(hours, orig_series, label="Original", color=style.color_original, linewidth=2.0)
     for s in range(recon_b_series.shape[0]):
         axes[1].plot(hours, recon_b_series[s], color=style.get_color(s + 1), alpha=0.6, linewidth=1.5)
     axes[1].set_title(title_b)
-    axes[1].set_xlabel("Hour")
+    axes[1].set_xlabel("Hour of Day")
     axes[1].grid(True, alpha=0.3)
 
-    axes[0].legend(loc="upper right")
+    axes[0].legend(loc="upper right", fontsize="small")
     plt.tight_layout()
     plt.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -154,7 +203,7 @@ def main():
     model, normalizer, conditioner = load_model(args.model_path, device=device, ev_path=args.ev_path)
 
     config_path = _resolve_config_path(args.model_path)
-    config = _load_train_config(config_path)
+    config = cast(Any, _load_train_config(config_path))
 
     generator = SyntheticGenerator(
         model=model,
@@ -174,7 +223,7 @@ def main():
     
     if args.meter_id is None:
         print("Warning: meter_id not provided; week generation will use random conditions.")
-        week_samples, used_conditions = generator.generate_continous(
+        week_samples, used_conditions = generator.generate_continuous(
             num_days=args.days,
             meter_id=0,
             start_date=start_date,
@@ -182,7 +231,7 @@ def main():
             temperature=args.temperature,
         )
     else:
-        week_samples, used_conditions = generator.generate_continous(
+        week_samples, used_conditions = generator.generate_continuous(
             num_days=args.days,
             meter_id=args.meter_id,
             start_date=start_date,
@@ -190,50 +239,33 @@ def main():
             temperature=args.temperature,
         )
 
+    if week_samples is None:
+        raise RuntimeError("Continuous generation returned no samples.")
+    if used_conditions is None:
+        raise RuntimeError("Continuous generation returned no conditions.")
+
     week_series = week_samples.detach().cpu().numpy()
     if week_series.ndim == 1:
         week_series = week_series[:, None]
 
-    conditions_dict = {}
-    if conditioner is not None and hasattr(conditioner, "get_condition_tags"):
-        tags = conditioner.get_condition_tags()
-        if used_conditions is not None:
-            # Parse the conditions from the first generated day
-            first_cond = used_conditions[0].flatten().detach().cpu().numpy() if used_conditions.ndim > 1 else used_conditions.flatten().detach().cpu().numpy()
-            for tag in tags:
-                try:
-                    start, end = conditioner.get_condition_indexes(tag)
-                    val = first_cond[start:end]
-                    
-                    # Formatting based on tag types
-                    if tag in ["days", "day_of_week"]:
-                        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-                        conditions_dict[tag] = day_names[int(np.argmax(val))]
-                    elif tag in ["months", "month_of_year"]:
-                        month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-                        conditions_dict[tag] = month_names[int(np.argmax(val))]
-                    elif "user" in tag.lower() or "lda" in tag.lower():
-                        conditions_dict[tag] = f"Dom. Topic {np.argmax(val)}"
-                    elif len(val) == 1: # Binary/Scalar conditions
-                        conditions_dict[tag] = f"{val[0]:.2f}"
-                    else: # One-hot conditions (EV phase, HP phase, active phases, etc.)
-                        conditions_dict[tag] = f"Class {np.argmax(val)}"
-                except Exception:
-                    conditions_dict[tag] = "Active"
-        else:
-            for tag in tags:
-                conditions_dict[tag] = "Active"
-    else:
+    conditions_dict = _summarize_used_conditions(used_conditions, conditioner)
+    if not conditions_dict:
         conditions_dict["Model"] = "Unconditioned"
 
     week_path = os.path.join(args.output_dir, "week_generation.png")
+    model_name = os.path.basename(os.path.normpath(args.model_path))
     _plot_week(
         week_series,
         seq_len=seq_len,
         output_path=week_path,
-        title=f"Week Generation ({args.days} days)",
+        title=f"Week Generation ({args.days} days) | Model: {model_name}",
         conditions=conditions_dict,
     )
+
+    if args.input_path is None:
+        print(f"Saved week-generation plot to {week_path}")
+        print("No --input-path provided, so skipping the EV-conditioned reconstruction demo.")
+        return
     
     # --- Reconstruction with EV toggle ---
     if conditioner is None or not hasattr(conditioner, "get_condition_tags"):
@@ -292,7 +324,7 @@ def main():
         hourly_aggregation = True
         aggregation_divisor = 1.0
 
-    stream = StreamingParquetBuffer(
+    stream = cast(Any, StreamingParquetBuffer(
         sm_files=[input_path],
         replay_buffer_capacity=64,
         min_buffer_size=0,
@@ -305,7 +337,7 @@ def main():
         phased_mode=phased_mode,
         meter_col=meter_col,
         feature_cols=value_cols,
-    )
+    ))
 
     target_date = pd.Timestamp(args.input_date).date() if args.input_date else None
     selected = None
@@ -397,3 +429,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# usage: python -m src.evaluation.generator_demo --model-path models/YourModelFolder --meter-id 123 --start-date 2026-01-05 --days 7 --temperature 1.0
+# usage: python -m src.evaluation.generator_demo --model-path models/hpc_runs/AutoRegressiveTransformerVAE_20260424_170101 --meter-id 100606 --start-date 2023-10-15 --days 7 --temperature 1.0 --input-path /Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/parq_hourly_6000/hourly_measurements_2023_10.parquet

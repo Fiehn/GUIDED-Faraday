@@ -59,6 +59,7 @@ class SyntheticGenerator:
             and getattr(self.model, 'num_features', None) is not None
             and getattr(self.model, 'sequence_length', None) is not None
         )
+
     def _is_baseline_model(self) -> bool:
         return hasattr(self.model, 'tag') and 'baseline' in self.model.tag
 
@@ -513,7 +514,7 @@ class SyntheticGenerator:
         return output, conditions
     
     @torch.no_grad()
-    def generate_continous(
+    def generate_continuous(
         self,
         num_days: int,
         meter_id: int,
