@@ -399,6 +399,9 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         else:
             meter_id = np.asarray(meter_id, dtype=np.int64)
 
+        # Ensure meter_id is at least 1-d (handles scalar tensors)
+        meter_id = np.atleast_1d(meter_id)
+
         self.batch_counter += 1
         for m_id in meter_id:
             self.user_last_seen[int(m_id)] = self.batch_counter
