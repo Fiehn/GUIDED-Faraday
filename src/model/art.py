@@ -23,14 +23,94 @@ class Tokenizer:
         # Maps integer tokens back to continuous floats
         return self.bins.to(x_int.device)[x_int]
 
+class VQTokenizer(nn.Module):
+    """
+    1D learned vector-quantized tokenizer. 
+    - codebook: [num_bins] learnable scalars
+    - Straigh-through estimarot for gradient flow
+    - EMA updates
+    """
+    def __init__(self, num_bins=256, max_val=20.0, decay=0.99, eps=1e-5):
+        super().__init__()
+        self.num_bins = num_bins
+        self.decay = decay
+        self.eps = eps
+
+        # Initialize codebook with linearly spaced values
+        codebook = torch.linspace(0, max_val, num_bins)
+        self.register_buffer('codebook', codebook)  # [num_bins]
+        # EMA accumulators
+        self.register_buffer('ema_cluster_size', torch.zeros(num_bins))
+        self.register_buffer('ema_embed_avg', torch.zeros(num_bins))
+    
+    @torch.no_grad()
+    def _ema_update(self, flat_input, encoding_indices):
+        if self.training:
+            # One hot-encode: [B*T, num_bins]
+            encodings = F.one_hot(encoding_indices, num_classes=self.num_bins).float()
+            # Update cluster size and embed avg
+            self.ema_cluster_size.mul_(self.decay).add_(encodings.sum(0), alpha=1 - self.decay)
+
+            # Laplace smoothing of cluster size
+            n = self.ema_cluster_size.sum()
+            cluster_size = ((self.ema_cluster_size + self.eps) / (n + self.num_bins * self.eps)) * n
+
+            # Update embed avg for scalar inputs: sum values per token index.
+            dw = torch.zeros_like(self.ema_embed_avg)
+            dw.index_add_(0, encoding_indices, flat_input)
+            self.ema_embed_avg.mul_(self.decay).add_(dw, alpha=1 - self.decay)
+
+            self.codebook.copy_(self.ema_embed_avg / cluster_size.clamp_min(self.eps))
+            # re-initialize any empty clusters
+            dead = self.ema_cluster_size < 1e-5
+            if dead.any():
+                random_idx = torch.randint(0, flat_input.size(0), (dead.sum().item(),), device=flat_input.device)
+                self.codebook[dead] = flat_input[random_idx]
+
+    def _quantize(self, x):
+        x_flat = x.reshape(-1)
+        distances = (x_flat.unsqueeze(1) - self.codebook.unsqueeze(0)) ** 2
+        indices = distances.argmin(dim=1)
+        x_q = self.codebook[indices].reshape(x.shape)
+        return x_q, indices
+
+    @torch.no_grad()
+    def encode(self, x):
+        _, indices = self._quantize(x)
+        return indices.reshape(x.shape)
+    
+    def forward(self, x):
+        """
+        x: [B, T] or [B] float tensor (unnormalized values)
+        Returns:
+            x_q: quantized values (same shape)
+            indices: token indices [B, T] (long)
+            vq_loss: commitment + codebook loss (scalar)
+        """
+        x_q, indices = self._quantize(x)
+
+        if self.training:
+            self._ema_update(x.reshape(-1), indices)
+        
+        # VQ losses
+        commitment_loss = F.mse_loss(x_q.detach(), x)
+        codebook_loss = F.mse_loss(x_q, x.detach())
+        vq_loss = commitment_loss + codebook_loss
+
+        return x_q, indices.reshape(x.shape), vq_loss
+    
+    def decode(self, indices):
+        return self.codebook[indices]
+                
+
 class AutoRegressiveTransformerVAE(CVAE):
     def __init__(self,
                  input_dim: int,
                  conditioner: Conditioner,
                  latent_dim: int,
-                 distribution_dict: dict = None,
-                 prior_type: str = None,
-                 hierarchy_config: HierarchicalConfig = None,
+                 distribution_dict: dict | None = None,
+                 prior_type: str | None = None,
+                 hierarchy_config: HierarchicalConfig | None = None,
                  sequence_length: int = 24,
                  num_features: int = 3,
                  num_layers: int = 4,
@@ -38,7 +118,8 @@ class AutoRegressiveTransformerVAE(CVAE):
                  d_model: int = 256,
                  dim_feedforward: int = 128,
                  bin_size: int = 256,
-                 normalizer: Normalizer = None,
+                 normalizer: Normalizer | None = None,
+                 tokenizer_type: str = "vq",
                     **kwargs):
         # Support config aliases used elsewhere in the codebase.
         num_layers = int(kwargs.pop("transformer_num_layers", num_layers))
@@ -61,7 +142,11 @@ class AutoRegressiveTransformerVAE(CVAE):
         self.sequence_length = int(sequence_length)
         self.num_features = int(num_features)
         self.d_model = int(d_model)
-        self.tokenizer = Tokenizer(max_val=10.0, num_bins=bin_size)
+        self.tokenizer_type = tokenizer_type
+        if tokenizer_type == "uniform":
+            self.tokenizer = Tokenizer(max_val=20.0, num_bins=bin_size)
+        else:
+            self.tokenizer = VQTokenizer(num_bins=bin_size, max_val=20.0)
         self.normalizer = normalizer
 
         # Encoder is handled by CVAE, but we need to override the decoder with an autoregressive transformer (or at least a transformer-based decoder).
@@ -173,14 +258,22 @@ class AutoRegressiveTransformerVAE(CVAE):
             x_unnormalized = x_unnormalized_time_first.reshape(x_interleaved.shape[0], -1).to(x_interleaved.device)
         else:
             x_unnormalized = x_interleaved
-        x_flat_tokens = self.tokenizer.encode(x_unnormalized).long().to(x_interleaved.device) # [B, L*F] -> [B, L*F]
-
+        if self.tokenizer_type == "uniform":
+            x_flat_tokens = self.tokenizer.encode(x_unnormalized).long().to(x_interleaved.device) # [B, L*F] -> [B, L*F]
+            vq_loss = torch.tensor(0.0, device=x_interleaved.device) # no VQ loss for uniform tokenizer
+        else:
+            x_q, x_flat_tokens, vq_loss = self.tokenizer(x_unnormalized) # [B, L*F] -> [B, L*F]
+            x_flat_tokens = x_flat_tokens.long().to(x_interleaved.device)
         # 2. Forward pass
         recon_params, q_params = self.forward(x_interleaved, c, num_samples=1, target_tokens=x_flat_tokens)
 
         # 3. Backward pass
         optim.zero_grad(set_to_none=True)
         loss_dict = self.loss(x_flat_tokens, recon_params, q_params, beta=beta, weighted_loss=weighted_loss, condition_dropout=condition_dropout)
+
+        # Add VQ loss if using VQTokenizer
+        loss_dict["loss"] = loss_dict["loss"] + vq_loss * 0.25 # scale VQ loss to prevent it from dominating early training
+
         loss_dict["loss"].backward()
 
         if gradient_clip is not None:

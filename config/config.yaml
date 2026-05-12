@@ -88,20 +88,20 @@ normalization:
 # ============================================================================
 model:
   # Model type: "vae", "cvae", "art", "set_guide_vae", "diffusion", "phase_splitter", "baseline_average", "baseline_quantile", "baseline_mean"
-  type: "sequential_vae"
+  type: "art"
   
   # Latent dimension (size of latent vector z)
   latent_dim: 128
 
   # Encoder configuration
   encoder:
-    type: "dictionary"  # Options: "dictionary", "mlp", "dictionary_cnn"
+    type: "dictionary_cnn"  # Options: "dictionary", "mlp", "dictionary_cnn"
     hidden_dims: [32, 64, 64]
     dropout: 0.2
   
   # Decoder configuration
   decoder:
-    type: "dictionary"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
+    type: "art"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
     hidden_dims: [64, 64, 32]
     dropout: 0.2
   

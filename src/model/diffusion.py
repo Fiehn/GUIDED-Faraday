@@ -8,10 +8,8 @@ from model.model_utils import *
 from model.model import BaseModel
 
 class NoiseScheduler(nn.Module):
-    """Noise schedule for diffusion models.
-
-    Inherits from nn.Module so that all schedule tensors are automatically
-    captured by the parent model's state_dict() via register_buffer().
+    """Noise schedule for diffusion models. Supports linear and cosine schedules. 
+    Precomputes and buffers all necessary noise parameters for efficient sampling and training.
     """
 
     def __init__(
@@ -38,6 +36,10 @@ class NoiseScheduler(nn.Module):
         self._init_buffers(torch.device(device))
 
     def _build_betas(self, device: torch.device) -> torch.Tensor:
+        """Construct the noise schedule (betas) based on the specified type.
+         - Linear: betas linearly spaced between beta_start and beta_end.
+         - Cosine: betas derived from a cosine function for smoother transitions.
+        """
         if self.schedule_type == "linear":
             return torch.linspace(self.beta_start, self.beta_end, self.num_timesteps, device=device)
 
@@ -49,6 +51,17 @@ class NoiseScheduler(nn.Module):
         return betas.clamp(min=1e-8, max=self.max_beta)
 
     def _init_buffers(self, device: torch.device) -> None:
+        """
+        Precompute and register all necessary buffers for the noise schedule, including:
+        - betas: The noise schedule itself.
+        - alphas: 1 - betas, representing the signal retention at each timestep.
+        - alphas_cumprod: Cumulative product of alphas, used for efficient sampling.
+        - sqrt_recip_alphas: Precomputed sqrt(1/alpha) for noise prediction.
+        - sqrt_alphas_cumprod: Precomputed sqrt of cumulative product of alphas for x_0 prediction.
+        - sqrt_one_minus_alphas_cumprod: Precomputed sqrt(1 - cumulative product of alphas) for noise scaling.
+        - posterior_variance: Variance of the posterior distribution q(x_{t-1} | x_t, x_0) used in the reverse diffusion process.
+        - posterior_mean_coef1 and posterior_mean_coef2: Coefficients for calculating the mean of the posterior distribution.
+        """
         betas = self._build_betas(device)
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
@@ -78,7 +91,11 @@ class NoiseScheduler(nn.Module):
         )
 
     def add_noise(self, x_start: torch.Tensor, t: torch.Tensor, noise: torch.Tensor | None = None):
-        """Forward noising q(x_t | x_0). Inputs are expected in [B, F, L]."""
+        """Forward noising q(x_t | x_0). Inputs are expected in [B, F, L].
+         - x_start: The original clean signal (x_0).
+         - t: The timesteps at which to add noise, shape [B].
+         - noise: Optional noise to add. If None, standard Gaussian noise is used.
+         """
         if noise is None:
             noise = torch.randn_like(x_start)
 
