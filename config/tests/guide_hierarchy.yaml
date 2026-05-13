@@ -157,7 +157,7 @@ model:
 conditioning:
   # Enable/disable conditioning
 
-  tags: ["day_of_week", "month_of_year", "user_profile", "heatpump_phase", "ev_phase"]
+  tags: ["day_of_week", "month_of_year", "user_profile", "heatpump_phase", "ev", "pv"]
   # ["day_of_week", "month_of_year", "user_profile", "nr_phases_active", "holiday", "heatpump_phase"]  
   
   # User profiling (based on LDA)
@@ -181,10 +181,10 @@ conditioning:
 # ============================================================================
 hierarchy:
   enabled: true
-  levels: ["stochastic", "stochastic", "stochastic"] # eg. ["linear", "StochasticLevel", "VQLevel"]
-  latent_dims: [256, 128, 64] # latent dimensions for each level
-  top_down: [true, true, true] # whether to use top-down connections for each level
-  bottom_up: [true, true, true] # whether to use bottom-up connections for each level
+  levels: ["linear", "stochastic", "stochastic"] # eg. ["linear", "StochasticLevel", "VQLevel"]
+  latent_dims: [128,128,128] # latent dimensions for each level
+  top_down: [false, false, true] # whether to use top-down connections for each level
+  bottom_up: [true, false, false] # whether to use bottom-up connections for each level
   loss_weights: [1.0, 1.0, 1.0] # weights for KL loss at each level
   
   aggregation: "concat"

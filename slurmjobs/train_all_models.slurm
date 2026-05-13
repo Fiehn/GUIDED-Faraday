@@ -25,4 +25,5 @@ python -u src/train.py --skip-validation --config "config/tests/diffusion.yaml"
 
 python -u src/train.py --skip-validation --config "config/tests/guide_cnn.yaml"
 python -u src/train.py --skip-validation --config "config/tests/guide_hierarchy.yaml"
+python -u src/train.py --skip-validation --config "config/tests/guide_hierarchy_cnn.yaml"
 python -u src/train.py --skip-validation --config "config/tests/guide_vamp.yaml"
