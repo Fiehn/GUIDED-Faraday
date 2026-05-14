@@ -203,45 +203,6 @@ class SetGuideVAE(CVAE):
             pooled = h.flatten(start_dim=1)  # [B, F*H] when ABL pooling is disabled
         return pooled
 
-    def _unpack_batch(self, batch):
-        """ Unpack batch supporting (x, meter_id, timestamps), (x, cond), or (x, meter_id) formats. """
-        if len(batch) == 4:
-            x, second, third, fourth = batch
-            # Regular CSV dataloader: (x, c, meter_id, timestamps)
-            if torch.is_tensor(second) and second.dim() >= 2:
-                return x, third, fourth
-            # Eval/extended tuple: (x, meter_id, timestamps, agg)
-            return x, second, third
-
-        if len(batch) == 3:
-            x, second, third = batch
-            # Phased condition tensor: cond=[B, 2, L]
-            if torch.is_tensor(second) and second.dim() == 3 and second.shape[1] >= 2:
-                meter_id = second[:, 0, 0].long()
-                timestamps = second[:, 1, 0].long()
-                return x, meter_id, timestamps
-
-            # Plain tuple: (x, meter_id, timestamps)
-            return x, second, third
-
-        if len(batch) != 2:
-            raise ValueError("SetGuideVAE expects batches as (x, meter_id, timestamps), (x, meter_id), or (x, cond)")
-
-        x, second = batch
-        meter_id = second
-        timestamps = None
-
-        if torch.is_tensor(second) and second.dim() == 3 and second.shape[1] >= 2:
-            # phased dataloader format: cond=[B, 2, L]
-            meter_id = second[:, 0, 0].long()
-            timestamps = second[:, 1, 0].long()
-        elif torch.is_tensor(second) and second.dim() == 2 and second.shape[1] >= 2:
-            # fallback packed format: [B, 2]
-            meter_id = second[:, 0].long()
-            timestamps = second[:, 1].long()
-
-        return x, meter_id, timestamps
-
     def forward(self, x: torch.Tensor, c: torch.Tensor, num_samples: int = 1):
         # Set encoder path
         x_phase_first = self._to_phase_first(x).float()

@@ -99,8 +99,9 @@ def setup_data_loader(config, normalizer, device="cpu"):
     skip_corrupt_files = bool(getattr(data_cfg, "skip_corrupt_files", True))
     max_skip_warnings = int(getattr(data_cfg, "max_skip_warnings", 20))
     output_aggregate_stream = bool(getattr(data_cfg, "output_aggregate_stream", False))
-    agg_divisor = float(getattr(data_cfg, "aggregation_divisor", 1.0))
     hourly_aggregation = bool(getattr(data_cfg.window, "aggregated", False))
+    aggregation_energy_unit = str(getattr(data_cfg, "aggregation_energy_unit", "wh")).lower()
+    agg_divisor = 1000.0 if hourly_aggregation and aggregation_energy_unit == "kwh" else float(getattr(data_cfg, "aggregation_divisor", 1.0))
 
     # Ensure test split exists for evaluation if training used test_ratio=0.
     train_ratio = float(getattr(data_cfg.splits, "train_ratio", 1.0))
