@@ -52,23 +52,38 @@ def load_model(model_path: str, device: str = "cpu", ev_path: str | None = None)
     model = create_model_from_config(config, device)
 
     # 4. Load the checkpoint
+    # Prefer checkpoints with a numeric epoch identifier (last numeric token in filename).
+    # If multiple checkpoints contain numbers, pick the one with the highest number.
+    # If no numeric tokens are present in any .pt file, fall back to the most recently
+    # modified .pt file in the directory.
+    import re
+
     checkpoint_path = None
     max_epoch = -1
-    for file in os.listdir(model_path):
-        if file.startswith("best_model_") and file.endswith(".pt"):
+    pt_files = [f for f in os.listdir(model_path) if f.endswith('.pt')]
+
+    for file in pt_files:
+        # Find all integer tokens in the filename and take the last one as epoch candidate
+        nums = re.findall(r"(\d+)", file)
+        if nums:
             try:
-                # Example: best_model_HierarchicalSplitter_20260426_182151_35.pt
-                epoch = int(file[:-3].split("_")[-1])
+                epoch = int(nums[-1])
                 if epoch > max_epoch:
                     max_epoch = epoch
                     checkpoint_path = os.path.join(model_path, file)
-            except ValueError:
-                if checkpoint_path is None:
-                    checkpoint_path = os.path.join(model_path, file)
+            except Exception:
+                # ignore parse errors and continue
+                continue
+
+    # If no numeric epochs found, fall back to the most recently modified .pt file
+    if checkpoint_path is None and pt_files:
+        pt_files_full = [os.path.join(model_path, f) for f in pt_files]
+        checkpoint_path = max(pt_files_full, key=os.path.getmtime)
     
     if checkpoint_path is None:
         raise FileNotFoundError(f"No checkpoint file found in {model_path}")
     
+    print(f"Loading model from checkpoint: {checkpoint_path}")
     normalizer, conditioner = model.load_model(checkpoint_path, device)
     model.eval() # Set model to evaluation mode for inference since it is the assumed state of load
     return model, normalizer, conditioner

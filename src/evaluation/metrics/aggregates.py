@@ -3,6 +3,7 @@ import os
 import matplotlib.pyplot as plt
 import json
 from typing import Dict, Any, List
+from matplotlib.ticker import AutoMinorLocator
 
 from datetime import datetime
 
@@ -77,8 +78,8 @@ class AggregatedProfiles(SyntheticMetric):
         real_data = self._extract_consumption_feature(self.real_data)
         synthetic_data = self._extract_consumption_feature(self.synthetic_data)
         
-        # Use the same number of samples for fair comparison
-        n_agg = min(self.n_samples, len(real_data), len(synthetic_data))
+        # Use all available samples (match the size to the smaller dataset)
+        n_agg = min(len(real_data), len(synthetic_data))
         if n_agg < 1:
             raise ValueError("AggregatedProfiles requires at least one sample in both real and synthetic data")
 
@@ -90,7 +91,7 @@ class AggregatedProfiles(SyntheticMetric):
         synth_aggregated = np.sum(synth_samples, axis=0)
         
         # Plot aggregated profiles
-        self._plot_aggregated_profiles(real_aggregated, synth_aggregated)
+        self._plot_aggregated_profiles(real_aggregated, synth_aggregated, n_agg=n_agg)
         
         # Compute Flexibility Distance
         fd_score = FlexibilityDistance.compute_fd_between_series(
@@ -114,13 +115,16 @@ class AggregatedProfiles(SyntheticMetric):
         
         return fd_score
     
-    def _plot_aggregated_profiles(self, real_aggregated: np.ndarray, synth_aggregated: np.ndarray):
+    def _plot_aggregated_profiles(self, real_aggregated: np.ndarray, synth_aggregated: np.ndarray, n_agg: int = None):
         """Plot aggregated real and synthetic profiles.
         Args:
             real_aggregated (np.ndarray): Aggregated profile from real data
             synth_aggregated (np.ndarray): Aggregated profile from synthetic data
+            n_agg (int): Number of samples aggregated (used for plot title)
         """
-        fig, ax = plt.subplots(figsize=(14, 6))
+        if n_agg is None:
+            n_agg = self.n_samples
+        fig, ax = plt.subplots(figsize=(18, 6))
         timesteps = np.arange(len(real_aggregated))
         ax.plot(timesteps, real_aggregated, label='Real Aggregated', 
                 color='blue', linewidth=2, alpha=0.8)
@@ -128,7 +132,10 @@ class AggregatedProfiles(SyntheticMetric):
                 color='red', linewidth=2, alpha=0.8, linestyle='--')
         ax.set_xlabel('Hour', fontsize=12)
         ax.set_ylabel('Aggregated Consumption [kWh]', fontsize=12)
-        ax.set_title(f'Aggregated Consumption Profiles (n={self.n_samples} samples)', fontsize=14)
+        ax.set_title(f'Aggregated Consumption Profiles (all n={n_agg} samples)', fontsize=14)
+        ax.xaxis.set_minor_locator(AutoMinorLocator(2))
+        ax.tick_params(axis='x', which='major', length=6)
+        ax.tick_params(axis='x', which='minor', length=3)
         ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()

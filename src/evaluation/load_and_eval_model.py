@@ -48,7 +48,7 @@ def _load_config_for_model(model_path: str):
     raise FileNotFoundError(f"No config file found in {model_path}")
 
 
-def setup_data_loader(config, normalizer, device="cpu"):
+def setup_data_loader(config, normalizer, device="cpu", model_path=None):
     """Build test loader using the phased replay dataloader implementation."""
     data_cfg = config.data
     data_mode = str(getattr(data_cfg, "mode", "csv")).lower()
@@ -57,11 +57,14 @@ def setup_data_loader(config, normalizer, device="cpu"):
     data_dir = getattr(config, "data_dir", None) or getattr(data_cfg, "data_dir", None) or getattr(data_cfg, "path", "data/_parquet_cache")
     configured_files = list(getattr(config, "data_files", []) or getattr(data_cfg, "data_files", []))
 
-    available_parquet_files = []
+    # Match training file selection: walk data_dir and include all .parquet
+    # except files that start with 'test' (training excluded those).
+    data_paths = []
     for root, _, files in os.walk(data_dir):
-        for file in files:
-            if file.endswith(".parquet"):
-                available_parquet_files.append(os.path.join(root, file))
+        for f in files:
+            if f.endswith(".parquet") and not f.startswith("test"):
+                data_paths.append(os.path.join(root, f))
+    available_parquet_files = sorted(data_paths)
 
     parquet_files = []
     if configured_files:
@@ -94,13 +97,16 @@ def setup_data_loader(config, normalizer, device="cpu"):
 
     replay_capacity = int(getattr(data_cfg, "replay_buffer_capacity", 10000))
     min_buffer_size = int(getattr(data_cfg, "min_buffer_size", 2000))
-    workers = int(getattr(data_cfg, "num_workers", 0))
+    workers = int(getattr(data_cfg, "num_workers", 4))
     eval_batches = int(getattr(data_cfg, "eval_batches", 5))
     skip_corrupt_files = bool(getattr(data_cfg, "skip_corrupt_files", True))
     max_skip_warnings = int(getattr(data_cfg, "max_skip_warnings", 20))
     output_aggregate_stream = bool(getattr(data_cfg, "output_aggregate_stream", False))
     agg_divisor = float(getattr(data_cfg, "aggregation_divisor", 1.0))
     hourly_aggregation = bool(getattr(data_cfg.window, "aggregated", False))
+    cache_scan_batches = int(getattr(data_cfg, "cache_scan_batches", 0)) or None
+    max_value_cfg = getattr(data_cfg, "max_value", None)
+    max_value = float(max_value_cfg) if max_value_cfg is not None else None
 
     # Ensure test split exists for evaluation if training used test_ratio=0.
     train_ratio = float(getattr(data_cfg.splits, "train_ratio", 1.0))
@@ -126,7 +132,7 @@ def setup_data_loader(config, normalizer, device="cpu"):
         batch_size=int(data_cfg.batch_size),
         eval_cache_device=None,
         eval_cache_batches=eval_batches,
-        cache_scan_batches=None,
+        cache_scan_batches=cache_scan_batches,
         pin_memory=(str(device) != "cpu"),
         output_aggregate_stream=output_aggregate_stream,
         skip_corrupt_files=skip_corrupt_files,
@@ -140,13 +146,57 @@ def setup_data_loader(config, normalizer, device="cpu"):
             "val_ratio": val_ratio,
             "test_ratio": test_ratio,
         },
-        max_value=float(getattr(data_cfg, "max_value", None)) or None,
+        max_value=max_value,
         max_hour_value=float(getattr(data_cfg, "max_hour_value", 20.0)) or None,
     )
 
     n_batches = max(1, eval_batches)
     loader_obj.refresh_test_cache(n_batches)
     test_loader = loader_obj.get_test_loader()
+
+    # Verify data config matches training
+    data_summary_path = os.path.join(model_path, "data_config_summary.json")
+    if os.path.exists(data_summary_path):
+        try:
+            import json as json_module
+            with open(data_summary_path, "r") as f:
+                training_data_config = json_module.load(f)
+            rerun_config = {
+                "data_files": parquet_files,
+                "num_files": len(parquet_files),
+                "split_seed": int(getattr(data_cfg.splits, "random_seed", 0)),
+                "split_ratios": {
+                    "train_ratio": train_ratio,
+                    "val_ratio": val_ratio,
+                    "test_ratio": test_ratio,
+                },
+                "batch_size": int(data_cfg.batch_size),
+                "window_input_len": int(data_cfg.window.input_len),
+                "window_stride": int(getattr(data_cfg.window, "stride", 1)),
+                "replay_buffer_capacity": replay_capacity,
+                "min_buffer_size": min_buffer_size,
+                "num_workers": workers,
+                "hourly_aggregation": hourly_aggregation,
+                "aggregation_divisor": agg_divisor,
+                "max_value": max_value,
+                "max_hour_value": float(getattr(data_cfg, "max_hour_value", 20.0)) or None,
+            }
+            key_diffs = []
+            for key in ["split_seed", "batch_size", "window_input_len", "window_stride", "replay_buffer_capacity", "min_buffer_size", "num_workers", "hourly_aggregation", "aggregation_divisor", "max_value", "max_hour_value"]:
+                if training_data_config.get(key) != rerun_config.get(key):
+                    key_diffs.append(f"{key}: training={training_data_config.get(key)} vs rerun={rerun_config.get(key)}")
+            if training_data_config.get("split_ratios") != rerun_config.get("split_ratios"):
+                key_diffs.append(f"split_ratios: training={training_data_config.get('split_ratios')} vs rerun={rerun_config.get('split_ratios')}")
+            if key_diffs:
+                print("[WARN] Data config differences detected between training and rerun:")
+                for diff in key_diffs:
+                    print(f"  - {diff}")
+            if training_data_config.get("num_files") != rerun_config.get("num_files"):
+                print(f"[WARN] File count mismatch: training={training_data_config.get('num_files')} vs rerun={rerun_config.get('num_files')}")
+            else:
+                print(f"✓ Data config matches training ({training_data_config.get('num_files')} files, seed={training_data_config.get('split_seed')})")
+        except Exception as e:
+            print(f"[WARN] Could not verify data config: {e}")
 
     # Fallback when streamed cache is empty but test dataset exists.
     if test_loader is None and hasattr(loader_obj, "test_dataset"):
@@ -177,7 +227,7 @@ def setup_data_loader(config, normalizer, device="cpu"):
                 batch_size=int(data_cfg.batch_size),
                 eval_cache_device=None,
                 eval_cache_batches=eval_batches,
-                cache_scan_batches=None,
+                cache_scan_batches=cache_scan_batches,
                 pin_memory=(str(device) != "cpu"),
                 output_aggregate_stream=output_aggregate_stream,
                 skip_corrupt_files=skip_corrupt_files,
@@ -187,7 +237,7 @@ def setup_data_loader(config, normalizer, device="cpu"):
                 meter_col=data_cfg.columns.meter_id,
                 split_seed=int(getattr(data_cfg.splits, "random_seed", 0)),
                 split_ratios={"train_ratio": 0.0, "val_ratio": 0.0, "test_ratio": 1.0},
-                max_value=float(getattr(data_cfg, "max_value", None)) or None,
+                max_value=max_value,
                 max_hour_value=float(getattr(data_cfg, "max_hour_value", 20.0)) or None,
             )
             loader_obj.refresh_test_cache(n_batches)
@@ -342,7 +392,7 @@ def main():
     
     # 2. Setup data loader
     print("\nStep 2: Setting up data loader...")
-    test_loader = setup_data_loader(config, normalizer, device=device)
+    test_loader = setup_data_loader(config, normalizer, device=device, model_path=model_path)
     
     # 3. Verify test loader is ready
     print("\nStep 3: Verifying test data...")
@@ -352,7 +402,11 @@ def main():
     try:
         batch_probe = next(iter(test_loader))
     except StopIteration:
-        raise ValueError("Could not prepare test loader. Test split produced zero batches.")
+        raise ValueError(
+            "Could not prepare test loader. The test stream is empty even after forcing test_ratio=1.0. "
+            "This usually means the replay buffer threshold is too high for the available test windows, "
+            "or the cached parquet data contains no valid windows after filtering."
+        )
 
     if not isinstance(batch_probe, (list, tuple)) or len(batch_probe) != 4:
         raise ValueError("Unexpected batch format from test loader; expected 4-tuple.")
