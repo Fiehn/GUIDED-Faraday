@@ -488,11 +488,17 @@ class SyntheticGenerator:
         final_samples = torch.cat(valid_samples, dim=0)[:num_samples]  # [N, D]
         N, D = final_samples.shape
         flat = final_samples
-        
+
         L = getattr(self.model, 'sequence_length', 24)
         F = D // L
 
-        output = flat.reshape(N, L, F)
+        # Mirror reconstruct(): models with num_features output D in phase-first order [F*L],
+        # so reshape as [N, F, L] and transpose to get [N, L, F] for the normalizer.
+        is_phase_first = getattr(self.model, 'num_features', None) is not None
+        if is_phase_first:
+            output = flat.reshape(N, F, L).transpose(1, 2)  # [N, L, F]
+        else:
+            output = flat.reshape(N, L, F)  # already [N, L, F]
 
         if self.secondary_model is not None:
             # Run without normalizer so we get normalized phase proportions
@@ -504,7 +510,7 @@ class SyntheticGenerator:
             conditions = split_cond
 
         if self.normalizer is not None and not self._is_art_model():
-            output = self.normalizer.inverse_transform(output.reshape(-1, F)).reshape(N, L, F)
+            output = self._apply_normalizer(output, inverse=True)
 
         # If conditions had a batch size > 1 and S > 1, the returned shape is (S * B, L, F).
         # To remain compatible with callers expecting (num_samples, L, F), 

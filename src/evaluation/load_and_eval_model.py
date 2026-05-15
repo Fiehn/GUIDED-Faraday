@@ -102,8 +102,9 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
     skip_corrupt_files = bool(getattr(data_cfg, "skip_corrupt_files", True))
     max_skip_warnings = int(getattr(data_cfg, "max_skip_warnings", 20))
     output_aggregate_stream = bool(getattr(data_cfg, "output_aggregate_stream", False))
-    agg_divisor = float(getattr(data_cfg, "aggregation_divisor", 1.0))
     hourly_aggregation = bool(getattr(data_cfg.window, "aggregated", False))
+    aggregation_energy_unit = str(getattr(data_cfg, "aggregation_energy_unit", "wh")).lower()
+    agg_divisor = 1000.0 if hourly_aggregation and aggregation_energy_unit == "kwh" else float(getattr(data_cfg, "aggregation_divisor", 1.0))
     cache_scan_batches = int(getattr(data_cfg, "cache_scan_batches", 0)) or None
     max_value_cfg = getattr(data_cfg, "max_value", None)
     max_value = float(max_value_cfg) if max_value_cfg is not None else None
