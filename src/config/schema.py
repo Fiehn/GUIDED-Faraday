@@ -96,6 +96,31 @@ class PhaseSplitterModelConfig(BaseModel):
     phase_splitter: PhaseSplitterConfig = Field(default_factory=PhaseSplitterConfig)
 
 
+class FaradayLossConfig(BaseModel):
+    model_config = {"extra": "allow"}
+    mse_weight: float = 1.0
+    mmd_weight: float = 100.0
+    upper_quantile_weight: float = 1.0
+    lower_quantile_weight: float = 1.0
+    median_quantile_weight: float = 1.0
+
+
+class GMMConfig(BaseModel):
+    model_config = {"extra": "allow"}
+    n_components: int = 300
+    covariance_type: str = "full"
+    max_iter: int = 100
+
+
+class FaradayModelConfig(BaseModel):
+    type: Literal["faraday"]
+    latent_dim: int
+    encoder: EncoderConfig
+    decoder: DecoderConfig
+    faraday: FaradayLossConfig = Field(default_factory=FaradayLossConfig)
+    gmm: GMMConfig = Field(default_factory=GMMConfig)
+
+
 class BaselineAverageModelConfig(BaseModel):
     type: Literal["baseline_average"]
 
@@ -117,6 +142,7 @@ ModelConfig = Annotated[
         SequentialVaeModelConfig,
         DiffusionModelConfig,
         PhaseSplitterModelConfig,
+        FaradayModelConfig,
         BaselineAverageModelConfig,
         BaselineQuantileModelConfig,
         BaselineMeanModelConfig,

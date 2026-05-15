@@ -26,9 +26,9 @@ data:
     stride: 96
   batch_size: 2048
   shuffle: true
-  replay_buffer_capacity: 10000
-  min_buffer_size: 4000
-  num_workers: 0
+  replay_buffer_capacity: 6000
+  min_buffer_size: 2000
+  num_workers: 8
   steps_per_epoch: 500
   eval_batches: 5
   eval_cache_on_gpu: true
@@ -36,7 +36,7 @@ data:
   cache_scan_batches: 0
   skip_corrupt_files: true
   max_skip_warnings: 20
-  aggregation_energy_unit: kwh
+  aggregation_energy_unit: wh
   output_aggregate_stream: false
 
 normalization:

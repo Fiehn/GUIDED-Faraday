@@ -364,6 +364,25 @@ def create_model_from_config(config, device="cpu"):
             decoder_dropout=decoder_dropout,
             phased_mode=phased_mode,
         )
+    elif model_type == "faraday":
+        from src.model.faraday import FaradayModel
+        faraday_cfg = getattr(model_cfg, "faraday", SimpleNamespace())
+        gmm_cfg = getattr(model_cfg, "gmm", SimpleNamespace())
+        model = FaradayModel(
+            sequence_length=seq_len,
+            latent_dim=model_cfg.latent_dim,
+            conditioner=conditioner,
+            encoder_hidden_dims=encoder_hidden_dims,
+            decoder_hidden_dims=decoder_hidden_dims,
+            mse_weight=float(getattr(faraday_cfg, "mse_weight", 1.0)),
+            mmd_weight=float(getattr(faraday_cfg, "mmd_weight", 100.0)),
+            upper_quantile_weight=float(getattr(faraday_cfg, "upper_quantile_weight", 1.0)),
+            lower_quantile_weight=float(getattr(faraday_cfg, "lower_quantile_weight", 1.0)),
+            median_quantile_weight=float(getattr(faraday_cfg, "median_quantile_weight", 1.0)),
+            gmm_n_components=int(getattr(gmm_cfg, "n_components", 300)),
+            gmm_covariance_type=str(getattr(gmm_cfg, "covariance_type", "full")),
+            gmm_max_iter=int(getattr(gmm_cfg, "max_iter", 100)),
+        )
     else:
         raise ValueError(f"Unknown model type '{model_type}' specified in config.")
 
