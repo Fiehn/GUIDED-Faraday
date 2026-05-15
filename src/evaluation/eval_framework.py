@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import json
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from datetime import datetime 
 
 import os
@@ -11,7 +11,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from src.evaluation.metrics.base.base import EvaluationMetric, ReconstructionMetric, SyntheticMetric, _save_standalone_metric_result
+from src.evaluation.metrics.base.base import EvaluationMetric, ReconstructionMetric, SyntheticMetric, PrivacyMetric, _save_standalone_metric_result
 
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
@@ -30,6 +30,7 @@ from src.evaluation.metrics.basic_reconstructions import ReconstructionRMSE, Rec
 
 from src.evaluation.metrics.base.base import _sanitize_numeric_array, _align_phases_by_mse, _align_phases_to_reference_mean, _to_json_serializable, _save_standalone_metric_result, _flatten_windows, _resolve_output_directory
 
+from src.evaluation.metrics.mia import MembershipInferenceAttack
 from tabulate import tabulate
 
 class EvalFramework:
@@ -74,11 +75,11 @@ class EvalFramework:
     """
     
     def __init__(
-        self, 
-        model: nn.Module, 
+        self,
+        model: nn.Module,
         dataloader: torch.utils.data.DataLoader,
         normalizer = None,
-        conditioner = None, 
+        conditioner = None,
         device: str = 'cpu',
         window_size: int = 24,
         n_synthetic_samples: int = 1000,
@@ -89,15 +90,23 @@ class EvalFramework:
         include_mean_baseline: bool = True,
         baseline_reference_data: np.ndarray = None,
         secondary_model: nn.Module = None,
+        train_dataloader: Optional[torch.utils.data.DataLoader] = None,
+        n_member_samples: int = 1000,
+        mia_reconstruction_samples: int = 1,
     ):
         """Initialize evaluation framework.
-        
+
         Args:
             model: Trained model
-            dataloader: DataLoader for evaluation data
-            normalizer: Data normalizer 
+            dataloader: DataLoader for evaluation data (test split)
+            normalizer: Data normalizer
             conditioner: Conditioner object (for CVAE)
             device: Device to run on ('cpu' or 'cuda')
+            train_dataloader: DataLoader for training data (member windows for MIA).
+                When provided, MIA is automatically registered in register_all().
+            n_member_samples: Maximum number of member windows to collect for MIA.
+            mia_reconstruction_samples: Reconstruction passes averaged per member
+                window.  Set to 1 for VAE-family, higher (e.g. 5) for diffusion.
         """
         self.model = model.to(device).eval()
         self.dataloader = dataloader
@@ -120,18 +129,25 @@ class EvalFramework:
             train_ref = prepared_data.get('train_data', None)
             if train_ref is not None:
                 self.baseline_reference_data = train_ref
-        
-        # Metrics storage 
+
+        self.train_dataloader = train_dataloader
+        self.n_member_samples = int(n_member_samples)
+        self.mia_reconstruction_samples = int(mia_reconstruction_samples)
+
+        # Metrics storage
         self.reconstruction_metrics: Dict[str, ReconstructionMetric] = {}
         self.synthetic_metrics: Dict[str, SyntheticMetric] = {}
+        self.privacy_metrics: Dict[str, PrivacyMetric] = {}
         self.results: Dict[str, float] = {}
         self.baseline_results: Dict[str, float] = {}
 
-        self._real_data: np.ndarray = None  # Cache real data for synthetic metrics that need it
-        self._reconstructed_data: np.ndarray = None  # Cache reconstructed data for metrics that need it
-        self._synthetic_data: np.ndarray = None  # Cache synthetic data for metrics that need it
-        self._timestamps: np.ndarray = None  # Cache timestamps for metrics that need it
+        self._real_data: np.ndarray = None
+        self._reconstructed_data: np.ndarray = None
+        self._synthetic_data: np.ndarray = None
+        self._timestamps: np.ndarray = None
         self._meter_ids: np.ndarray = None
+        self._train_data: Optional[np.ndarray] = None
+        self._train_reconstructed_data: Optional[np.ndarray] = None
 
     def register_all(self, phased: bool = False) -> None:
         """Convenience method to register all default metrics."""
@@ -153,6 +169,16 @@ class EvalFramework:
             self.register_metric(SetMaximumMeanDiscrepancy())
         else:
             self.register_metric(MaximumMeanDiscrepancy())
+
+        has_train = (
+            self.train_dataloader is not None
+            or (isinstance(self.prepared_data, dict) and self.prepared_data.get('train_data') is not None)
+        )
+        if has_train:
+            k = self.mia_reconstruction_samples if self.mia_reconstruction_samples > 1 else (
+                5 if self.generator._is_diffusion else 1
+            )
+            self.register_metric(MembershipInferenceAttack(n_reconstruction_samples=k))
 
     def _is_cvae(self) -> bool:
         """Check if model is a CVAE based on presence of conditioner on the model."""
@@ -268,7 +294,12 @@ class EvalFramework:
             self._synthetic_data = _sanitize_numeric_array(np.asarray(self.prepared_data.get('synthetic_data')))
             self._timestamps = self.prepared_data.get('timestamps')
             self._meter_ids = self.prepared_data.get('meter_ids')
-
+            train_data = self.prepared_data.get('train_data')
+            train_recon = self.prepared_data.get('train_reconstructed_data')
+            if train_data is not None:
+                self._train_data = _sanitize_numeric_array(np.asarray(train_data))
+            if train_recon is not None:
+                self._train_reconstructed_data = _sanitize_numeric_array(np.asarray(train_recon))
             return
 
         if self.verbose:
@@ -333,7 +364,40 @@ class EvalFramework:
 
         self._synthetic_data = _sanitize_numeric_array(self._generate_synthetic(self.n_synthetic_samples))
 
-    
+        # Collect member windows (training data) for MIA privacy metrics.
+        if self.train_dataloader is not None and self.privacy_metrics:
+            if self.verbose:
+                print("Collecting member windows for MIA...")
+            train_real_batches = []
+            train_recon_batches = []
+            n_collected = 0
+            self.model.eval()
+            with torch.no_grad():
+                for batch in self.train_dataloader:
+                    if n_collected >= self.n_member_samples:
+                        break
+                    try:
+                        data, meter_ids, timestamps, _agg = self._unpack_batch(batch)
+                    except Exception:
+                        continue
+                    data = data.to(self.device)
+                    data_denorm = self._inverse_transform_for_metrics(data)
+                    x_flat = self._flatten_for_metrics(data_denorm)
+                    train_real_batches.append(x_flat.cpu().numpy())
+                    recon = self._reconstruct_mean(
+                        data, self.mia_reconstruction_samples,
+                        meter_id=meter_ids, timestamps=timestamps,
+                    )
+                    train_recon_batches.append(recon.cpu().numpy())
+                    n_collected += len(data)
+            if train_real_batches:
+                self._train_data = _sanitize_numeric_array(
+                    np.concatenate(train_real_batches, axis=0)[:self.n_member_samples]
+                )
+                self._train_reconstructed_data = _sanitize_numeric_array(
+                    np.concatenate(train_recon_batches, axis=0)[:self.n_member_samples]
+                )
+
     def _reconstruct(self, x: torch.Tensor, 
                      meter_id: torch.Tensor | int | None = None, 
                      timestamps: torch.Tensor | None=None) -> torch.Tensor:
@@ -376,7 +440,28 @@ class EvalFramework:
             recon = self._flatten_for_metrics(recon_lf)
 
         return recon  # [B, D]
-    
+
+    def _reconstruct_mean(
+        self,
+        x: torch.Tensor,
+        n_samples: int = 1,
+        meter_id=None,
+        timestamps=None,
+    ) -> torch.Tensor:
+        """Reconstruct x and average over n_samples passes.
+
+        For VAE-family (n_samples=1) this is identical to _reconstruct.
+        For diffusion (n_samples>1) the stochastic reconstructions are averaged
+        to produce a more stable per-window error estimate for MIA.
+        """
+        if n_samples <= 1:
+            return self._reconstruct(x, meter_id=meter_id, timestamps=timestamps)
+        recons = torch.stack([
+            self._reconstruct(x, meter_id=meter_id, timestamps=timestamps)
+            for _ in range(n_samples)
+        ])
+        return recons.mean(dim=0)
+
     def _generate_synthetic(self, n_samples: int) -> np.ndarray:
         """Sample from prior using real conditions to match the real data distribution.
          For CVAE, conditions are sampled from the real conditions collected during reconstruction preparation.
@@ -473,12 +558,22 @@ class EvalFramework:
                 metric.timestamps = (np.asarray(self._timestamps)[:n] if self._timestamps is not None else None)
                 metric.meter_ids = (np.asarray(self._meter_ids)[:n] if self._meter_ids is not None else None)
 
+        for metric in self.privacy_metrics.values():
+            metric.member_data = self._train_data
+            metric.non_member_data = self._real_data
+            metric.member_reconstructed_data = self._train_reconstructed_data
+            metric.non_member_reconstructed_data = self._reconstructed_data
+            metric.model = self.model
+            metric.device = self.device
+            metric.normalizer = self.normalizer
+            metric.conditioner = self.conditioner
+            metric.output_path = self.output_path
+
     def register_metric(self, metric: EvaluationMetric) -> None:
-        """Register an evaluation metric. 
+        """Register an evaluation metric.
         Args:
-            metric: An instance of ReconstructionMetric or SyntheticMetric
+            metric: An instance of ReconstructionMetric, SyntheticMetric, or PrivacyMetric
         """
-        # Accept metric classes for convenience (e.g., from register_all)
         if isinstance(metric, type):
             if issubclass(metric, EvaluationMetric):
                 metric = metric()
@@ -489,9 +584,13 @@ class EvalFramework:
             self.reconstruction_metrics[metric.name] = metric
         elif isinstance(metric, SyntheticMetric):
             self.synthetic_metrics[metric.name] = metric
+        elif isinstance(metric, PrivacyMetric):
+            self.privacy_metrics[metric.name] = metric
         else:
             metric_label = getattr(metric, 'name', metric.__class__.__name__)
-            raise ValueError(f"Metric {metric_label} must inherit from ReconstructionMetric or SyntheticMetric")
+            raise ValueError(
+                f"Metric {metric_label} must inherit from ReconstructionMetric, SyntheticMetric, or PrivacyMetric"
+            )
     
     def register_metrics(self, metrics: List[EvaluationMetric]) -> None:
         """Register multiple metrics at once.
@@ -539,12 +638,21 @@ class EvalFramework:
                     value = metric.compute()
                     self.results[name] = value
                 except Exception as e:
-                    
+                    import traceback; traceback.print_exc(); print(f"Warning: metric '{name}' failed: {e}")
+                    self.results[name] = None
+
+        # Run privacy metrics
+        if self.privacy_metrics:
+            for name, metric in self.privacy_metrics.items():
+                try:
+                    value = metric.compute()
+                    self.results[name] = value
+                except Exception as e:
                     import traceback; traceback.print_exc(); print(f"Warning: metric '{name}' failed: {e}")
                     self.results[name] = None
 
         self._print_results_table()
-        
+
         return self.results
 
     def evaluate_reconstruction_only(self) -> Dict[str, float]:
@@ -595,6 +703,8 @@ class EvalFramework:
         """Return optimization direction for display/benchmarking."""
         if metric_name == "TSTR (Train on Synthetic, Test on Real)":
             return "target_1"
+        if "MIA" in metric_name:
+            return "target_0.5"
         if "Log-Likelihood" in metric_name or metric_name == "Visual Evaluations":
             return "higher"
         return "lower"
@@ -605,10 +715,19 @@ class EvalFramework:
 
         table_data = []
         for name, value in self.results.items():
-            model_str = "ERROR" if value is None else (f"{float(value):.6f}" if isinstance(value, (float, int, np.floating, np.integer)) else str(value))
-                    
+            model_str = "ERROR" if value is None else (
+                "N/A (no train data)" if value is None and name in self.privacy_metrics
+                else (f"{float(value):.6f}" if isinstance(value, (float, int, np.floating, np.integer)) else str(value))
+            )
             goal = self._metric_direction(name)
-            goal_label = "target=1" if goal == "target_1" else ("higher" if goal == "higher" else "lower")
+            if goal == "target_1":
+                goal_label = "target=1"
+            elif goal == "target_0.5":
+                goal_label = "target=0.5 (privacy)"
+            elif goal == "higher":
+                goal_label = "higher"
+            else:
+                goal_label = "lower"
             table_data.append([name, goal_label, model_str])
 
         headers = ["Metric", "Goal", "Model"]
@@ -650,6 +769,9 @@ class PhasedEvaluationSuite:
         n_synthetic_samples: int = 1000,
         output_path: str = 'output',
         secondary_model = None,
+        train_dataloader: Optional[torch.utils.data.DataLoader] = None,
+        n_member_samples: int = 1000,
+        mia_reconstruction_samples: int = 1,
     ):
         self.model = model
         self.secondary_model = secondary_model if secondary_model is not None else None
@@ -660,6 +782,9 @@ class PhasedEvaluationSuite:
         self.window_size = int(window_size)
         self.n_synthetic_samples = int(n_synthetic_samples)
         self.output_path = output_path
+        self.train_dataloader = train_dataloader
+        self.n_member_samples = int(n_member_samples)
+        self.mia_reconstruction_samples = int(mia_reconstruction_samples)
 
     def _prepare_base_framework(self) -> EvalFramework:
         framework = EvalFramework(
@@ -674,7 +799,16 @@ class PhasedEvaluationSuite:
             evaluation_title='PHASED DATA PREPARATION',
             verbose=False,
             secondary_model=self.secondary_model,
+            train_dataloader=self.train_dataloader,
+            n_member_samples=self.n_member_samples,
+            mia_reconstruction_samples=self.mia_reconstruction_samples,
         )
+        # Register privacy metrics so _prepare_data collects member windows.
+        if self.train_dataloader is not None:
+            k = self.mia_reconstruction_samples if self.mia_reconstruction_samples > 1 else (
+                5 if framework.generator._is_diffusion else 1
+            )
+            framework.register_metric(MembershipInferenceAttack(n_reconstruction_samples=k))
         framework._prepare_data()
         return framework
 
@@ -735,6 +869,8 @@ class PhasedEvaluationSuite:
             'synthetic_data': _flatten_windows(synthetic_phase.sum(axis=1)),
             'timestamps': base._timestamps,
             'meter_ids': base._meter_ids,
+            'train_data': base._train_data,
+            'train_reconstructed_data': base._train_reconstructed_data,
         }
         aggregate_results = self._run_prepared_eval(
             prepared_data=aggregated_prepared,

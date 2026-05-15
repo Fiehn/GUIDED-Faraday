@@ -1,7 +1,7 @@
 import os
-import yaml
 import shutil
 from types import SimpleNamespace
+from src.config.loader import load_config as _load_validated_config
 from src.model.cvae import CVAE
 from src.model.set import SetGuideVAE
 from src.model.sequential import SequentialPhaseVAE
@@ -25,12 +25,13 @@ def _to_namespace(obj):
 
 
 def _load_train_config(config_path: str | None = None):
-    """Load YAML config and add aliases expected by train()."""
+    """Load, validate, and merge YAML config; add aliases expected by train()."""
     if config_path is None:
         return None
 
-    with open(config_path, "r") as f:
-        raw = yaml.safe_load(f) or {}
+    # Validate and merge (handles base: override composition)
+    schema = _load_validated_config(config_path)
+    raw = schema.model_dump()
 
     cfg = _to_namespace(raw)
     cfg._config_path = os.path.abspath(config_path)
@@ -43,12 +44,12 @@ def _load_train_config(config_path: str | None = None):
     cfg.splits = cfg.data.splits
     cfg.data_dir = cfg.data.data_dir
     cfg.data_files = getattr(cfg.data, "data_files", [])
-    cfg.model_type = str(cfg.model.type).lower() if hasattr(cfg, "model") and hasattr(cfg.model, "type") else "vae"
+    cfg.model_type = str(cfg.model.type).lower()
 
-    # Backward-compatible alias: train() expects config.normalizer.method
+    # normalizer alias: train() expects config.normalizer.method
     if hasattr(cfg, "normalization"):
         cfg.normalizer = cfg.normalization
-    elif not hasattr(cfg, "normalizer"):
+    else:
         cfg.normalizer = SimpleNamespace(method="log1p")
 
     # Runtime toggles used in train()
