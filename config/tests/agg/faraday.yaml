@@ -14,13 +14,13 @@ normalization:
 
 model:
   type: faraday
-  latent_dim: 32
+  latent_dim: 128
   encoder:
     type: mlp  # Faraday always uses MLP; the type field is ignored at runtime
-    hidden_dims: [512, 256, 128, 64, 32]
+    hidden_dims: [512, 512, 1024, 256, 128]
   decoder:
     type: mlp
-    hidden_dims: [32, 64, 128, 256, 512]
+    hidden_dims: [128, 256, 1024, 512, 512]
 
   faraday:
     mse_weight: 1.0

@@ -308,23 +308,24 @@ class BaseModel(nn.Module, ABC):
             lr_scheduler = None
 
         # === Beta Scheduler Setup ===
+        _steps_per_epoch_for_beta = int(getattr(data_cfg, "steps_per_epoch", 100))
         beta_scheduler = None
         if getattr(train_cfg.beta_annealing, "enabled", False):
             from src.model.model_utils import CyclicalBetaScheduler
-            total_steps = num_epochs * int(getattr(train_cfg, "steps_per_epoch", 100))
+            total_steps = num_epochs * _steps_per_epoch_for_beta
             beta_scheduler = CyclicalBetaScheduler(
                 total_steps=total_steps,
                 beta_max= float(getattr(train_cfg.beta, "beta", 1.0)),
                 n_cycles= int(getattr(train_cfg.beta_annealing, "n_cycles", 1)),
                 ratio= float(getattr(train_cfg.beta_annealing, "cycle_ratio", 0.5)),
             )
-
+        
         # === Main Training Loop ===
         eval_batches = int(getattr(data_cfg, "eval_batches", 5))
         eval_every_n_epochs = int(getattr(train_cfg, "eval_every_n_epochs", 1))
-        eval_cache_refresh = bool(getattr(train_cfg, "eval_cache_refresh", True))
-        steps_per_epoch = int(getattr(train_cfg, "steps_per_epoch", 100))
-        
+        eval_cache_refresh = bool(getattr(data_cfg, "eval_cache_refresh", True))
+        steps_per_epoch = int(getattr(data_cfg, "steps_per_epoch", 100))
+
         gradient_clip = float(getattr(train_cfg, "gradient_clip", True))
         gradient_clip_max_norm = float(getattr(train_cfg, "gradient_clip_max_norm", 1.0))
 
@@ -335,6 +336,7 @@ class BaseModel(nn.Module, ABC):
             should_eval_epoch = eval_batches > 0
             should_eval_epoch = eval_batches > 0 and ((epoch + 1) % max(1, eval_every_n_epochs) == 0)
 
+            print(f"\nEpoch [{epoch+1}/{num_epochs}] — loading data ...", flush=True)
             cache_start_t = time.perf_counter()
             train_loader, epoch_eval_loader = data_loader.get_epoch_loaders(
                 steps_per_epoch = steps_per_epoch,
@@ -342,6 +344,7 @@ class BaseModel(nn.Module, ABC):
                 refresh_eval = should_eval_epoch and eval_cache_refresh,
             )
             cache_time_s = time.perf_counter() - cache_start_t
+            print(f"Epoch [{epoch+1}/{num_epochs}] — data ready in {cache_time_s:.1f}s, training ...", flush=True)
             if train_loader is None:
                 raise RuntimeError("DataLoader returned None for train_loader. Cannot proceed with training.")
             
@@ -383,9 +386,8 @@ class BaseModel(nn.Module, ABC):
             file_progress = data_loader.get_file_progress()
             print(
                 f"Epoch [{epoch+1}/{num_epochs}] "
-                f"Train Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | KL: {avg_kl:.4f}) | "
-                f"File seen/completed/skipped: {file_progress['seen']}/{file_progress['completed']}/{file_progress['skipped']} | "
-                f"of {file_progress['total']} "
+                f"Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | KL: {avg_kl:.4f} | "
+                f"data {cache_time_s:.1f}s  train {train_time_s:.1f}s"
             )
 
             if lr_scheduler is not None:

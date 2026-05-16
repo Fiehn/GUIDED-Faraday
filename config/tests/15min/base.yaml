@@ -53,7 +53,7 @@ conditioning:
     n_topics: 40
     num_clusters: 200
     random_state: 42
-    cache_path: ./models/UserProfiles/user_profiles.pkl
+    cache_path: ./models/UserProfiles/user_profiles_phased.pkl
     verbose: false
   online_user_profile:
     decay: 0.95

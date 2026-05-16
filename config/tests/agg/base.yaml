@@ -5,7 +5,7 @@
 data:
   mode: csv
   # Edit this path for your machine:
-  data_dir: "E:/Data/processed_data/hourly_data/sm_files"
+  data_dir: "E:/Data/processed_data/hourly_data/_parquet_cache"
   data_files: []
   columns:
     meter_id: meter_number
@@ -24,12 +24,12 @@ data:
     aggregated: true
     input_len: 24
     stride: 24
-  batch_size: 2048
+  batch_size: 256
   shuffle: true
   replay_buffer_capacity: 10000
-  min_buffer_size: 4000
-  num_workers: 0
-  steps_per_epoch: 500
+  min_buffer_size: 3000
+  num_workers: 8
+  steps_per_epoch: 1000
   eval_batches: 5
   eval_cache_on_gpu: true
   eval_cache_refresh: false
@@ -40,14 +40,14 @@ data:
   output_aggregate_stream: false
 
 normalization:
-  method: log1p
+  method: null
   cache_dir: null
   force_recompute: false
   log1p:
     epsilon: 1.0e-6
 
 conditioning:
-  tags: [day_of_week, month_of_year, user_profile, heatpump_phase, ev, pv]
+  tags: [day_of_week, month_of_year, heatpump_phase, ev, pv] # user_profile, 
   user_profile:
     online: false
     n_topics: 40
@@ -85,10 +85,10 @@ training:
     patience: 7
     min_delta: 0.001
   checkpointing:
-    save_freq: 10
+    save_freq: 15
     save_dir: ./models
     save_best_model: true
-    save_best_after_fraction: 0.25
+    save_best_after_fraction: 0.0
     save_final_model: true
 
 logging:

@@ -24,11 +24,11 @@ data:
     aggregated: true
     input_len: 24
     stride: 24
-  batch_size: 512
+  batch_size: 2048
   shuffle: true
   replay_buffer_capacity: 10000
   min_buffer_size: 4000
-  num_workers: 0
+  num_workers: 8
   steps_per_epoch: 500
   eval_batches: 5
   eval_cache_on_gpu: true
@@ -53,7 +53,7 @@ conditioning:
     n_topics: 40
     num_clusters: 200
     random_state: 42
-    cache_path: ./models/UserProfiles/user_profiles.pkl
+    cache_path: ./models/UserProfiles/user_profiles_phased.pkl
     verbose: false
   online_user_profile:
     decay: 0.95
