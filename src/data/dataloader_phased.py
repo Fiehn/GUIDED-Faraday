@@ -370,21 +370,6 @@ class StreamingParquetBuffer(IterableDataset):
                     # Window-level deterministic split
                     if not self._keep_window(int(meter_id_t.item()), int(timestamp_t.item())):
                         continue
-                    if self.max_value is not None and seq.abs().sum() > self.max_value:
-                        continue
-                    # Drop entire window if any single hour (summed across features/phases)
-                    # exceeds the per-hour threshold.
-                    if self.max_hour_value is not None:
-                        # seq shape: [L, F] -> sum across F to get per-hour total
-                        try:
-                            hourly = seq.abs().sum(dim=1)
-                            if hourly.max().item() > float(self.max_hour_value):
-                                continue
-                        except Exception:
-                            # If tensor ops fail for any reason, skip this window conservatively.
-                            continue
-                    if seq.abs().sum() == 0:
-                        continue
                     # Apply normalization if normalizer is provided
                     if self.normalizer is not None:
                         # seq shape is [24, 3], broadcasting with [3,]
@@ -465,18 +450,47 @@ class StreamingParquetBuffer(IterableDataset):
         if len(values) < self.window_spec.input_len:
             return sequences
 
-        for start in range(0, len(values) - self.window_spec.input_len + 1, self.window_spec.stride):
-            end = start + self.window_spec.input_len
-            
-            # Window shape before transpose: [L, F]
-            window = torch.tensor(values[start:end], dtype=torch.float32)
+        input_len = self.window_spec.input_len
 
-            # Per-window metadata (single values, not packed sequences)
-            meter_id_t = torch.tensor(int(meter_id), dtype=torch.long)
+        # Pre-compute per-timestep absolute totals across features once for all windows.
+        abs_totals = np.abs(values).sum(axis=1)  # [N]
+
+        # Prefix sums for O(1) per-window filter checks.
+        prefix = np.empty(len(values) + 1, dtype=np.float64)
+        prefix[0] = 0.0
+        np.cumsum(abs_totals, out=prefix[1:])
+
+        if self.max_hour_value is not None:
+            bad_hour = (abs_totals > self.max_hour_value).astype(np.int32)
+            prefix_bad = np.empty(len(values) + 1, dtype=np.int64)
+            prefix_bad[0] = 0
+            np.cumsum(bad_hour, out=prefix_bad[1:])
+        else:
+            prefix_bad = None
+
+        meter_id_t = torch.tensor(int(meter_id), dtype=torch.long)
+
+        for start in range(0, len(values) - input_len + 1, self.window_spec.stride):
+            end = start + input_len
+
+            # max_hour_value: reject if any timestep's phase-sum exceeds threshold
+            if prefix_bad is not None and prefix_bad[end] > prefix_bad[start]:
+                continue
+
+            window_abs_sum = prefix[end] - prefix[start]
+
+            # max_value: reject if total absolute sum across window exceeds threshold
+            if self.max_value is not None and window_abs_sum > self.max_value:
+                continue
+
+            # zero-sum: reject all-zero windows
+            if window_abs_sum == 0.0:
+                continue
+
+            window = torch.from_numpy(np.ascontiguousarray(values[start:end]))
             timestamp_t = torch.tensor(int(timestamps[start]), dtype=torch.long)
-
             sequences.append((window, meter_id_t, timestamp_t))
-        
+
         return sequences
 
     def _extract_sequences(self, df, meter_id=None, meter_col_name: str | None = None):
@@ -683,9 +697,6 @@ class PhasedReplayDataloaders:
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,
         }
-        if self.num_workers > 0:
-            loader_kwargs["persistent_workers"] = True
-            loader_kwargs["prefetch_factor"] = 2
         return DataLoader(dataset, **loader_kwargs)
 
     def _get_train_stream_loader(self):
@@ -775,9 +786,7 @@ class PhasedReplayDataloaders:
         max_scan_batches = self.cache_scan_batches or max(30, total_batches * 40)
 
         _t0 = _time.perf_counter()
-        _report_every = max(1, total_batches // 10)
         _batches_read = 0
-        print(f"  [data] Collecting {which}: {target:,} samples ({total_batches} batches) ...", flush=True)
 
         if which == "train":
             next_batch = self._next_train_stream_batch
@@ -823,11 +832,6 @@ class PhasedReplayDataloaders:
                 agg_out[samples:samples + take].copy_(agg_batch[:take])
                 samples += int(take)
 
-            if _batches_read % _report_every == 0 or samples >= target:
-                elapsed = _time.perf_counter() - _t0
-                pct = 100 * samples / target if target > 0 else 100
-                print(f"  [data]   {samples:>8,}/{target:,} ({pct:4.0f}%)  {elapsed:5.1f}s", flush=True)
-
             if samples >= target:
                 break
 
@@ -836,7 +840,6 @@ class PhasedReplayDataloaders:
             print(f"  [data] WARNING: no {which} samples collected in {elapsed:.1f}s", flush=True)
             return None, None, None, None
 
-        print(f"  [data] Collected {which}: {samples:,} samples in {elapsed:.1f}s", flush=True)
         return x_out[:samples], meter_out[:samples], ts_out[:samples], agg_out[:samples]
 
     def _collect_cache(self, target_train: int, target_eval: int):

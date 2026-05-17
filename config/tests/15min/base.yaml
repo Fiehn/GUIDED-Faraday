@@ -28,7 +28,7 @@ data:
   shuffle: true
   replay_buffer_capacity: 6000
   min_buffer_size: 2000
-  num_workers: 8
+  num_workers: 4
   steps_per_epoch: 500
   eval_batches: 5
   eval_cache_on_gpu: true
@@ -53,7 +53,7 @@ conditioning:
     n_topics: 40
     num_clusters: 200
     random_state: 42
-    cache_path: ./models/UserProfiles/user_profiles_phased.pkl
+    cache_path: ./models/UserProfiles/user_profiles.pkl
     verbose: false
   online_user_profile:
     decay: 0.95
