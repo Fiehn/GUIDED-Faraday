@@ -51,6 +51,15 @@ class AggregatedProfiles(SyntheticMetric):
 
     def _extract_consumption_feature(self, data: np.ndarray) -> np.ndarray:
         arr = _sanitize_numeric_array(np.asarray(data))
+        if arr.ndim == 3:
+            # Already window-shaped. Sum across the phase/feature axis so the
+            # aggregate profile reflects total consumption per timestep.
+            if arr.shape[1] == self.window_size and arr.shape[2] != self.window_size:
+                return arr.sum(axis=2)
+            if arr.shape[2] == self.window_size and arr.shape[1] != self.window_size:
+                return arr.sum(axis=1)
+            raise ValueError(f"Unexpected 3D window shape {arr.shape}")
+
         if arr.ndim != 2:
             raise ValueError(f"Expected 2D flattened array [N, D], got {arr.shape}")
 
@@ -67,11 +76,12 @@ class AggregatedProfiles(SyntheticMetric):
             return arr.reshape(-1, self.window_size)
 
         if self._uses_phase_first_flatten():
-            # Flatten order is [f0_t0..f0_tL-1, f1_t0..], so feature 0 is contiguous.
-            return arr.reshape(-1, n_features, self.window_size)[:, 0, :]
+            # Flatten order is [f0_t0..f0_tL-1, f1_t0..], so reshape to
+            # [N, F, L] and sum all phases/features.
+            return arr.reshape(-1, n_features, self.window_size).sum(axis=1)
 
         # Fallback for time-first flatten order [t0_f0, t0_f1, ..., t1_f0, ...].
-        return arr.reshape(-1, self.window_size, n_features)[:, :, 0]
+        return arr.reshape(-1, self.window_size, n_features).sum(axis=2)
     
     def compute(self) -> float:
         """Aggregate real and synthetic data, then compute Flexibility Distance."""

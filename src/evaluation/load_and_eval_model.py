@@ -54,7 +54,8 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
     data_mode = str(getattr(data_cfg, "mode", "csv")).lower()
     phased_mode = data_mode in {"phased", "phased_parquet"}
 
-    data_dir = getattr(config, "data_dir", None) or getattr(data_cfg, "data_dir", None) or getattr(data_cfg, "path", "data/_parquet_cache")
+    # data_dir = getattr(config, "data_dir", None) or getattr(data_cfg, "data_dir", None) or getattr(data_cfg, "path", "data/_parquet_cache")
+    data_dir = getattr(config, "data_dir", None) or getattr(data_cfg, "data_dir", None) or getattr(data_cfg, "path", "/Volumes/USB/parq_hourly")
     configured_files = list(getattr(config, "data_files", []) or getattr(data_cfg, "data_files", []))
 
     # Match training file selection: walk data_dir and include all .parquet
@@ -104,7 +105,7 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
     output_aggregate_stream = bool(getattr(data_cfg, "output_aggregate_stream", False))
     hourly_aggregation = bool(getattr(data_cfg.window, "aggregated", False))
     aggregation_energy_unit = str(getattr(data_cfg, "aggregation_energy_unit", "wh")).lower()
-    agg_divisor = 1000.0 if hourly_aggregation and aggregation_energy_unit == "kwh" else float(getattr(data_cfg, "aggregation_divisor", 1.0))
+    agg_divisor = 1000.0 if hourly_aggregation and aggregation_energy_unit == "kwh" else 1.0
     cache_scan_batches = int(getattr(data_cfg, "cache_scan_batches", 0)) or None
     max_value_cfg = getattr(data_cfg, "max_value", None)
     max_value = float(max_value_cfg) if max_value_cfg is not None else None
@@ -151,6 +152,9 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
         max_hour_value=float(getattr(data_cfg, "max_hour_value", 20.0)) or None,
     )
 
+    if phased_mode:
+        print(f"Phased aggregation unit: {aggregation_energy_unit} (divisor={agg_divisor:g})")
+
     n_batches = max(1, eval_batches)
     loader_obj.refresh_test_cache(n_batches)
     test_loader = loader_obj.get_test_loader()
@@ -162,48 +166,49 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
         print(f"[WARN] Could not build train loader for MIA: {e}")
 
     # Verify data config matches training
-    data_summary_path = os.path.join(model_path, "data_config_summary.json")
-    if os.path.exists(data_summary_path):
-        try:
-            import json as json_module
-            with open(data_summary_path, "r") as f:
-                training_data_config = json_module.load(f)
-            rerun_config = {
-                "data_files": parquet_files,
-                "num_files": len(parquet_files),
-                "split_seed": int(getattr(data_cfg.splits, "random_seed", 0)),
-                "split_ratios": {
-                    "train_ratio": train_ratio,
-                    "val_ratio": val_ratio,
-                    "test_ratio": test_ratio,
-                },
-                "batch_size": int(data_cfg.batch_size),
-                "window_input_len": int(data_cfg.window.input_len),
-                "window_stride": int(getattr(data_cfg.window, "stride", 1)),
-                "replay_buffer_capacity": replay_capacity,
-                "min_buffer_size": min_buffer_size,
-                "num_workers": workers,
-                "hourly_aggregation": hourly_aggregation,
-                "aggregation_divisor": agg_divisor,
-                "max_value": max_value,
-                "max_hour_value": float(getattr(data_cfg, "max_hour_value", 20.0)) or None,
-            }
-            key_diffs = []
-            for key in ["split_seed", "batch_size", "window_input_len", "window_stride", "replay_buffer_capacity", "min_buffer_size", "num_workers", "hourly_aggregation", "aggregation_divisor", "max_value", "max_hour_value"]:
-                if training_data_config.get(key) != rerun_config.get(key):
-                    key_diffs.append(f"{key}: training={training_data_config.get(key)} vs rerun={rerun_config.get(key)}")
-            if training_data_config.get("split_ratios") != rerun_config.get("split_ratios"):
-                key_diffs.append(f"split_ratios: training={training_data_config.get('split_ratios')} vs rerun={rerun_config.get('split_ratios')}")
-            if key_diffs:
-                print("[WARN] Data config differences detected between training and rerun:")
-                for diff in key_diffs:
-                    print(f"  - {diff}")
-            if training_data_config.get("num_files") != rerun_config.get("num_files"):
-                print(f"[WARN] File count mismatch: training={training_data_config.get('num_files')} vs rerun={rerun_config.get('num_files')}")
-            else:
-                print(f"✓ Data config matches training ({training_data_config.get('num_files')} files, seed={training_data_config.get('split_seed')})")
-        except Exception as e:
-            print(f"[WARN] Could not verify data config: {e}")
+    if model_path is not None:
+        data_summary_path = os.path.join(model_path, "data_config_summary.json")
+        if os.path.exists(data_summary_path):
+            try:
+                import json as json_module
+                with open(data_summary_path, "r") as f:
+                    training_data_config = json_module.load(f)
+                rerun_config = {
+                    "data_files": parquet_files,
+                    "num_files": len(parquet_files),
+                    "split_seed": int(getattr(data_cfg.splits, "random_seed", 0)),
+                    "split_ratios": {
+                        "train_ratio": train_ratio,
+                        "val_ratio": val_ratio,
+                        "test_ratio": test_ratio,
+                    },
+                    "batch_size": int(data_cfg.batch_size),
+                    "window_input_len": int(data_cfg.window.input_len),
+                    "window_stride": int(getattr(data_cfg.window, "stride", 1)),
+                    "replay_buffer_capacity": replay_capacity,
+                    "min_buffer_size": min_buffer_size,
+                    "num_workers": workers,
+                    "hourly_aggregation": hourly_aggregation,
+                    "aggregation_divisor": agg_divisor,
+                    "max_value": max_value,
+                    "max_hour_value": float(getattr(data_cfg, "max_hour_value", 20.0)) or None,
+                }
+                key_diffs = []
+                for key in ["split_seed", "batch_size", "window_input_len", "window_stride", "replay_buffer_capacity", "min_buffer_size", "num_workers", "hourly_aggregation", "aggregation_divisor", "max_value", "max_hour_value"]:
+                    if training_data_config.get(key) != rerun_config.get(key):
+                        key_diffs.append(f"{key}: training={training_data_config.get(key)} vs rerun={rerun_config.get(key)}")
+                if training_data_config.get("split_ratios") != rerun_config.get("split_ratios"):
+                    key_diffs.append(f"split_ratios: training={training_data_config.get('split_ratios')} vs rerun={rerun_config.get('split_ratios')}")
+                if key_diffs:
+                    print("[WARN] Data config differences detected between training and rerun:")
+                    for diff in key_diffs:
+                        print(f"  - {diff}")
+                if training_data_config.get("num_files") != rerun_config.get("num_files"):
+                    print(f"[WARN] File count mismatch: training={training_data_config.get('num_files')} vs rerun={rerun_config.get('num_files')}")
+                else:
+                    print(f"✓ Data config matches training ({training_data_config.get('num_files')} files, seed={training_data_config.get('split_seed')})")
+            except Exception as e:
+                print(f"[WARN] Could not verify data config: {e}")
 
     # Fallback when streamed cache is empty but test dataset exists.
     if test_loader is None and hasattr(loader_obj, "test_dataset"):
@@ -261,7 +266,7 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
     return test_loader, train_loader
 
 
-def run_evaluation(model, test_loader, normalizer, conditioner, config, output_path, device="cpu", train_loader=None):
+def run_evaluation(model, test_loader, normalizer, conditioner, config, output_path, device="cpu", secondary_model=None, train_loader=None):
     """
     Run the evaluation framework on the test loader.
     
@@ -278,14 +283,15 @@ def run_evaluation(model, test_loader, normalizer, conditioner, config, output_p
     
     eval_cfg = getattr(config, "evaluation", SimpleNamespace())
     eval_device = str(getattr(eval_cfg, "device", device))
-    default_synth_samples = 300 if model.__class__.__name__ == "AutoRegressiveTransformerVAE" else 1000
+    default_synth_samples = 1000
     n_synth_samples = int(getattr(eval_cfg, "n_synthetic_samples", default_synth_samples))
 
     eval_normalizer = copy.deepcopy(normalizer) if normalizer is not None else None
     if eval_normalizer is not None and hasattr(eval_normalizer, "to"):
         eval_normalizer = eval_normalizer.to(eval_device)
 
-    phased_mode = bool(getattr(config.data, "phased", True))
+    data_mode = str(getattr(config.data, "mode", "csv")).lower()
+    phased_mode = data_mode in {"phased", "phased_parquet"}
     is_diffusion = hasattr(model, 'noise_scheduler') and hasattr(model, 'reconstruct')
     mia_k = 5 if is_diffusion else 1
 
@@ -306,6 +312,7 @@ def run_evaluation(model, test_loader, normalizer, conditioner, config, output_p
             window_size=int(config.data.window.input_len),
             n_synthetic_samples=n_synth_samples,
             output_path=output_path,
+            secondary_model=secondary_model,
             train_dataloader=train_loader,
             mia_reconstruction_samples=mia_k,
         )
@@ -325,6 +332,7 @@ def run_evaluation(model, test_loader, normalizer, conditioner, config, output_p
                     window_size=int(config.data.window.input_len),
                     n_synthetic_samples=n_synth_samples,
                     output_path=output_path,
+                    secondary_model=secondary_model,
                     train_dataloader=train_loader,
                     mia_reconstruction_samples=mia_k,
                 )
@@ -341,6 +349,7 @@ def run_evaluation(model, test_loader, normalizer, conditioner, config, output_p
             device=eval_device,
             n_synthetic_samples=n_synth_samples,
             output_path=output_path,
+            secondary_model=secondary_model,
             train_dataloader=train_loader,
             mia_reconstruction_samples=mia_k,
         )
@@ -360,6 +369,7 @@ def run_evaluation(model, test_loader, normalizer, conditioner, config, output_p
                     device="cpu",
                     n_synthetic_samples=n_synth_samples,
                     output_path=output_path,
+                    secondary_model=secondary_model,
                     train_dataloader=train_loader,
                     mia_reconstruction_samples=mia_k,
                 )
@@ -388,6 +398,13 @@ def main():
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to use for evaluation (default: cuda if available, else cpu)"
     )
+
+    parser.add_argument(
+        "--phase-splitter-path",
+        type=str,
+        default=None,
+        help="Optional path to a trained HierarchicalSplitter folder used to split generated aggregate profiles into phases.",
+    )
     
     args = parser.parse_args()
     
@@ -408,6 +425,10 @@ def main():
     print("Step 1: Loading model...")
     model, normalizer, conditioner = load_model(model_path, device=device)
     config = _load_config_for_model(model_path)
+    secondary_model = None
+    if args.phase_splitter_path is not None:
+        print(f"Loading phase splitter from: {args.phase_splitter_path}")
+        secondary_model, _, _ = load_model(args.phase_splitter_path, device=device)
     
     # 2. Setup data loader
     print("\nStep 2: Setting up data loader...")
@@ -435,8 +456,11 @@ def main():
     # 4. Create output folder with timestamp
     now = datetime.now()
     timestamp = now.strftime("%Y%m%d_%H%M%S")
+    print(f"[DEBUG] main model_path = {model_path}")
+    print(f"[DEBUG] phase_splitter_path = {args.phase_splitter_path}")
     eval_output_dir = os.path.join(model_path, f"rerun_evaluation_{timestamp}")
     os.makedirs(eval_output_dir, exist_ok=True)
+    print(f"[DEBUG] eval_output_dir = {eval_output_dir}")
     
     print(f"\nStep 4: Running evaluation...")
     print(f"Output directory: {eval_output_dir}\n")
@@ -451,6 +475,7 @@ def main():
         config=config,
         output_path=eval_output_dir,
         device=device,
+        secondary_model=secondary_model,
     )
     
     print(f"\n{'='*70}")
