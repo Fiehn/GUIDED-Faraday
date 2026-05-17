@@ -1,7 +1,7 @@
 import os
-import yaml
 import shutil
 from types import SimpleNamespace
+from src.config.loader import load_config as _load_validated_config
 from src.model.cvae import CVAE
 from src.model.set import SetGuideVAE
 from src.model.sequential import SequentialPhaseVAE
@@ -25,12 +25,13 @@ def _to_namespace(obj):
 
 
 def _load_train_config(config_path: str | None = None):
-    """Load YAML config and add aliases expected by train()."""
+    """Load, validate, and merge YAML config; add aliases expected by train()."""
     if config_path is None:
         return None
 
-    with open(config_path, "r") as f:
-        raw = yaml.safe_load(f) or {}
+    # Validate and merge (handles base: override composition)
+    schema = _load_validated_config(config_path)
+    raw = schema.model_dump()
 
     cfg = _to_namespace(raw)
     cfg._config_path = os.path.abspath(config_path)
@@ -43,12 +44,12 @@ def _load_train_config(config_path: str | None = None):
     cfg.splits = cfg.data.splits
     cfg.data_dir = cfg.data.data_dir
     cfg.data_files = getattr(cfg.data, "data_files", [])
-    cfg.model_type = str(cfg.model.type).lower() if hasattr(cfg, "model") and hasattr(cfg.model, "type") else "vae"
+    cfg.model_type = str(cfg.model.type).lower()
 
-    # Backward-compatible alias: train() expects config.normalizer.method
+    # normalizer alias: train() expects config.normalizer.method
     if hasattr(cfg, "normalization"):
         cfg.normalizer = cfg.normalization
-    elif not hasattr(cfg, "normalizer"):
+    else:
         cfg.normalizer = SimpleNamespace(method="log1p")
 
     # Runtime toggles used in train()
@@ -362,6 +363,25 @@ def create_model_from_config(config, device="cpu"):
             encoder_dropout=encoder_dropout,
             decoder_dropout=decoder_dropout,
             phased_mode=phased_mode,
+        )
+    elif model_type == "faraday":
+        from src.model.faraday import FaradayModel
+        faraday_cfg = getattr(model_cfg, "faraday", SimpleNamespace())
+        gmm_cfg = getattr(model_cfg, "gmm", SimpleNamespace())
+        model = FaradayModel(
+            sequence_length=seq_len,
+            latent_dim=model_cfg.latent_dim,
+            conditioner=conditioner,
+            encoder_hidden_dims=encoder_hidden_dims,
+            decoder_hidden_dims=decoder_hidden_dims,
+            mse_weight=float(getattr(faraday_cfg, "mse_weight", 1.0)),
+            mmd_weight=float(getattr(faraday_cfg, "mmd_weight", 100.0)),
+            upper_quantile_weight=float(getattr(faraday_cfg, "upper_quantile_weight", 1.0)),
+            lower_quantile_weight=float(getattr(faraday_cfg, "lower_quantile_weight", 1.0)),
+            median_quantile_weight=float(getattr(faraday_cfg, "median_quantile_weight", 1.0)),
+            gmm_n_components=int(getattr(gmm_cfg, "n_components", 300)),
+            gmm_covariance_type=str(getattr(gmm_cfg, "covariance_type", "full")),
+            gmm_max_iter=int(getattr(gmm_cfg, "max_iter", 100)),
         )
     else:
         raise ValueError(f"Unknown model type '{model_type}' specified in config.")

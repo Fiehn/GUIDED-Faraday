@@ -1,0 +1,104 @@
+# Shared base config for phased comparison experiments.
+# Machine-specific: edit data.data_dir for your machine.
+# Override configs reference this file via `base: base.yaml`.
+
+data:
+  mode: csv
+  # Edit this path for your machine:
+  data_dir: "E:/Data/processed_data/hourly_data/_parquet_cache"
+  data_files: []
+  columns:
+    meter_id: meter_number
+    timestamp_dst: timestamp_dst
+    timestamp_utc: timestamp_utc
+    value_cols: [hourly_energy_consumption]
+  nan_as_zero: false
+  max_value: 200.0
+  max_hour_value: 20.0
+  splits:
+    train_ratio: 0.8
+    val_ratio: 0.1
+    test_ratio: 0.1
+    random_seed: 42
+  window:
+    aggregated: true
+    input_len: 24
+    stride: 24
+  batch_size: 256
+  shuffle: true
+  replay_buffer_capacity: 10000
+  min_buffer_size: 3000
+  num_workers: 8
+  steps_per_epoch: 1000
+  eval_batches: 5
+  eval_cache_on_gpu: true
+  eval_cache_refresh: false
+  cache_scan_batches: 0
+  skip_corrupt_files: true
+  max_skip_warnings: 20
+  aggregation_energy_unit: kwh
+  output_aggregate_stream: false
+
+normalization:
+  method: null
+  cache_dir: null
+  force_recompute: false
+  log1p:
+    epsilon: 1.0e-6
+
+conditioning:
+  tags: [day_of_week, month_of_year, heatpump_phase, ev, pv] # user_profile, 
+  user_profile:
+    online: false
+    n_topics: 40
+    num_clusters: 200
+    random_state: 42
+    cache_path: ./models/UserProfiles/user_profiles.pkl
+    verbose: false
+  online_user_profile:
+    decay: 0.95
+  ev_phase:
+    path: data/EV/EV_detection_reduced_60000_SM.csv
+
+training:
+  optimizer: adam
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  gradient_clip: true
+  gradient_clip_max_norm: 1.0
+  lr_scheduler:
+    enabled: true
+    scheduler_type: cosine
+    step_size: 10
+    gamma: 0.9
+  num_epochs: 100
+  beta: 1.0
+  beta_annealing:
+    enabled: true
+    n_cycles: 1
+    ratio: 0.25
+  weighted_loss: 0.2
+  early_stopping:
+    enabled: false
+    stop_on_all_files_used: true
+    min_epochs_before_full_data_stop: 1
+    patience: 7
+    min_delta: 0.001
+  checkpointing:
+    save_freq: 15
+    save_dir: ./models
+    save_best_model: true
+    save_best_after_fraction: 0.0
+    save_final_model: true
+
+logging:
+  log_dir: ./models
+  save_config: true
+  config_save_dir: ./models
+
+visualize:
+  num_samples: 5
+  num_recon_per: 5
+  num_synthetic: 40
+  num_originals: 4
+  num_synthetic_per: 10

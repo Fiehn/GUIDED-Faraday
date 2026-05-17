@@ -159,6 +159,12 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
     loader_obj.refresh_test_cache(n_batches)
     test_loader = loader_obj.get_test_loader()
 
+    train_loader = None
+    try:
+        train_loader, _ = loader_obj.get_epoch_loaders(steps_per_epoch=eval_batches, eval_batches=0)
+    except Exception as e:
+        print(f"[WARN] Could not build train loader for MIA: {e}")
+
     # Verify data config matches training
     if model_path is not None:
         data_summary_path = os.path.join(model_path, "data_config_summary.json")
@@ -257,10 +263,10 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
                     pin_memory=(str(device) != "cpu"),
                 )
 
-    return test_loader
+    return test_loader, train_loader
 
 
-def run_evaluation(model, test_loader, normalizer, conditioner, config, output_path, device="cpu", secondary_model=None):
+def run_evaluation(model, test_loader, normalizer, conditioner, config, output_path, device="cpu", secondary_model=None, train_loader=None):
     """
     Run the evaluation framework on the test loader.
     
@@ -286,11 +292,15 @@ def run_evaluation(model, test_loader, normalizer, conditioner, config, output_p
 
     data_mode = str(getattr(config.data, "mode", "csv")).lower()
     phased_mode = data_mode in {"phased", "phased_parquet"}
-    
+    is_diffusion = hasattr(model, 'noise_scheduler') and hasattr(model, 'reconstruct')
+    mia_k = 5 if is_diffusion else 1
+
     print(f"\nRunning evaluation (phased_mode={phased_mode})...")
     print(f"  Output path: {output_path}")
     print(f"  Device: {eval_device}")
     print(f"  Synthetic samples: {n_synth_samples}")
+    if train_loader is not None:
+        print(f"  MIA enabled (K={mia_k} reconstruction samples)")
 
     if phased_mode:
         evaluator = PhasedEvaluationSuite(
@@ -303,6 +313,8 @@ def run_evaluation(model, test_loader, normalizer, conditioner, config, output_p
             n_synthetic_samples=n_synth_samples,
             output_path=output_path,
             secondary_model=secondary_model,
+            train_dataloader=train_loader,
+            mia_reconstruction_samples=mia_k,
         )
         try:
             evaluator.evaluate()
@@ -321,6 +333,8 @@ def run_evaluation(model, test_loader, normalizer, conditioner, config, output_p
                     n_synthetic_samples=n_synth_samples,
                     output_path=output_path,
                     secondary_model=secondary_model,
+                    train_dataloader=train_loader,
+                    mia_reconstruction_samples=mia_k,
                 )
                 evaluator.evaluate()
                 print("✓ Evaluation completed successfully on CPU.")
@@ -336,6 +350,8 @@ def run_evaluation(model, test_loader, normalizer, conditioner, config, output_p
             n_synthetic_samples=n_synth_samples,
             output_path=output_path,
             secondary_model=secondary_model,
+            train_dataloader=train_loader,
+            mia_reconstruction_samples=mia_k,
         )
         evaluator.register_all()
         try:
@@ -354,6 +370,8 @@ def run_evaluation(model, test_loader, normalizer, conditioner, config, output_p
                     n_synthetic_samples=n_synth_samples,
                     output_path=output_path,
                     secondary_model=secondary_model,
+                    train_dataloader=train_loader,
+                    mia_reconstruction_samples=mia_k,
                 )
                 evaluator.register_all()
                 evaluator.evaluate()
@@ -414,8 +432,8 @@ def main():
     
     # 2. Setup data loader
     print("\nStep 2: Setting up data loader...")
-    test_loader = setup_data_loader(config, normalizer, device=device, model_path=model_path)
-    
+    test_loader, train_loader = setup_data_loader(config, normalizer, device=device, model_path=model_path)
+
     # 3. Verify test loader is ready
     print("\nStep 3: Verifying test data...")
     if test_loader is None:
@@ -451,6 +469,7 @@ def main():
     run_evaluation(
         model=model,
         test_loader=test_loader,
+        train_loader=train_loader,
         normalizer=normalizer,
         conditioner=conditioner,
         config=config,

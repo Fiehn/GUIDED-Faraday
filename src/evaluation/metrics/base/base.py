@@ -2,7 +2,7 @@ import json
 import os
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -177,8 +177,37 @@ class ReconstructionMetric(EvaluationMetric):
 
 class SyntheticMetric(EvaluationMetric):
     """Base class for synthetic data evaluation metrics."""
-    
+
     @abstractmethod
     def compute(self) -> float:
         """Compute metric on synthetic samples."""
+        pass
+
+
+class PrivacyMetric(EvaluationMetric):
+    """Base class for privacy evaluation metrics.
+
+    Receives member (training) and non-member (test) windows together with
+    their pre-computed reconstructions.  Subclasses may also use the injected
+    model and normalizer to run additional reconstruction passes (e.g. K>1 for
+    diffusion stochasticity).
+
+    Outlier-injection extension point: swap out ``member_data`` /
+    ``member_reconstructed_data`` for outlier-augmented arrays before calling
+    ``compute()`` to implement the improved attack from arXiv:2407.11785.
+    """
+
+    member_data: "Optional[np.ndarray]" = None
+    non_member_data: "Optional[np.ndarray]" = None
+    member_reconstructed_data: "Optional[np.ndarray]" = None
+    non_member_reconstructed_data: "Optional[np.ndarray]" = None
+    model: "Optional[Any]" = None
+    normalizer: "Optional[Any]" = None
+    conditioner: "Optional[Any]" = None
+    device: str = 'cpu'
+    output_path: "Optional[str]" = None
+
+    @abstractmethod
+    def compute(self) -> float:
+        """Compute privacy metric and return scalar summary."""
         pass

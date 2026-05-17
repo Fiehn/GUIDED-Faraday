@@ -564,11 +564,13 @@ class PhasedReplayDataloaders:
         sm_files = list(sm_files)
         self.total_files = len(set(sm_files))
 
-        # Manager-backed maps are shared across DataLoader workers.
-        self._stats_manager = mp.Manager()
-        self._file_seen_map = self._stats_manager.dict()
-        self._file_completed_map = self._stats_manager.dict()
-        self._file_skipped_map = self._stats_manager.dict()
+        # Regular dicts — per-process copies in DataLoader workers (logging only).
+        # mp.Manager().dict() proxies fail to reconnect on Windows+Python 3.13 when
+        # workers are spawned, causing silent worker crashes.
+        self._stats_manager = None
+        self._file_seen_map = {}
+        self._file_completed_map = {}
+        self._file_skipped_map = {}
 
         self.files_seen = 0
         self.files_completed = 0
@@ -758,6 +760,7 @@ class PhasedReplayDataloaders:
                 return None
 
     def _collect_stream_cache(self, which: str, target: int):
+        import time as _time
         target = max(0, int(target))
         if target == 0:
             return None, None, None, None
@@ -771,6 +774,11 @@ class PhasedReplayDataloaders:
         total_batches = max(1, (target + self.batch_size - 1) // self.batch_size)
         max_scan_batches = self.cache_scan_batches or max(30, total_batches * 40)
 
+        _t0 = _time.perf_counter()
+        _report_every = max(1, total_batches // 10)
+        _batches_read = 0
+        print(f"  [data] Collecting {which}: {target:,} samples ({total_batches} batches) ...", flush=True)
+
         if which == "train":
             next_batch = self._next_train_stream_batch
         elif which == "val":
@@ -782,6 +790,7 @@ class PhasedReplayDataloaders:
 
         for _ in range(max_scan_batches):
             batch = next_batch()
+            _batches_read += 1
             if batch is None:
                 break
             if not isinstance(batch, (list, tuple)) or len(batch) != 4:
@@ -807,18 +816,27 @@ class PhasedReplayDataloaders:
 
             take = min(remaining, x.shape[0])
             if take > 0:
+                assert x_out is not None and meter_out is not None and ts_out is not None and agg_out is not None
                 x_out[samples:samples + take].copy_(x[:take])
                 meter_out[samples:samples + take].copy_(meter_batch[:take])
                 ts_out[samples:samples + take].copy_(ts_batch[:take])
                 agg_out[samples:samples + take].copy_(agg_batch[:take])
                 samples += int(take)
 
+            if _batches_read % _report_every == 0 or samples >= target:
+                elapsed = _time.perf_counter() - _t0
+                pct = 100 * samples / target if target > 0 else 100
+                print(f"  [data]   {samples:>8,}/{target:,} ({pct:4.0f}%)  {elapsed:5.1f}s", flush=True)
+
             if samples >= target:
                 break
 
+        elapsed = _time.perf_counter() - _t0
         if x_out is None or samples == 0:
+            print(f"  [data] WARNING: no {which} samples collected in {elapsed:.1f}s", flush=True)
             return None, None, None, None
 
+        print(f"  [data] Collected {which}: {samples:,} samples in {elapsed:.1f}s", flush=True)
         return x_out[:samples], meter_out[:samples], ts_out[:samples], agg_out[:samples]
 
     def _collect_cache(self, target_train: int, target_eval: int):
@@ -921,6 +939,20 @@ class PhasedReplayDataloaders:
         train_x, train_meter, train_timestamps, train_agg, eval_x, eval_meter, eval_timestamps, eval_agg = self._collect_cache(target_train, target_eval)
         if train_x is None or train_meter is None or train_timestamps is None or train_x.shape[0] == 0:
             return None, self.eval_loader
+
+        # Cache training tensors on GPU if eval_cache_device is set.
+        # This eliminates per-batch CPU→GPU transfers during the training loop.
+        # if self.eval_cache_device is not None:
+        #     try:
+        #         train_x = train_x.to(self.eval_cache_device)
+        #         train_meter = train_meter.to(self.eval_cache_device)
+        #         train_timestamps = train_timestamps.to(self.eval_cache_device)
+        #         train_agg = train_agg.to(self.eval_cache_device)
+        #     except RuntimeError as e:
+        #         if "out of memory" in str(e).lower():
+        #             print("Warning: train cache GPU transfer OOM; keeping train cache on CPU.")
+        #         else:
+        #             raise
 
         train_ds = TensorDataset(train_x, train_meter, train_timestamps, train_agg)
         pin_train_memory = self.pin_memory and train_x.device.type == "cpu"

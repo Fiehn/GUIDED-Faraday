@@ -214,28 +214,31 @@ def train(config, train_only_user_profile: bool = False):
     skip_corrupt_files = bool(getattr(data_cfg, "skip_corrupt_files", True))
     max_skip_warnings = int(getattr(data_cfg, "max_skip_warnings", 20))
     
-    normalizer_cfg = getattr(config, "normalizer", SimpleNamespace())
-    norm_method = str(getattr(normalizer_cfg, "method", "log1p")).lower() if not phased_mode else "log1p_phase"
-    norm_cache_dir = getattr(normalizer_cfg, "cache_dir", None)
-    if isinstance(norm_cache_dir, str) and norm_cache_dir.strip() == "":
-        norm_cache_dir = None
-    norm_force_recompute = bool(getattr(normalizer_cfg, "force_recompute", False))
-    normalizer = Normalizer(method=norm_method)
-    normalizer.fit_normalizer_on_files(
-        filenames=parquet_paths,
-        window_spec=window,
-        feature_cols=data_cfg.columns.value_cols,
-        meter_col=data_cfg.columns.meter_id,
-        hourly_aggregation=bool(data_cfg.window.aggregated),
-        aggregation_divisor=aggregation_divisor,
-        nan_as_zero=nan_as_zero,
-        phased=phased_mode,
-        force_recompute=norm_force_recompute,
-        save_path=norm_cache_dir,
-        device=device,
-    )
-    normalizer.save(os.path.join(log_path, "normalizer.pt"))
-
+    normalizer_cfg = getattr(config, "normalization", SimpleNamespace())
+    if normalizer_cfg.method is None or (isinstance(normalizer_cfg.method, str) and normalizer_cfg.method.strip() == "") or str(normalizer_cfg.method).lower() == "none":
+        normalizer = None
+    else:
+        norm_method = str(getattr(normalizer_cfg, "method", "log1p")).lower() if not phased_mode else "log1p_phase"
+        norm_cache_dir = getattr(normalizer_cfg, "cache_dir", None)
+        if isinstance(norm_cache_dir, str) and norm_cache_dir.strip() == "":
+            norm_cache_dir = None
+        norm_force_recompute = bool(getattr(normalizer_cfg, "force_recompute", False))
+        normalizer = Normalizer(method=norm_method)
+        normalizer.fit_normalizer_on_files(
+            filenames=parquet_paths,
+            window_spec=window,
+            feature_cols=data_cfg.columns.value_cols,
+            meter_col=data_cfg.columns.meter_id,
+            hourly_aggregation=bool(data_cfg.window.aggregated),
+            aggregation_divisor=aggregation_divisor,
+            nan_as_zero=nan_as_zero,
+            phased=phased_mode,
+            force_recompute=norm_force_recompute,
+            save_path=norm_cache_dir,
+            device=device,
+        )
+        normalizer.save(os.path.join(log_path, "normalizer.pt"))
+    
     if normalizer is not None:
         # Attach the normalizer to the model so it can be automatically saved/loaded
         model.normalizer = copy.deepcopy(normalizer)
