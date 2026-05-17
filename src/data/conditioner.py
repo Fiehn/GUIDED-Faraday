@@ -1192,7 +1192,7 @@ class ElectricVehicleConditioner(BaseConditioner):
     Conditions the model on EV class one-hot encoded as:
     [No EV, 1-phase EV, 2-phase EV, 3-phase EV].
 
-    Reads EV detector output from CSV (default: data/EV_detection_6000_SM.csv)
+    Reads EV detector output from CSV (default: data/EV/EV_detection_reduced_60000_SM.csv)
     and maps base meter ids to an EV phase class.
     """
     def __init__(self, topology_path='data/EV/EV_detection_reduced_60000_SM.csv'):
@@ -1323,7 +1323,7 @@ class ElectricVehicleConditionerBool(BaseConditioner):
     Conditions the model on EV presence one-hot encoded as:
     [No EV, Has EV].
 
-    Reads EV detector output from CSV (default: data/EV_detection_6000_SM.csv)
+    Reads EV detector output from CSV (default: data/EV/EV_detection_reduced_60000_SM.csv)
     and maps base meter ids to an EV presence class.
     """
     def __init__(self, topology_path='data/EV/EV_detection_reduced_60000_SM.csv'):
