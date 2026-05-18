@@ -1,7 +1,5 @@
 base: base.yaml
 
-data:
-  batch_size: 2048
 
 model:
   type: set_guide_vae

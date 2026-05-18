@@ -270,7 +270,7 @@ class BaseModel(nn.Module, ABC):
 
         # === Learning Rate Scheduler Setup ===
         if getattr(train_cfg.lr_scheduler, "enabled", False):
-            scheduler_type = getattr(train_cfg.lr_scheduler, "type", "step").lower()
+            scheduler_type = getattr(train_cfg.lr_scheduler, "scheduler_type", "step").lower()
             if scheduler_type == "step":
                 step_size = int(getattr(train_cfg.lr_scheduler, "step_size", 10))
                 gamma = float(getattr(train_cfg.lr_scheduler, "gamma", 0.1))

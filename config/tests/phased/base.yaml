@@ -24,11 +24,11 @@ data:
     aggregated: true
     input_len: 24
     stride: 24
-  batch_size: 2048
+  batch_size: 1024
   shuffle: true
-  replay_buffer_capacity: 10000
-  min_buffer_size: 4000
-  num_workers: 8
+  replay_buffer_capacity: 9000
+  min_buffer_size: 3000
+  num_workers: 6
   steps_per_epoch: 500
   eval_batches: 5
   eval_cache_on_gpu: true

@@ -25,7 +25,12 @@ class WindowSpec:
 
 class StreamingParquetBuffer(IterableDataset):
     """An IterableDataset that reads data from a Parquet file in a streaming manner and uses a replay buffer to store and sample data for training."""
-    def __init__(self, 
+
+    # Rows per chunk when reading large unphased files (one file = all meters).
+    # Phased files are one-meter-per-file and are read whole.
+    _UNPHASED_CHUNK_ROWS = 250_000
+
+    def __init__(self,
                  sm_files, 
                  replay_buffer_capacity: int = 10000, 
                  min_buffer_size: int = 2000, 
@@ -279,8 +284,19 @@ class StreamingParquetBuffer(IterableDataset):
         # Aggregate first so index labels align with the target base frequency.
         # Building full_index before resampling can misalign (e.g., :45 vs :00)
         # and reindex would then wipe out all values as NaN.
+        #
+        # Skip resample when data is already at (or sparser than) the target
+        # frequency — the check is O(1) and avoids the full pandas resample
+        # machinery for already-hourly parquet caches.
+        # TODO: REMEMBER THIS 'guy'! we are using kw not kwh on the 15 min scale
         if self.aggregation:
-            df = df.resample(self.base_frequency).mean() # TODO: REMEMBER THIS 'guy'! we are using kw not kwh on the 15 min scale
+            needs_resample = False
+            if len(df) > 1:
+                first_diff = df.index[1] - df.index[0]
+                target_delta = pd.Timedelta(self.base_frequency)
+                needs_resample = first_diff < target_delta * 0.9
+            if needs_resample:
+                df = df.resample(self.base_frequency).mean()
             if self.aggregation_divisor != 1.0:
                 df = df / self.aggregation_divisor
 
@@ -325,6 +341,43 @@ class StreamingParquetBuffer(IterableDataset):
         meter_id = self._extract_meter_id(file_path) if self.phased_mode else None
         return prepared, meter_id, meter_col_name
 
+    def _iter_file_chunks(self, file_path: str, worker_id: int = 0, num_workers: int = 1):
+        """Yield (prepared_df, meter_col_name) in row-bounded chunks.
+
+        Only used in unphased mode. Partitions at the row-group level so that
+        multiple DataLoader workers can operate on the same large file in parallel:
+        worker i reads row groups i, i+num_workers, i+2*num_workers, …
+        Within each row group, reads are chunked to _UNPHASED_CHUNK_ROWS to cap
+        peak memory (each row group is ~1 M rows for this dataset).
+        """
+        parquet_file = pq.ParquetFile(file_path)
+        file_cols = parquet_file.schema.names
+        cols_to_load, rename_map, time_col_name, meter_col_name = self._select_columns(file_cols)
+
+        if not cols_to_load or time_col_name is None or meter_col_name is None:
+            return
+
+        num_row_groups = parquet_file.metadata.num_row_groups
+        for rg_idx in range(worker_id, num_row_groups, num_workers):
+            for batch in parquet_file.iter_batches(
+                batch_size=self._UNPHASED_CHUNK_ROWS,
+                row_groups=[rg_idx],
+                columns=cols_to_load,
+            ):
+                df = batch.to_pandas(ignore_metadata=True)
+                if df.empty:
+                    continue
+                df = df.rename(columns=rename_map)
+                effective_meter_col = meter_col_name
+                if meter_col_name not in df.columns and meter_col_name in list(getattr(df.index, "names", [])):
+                    df = df.reset_index()
+                    df = df.rename(columns={meter_col_name: self.meter_col})
+                    effective_meter_col = self.meter_col
+                prepared = self._prepare_time_index(df, time_col_name, effective_meter_col)
+                if prepared.empty:
+                    continue
+                yield prepared, effective_meter_col
+
     def _meter_value_to_int(self, meter_value) -> int:
         try:
             return int(meter_value)
@@ -342,64 +395,79 @@ class StreamingParquetBuffer(IterableDataset):
         worker_id = 0 if worker_info is None else int(worker_info.id)
         self._rng = random.Random(base_seed + 1009 * worker_id)
 
-        if worker_info is None:
-            # Single-process data loading
-            files_for_this_worker = list(self.sm_files) # copy the list
-        else:
-            # Multi-process data loading
-            per_worker = int(math.ceil(len(self.sm_files) / float(worker_info.num_workers)))
-            start_idx = worker_info.id * per_worker
-            end_idx = min(start_idx + per_worker, len(self.sm_files))
+        num_workers = 1 if worker_info is None else int(worker_info.num_workers)
 
+        if worker_info is None:
+            # Single-process data loading — worker owns all files.
+            files_for_this_worker = list(self.sm_files)
+        elif self.phased_mode:
+            # Phased: many small files (one per meter) — partition by file so
+            # each worker owns a disjoint subset and reads each file whole.
+            per_worker = int(math.ceil(len(self.sm_files) / float(num_workers)))
+            start_idx = worker_id * per_worker
+            end_idx = min(start_idx + per_worker, len(self.sm_files))
             files_for_this_worker = self.sm_files[start_idx:end_idx]
-        
+        else:
+            # Unphased: few large files (all meters in one file) — every worker
+            # gets every file, but _iter_file_chunks partitions within each file
+            # at the row-group level so no two workers duplicate work.
+            files_for_this_worker = list(self.sm_files)
+
         if self.sample_random:
             self._rng.shuffle(files_for_this_worker)
 
-        # === Lazy parquet streaming ===
-        for file in files_for_this_worker:
-            self._mark_file_seen(file)
-            try:
-                file_df, meter_id, meter_col_name = self._load_file_dataframe(file)
-                if file_df is None:
-                    continue
+        if not files_for_this_worker:
+            return
 
-                sequences = self._extract_sequences(file_df, meter_id=meter_id, meter_col_name=meter_col_name)
-
-                for seq, meter_id_t, timestamp_t in sequences:
-                    # Window-level deterministic split
-                    if not self._keep_window(int(meter_id_t.item()), int(timestamp_t.item())):
-                        continue
-                    # Apply normalization if normalizer is provided
-                    if self.normalizer is not None:
-                        # seq shape is [24, 3], broadcasting with [3,]
-                        seq = self.normalizer.transform(seq)
-
-                    # Keep model input as [F, L]
-                    seq = seq.T
-
-                    # Always emit aggregate tensor to keep tuple width fixed.
-                    if self.output_aggregate_stream:
-                        agg = seq.sum(dim=0, keepdim=True)
+        # === Lazy parquet streaming (infinite loop so workers never exhaust) ===
+        while True:
+            for file in files_for_this_worker:
+                self._mark_file_seen(file)
+                try:
+                    if self.phased_mode:
+                        # One small file per meter — load whole.
+                        file_df, meter_id, meter_col_name = self._load_file_dataframe(file)
+                        if file_df is None:
+                            continue
+                        chunks = [(file_df, meter_id, meter_col_name)]
                     else:
-                        agg = torch.empty((0, seq.shape[-1]), dtype=seq.dtype, device=seq.device)
+                        # One large file for all meters — stream in row-group
+                        # partitioned chunks; worker_id/num_workers determine
+                        # which row groups this worker is responsible for.
+                        chunks = (
+                            (chunk_df, None, chunk_meter_col)
+                            for chunk_df, chunk_meter_col in self._iter_file_chunks(file, worker_id, num_workers)
+                        )
 
-                    # Push standardized sample tuple: (x, meter_id, timestamp, agg)
-                    self._push_to_buffer((seq, meter_id_t, timestamp_t, agg))
-
-                    # Yield only when the buffer is adequately mixed
-                    if self.current_size >= self.min_buffer_size:
-                        # The yield pauses the loop right here until PyTorch needs more data
-                        yield self._sample_from_buffer()
-            except Exception as e:
-                if self.skip_corrupt_files and self._is_recoverable_file_error(e):
-                    reason = f"{type(e).__name__}: {e}"
-                    self._mark_file_skipped(file, reason)
-                    self._warn_skipped_file(file, e)
-                    continue
-                raise
-            finally:
-                self._mark_file_completed(file)
+                    for chunk_df, chunk_meter_id, chunk_meter_col in chunks:
+                        sequences = self._extract_sequences(
+                            chunk_df, meter_id=chunk_meter_id, meter_col_name=chunk_meter_col
+                        )
+                        for seq, meter_id_t, timestamp_t in sequences:
+                            if not self._keep_window(int(meter_id_t.item()), int(timestamp_t.item())):
+                                continue
+                            if self.normalizer is not None:
+                                seq = self.normalizer.transform(seq)
+                            seq = seq.T
+                            if self.output_aggregate_stream:
+                                agg = seq.sum(dim=0, keepdim=True)
+                            else:
+                                agg = torch.empty((0, seq.shape[-1]), dtype=seq.dtype, device=seq.device)
+                            self._push_to_buffer((seq, meter_id_t, timestamp_t, agg))
+                            if self.current_size >= self.min_buffer_size:
+                                yield self._sample_from_buffer()
+                except Exception as e:
+                    if self.skip_corrupt_files and self._is_recoverable_file_error(e):
+                        reason = f"{type(e).__name__}: {e}"
+                        self._mark_file_skipped(file, reason)
+                        self._warn_skipped_file(file, e)
+                        continue
+                    raise
+                finally:
+                    self._mark_file_completed(file)
+            # Reshuffle after each full pass through the file list
+            if self.sample_random:
+                self._rng.shuffle(files_for_this_worker)
     
     def _extract_sequences_for_meter(self, meter_df: pd.DataFrame, meter_id: int):
         sequences = []
@@ -425,25 +493,18 @@ class StreamingParquetBuffer(IterableDataset):
             if phase_df.empty:
                 return sequences
 
-        # Robust timestamp extraction: normalize the index to UTC datetimes first,
-        # then convert using the actual datetime resolution instead of assuming ns.
+        # Get Unix timestamps in seconds without any pandas int-cast API.
+        # astype('int64') on a tz-aware DatetimeIndex raises TypeError in pandas 3+.
+        # Strategy: convert to UTC, strip tz-awareness (values stay identical),
+        # then go through numpy — datetime64[s].view(int64) == Unix seconds.
         try:
             dt_index = pd.DatetimeIndex(pd.to_datetime(phase_df.index, utc=True, errors='coerce'))
-            if dt_index.isna().any():
+            if np.any(pd.isnull(dt_index)):
                 raise ValueError("Datetime conversion produced NaT values")
 
-            raw_values = dt_index.astype('int64')
-            unit = getattr(getattr(dt_index, 'dtype', None), 'unit', 'ns')
-            divisor_by_unit = {
-                's': 1,
-                'ms': 10**3,
-                'us': 10**6,
-                'ns': 10**9,
-            }
-            divisor = divisor_by_unit.get(unit, 10**9)
-            timestamps = (raw_values // divisor).astype(np.int64)
+            naive = dt_index.tz_convert('UTC').tz_localize(None)
+            timestamps = naive.to_numpy(dtype='datetime64[s]').view(np.int64)
         except Exception as e:
-            import sys
             raise
         
         values = phase_df.astype(np.float32).to_numpy()
@@ -470,26 +531,44 @@ class StreamingParquetBuffer(IterableDataset):
 
         meter_id_t = torch.tensor(int(meter_id), dtype=torch.long)
 
-        for start in range(0, len(values) - input_len + 1, self.window_spec.stride):
-            end = start + input_len
+        # Align to local midnight (Europe/Copenhagen).  The UTC index is
+        # converted to Copenhagen time so that hour == 0 reliably identifies
+        # the start of a calendar day regardless of DST or when the meter first
+        # started recording.  For a sub-series that begins mid-day (e.g. at a
+        # chunk boundary) this skips ahead to the next midnight.
+        try:
+            local_hours = dt_index.tz_convert("Europe/Copenhagen").hour
+            midnight_hits = np.where(local_hours == 0)[0]
+            first_aligned_idx = int(midnight_hits[0]) if len(midnight_hits) > 0 else 0
+        except Exception:
+            first_aligned_idx = 0
 
-            # max_hour_value: reject if any timestep's phase-sum exceeds threshold
-            if prefix_bad is not None and prefix_bad[end] > prefix_bad[start]:
-                continue
+        # Vectorised filter: compute all candidate start positions at once.
+        all_starts = np.arange(first_aligned_idx, len(values) - input_len + 1, self.window_spec.stride, dtype=np.intp)
+        if len(all_starts) == 0:
+            return sequences
+        all_ends = all_starts + input_len
 
-            window_abs_sum = prefix[end] - prefix[start]
+        window_sums = prefix[all_ends] - prefix[all_starts]
+        valid = window_sums > 0.0
+        if self.max_value is not None:
+            valid &= window_sums <= self.max_value
+        if prefix_bad is not None:
+            valid &= prefix_bad[all_ends] == prefix_bad[all_starts]
 
-            # max_value: reject if total absolute sum across window exceeds threshold
-            if self.max_value is not None and window_abs_sum > self.max_value:
-                continue
+        valid_starts = all_starts[valid]
+        if len(valid_starts) == 0:
+            return sequences
 
-            # zero-sum: reject all-zero windows
-            if window_abs_sum == 0.0:
-                continue
+        # Extract all valid windows in one numpy fancy-index call (one bulk copy
+        # instead of N individual slice copies in a Python loop).
+        indices = valid_starts[:, None] + np.arange(input_len, dtype=np.intp)  # [N, L]
+        windows_np = values[indices]  # [N, L, F] — fancy indexing always copies
+        windows_t = torch.from_numpy(windows_np)
+        ts_t = torch.from_numpy(timestamps[valid_starts].copy())
 
-            window = torch.from_numpy(np.ascontiguousarray(values[start:end]))
-            timestamp_t = torch.tensor(int(timestamps[start]), dtype=torch.long)
-            sequences.append((window, meter_id_t, timestamp_t))
+        for i in range(len(valid_starts)):
+            sequences.append((windows_t[i], meter_id_t, ts_t[i]))
 
         return sequences
 
@@ -512,11 +591,21 @@ class StreamingParquetBuffer(IterableDataset):
             return []
 
         grouped = df.loc[valid].copy()
-        grouped["_meter_id_int"] = grouped[meter_col_name].apply(self._meter_value_to_int).astype(np.int64)
+
+        # Vectorised meter-ID extraction: pd.to_numeric is 100-500x faster than
+        # .apply() for the common case where IDs are numeric.  Non-numeric IDs
+        # (SHA1 fallback) are handled row-by-row only for the rare mixed case.
+        meter_numeric = pd.to_numeric(grouped[meter_col_name], errors='coerce')
+        if meter_numeric.isna().any():
+            grouped["_meter_id_int"] = grouped[meter_col_name].apply(self._meter_value_to_int).to_numpy(dtype=np.int64)
+        else:
+            grouped["_meter_id_int"] = meter_numeric.to_numpy(dtype=np.int64)
 
         sequences = []
         for meter_value, meter_df in grouped.groupby("_meter_id_int", sort=False):
-            meter_frame = meter_df.sort_values("_timestamp").set_index("_timestamp")
+            # _prepare_time_index already sorted by [meter_col, _timestamp], so
+            # sorting again inside each group is redundant — just set the index.
+            meter_frame = meter_df.set_index("_timestamp")
             meter_frame = meter_frame[~meter_frame.index.duplicated(keep='last')]
             sequences.extend(self._extract_sequences_for_meter(meter_frame, meter_id=int(meter_value)))
         return sequences
@@ -624,6 +713,7 @@ class PhasedReplayDataloaders:
         self._val_stream_iter = None
         self._test_stream_loader = None
         self._test_stream_iter = None
+        self._stream_epoch_count = 0
 
         # Validation stream (used during training): deterministic ordering and deterministic buffer sampling.
         self.val_dataset = StreamingParquetBuffer(
@@ -697,7 +787,19 @@ class PhasedReplayDataloaders:
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,
         }
+        if self.num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 2
         return DataLoader(dataset, **loader_kwargs)
+
+    def _reset_train_stream(self):
+        """Tear down stream workers and force respawn on next access.
+
+        Called proactively every N epochs to prevent long-running worker OOM,
+        and reactively when a worker crash (RuntimeError) is detected.
+        """
+        self._train_stream_iter = None
+        self._train_stream_loader = None
 
     def _get_train_stream_loader(self):
         if self._train_stream_loader is None:
@@ -741,6 +843,17 @@ class PhasedReplayDataloaders:
                 return next(self._train_stream_iter)
             except StopIteration:
                 return None
+        except RuntimeError as e:
+            # A DataLoader worker process died (OOM or unhandled exception).
+            # Reset completely so fresh workers are spawned on retry.
+            print(
+                f"[data] WARNING: train stream worker crashed ({type(e).__name__}: {e}); "
+                "restarting workers and retrying.",
+                flush=True,
+            )
+            self._reset_train_stream()
+            self._train_stream_iter = iter(self._get_train_stream_loader())
+            return next(self._train_stream_iter)
 
     def _next_val_stream_batch(self):
         loader = self._get_val_stream_loader()
@@ -930,6 +1043,12 @@ class PhasedReplayDataloaders:
         )
 
     def get_epoch_loaders(self, steps_per_epoch: int, eval_batches: int, refresh_eval: bool = False):
+        self._stream_epoch_count += 1
+        # Proactively recycle train-stream workers every 10 epochs to prevent
+        # long-running worker OOM from pandas/numpy memory fragmentation.
+        if self.num_workers > 0 and self._stream_epoch_count % 10 == 0:
+            self._reset_train_stream()
+
         target_train = max(1, int(steps_per_epoch)) * self.batch_size
         need_eval = int(eval_batches) > 0
         target_eval = 0

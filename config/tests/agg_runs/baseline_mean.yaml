@@ -1,0 +1,4 @@
+base: base.yaml
+
+model:
+  type: baseline_mean

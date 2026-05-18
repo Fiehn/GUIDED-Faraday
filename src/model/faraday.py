@@ -156,6 +156,7 @@ class FaradayModel(BaseModel):
         self.lower_quantile_weight = lower_quantile_weight
         self.median_quantile_weight = median_quantile_weight
         self.gmm_max_iter = gmm_max_iter
+        self.gmm_fit_batches = kwargs.get("gmm_fit_batches", 500)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -285,12 +286,23 @@ class FaradayModel(BaseModel):
 
     def _fit_gmm(self, data_loader, device: str = "cpu"):
         """Encode the entire training set and fit the GMM on latent codes."""
+        from data.dataloader_phased import PhasedReplayDataloaders
+
         self.eval()
         self.to(device)
         z_list: list[torch.Tensor] = []
 
+        if isinstance(data_loader, PhasedReplayDataloaders):
+            loader = data_loader._get_train_stream_loader()
+            max_batches = self.gmm_fit_batches
+        else:
+            loader = data_loader
+            max_batches = None
+
         with torch.no_grad():
-            for batch in data_loader:
+            for i, batch in enumerate(loader):
+                if max_batches is not None and i >= max_batches:
+                    break
                 batch = self.move_to_device(batch, device)
                 x, meter_id, timestamps, _ = self._unpack_batch(batch)
                 x_flat = self._prep_inputs(x)

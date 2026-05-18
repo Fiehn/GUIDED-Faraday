@@ -13,8 +13,8 @@ data:
     timestamp_utc: timestamp_utc
     value_cols: [hourly_energy_consumption]
   nan_as_zero: false
-  max_value: 200.0
-  max_hour_value: 20.0
+  max_value: null
+  max_hour_value: null
   splits:
     train_ratio: 0.8
     val_ratio: 0.1
@@ -24,10 +24,10 @@ data:
     aggregated: false
     input_len: 96
     stride: 96
-  batch_size: 2048
+  batch_size: 512
   shuffle: true
-  replay_buffer_capacity: 6000
-  min_buffer_size: 2000
+  replay_buffer_capacity: 5000
+  min_buffer_size: 1000
   num_workers: 4
   steps_per_epoch: 500
   eval_batches: 5
