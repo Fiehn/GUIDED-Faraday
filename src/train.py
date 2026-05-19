@@ -24,7 +24,8 @@ from evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
 from src.visualization.plot_styling import PlotStyle
 from src.model.factory import _load_train_config, _save_training_config_snapshot, create_model_from_config
 
-def _run_evaluation_and_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, phased_mode: bool, secondary_model = None):
+def _run_evaluation_and_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, phased_mode: bool, secondary_model = None,
+                                      train_loader = None):
     """Route evaluation by mode and run shared visualizations."""
     if test_loader is None:
         print("Warning: test_loader is None; skipping evaluation and visualization.")
@@ -76,6 +77,7 @@ def _run_evaluation_and_visualization(model, test_loader, normalizer, conditione
                     window_size=config.window.input_len,
                     n_synthetic_samples=n_synth_samples,
                     output_path=log_path,
+                    train_dataloader=train_loader,
                 )
                 phased_evaluator.evaluate()
             else:
@@ -89,6 +91,7 @@ def _run_evaluation_and_visualization(model, test_loader, normalizer, conditione
             device=eval_device,
             n_synthetic_samples=n_synth_samples,
             output_path=log_path,
+            train_dataloader=train_loader,
         )
         evaluator.register_all()
         try:
@@ -108,6 +111,7 @@ def _run_evaluation_and_visualization(model, test_loader, normalizer, conditione
                     n_synthetic_samples=n_synth_samples,
                     output_path=log_path,
                     secondary_model=secondary_model,
+                    train_dataloader=train_loader,
                 )
                 evaluator.register_all()
                 evaluator.evaluate()
@@ -304,6 +308,8 @@ def train(config, train_only_user_profile: bool = False):
         data_loader.refresh_test_cache(eval_batches)
         combined_test_loader = data_loader.get_test_loader()
 
+    train_loader = data_loader.get_train_epoch_loader(steps_per_epoch=eval_batches) if eval_batches > 0 else None
+
     if combined_test_loader is not None and model_type != "phase_splitter":
         _run_evaluation_and_visualization(
             model=model,
@@ -316,6 +322,7 @@ def train(config, train_only_user_profile: bool = False):
             phased_mode=True,
             conditioner=conditioner,
             secondary_model=None,
+            train_loader=train_loader,
         )
     elif model_type == "phase_splitter":
         if combined_test_loader is None:

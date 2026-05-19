@@ -1,0 +1,30 @@
+base: base.yaml
+
+data:
+  batch_size: 2048
+
+model:
+  type: set_guide_vae
+  latent_dim: 128
+  encoder:
+    type: dictionary_cnn
+    hidden_dims: [256, 512, 256, 128]
+    dropout: 0.2
+  decoder:
+    type: dictionary_cnn
+    hidden_dims: [128, 256, 512, 256]
+    dropout: 0.2
+  prior:
+    type: learnable_dictionary
+    dictionary_size: 512
+    vamp_num_components: 40
+    init_from_data: true
+    init_noise_scale: 0.01
+  set:
+    hidden_dim: 256
+    num_heads: 4
+    num_inds: 16
+    num_blocks: 2
+    num_features: 3
+    is_isab: true
+    use_abl_pool: true

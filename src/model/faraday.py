@@ -5,11 +5,28 @@ Ported from OpenSynth (Apache-2.0): https://github.com/OpenSynth-energy/OpenSynt
 """
 from __future__ import annotations
 
+import os
+import re
+import glob as _glob
 import torch
 import torch.nn as nn
 
 from model.model import BaseModel
 from model.gmm import GaussianMixtureModel
+
+
+def _find_best_checkpoint(model_dir: str) -> str:
+    """Return the best-model checkpoint with the highest epoch, or _final as fallback."""
+    candidates = _glob.glob(os.path.join(model_dir, "best_model_*.pt"))
+    if candidates:
+        def _epoch(p: str) -> int:
+            m = re.search(r"_(\d+)\.pt$", p)
+            return int(m.group(1)) if m else -1
+        return max(candidates, key=_epoch)
+    finals = _glob.glob(os.path.join(model_dir, "*_final.pt"))
+    if finals:
+        return finals[0]
+    raise FileNotFoundError(f"No checkpoint found in {model_dir}")
 
 
 _MMD_BANDWIDTHS = [10, 15, 20, 50]
@@ -317,6 +334,150 @@ class FaradayModel(BaseModel):
         self.gmm.to(device)
         self.gmm.fit(Z, n_iter=self.gmm_max_iter)
 
+    def refit_gmm(self, checkpoint_path: str, data_loader, device: str = "cpu"):
+        """Load a saved checkpoint, refit the GMM, and overwrite the checkpoint.
+
+        Use this when the VAE has already been trained but the saved checkpoint
+        has an unfitted GMM (e.g. it was a best-model checkpoint saved mid-training).
+        """
+        import os
+        self.load_model(checkpoint_path, device=device)
+        print(f"Loaded checkpoint: {checkpoint_path}")
+        self._fit_gmm(data_loader, device=device)
+        self.save_model(
+            save_path=os.path.dirname(os.path.abspath(checkpoint_path)),
+            model_name=os.path.splitext(os.path.basename(checkpoint_path))[0],
+            device=device,
+            normalizer=getattr(self, "normalizer", None),
+        )
+        print(f"Checkpoint re-saved with fitted GMM: {checkpoint_path}")
+
     def fit(self, data_loader, device, logging_dir, writer, data_cfg, checkpoint_cfg, train_cfg, prior_cfg):
         super().fit(data_loader, device, logging_dir, writer, data_cfg, checkpoint_cfg, train_cfg, prior_cfg)
+
+        best_path = getattr(self, "_best_checkpoint_path", None)
+        if best_path is not None:
+            # Restore best VAE weights before fitting the GMM so the latent
+            # space matches the best checkpoint rather than the final epoch.
+            print(f"Loading best checkpoint for GMM fitting: {best_path}")
+            self.load_model(best_path, device=device)
+
         self._fit_gmm(data_loader, device=device)
+
+        save_path = best_path if best_path is not None else None
+        if save_path is not None:
+            import os
+            self.save_model(
+                save_path=os.path.dirname(save_path),
+                model_name=os.path.splitext(os.path.basename(save_path))[0],
+                device=device,
+                normalizer=getattr(self, "normalizer", None),
+            )
+            print(f"Best model re-saved with fitted GMM: {save_path}")
+        else:
+            # No best model was saved (checkpointing disabled or too few epochs)
+            self.save_model(
+                save_path=logging_dir,
+                model_name=f"{self.tag}_final",
+                device=device,
+                normalizer=getattr(self, "normalizer", None),
+            )
+
+
+if __name__ == "__main__":
+    import sys
+    import argparse
+    import copy
+
+    _this_dir = os.path.dirname(os.path.abspath(__file__))   # src/model/
+    _src_dir = os.path.dirname(_this_dir)                    # src/
+    _project_dir = os.path.dirname(_src_dir)                 # project root
+    for _p in (_src_dir, _project_dir):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+
+    from src.model.factory import _load_train_config, create_model_from_config
+    from data.dataloader_phased import PhasedReplayDataloaders
+    from data.normalizer import Normalizer
+    from data.dataloader_phased import WindowSpec
+
+    parser = argparse.ArgumentParser(description="Refit Faraday GMM on a saved checkpoint")
+    parser.add_argument(
+        "--config",
+        default=os.path.join(_project_dir, "config", "tests", "agg_runs", "faraday.yaml"),
+    )
+    parser.add_argument(
+        "--model-dir",
+        default=os.path.join(_project_dir, "models", "FaradayModel_20260518_163222"),
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Explicit .pt path; auto-selects best_model with highest epoch if omitted",
+    )
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    checkpoint_path = args.checkpoint or _find_best_checkpoint(args.model_dir)
+    print(f"Checkpoint : {checkpoint_path}")
+    print(f"Device     : {args.device}")
+
+    config = _load_train_config(args.config)
+    data_cfg = getattr(config, "data", None)
+
+    # Load the normalizer saved alongside the model (same stats used at training time).
+    normalizer_path = os.path.join(args.model_dir, "normalizer.pt")
+    normalizer = Normalizer.load(normalizer_path) if os.path.exists(normalizer_path) else None
+    if normalizer is None:
+        print("Warning: normalizer.pt not found — data will not be normalised before GMM fitting")
+
+    # Discover data files (same logic as train.py).
+    data_dir = config.data_dir
+    configured_files = list(config.data_files) if len(config.data_files) > 0 else []
+    if configured_files:
+        parquet_paths = [f if os.path.isabs(f) else os.path.join(data_dir, f) for f in configured_files]
+    else:
+        parquet_paths = sorted(
+            os.path.join(root, f)
+            for root, _, files in os.walk(data_dir)
+            for f in files
+            if f.endswith(".parquet") and not f.startswith("test")
+        )
+    parquet_paths = [p for p in parquet_paths if os.path.exists(p)]
+    if not parquet_paths:
+        raise ValueError(f"No .parquet files found under {data_dir}")
+
+    window = WindowSpec(input_len=config.window.input_len, stride=config.window.stride)
+
+    data_loader = PhasedReplayDataloaders(
+        sm_files=parquet_paths,
+        replay_buffer_capacity=int(getattr(data_cfg, "replay_buffer_capacity", 10000)),
+        min_buffer_size=int(getattr(data_cfg, "min_buffer_size", 2000)),
+        window_spec=window,
+        normalizer=normalizer,
+        num_workers=int(getattr(data_cfg, "num_workers", 4)),
+        hourly_aggregation=data_cfg.window.aggregated,
+        aggregation_divisor=1.0,
+        batch_size=data_cfg.batch_size,
+        eval_cache_batches=0,
+        pin_memory=(args.device != "cpu"),
+        output_aggregate_stream=False,
+        skip_corrupt_files=bool(getattr(data_cfg, "skip_corrupt_files", True)),
+        phased_mode=str(getattr(data_cfg, "mode", "csv")).lower() in {"phased", "phased_parquet"},
+        feature_cols=data_cfg.columns.value_cols,
+        meter_col=data_cfg.columns.meter_id,
+        split_seed=int(getattr(data_cfg.splits, "random_seed", 0)),
+        split_ratios={
+            "train_ratio": float(getattr(data_cfg.splits, "train_ratio", 1.0)),
+            "val_ratio": float(getattr(data_cfg.splits, "val_ratio", 0.0)),
+            "test_ratio": float(getattr(data_cfg.splits, "test_ratio", 0.0)),
+        },
+        max_value=float(v) if (v := getattr(data_cfg, "max_value", None)) is not None else None,
+        max_hour_value=float(v) if (v := getattr(data_cfg, "max_hour_value", None)) is not None else None,
+    )
+
+    model = create_model_from_config(config, device=args.device)
+    if normalizer is not None:
+        model.normalizer = copy.deepcopy(normalizer)
+
+    model.refit_gmm(checkpoint_path, data_loader, device=args.device)

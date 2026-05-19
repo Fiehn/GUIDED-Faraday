@@ -259,10 +259,8 @@ class BaseModel(nn.Module, ABC):
             self.normalizer.to(device)
 
         if not bool(getattr(prior_cfg, "init_from_data", True)) and hasattr(self, "prior") and isinstance(self.prior, VampPrior):
-            init_loader, _ = data_loader.get_epoch_loaders(
+            init_loader = data_loader.get_train_epoch_loader(
                 steps_per_epoch=1,
-                eval_batches=0,
-                refresh_eval=False,
             )
             init_batch = next(iter(init_loader)) if init_loader is not None else None
             noise_scale = float(getattr(prior_cfg, "init_noise_scale", 0.01))
@@ -338,10 +336,8 @@ class BaseModel(nn.Module, ABC):
 
             print(f"\nEpoch [{epoch+1}/{num_epochs}] — loading data ...", flush=True)
             cache_start_t = time.perf_counter()
-            train_loader, epoch_eval_loader = data_loader.get_epoch_loaders(
+            train_loader = data_loader.get_train_epoch_loader(
                 steps_per_epoch = steps_per_epoch,
-                eval_batches = eval_batches if should_eval_epoch else 0,
-                refresh_eval = should_eval_epoch and eval_cache_refresh,
             )
             cache_time_s = time.perf_counter() - cache_start_t
             print(f"Epoch [{epoch+1}/{num_epochs}] — data ready in {cache_time_s:.1f}s, training ...", flush=True)
@@ -402,6 +398,10 @@ class BaseModel(nn.Module, ABC):
 
             writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
 
+            epoch_eval_loader = data_loader.get_val_epoch_loader(
+                eval_batches = eval_batches if should_eval_epoch else 0,
+            )
+
             if should_eval_epoch and epoch_eval_loader is not None:
                 eval_start_t = time.perf_counter()
                 try:
@@ -435,12 +435,14 @@ class BaseModel(nn.Module, ABC):
                     ):
                         best_eval_loss_for_saving = eval_metrics['loss']
                         save_start_t = time.perf_counter()
+                        best_model_name = f"best_model_{self.tag}_{epoch+1}"
                         self.save_model(
                             save_path=logging_dir,
-                            model_name=f"best_model_{self.tag}_{epoch+1}",
+                            model_name=best_model_name,
                             device=device,
                             normalizer=getattr(self, "normalizer", None)
                         )
+                        self._best_checkpoint_path = os.path.join(logging_dir, f"{best_model_name}.pt")
                         save_time_s = time.perf_counter() - save_start_t
 
                     if use_early_stopping and early_stopper is not None:

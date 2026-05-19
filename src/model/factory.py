@@ -1,6 +1,10 @@
 import os
 import shutil
+from pathlib import Path
 from types import SimpleNamespace
+
+import yaml
+
 from src.config.loader import load_config as _load_validated_config
 from src.model.cvae import CVAE
 from src.model.set import SetGuideVAE
@@ -36,6 +40,17 @@ def _load_train_config(config_path: str | None = None):
     cfg = _to_namespace(raw)
     cfg._config_path = os.path.abspath(config_path)
 
+    # Track base config path for snapshot (two-file composition)
+    with open(config_path, encoding="utf-8") as f:
+        _raw_override = yaml.safe_load(f) or {}
+    if "base" in _raw_override:
+        _base_ref = Path(_raw_override["base"])
+        if not _base_ref.is_absolute():
+            _base_ref = Path(config_path).parent / _base_ref
+        cfg._base_config_path = str(_base_ref.resolve())
+    else:
+        cfg._base_config_path = None
+
     # Aliases expected by existing train() implementation
     if not hasattr(cfg, "data"):
         raise ValueError("Config must contain a top-level 'data' section")
@@ -68,6 +83,9 @@ def _save_training_config_snapshot(config, log_path: str):
 
     if src_path and os.path.exists(src_path):
         shutil.copy2(src_path, dst_path)
+        base_path = getattr(config, "_base_config_path", None)
+        if base_path and os.path.exists(base_path):
+            shutil.copy2(base_path, os.path.join(log_path, "base_config_used.yaml"))
     else:
         print("Warning: could not resolve original config file path; skipping config snapshot save.")
 

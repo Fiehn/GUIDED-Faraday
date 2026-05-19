@@ -5,7 +5,7 @@
 data:
   mode: csv
   # Edit this path for your machine:
-  data_dir: "E:/Data/processed_data/hourly_data/_parquet_cache"
+  data_dir: "data/_parquet_cache" #"E:/Data/processed_data/hourly_data/_parquet_cache"
   data_files: []
   columns:
     meter_id: meter_number
@@ -24,12 +24,12 @@ data:
     aggregated: true
     input_len: 24
     stride: 24
-  batch_size: 2048
+  batch_size: 4096
   shuffle: true
-  replay_buffer_capacity: 10000
-  min_buffer_size: 5000
-  num_workers: 8
-  steps_per_epoch: 1000
+  replay_buffer_capacity: 20000
+  min_buffer_size: 2000
+  num_workers: 2
+  steps_per_epoch: 500
   eval_batches: 5
   eval_cache_on_gpu: true
   eval_cache_refresh: false

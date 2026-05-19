@@ -35,7 +35,7 @@ data:
   # Data loading options
   nan_as_zero: false # Currently only for CSV data mode
   max_value: 200.0 # Set to a positive number to filter out windows with any value above this threshold (e.g., 200 kWh for hourly data)
-  
+  max_hourly_value: 20.0
   # Train/val/test split (by meter ID)
   splits:
     train_ratio: 0.8
@@ -50,13 +50,13 @@ data:
     stride: 24     # Non-overlapping windows (one per day)
   
   # DataLoader settings
-  batch_size: 32
+  batch_size: 8
   shuffle: true
-  replay_buffer_capacity: 2000
+  replay_buffer_capacity: 32
   min_buffer_size: 0
   num_workers: 0
-  steps_per_epoch: 500
-  eval_batches: 5
+  steps_per_epoch: 20
+  eval_batches: 1
   eval_cache_on_gpu: true
   eval_cache_refresh: false
   cache_scan_batches: 0
@@ -216,7 +216,7 @@ training:
     gamma: 0.9
   
   # Number of training epochs
-  num_epochs: 2
+  num_epochs: 1
   
   # Beta (KL weight) settings
   beta: 1.0 # 1.0
