@@ -50,6 +50,13 @@ class SyntheticGenerator:
         self._is_cvae = hasattr(model, 'conditioner') and model.conditioner is not None
         self._is_diffusion = self._is_diffusion_model()
 
+        # Inject normalizer into mean-baseline models so they can correct for the
+        # Jensen's inequality bias that arises when log1p normalization is used:
+        # inverse_transform(mean_z≈0) = geometric_mean ≠ arithmetic_mean.
+        if self._is_baseline_model() and normalizer is not None:
+            if getattr(self.model, 'normalizer', None) is None:
+                self.model.normalizer = normalizer
+
     def _is_diffusion_model(self) -> bool:
         return hasattr(self.model, 'noise_scheduler') and hasattr(self.model, 'reconstruct')
 

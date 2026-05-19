@@ -1,5 +1,6 @@
 import os
 import json
+import itertools
 from typing import Optional
 from datetime import datetime, timezone
 import numpy as np
@@ -586,10 +587,12 @@ class Normalizer:
         # === Compute Stats ===
         from data.dataloader_phased import StreamingParquetBuffer
         from torch.utils.data import DataLoader
+        batch_size = 256
+        capacity = 10000
         phased_ds = StreamingParquetBuffer(
-            sm_files=filenames, 
-            replay_buffer_capacity=10000, 
-            min_buffer_size=1000,
+            sm_files=filenames,
+            replay_buffer_capacity=capacity,
+            min_buffer_size=batch_size,  # must be >= batch_size so first draw is never empty
             window_spec=window_spec,
             num_workers=0,
             feature_cols=feature_cols,
@@ -598,11 +601,12 @@ class Normalizer:
             phased_mode=phased,
             meter_col=meter_col,
             nan_as_zero=nan_as_zero,
-            batch_size=256,
+            batch_size=batch_size,
         )
         train_loader = DataLoader(phased_ds, batch_size=None, num_workers=0, pin_memory=True)
-        
-        for X_batch in tqdm(train_loader, desc="Fitting normalizer"):
+        # The dataloader loops infinitely; cap at max_samples for normalizer fitting.
+        max_batches = max(200, capacity * 20 // batch_size)
+        for X_batch in tqdm(itertools.islice(train_loader, max_batches), desc="Fitting normalizer", total=max_batches):
             x_gpu = X_batch[0].to(device)
             self.fit_incremental(x_gpu)
         self.finalise_fit()

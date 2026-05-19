@@ -41,6 +41,17 @@ def build_features(x_windows):
     """
     features = []
     
+    # TODO:
+    # conditions
+    # peak height, valleys
+    # total daily consumption (scale)
+    # peak-valley distance
+    # total energy
+    # feature engeneer the booleans.
+    # load curves are traditionally done with clustering on customer profiles.
+    # We might be able to just use those profiles directly in the aggregate!
+    # Sommer and winter, day of week.
+
     # 1. Row-wise Normalization (Crucial Step!)
     # Divide each hour by the maximum hour in that specific day.
     # This bounds every profile between 0.0 and 1.0.

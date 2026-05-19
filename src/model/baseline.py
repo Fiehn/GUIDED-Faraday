@@ -149,11 +149,12 @@ class QuantileBaselineModel(BaseModel):
 
 class AverageBaselineModel(BaseModel):
     def __init__(self, phased_mode: bool = False,
-                    sequence_length: int = 24, 
+                    sequence_length: int = 24,
                         device: str = "cpu",
                     **kwargs):
         super().__init__(phased_mode=phased_mode, sequence_length=sequence_length, **kwargs)
         self.device = device
+        self.normalizer = None  # injected at inference time by SyntheticGenerator
         self.tag = "baseline_average" + str("_phased" if phased_mode else "")
 
 
@@ -214,26 +215,55 @@ class AverageBaselineModel(BaseModel):
         buffer_device = self.running_sum.device
         return {"loss": torch.tensor(0.0, device=device, requires_grad=False), "recon_loglikelihood": torch.tensor(0.0, device=buffer_device, requires_grad=False), "kl_divergence": torch.tensor(0.0, device=buffer_device, requires_grad=False)}
 
+    def _log1p_bias_correction(self, shape_lf: torch.Size) -> torch.Tensor:
+        """Return per-feature Jensen correction (+σ/2 in z-space) for log1p normalization.
+
+        For log1p normalization inverse_transform(0) = expm1(μ) = geometric mean, not
+        the arithmetic mean.  Adding σ/2 in z-space gives
+        expm1(σ/2 * σ + μ) = expm1(μ + σ²/2) ≈ E[x], recovering the true mean.
+        Returns a [L, F] zero tensor when no correction is needed.
+        """
+        L, F = shape_lf
+        zero = torch.zeros(L, F, dtype=torch.float32)
+        if self.normalizer is None:
+            return zero
+        log_methods = getattr(self.normalizer, 'LOG_METHODS', set())
+        if getattr(self.normalizer, 'method', None) not in log_methods:
+            return zero
+        std = getattr(self.normalizer, 'std', None)
+        if std is None:
+            return zero
+        # std is [1, F]; correction is σ/2 per feature, broadcast to [L, F]
+        correction_f = (std.reshape(-1).float() / 2.0).cpu()  # [F]
+        return correction_f.unsqueeze(0).expand(L, F)  # [L, F]
+
     @torch.no_grad()
     def sample(self, num_samples_prior=1, num_samples_posterior=1, **kwargs):
         # Sampling simply returns the mean profile expanded to the requested size
         num_samples = kwargs.get('num_samples', num_samples_prior)
-        global_mean = self.get_global_mean() # [L, F]
-        
+        global_mean = self.get_global_mean()  # [L, F]
+
+        # Correct Jensen's inequality bias introduced by log1p normalization
+        correction = self._log1p_bias_correction(global_mean.shape).to(global_mean.device)
+        global_mean = global_mean + correction
+
         # Consistent with CVAE: return [S, num_x_samples, B, D]
         if self.phased_mode:
-            global_mean = global_mean.transpose(0, 1) # [F, L]
-            
+            global_mean = global_mean.transpose(0, 1)  # [F, L]
+
         return global_mean.reshape(1, 1, 1, -1).expand(num_samples, -1, -1, -1)
 
     @torch.no_grad()
     def reconstruct(self, x, meter_ids=None, timestamps=None, num_samples=1, **kwargs):
         # Reconstructions ignore the input values and return the dataset-wide mean
-        global_mean = self.get_global_mean() # [L, F]
-        
+        global_mean = self.get_global_mean()  # [L, F]
+
+        correction = self._log1p_bias_correction(global_mean.shape).to(global_mean.device)
+        global_mean = global_mean + correction
+
         if self.phased_mode:
-            global_mean = global_mean.transpose(0, 1) # [F, L]
-            
+            global_mean = global_mean.transpose(0, 1)  # [F, L]
+
         batch_size = x.shape[0]
         # Return shape [S, B, D]
         reconstruction = global_mean.reshape(1, 1, -1).expand(num_samples, batch_size, -1)
@@ -244,11 +274,12 @@ class FlatMeanBaselineModel(BaseModel):
     Predicts the mean of the dataset (at all timesteps at once. Just a pure mean over features) as a constant for every input. Uses train_core to update the mean.
     """
     def __init__(self, phased_mode: bool = False,
-                    sequence_length: int = 24, 
+                    sequence_length: int = 24,
                     device: str = "cpu",
                     **kwargs):
         super().__init__(phased_mode=phased_mode, sequence_length=sequence_length, **kwargs)
         self.device = device
+        self.normalizer = None  # injected at inference time by SyntheticGenerator
         self.tag = "flat_mean_baseline" + str("_phased" if phased_mode else "")
 
         self.register_buffer(
@@ -278,19 +309,37 @@ class FlatMeanBaselineModel(BaseModel):
         buffer_device = self.running_sum.device
         return {"loss": torch.tensor(0.0, device=device, requires_grad=False), "recon_loglikelihood": torch.tensor(0.0, device=buffer_device, requires_grad=False), "kl_divergence": torch.tensor(0.0, device=buffer_device, requires_grad=False)}
     
+    def _log1p_bias_correction(self, shape_lf: torch.Size) -> torch.Tensor:
+        """See AverageBaselineModel._log1p_bias_correction for details."""
+        L, F = shape_lf
+        zero = torch.zeros(L, F, dtype=torch.float32)
+        if self.normalizer is None:
+            return zero
+        log_methods = getattr(self.normalizer, 'LOG_METHODS', set())
+        if getattr(self.normalizer, 'method', None) not in log_methods:
+            return zero
+        std = getattr(self.normalizer, 'std', None)
+        if std is None:
+            return zero
+        correction_f = (std.reshape(-1).float() / 2.0).cpu()
+        return correction_f.unsqueeze(0).expand(L, F)
+
     @torch.no_grad()
     def reconstruct(self, x, meter_ids=None, timestamps=None, num_samples=1, **kwargs):
         # Reconstructions ignore the input values and return the dataset-wide mean
-        global_mean = self.get_global_mean() # [L, F]
-        
+        global_mean = self.get_global_mean()  # [L, F]
+
+        correction = self._log1p_bias_correction(global_mean.shape).to(global_mean.device)
+        global_mean = global_mean + correction
+
         if self.phased_mode:
-            global_mean = global_mean.transpose(0, 1) # [F, L]
-            
+            global_mean = global_mean.transpose(0, 1)  # [F, L]
+
         batch_size = x.shape[0]
         # Return shape [S, B, D]
         reconstruction = global_mean.reshape(1, 1, -1).expand(num_samples, batch_size, -1)
         return reconstruction
-    
+
     def get_global_mean(self) -> torch.Tensor:
         """Computes the exact global average across the dataset."""
         # Prevent division by zero by clamping the denominator to 1
@@ -320,13 +369,16 @@ class FlatMeanBaselineModel(BaseModel):
     def sample(self, num_samples_prior=1, num_samples_posterior=1, **kwargs):
         # Sampling simply returns the mean profile expanded to the requested size
         num_samples = kwargs.get('num_samples', num_samples_prior)
-        global_mean = self.get_global_mean() # [L, F]
-        
+        global_mean = self.get_global_mean()  # [L, F]
+
+        correction = self._log1p_bias_correction(global_mean.shape).to(global_mean.device)
+        global_mean = global_mean + correction
+
         if self.phased_mode:
-            global_mean = global_mean.transpose(0, 1) # [F, L]
-            
+            global_mean = global_mean.transpose(0, 1)  # [F, L]
+
         return global_mean.reshape(1, 1, 1, -1).expand(num_samples, -1, -1, -1)
-    
+
     def get_optimizer(self, lr, weight_decay, *args, **kwargs):
         # Dummy optimizer to prevent the PyTorch optimizer crash in fit()
         dummy_param = torch.nn.Parameter(torch.zeros(1))
