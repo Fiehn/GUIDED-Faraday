@@ -56,6 +56,7 @@ class StreamingParquetBuffer(IterableDataset):
                  seed: int | None = None,
                  split: str | None = None,
                  split_ratios: dict | None = None,
+                 split_mode: str | None = None,
                  max_value: float | None = None,
                  max_hour_value: float | None = 20.0,
                  batch_size: int = 256,
@@ -66,6 +67,7 @@ class StreamingParquetBuffer(IterableDataset):
         self.seed = None if seed is None else int(seed)
         self.split = None if split is None else str(split).lower()
         self.split_ratios = split_ratios or {}
+        self.split_mode = None if split_mode is None else str(split_mode).lower()
         self.max_value = float(max_value) if max_value is not None else None
         self.max_hour_value = float(max_hour_value) if max_hour_value is not None else None
         self.batch_size = int(batch_size)
@@ -128,6 +130,37 @@ class StreamingParquetBuffer(IterableDataset):
                 self.file_skipped_map[file_path] = reason[:300]
             except Exception:
                 pass
+
+    def _split_bucket(self, meter_id: int, timestamp_s: int) -> str:
+        """Assign a window to train/val/test via SHA1(seed|meter|timestamp).
+
+        Used when split_mode != "new". Splits at the window level so every
+        meter is represented across all splits regardless of file assignment.
+        """
+        train_ratio = float(self.split_ratios.get("train_ratio", 1.0))
+        val_ratio = float(self.split_ratios.get("val_ratio", 0.0))
+        test_ratio = float(self.split_ratios.get("test_ratio", 0.0))
+        total = train_ratio + val_ratio + test_ratio
+        if total <= 0:
+            return "train"
+        train_ratio /= total
+        val_ratio /= total
+
+        seed_str = "0" if self.seed is None else str(int(self.seed))
+        key = f"{seed_str}|{int(meter_id)}|{int(timestamp_s)}".encode("utf-8")
+        digest = hashlib.sha1(key).digest()
+        u = int.from_bytes(digest[:8], "big") / float(2**64)
+
+        if u < train_ratio:
+            return "train"
+        if u < train_ratio + val_ratio:
+            return "val"
+        return "test"
+
+    def _keep_window(self, meter_id: int, timestamp_s: int) -> bool:
+        if self.split is None:
+            return True
+        return self._split_bucket(meter_id, timestamp_s) == self.split
 
     def _is_recoverable_file_error(self, error: Exception) -> bool:
         if isinstance(error, OSError):
@@ -425,23 +458,29 @@ class StreamingParquetBuffer(IterableDataset):
                             
                             # Lock ONCE per chunk to minimize CPU contention
                             with self._buffer_lock:
+                                pushed = 0
                                 for seq, meter_id_t, timestamp_t in sequences:
+                                    if self.split_mode != "new" and not self._keep_window(
+                                        int(meter_id_t.item()), int(timestamp_t.item())
+                                    ):
+                                        continue
                                     if self.normalizer is not None:
                                         seq = self.normalizer.transform(seq)
-                                    
+
                                     # Fast transpose
                                     seq = seq.T.contiguous()
-                                    
+
                                     if self.output_aggregate_stream:
                                         agg = seq.sum(dim=0, keepdim=True)
                                     else:
                                         agg = torch.empty((0, seq.shape[-1]), dtype=seq.dtype, device=seq.device)
-                                    
+
                                     # O(1) Pointer Overwrite. The OS Garbage Collector handles deletion silently.
                                     self.buffer[self.ptr] = (seq, meter_id_t, timestamp_t, agg)
                                     self.ptr = (self.ptr + 1) % self.replay_buffer_capacity
                                     self.current_size = min(self.current_size + 1, self.replay_buffer_capacity)
-                                self._push_count += len(sequences)
+                                    pushed += 1
+                                self._push_count += pushed
 
                     except Exception as e:
                         if self.skip_corrupt_files and self._is_recoverable_file_error(e):
@@ -587,9 +626,10 @@ class StreamingParquetBuffer(IterableDataset):
             return sequences
 
         # ====================================================================
-        # NEW DETERMINISTIC MODULO STRIDE SPLIT
+        # DETERMINISTIC MODULO STRIDE SPLIT (split_mode="new" only)
+        # SHA1 per-window split is applied in the background thread instead.
         # ====================================================================
-        if self.split is not None:
+        if self.split is not None and self.split_mode == "new":
             train_ratio = float(self.split_ratios.get("train_ratio", 1.0))
             val_ratio   = float(self.split_ratios.get("val_ratio",   0.0))
             test_ratio  = float(self.split_ratios.get("test_ratio",  0.0))
@@ -722,6 +762,7 @@ class PhasedReplayDataloaders:
             feature_cols: list[str] | None = None,
             split_seed: int | None = None,
             split_ratios: dict | None = None,
+            split_mode: str | None = None,
                 max_value: float | None = None,
                 max_hour_value: float | None = 20.0,
     ):
@@ -736,6 +777,7 @@ class PhasedReplayDataloaders:
         self.phased_mode = bool(phased_mode)
         self.split_seed = None if split_seed is None else int(split_seed)
         self.split_ratios = split_ratios or {}
+        self.split_mode = None if split_mode is None else str(split_mode).lower()
         self.max_hour_value = float(max_hour_value) if max_hour_value is not None else None
 
         sm_files = list(sm_files)
@@ -775,6 +817,7 @@ class PhasedReplayDataloaders:
             seed=self.split_seed,
             split="train",
             split_ratios=self.split_ratios,
+            split_mode=self.split_mode,
             max_value=max_value,
             max_hour_value=self.max_hour_value,
             batch_size=self.batch_size,
@@ -814,6 +857,7 @@ class PhasedReplayDataloaders:
             seed=self.split_seed,
             split="val",
             split_ratios=self.split_ratios,
+            split_mode=self.split_mode,
             max_value=max_value,
             max_hour_value=self.max_hour_value,
             batch_size=self.batch_size,
@@ -843,6 +887,7 @@ class PhasedReplayDataloaders:
             seed=self.split_seed,
             split="test",
             split_ratios=self.split_ratios,
+            split_mode=self.split_mode,
             max_value=max_value,
             max_hour_value=self.max_hour_value,
             batch_size=self.batch_size,

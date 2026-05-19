@@ -593,7 +593,7 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
             meter_col="meter_number",
         )
 
-        loader = DataLoader(phased_ds, batch_size=1024, num_workers=0)
+        loader = DataLoader(phased_ds, batch_size=None, num_workers=0)
 
         class WrapperLoader:
             def __init__(self, loader):

@@ -275,6 +275,7 @@ def train(config, train_only_user_profile: bool = False):
                 "val_ratio": float(getattr(data_cfg.splits, "val_ratio", 0.0)),
                 "test_ratio": float(getattr(data_cfg.splits, "test_ratio", 0.0)),
             },
+            split_mode=getattr(data_cfg.splits, "split_mode", None),
             max_value=float(v) if (v := getattr(data_cfg, "max_value", None)) is not None else None,
             max_hour_value=float(v) if (v := getattr(data_cfg, "max_hour_value", None)) is not None else None,
         )

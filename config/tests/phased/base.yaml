@@ -16,19 +16,20 @@ data:
   max_value: 200.0
   max_hour_value: 20.0
   splits:
-    train_ratio: 0.8
+    train_ratio: 0.85
     val_ratio: 0.1
-    test_ratio: 0.1
+    test_ratio: 0.05
     random_seed: 42
+    split_mode: "new"
   window:
     aggregated: true
     input_len: 24
     stride: 24
-  batch_size: 1024
+  batch_size: 2048
   shuffle: true
-  replay_buffer_capacity: 9000
-  min_buffer_size: 3000
-  num_workers: 6
+  replay_buffer_capacity: 20000
+  min_buffer_size: 2000
+  num_workers: 2
   steps_per_epoch: 500
   eval_batches: 5
   eval_cache_on_gpu: true
