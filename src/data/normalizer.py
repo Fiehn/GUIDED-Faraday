@@ -589,7 +589,7 @@ class Normalizer:
         phased_ds = StreamingParquetBuffer(
             sm_files=filenames, 
             replay_buffer_capacity=10000, 
-            min_buffer_size=0,
+            min_buffer_size=1000,
             window_spec=window_spec,
             num_workers=0,
             feature_cols=feature_cols,
@@ -598,8 +598,9 @@ class Normalizer:
             phased_mode=phased,
             meter_col=meter_col,
             nan_as_zero=nan_as_zero,
+            batch_size=256,
         )
-        train_loader = DataLoader(phased_ds, batch_size=256, num_workers=0, pin_memory=True)
+        train_loader = DataLoader(phased_ds, batch_size=None, num_workers=0, pin_memory=True)
         
         for X_batch in tqdm(train_loader, desc="Fitting normalizer"):
             x_gpu = X_batch[0].to(device)

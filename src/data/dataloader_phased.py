@@ -4,13 +4,16 @@ import torch
 import random
 import pyarrow as pa
 import pyarrow.parquet as pq
-import multiprocessing as mp
 from torch.utils.data import IterableDataset, DataLoader, get_worker_info, TensorDataset
 from typing import Optional
 import numpy as np
 import os
 import pandas as pd
 from dataclasses import dataclass
+import gc
+
+import threading
+import time
 
 import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -25,7 +28,12 @@ class WindowSpec:
 
 class StreamingParquetBuffer(IterableDataset):
     """An IterableDataset that reads data from a Parquet file in a streaming manner and uses a replay buffer to store and sample data for training."""
-    def __init__(self, 
+
+    # Rows per chunk when reading large unphased files (one file = all meters).
+    # Phased files are one-meter-per-file and are read whole.
+    _UNPHASED_CHUNK_ROWS = 250_000
+
+    def __init__(self,
                  sm_files, 
                  replay_buffer_capacity: int = 10000, 
                  min_buffer_size: int = 2000, 
@@ -48,8 +56,10 @@ class StreamingParquetBuffer(IterableDataset):
                  seed: int | None = None,
                  split: str | None = None,
                  split_ratios: dict | None = None,
+                 split_mode: str | None = None,
                  max_value: float | None = None,
                  max_hour_value: float | None = 20.0,
+                 batch_size: int = 256,
                  ):
         self.sm_files = sm_files
         self.replay_buffer_capacity = replay_buffer_capacity
@@ -57,8 +67,10 @@ class StreamingParquetBuffer(IterableDataset):
         self.seed = None if seed is None else int(seed)
         self.split = None if split is None else str(split).lower()
         self.split_ratios = split_ratios or {}
+        self.split_mode = None if split_mode is None else str(split_mode).lower()
         self.max_value = float(max_value) if max_value is not None else None
         self.max_hour_value = float(max_hour_value) if max_hour_value is not None else None
+        self.batch_size = int(batch_size)
 
         # The buffer exists per worker
         # if capacity is 500 and num_workers is 4, then the total effective buffer capacity is 2000
@@ -98,39 +110,6 @@ class StreamingParquetBuffer(IterableDataset):
         self.output_aggregate_stream = bool(output_aggregate_stream)
         self.sample_random = bool(sample_random)
 
-    def _split_bucket(self, meter_id: int, timestamp_s: int) -> str:
-        """Deterministically assign a window to train/val/test based on a seeded hash.
-
-        This splits at the WINDOW level (not file level), which is important when each
-        file corresponds to a condition and must be represented across splits.
-        """
-        train_ratio = float(self.split_ratios.get("train_ratio", 1.0))
-        val_ratio = float(self.split_ratios.get("val_ratio", 0.0))
-        test_ratio = float(self.split_ratios.get("test_ratio", 0.0))
-        total = train_ratio + val_ratio + test_ratio
-        if total <= 0:
-            return "train"
-        train_ratio /= total
-        val_ratio /= total
-        test_ratio /= total
-
-        # Stable uniform in [0,1) from sha1(seed|meter|timestamp)
-        seed_str = "0" if self.seed is None else str(int(self.seed))
-        key = f"{seed_str}|{int(meter_id)}|{int(timestamp_s)}".encode("utf-8")
-        digest = hashlib.sha1(key).digest()
-        u = int.from_bytes(digest[:8], "big") / float(2**64)
-
-        if u < train_ratio:
-            return "train"
-        if u < train_ratio + val_ratio:
-            return "val"
-        return "test"
-
-    def _keep_window(self, meter_id: int, timestamp_s: int) -> bool:
-        if self.split is None:
-            return True
-        return self._split_bucket(meter_id, timestamp_s) == self.split
-
     def _mark_file_seen(self, file_path: str):
         if self.file_seen_map is not None:
             try:
@@ -152,6 +131,37 @@ class StreamingParquetBuffer(IterableDataset):
             except Exception:
                 pass
 
+    def _split_bucket(self, meter_id: int, timestamp_s: int) -> str:
+        """Assign a window to train/val/test via SHA1(seed|meter|timestamp).
+
+        Used when split_mode != "new". Splits at the window level so every
+        meter is represented across all splits regardless of file assignment.
+        """
+        train_ratio = float(self.split_ratios.get("train_ratio", 1.0))
+        val_ratio = float(self.split_ratios.get("val_ratio", 0.0))
+        test_ratio = float(self.split_ratios.get("test_ratio", 0.0))
+        total = train_ratio + val_ratio + test_ratio
+        if total <= 0:
+            return "train"
+        train_ratio /= total
+        val_ratio /= total
+
+        seed_str = "0" if self.seed is None else str(int(self.seed))
+        key = f"{seed_str}|{int(meter_id)}|{int(timestamp_s)}".encode("utf-8")
+        digest = hashlib.sha1(key).digest()
+        u = int.from_bytes(digest[:8], "big") / float(2**64)
+
+        if u < train_ratio:
+            return "train"
+        if u < train_ratio + val_ratio:
+            return "val"
+        return "test"
+
+    def _keep_window(self, meter_id: int, timestamp_s: int) -> bool:
+        if self.split is None:
+            return True
+        return self._split_bucket(meter_id, timestamp_s) == self.split
+
     def _is_recoverable_file_error(self, error: Exception) -> bool:
         if isinstance(error, OSError):
             return True
@@ -167,6 +177,7 @@ class StreamingParquetBuffer(IterableDataset):
             "parquet",
             "decompression",
             "invalid",
+            "out-of-bounds",
         )
         return any(token in msg for token in tokens)
 
@@ -186,23 +197,6 @@ class StreamingParquetBuffer(IterableDataset):
                     "for this worker. Suppressing further skip logs."
                 )
     
-    def _push_to_buffer(self, item):
-        self.buffer[self.ptr] = item
-        self.ptr = (self.ptr + 1) % self.replay_buffer_capacity
-        self.current_size = min(self.current_size + 1, self.replay_buffer_capacity)
-
-    def _sample_from_buffer(self):
-        if self.current_size < self.min_buffer_size:
-            raise ValueError(f"Buffer size {self.current_size} is less than the minimum required {self.min_buffer_size} for sampling.")
-        if self.sample_random:
-            # Uses worker-local RNG for determinism across runs.
-            idx = self._rng.randrange(self.current_size)
-            return self.buffer[idx]
-
-        # Deterministic mode: always emit the newest inserted sample.
-        idx = (self.ptr - 1) % self.replay_buffer_capacity
-        return self.buffer[idx]
-
     def _extract_meter_id(self, file_path: str) -> int:
         if not self.phased_mode:
             raise ValueError("_extract_meter_id is only valid when phased_mode=True")
@@ -279,8 +273,19 @@ class StreamingParquetBuffer(IterableDataset):
         # Aggregate first so index labels align with the target base frequency.
         # Building full_index before resampling can misalign (e.g., :45 vs :00)
         # and reindex would then wipe out all values as NaN.
+        #
+        # Skip resample when data is already at (or sparser than) the target
+        # frequency — the check is O(1) and avoids the full pandas resample
+        # machinery for already-hourly parquet caches.
+        # TODO: REMEMBER THIS 'guy'! we are using kw not kwh on the 15 min scale
         if self.aggregation:
-            df = df.resample(self.base_frequency).mean() # TODO: REMEMBER THIS 'guy'! we are using kw not kwh on the 15 min scale
+            needs_resample = False
+            if len(df) > 1:
+                first_diff = df.index[1] - df.index[0]
+                target_delta = pd.Timedelta(self.base_frequency)
+                needs_resample = first_diff < target_delta * 0.9
+            if needs_resample:
+                df = df.resample(self.base_frequency).mean()
             if self.aggregation_divisor != 1.0:
                 df = df / self.aggregation_divisor
 
@@ -325,6 +330,52 @@ class StreamingParquetBuffer(IterableDataset):
         meter_id = self._extract_meter_id(file_path) if self.phased_mode else None
         return prepared, meter_id, meter_col_name
 
+    def _iter_file_chunks(self, file_path: str, worker_id: int = 0, num_workers: int = 1):
+        """Yield (prepared_df, meter_col_name) in row-bounded chunks.
+
+        Only used in unphased mode. Partitions at the row-group level so that
+        multiple DataLoader workers can operate on the same large file in parallel:
+        worker i reads row groups i, i+num_workers, i+2*num_workers, …
+        Within each row group, reads are chunked to _UNPHASED_CHUNK_ROWS to cap
+        peak memory (each row group is ~1 M rows for this dataset).
+        """
+        parquet_file = pq.ParquetFile(file_path)
+        file_cols = parquet_file.schema.names
+        cols_to_load, rename_map, time_col_name, meter_col_name = self._select_columns(file_cols)
+
+        if not cols_to_load or time_col_name is None or meter_col_name is None:
+            return
+
+        num_row_groups = parquet_file.metadata.num_row_groups
+        for rg_idx in range(worker_id, num_row_groups, num_workers):
+            try:
+                for batch in parquet_file.iter_batches(
+                    batch_size=self._UNPHASED_CHUNK_ROWS,
+                    row_groups=[rg_idx],
+                    columns=cols_to_load,
+                ):
+                    df = batch.to_pandas(ignore_metadata=True)
+                    if df.empty:
+                        continue
+                    df = df.rename(columns=rename_map)
+                    effective_meter_col = meter_col_name
+                    if meter_col_name not in df.columns and meter_col_name in list(getattr(df.index, "names", [])):
+                        df = df.reset_index()
+                        df = df.rename(columns={meter_col_name: self.meter_col})
+                        effective_meter_col = self.meter_col
+                    prepared = self._prepare_time_index(df, time_col_name, effective_meter_col)
+                    if prepared.empty:
+                        continue
+                    yield prepared, effective_meter_col
+            except Exception as e:
+                if self.skip_corrupt_files and self._is_recoverable_file_error(e):
+                    print(f"  [data] Recovered: Skipped corrupted row group {rg_idx} in {os.path.basename(file_path)}", flush=True)
+                    continue
+                
+                # If it's a completely unrecognized fatal error, raise it 
+                # so the outer loop catches it and skips the file.
+                raise
+
     def _meter_value_to_int(self, meter_value) -> int:
         try:
             return int(meter_value)
@@ -334,6 +385,14 @@ class StreamingParquetBuffer(IterableDataset):
             return int(digest[:8], 16)
     
     def __iter__(self):
+        # If this split has a zero ratio, yield nothing. Without this guard,
+        # the while True below loops forever without yielding, deadlocking any
+        # caller that expects StopIteration (e.g. val stream when train_ratio=1.0).
+        if self.split is not None:
+            _ratio_key = f"{self.split}_ratio"
+            if float(self.split_ratios.get(_ratio_key, 1.0)) <= 0.0:
+                return
+
         # === Multiprocessing traffic control ===
         worker_info = get_worker_info()
 
@@ -342,79 +401,139 @@ class StreamingParquetBuffer(IterableDataset):
         worker_id = 0 if worker_info is None else int(worker_info.id)
         self._rng = random.Random(base_seed + 1009 * worker_id)
 
-        if worker_info is None:
-            # Single-process data loading
-            files_for_this_worker = list(self.sm_files) # copy the list
-        else:
-            # Multi-process data loading
-            per_worker = int(math.ceil(len(self.sm_files) / float(worker_info.num_workers)))
-            start_idx = worker_info.id * per_worker
-            end_idx = min(start_idx + per_worker, len(self.sm_files))
+        num_workers = 1 if worker_info is None else int(worker_info.num_workers)
 
+        if worker_info is None:
+            # Single-process data loading — worker owns all files.
+            files_for_this_worker = list(self.sm_files)
+        elif self.phased_mode:
+            # Phased: many small files (one per meter) — partition by file so
+            # each worker owns a disjoint subset and reads each file whole.
+            per_worker = int(math.ceil(len(self.sm_files) / float(num_workers)))
+            start_idx = worker_id * per_worker
+            end_idx = min(start_idx + per_worker, len(self.sm_files))
             files_for_this_worker = self.sm_files[start_idx:end_idx]
-        
+        else:
+            # Unphased: few large files (all meters in one file) — every worker
+            # gets every file, but _iter_file_chunks partitions within each file
+            # at the row-group level so no two workers duplicate work.
+            files_for_this_worker = list(self.sm_files)
+
         if self.sample_random:
             self._rng.shuffle(files_for_this_worker)
 
-        # === Lazy parquet streaming ===
-        for file in files_for_this_worker:
-            self._mark_file_seen(file)
-            try:
-                file_df, meter_id, meter_col_name = self._load_file_dataframe(file)
-                if file_df is None:
-                    continue
+        if not files_for_this_worker:
+            return
+        
+        self._buffer_lock = threading.Lock()
+        
+        self.buffer = [None] * self.replay_buffer_capacity
+        self.ptr = 0
+        self.current_size = 0
+        
+        self._push_count = 0
+        self._yield_count = 0
 
-                sequences = self._extract_sequences(file_df, meter_id=meter_id, meter_col_name=meter_col_name)
+        def background_file_reader():
+            while True:
+                for file in files_for_this_worker:
+                    self._mark_file_seen(file)
+                    try:
+                        if self.phased_mode:
+                            file_df, m_id, m_col = self._load_file_dataframe(file)
+                            if file_df is None: continue
+                            chunks = [(file_df, m_id, m_col)]
+                        else:
+                            chunks = (
+                                (chunk_df, None, chunk_meter_col)
+                                for chunk_df, chunk_meter_col in self._iter_file_chunks(file, worker_id, num_workers)
+                            )
 
-                for seq, meter_id_t, timestamp_t in sequences:
-                    # Window-level deterministic split
-                    if not self._keep_window(int(meter_id_t.item()), int(timestamp_t.item())):
-                        continue
-                    if self.max_value is not None and seq.abs().sum() > self.max_value:
-                        continue
-                    # Drop entire window if any single hour (summed across features/phases)
-                    # exceeds the per-hour threshold.
-                    if self.max_hour_value is not None:
-                        # seq shape: [L, F] -> sum across F to get per-hour total
-                        try:
-                            hourly = seq.abs().sum(dim=1)
-                            if hourly.max().item() > float(self.max_hour_value):
-                                continue
-                        except Exception:
-                            # If tensor ops fail for any reason, skip this window conservatively.
+                        for chunk_df, chunk_m_id, chunk_m_col in chunks:
+                            # If the GPU hasn't caught up, go to sleep and free the CPU/RAM.
+                            while self._push_count - self._yield_count >= self.replay_buffer_capacity:
+                                time.sleep(0.05)
+
+                            sequences = self._extract_sequences(chunk_df, meter_id=chunk_m_id, meter_col_name=chunk_m_col)
+                            
+                            # Lock ONCE per chunk to minimize CPU contention
+                            with self._buffer_lock:
+                                pushed = 0
+                                for seq, meter_id_t, timestamp_t in sequences:
+                                    if self.split_mode != "new" and not self._keep_window(
+                                        int(meter_id_t.item()), int(timestamp_t.item())
+                                    ):
+                                        continue
+                                    if self.normalizer is not None:
+                                        seq = self.normalizer.transform(seq)
+
+                                    # Fast transpose
+                                    seq = seq.T.contiguous()
+
+                                    if self.output_aggregate_stream:
+                                        agg = seq.sum(dim=0, keepdim=True)
+                                    else:
+                                        agg = torch.empty((0, seq.shape[-1]), dtype=seq.dtype, device=seq.device)
+
+                                    # O(1) Pointer Overwrite. The OS Garbage Collector handles deletion silently.
+                                    self.buffer[self.ptr] = (seq, meter_id_t, timestamp_t, agg)
+                                    self.ptr = (self.ptr + 1) % self.replay_buffer_capacity
+                                    self.current_size = min(self.current_size + 1, self.replay_buffer_capacity)
+                                    pushed += 1
+                                self._push_count += pushed
+
+                    except Exception as e:
+                        if self.skip_corrupt_files and self._is_recoverable_file_error(e):
+                            self._warn_skipped_file(file, e)
                             continue
-                    if seq.abs().sum() == 0:
-                        continue
-                    # Apply normalization if normalizer is provided
-                    if self.normalizer is not None:
-                        # seq shape is [24, 3], broadcasting with [3,]
-                        seq = self.normalizer.transform(seq)
+                        print(f"Background thread error on {file}: {e}", flush=True)
+                    finally:
+                        self._mark_file_completed(file)
+                        
+                if self.sample_random:
+                    self._rng.shuffle(files_for_this_worker)
 
-                    # Keep model input as [F, L]
-                    seq = seq.T
+        # Start the background daemon thread
+        io_thread = threading.Thread(target=background_file_reader, daemon=True)
+        io_thread.start()
 
-                    # Always emit aggregate tensor to keep tuple width fixed.
-                    if self.output_aggregate_stream:
-                        agg = seq.sum(dim=0, keepdim=True)
-                    else:
-                        agg = torch.empty((0, seq.shape[-1]), dtype=seq.dtype, device=seq.device)
-
-                    # Push standardized sample tuple: (x, meter_id, timestamp, agg)
-                    self._push_to_buffer((seq, meter_id_t, timestamp_t, agg))
-
-                    # Yield only when the buffer is adequately mixed
+        # === Lazy parquet streaming (infinite loop so workers never exhaust) ===
+        while True:
+            # Wait for the buffer to warm up
+            while True:
+                with self._buffer_lock:
                     if self.current_size >= self.min_buffer_size:
-                        # The yield pauses the loop right here until PyTorch needs more data
-                        yield self._sample_from_buffer()
-            except Exception as e:
-                if self.skip_corrupt_files and self._is_recoverable_file_error(e):
-                    reason = f"{type(e).__name__}: {e}"
-                    self._mark_file_skipped(file, reason)
-                    self._warn_skipped_file(file, e)
-                    continue
-                raise
-            finally:
-                self._mark_file_completed(file)
+                        break
+                time.sleep(0.005) 
+            
+            chunk_list = []
+            
+            with self._buffer_lock:
+                take_count = min(self.batch_size, self.current_size)
+                
+                # THE MITIGATION: random.sample guarantees we NEVER pull the same index 
+                # twice in a single batch. Intra-batch duplicates are mathematically eliminated.
+                if self.sample_random:
+                    indices = self._rng.sample(range(self.current_size), take_count)
+                else:
+                    # Deterministic fallback: just take the most recently written items
+                    start_idx = (self.ptr - take_count) % self.replay_buffer_capacity
+                    indices = [(start_idx + i) % self.replay_buffer_capacity for i in range(take_count)]
+                
+                for idx in indices:
+                    chunk_list.append(self.buffer[idx])
+            
+            # Fast C++ Concatenation
+            x_cat = torch.stack([c[0] for c in chunk_list], dim=0)
+            m_cat = torch.stack([c[1] for c in chunk_list], dim=0)
+            t_cat = torch.stack([c[2] for c in chunk_list], dim=0)
+            a_cat = torch.stack([c[3] for c in chunk_list], dim=0)
+
+            self._yield_count += take_count
+            
+            # Yield massive blocks to prevent IPC queue flooding
+            # .clone() severs the memory link so PyTorch doesn't leak memory
+            yield (x_cat.clone(), m_cat.clone(), t_cat.clone(), a_cat.clone())
     
     def _extract_sequences_for_meter(self, meter_df: pd.DataFrame, meter_id: int):
         sequences = []
@@ -440,43 +559,122 @@ class StreamingParquetBuffer(IterableDataset):
             if phase_df.empty:
                 return sequences
 
-        # Robust timestamp extraction: normalize the index to UTC datetimes first,
-        # then convert using the actual datetime resolution instead of assuming ns.
+        # Get Unix timestamps in seconds without any pandas int-cast API.
+        # astype('int64') on a tz-aware DatetimeIndex raises TypeError in pandas 3+.
+        # Strategy: convert to UTC, strip tz-awareness (values stay identical),
+        # then go through numpy — datetime64[s].view(int64) == Unix seconds.
         try:
             dt_index = pd.DatetimeIndex(pd.to_datetime(phase_df.index, utc=True, errors='coerce'))
-            if dt_index.isna().any():
+            if np.any(pd.isnull(dt_index)):
                 raise ValueError("Datetime conversion produced NaT values")
 
-            raw_values = dt_index.astype('int64')
-            unit = getattr(getattr(dt_index, 'dtype', None), 'unit', 'ns')
-            divisor_by_unit = {
-                's': 1,
-                'ms': 10**3,
-                'us': 10**6,
-                'ns': 10**9,
-            }
-            divisor = divisor_by_unit.get(unit, 10**9)
-            timestamps = (raw_values // divisor).astype(np.int64)
-        except Exception as e:
-            import sys
+            naive = dt_index.tz_convert('UTC').tz_localize(None)
+            timestamps = naive.to_numpy(dtype='datetime64[s]').view(np.int64)
+        except Exception:
             raise
         
         values = phase_df.astype(np.float32).to_numpy()
         if len(values) < self.window_spec.input_len:
             return sequences
 
-        for start in range(0, len(values) - self.window_spec.input_len + 1, self.window_spec.stride):
-            end = start + self.window_spec.input_len
+        input_len = self.window_spec.input_len
+
+        # Pre-compute per-timestep absolute totals across features once for all windows.
+        abs_totals = np.abs(values).sum(axis=1)  # [N]
+
+        # Prefix sums for O(1) per-window filter checks.
+        prefix = np.empty(len(values) + 1, dtype=np.float64)
+        prefix[0] = 0.0
+        np.cumsum(abs_totals, out=prefix[1:])
+
+        if self.max_hour_value is not None:
+            bad_hour = (abs_totals > self.max_hour_value).astype(np.int32)
+            prefix_bad = np.empty(len(values) + 1, dtype=np.int64)
+            prefix_bad[0] = 0
+            np.cumsum(bad_hour, out=prefix_bad[1:])
+        else:
+            prefix_bad = None
+
+        meter_id_t = torch.tensor(int(meter_id), dtype=torch.long)
+
+        # Align to local midnight using Unix-second arithmetic: try CET (UTC+1),
+        # CEST (UTC+2), then UTC. This avoids tz_convert("Europe/Copenhagen"),
+        # which costs ~6 ms per meter (pandas timezone-db lookup) and becomes the
+        # dominant bottleneck at 60k meters (~48s per epoch with 8 workers).
+        first_aligned_idx = 0
+        for _tz_offset in (3600, 7200, 0):
+            _hits = np.where((timestamps + _tz_offset) % 86400 == 0)[0]
+            if len(_hits) > 0:
+                first_aligned_idx = int(_hits[0])
+                break
+
+        # Vectorised filter: compute all candidate start positions at once.
+        all_starts = np.arange(first_aligned_idx, len(values) - input_len + 1, self.window_spec.stride, dtype=np.intp)
+        if len(all_starts) == 0:
+            return sequences
+        all_ends = all_starts + input_len
+
+        window_sums = prefix[all_ends] - prefix[all_starts]
+        valid = window_sums > 0.0
+        if self.max_value is not None:
+            valid &= window_sums <= self.max_value
+        if prefix_bad is not None:
+            valid &= prefix_bad[all_ends] == prefix_bad[all_starts]
+
+        valid_starts = all_starts[valid]
+        if len(valid_starts) == 0:
+            return sequences
+
+        # ====================================================================
+        # DETERMINISTIC MODULO STRIDE SPLIT (split_mode="new" only)
+        # SHA1 per-window split is applied in the background thread instead.
+        # ====================================================================
+        if self.split is not None and self.split_mode == "new":
+            train_ratio = float(self.split_ratios.get("train_ratio", 1.0))
+            val_ratio   = float(self.split_ratios.get("val_ratio",   0.0))
+            test_ratio  = float(self.split_ratios.get("test_ratio",  0.0))
             
-            # Window shape before transpose: [L, F]
-            window = torch.tensor(values[start:end], dtype=torch.float32)
+            total = train_ratio + val_ratio + test_ratio
+            if total > 0.0:
+                train_ratio /= total
+                val_ratio /= total
+                
+                # Base resolution of 100 allows for precise percentage splits (e.g., 80/10/10)
+                resolution = 100
+                train_cut = int(train_ratio * resolution)
+                val_cut = train_cut + int(val_ratio * resolution)
+                
+                # Offset staggers the split so different meters hold out different hours.
+                # If meter_id is 1005, offset is 5.
+                meter_offset = int(meter_id) % resolution
+                
+                # Create a simple sequence: [0, 1, 2, 3, 4, ... N]
+                # Apply the offset, and wrap around using modulo 100
+                cycle_pos = (np.arange(len(valid_starts)) + meter_offset) % resolution
+                
+                # Generate the boolean mask
+                if self.split == "train":
+                    keep = cycle_pos < train_cut
+                elif self.split == "val":
+                    keep = (cycle_pos >= train_cut) & (cycle_pos < val_cut)
+                else:
+                    keep = cycle_pos >= val_cut
+                    
+                valid_starts = valid_starts[keep]
+                
+                if len(valid_starts) == 0:
+                    return sequences
+        # ====================================================================
 
-            # Per-window metadata (single values, not packed sequences)
-            meter_id_t = torch.tensor(int(meter_id), dtype=torch.long)
-            timestamp_t = torch.tensor(int(timestamps[start]), dtype=torch.long)
+        # Extract all valid windows in one numpy fancy-index call
+        indices = valid_starts[:, None] + np.arange(input_len, dtype=np.intp)  # [N, L]
+        windows_np = values[indices]  # [N, L, F] 
+        windows_t = torch.from_numpy(windows_np)
+        ts_t = torch.from_numpy(timestamps[valid_starts].copy())
 
-            sequences.append((window, meter_id_t, timestamp_t))
-        
+        for i in range(len(valid_starts)):
+            sequences.append((windows_t[i].clone(), meter_id_t, ts_t[i].clone()))
+
         return sequences
 
     def _extract_sequences(self, df, meter_id=None, meter_col_name: str | None = None):
@@ -498,13 +696,32 @@ class StreamingParquetBuffer(IterableDataset):
             return []
 
         grouped = df.loc[valid].copy()
-        grouped["_meter_id_int"] = grouped[meter_col_name].apply(self._meter_value_to_int).astype(np.int64)
+
+        # Vectorised meter-ID extraction: pd.to_numeric is 100-500x faster than
+        # .apply() for the common case where IDs are numeric.  Non-numeric IDs
+        # (SHA1 fallback) are handled row-by-row only for the rare mixed case.
+        meter_numeric = pd.to_numeric(grouped[meter_col_name], errors='coerce')
+        if meter_numeric.isna().any():
+            grouped["_meter_id_int"] = grouped[meter_col_name].apply(self._meter_value_to_int).to_numpy(dtype=np.int64)
+        else:
+            grouped["_meter_id_int"] = meter_numeric.to_numpy(dtype=np.int64)
 
         sequences = []
-        for meter_value, meter_df in grouped.groupby("_meter_id_int", sort=False):
-            meter_frame = meter_df.sort_values("_timestamp").set_index("_timestamp")
+        for meter_value, meter_df in grouped.groupby("_meter_id_int"):
+            meter_frame = meter_df.set_index("_timestamp")
             meter_frame = meter_frame[~meter_frame.index.duplicated(keep='last')]
             sequences.extend(self._extract_sequences_for_meter(meter_frame, meter_id=int(meter_value)))
+            
+            del meter_frame
+            del meter_df
+
+        del grouped
+        del meter_series
+        del meter_numeric
+        del df 
+        
+        # Force Python to tell PyArrow to release the C++ memory back to the OS
+        gc.collect()
         return sequences
 
 class PhasedReplayDataloaders:
@@ -545,6 +762,7 @@ class PhasedReplayDataloaders:
             feature_cols: list[str] | None = None,
             split_seed: int | None = None,
             split_ratios: dict | None = None,
+            split_mode: str | None = None,
                 max_value: float | None = None,
                 max_hour_value: float | None = 20.0,
     ):
@@ -559,6 +777,7 @@ class PhasedReplayDataloaders:
         self.phased_mode = bool(phased_mode)
         self.split_seed = None if split_seed is None else int(split_seed)
         self.split_ratios = split_ratios or {}
+        self.split_mode = None if split_mode is None else str(split_mode).lower()
         self.max_hour_value = float(max_hour_value) if max_hour_value is not None else None
 
         sm_files = list(sm_files)
@@ -598,8 +817,10 @@ class PhasedReplayDataloaders:
             seed=self.split_seed,
             split="train",
             split_ratios=self.split_ratios,
+            split_mode=self.split_mode,
             max_value=max_value,
             max_hour_value=self.max_hour_value,
+            batch_size=self.batch_size,
         )
 
         self.eval_loader = None
@@ -610,6 +831,7 @@ class PhasedReplayDataloaders:
         self._val_stream_iter = None
         self._test_stream_loader = None
         self._test_stream_iter = None
+        self._stream_epoch_count = 0
 
         # Validation stream (used during training): deterministic ordering and deterministic buffer sampling.
         self.val_dataset = StreamingParquetBuffer(
@@ -635,8 +857,10 @@ class PhasedReplayDataloaders:
             seed=self.split_seed,
             split="val",
             split_ratios=self.split_ratios,
+            split_mode=self.split_mode,
             max_value=max_value,
             max_hour_value=self.max_hour_value,
+            batch_size=self.batch_size,
         )
 
         # True test stream (never used during training unless explicitly requested).
@@ -663,8 +887,10 @@ class PhasedReplayDataloaders:
             seed=self.split_seed,
             split="test",
             split_ratios=self.split_ratios,
+            split_mode=self.split_mode,
             max_value=max_value,
             max_hour_value=self.max_hour_value,
+            batch_size=self.batch_size,
         )
 
     def get_file_progress(self):
@@ -679,7 +905,7 @@ class PhasedReplayDataloaders:
 
     def _make_stream(self, dataset):
         loader_kwargs = {
-            "batch_size": self.batch_size,
+            "batch_size": None,
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,
         }
@@ -688,19 +914,30 @@ class PhasedReplayDataloaders:
             loader_kwargs["prefetch_factor"] = 2
         return DataLoader(dataset, **loader_kwargs)
 
+    def _reset_train_stream(self):
+        """Reset the training stream iterator and optionally recycle workers.
+
+        Called proactively every N epochs (OOM prevention) and reactively on
+        worker crashes. With persistent workers, we must NOT drop the loader
+        while workers may have buffered batches: GC cleanup of a DataLoader
+        whose workers are blocked on a full output queue deadlocks on
+        Windows + Python 3.13. Instead, keep the loader alive and let the
+        next iter() call signal workers to start a new epoch cleanly.
+        """
+        self._train_stream_iter = None
+        if self.num_workers == 0:
+            # Single-process mode: no workers to deadlock; safe to recreate.
+            self._train_stream_loader = None
+
     def _get_train_stream_loader(self):
         if self._train_stream_loader is None:
             self._train_stream_loader = self._make_stream(self.train_dataset)
         return self._train_stream_loader
 
-    def _get_eval_stream_loader(self):
-        # Backwards-compat alias: "eval" means validation during training.
-        return self._get_val_stream_loader()
-
     def _get_val_stream_loader(self):
         if self._val_stream_loader is None:
             loader_kwargs = {
-                "batch_size": self.batch_size,
+                "batch_size": None,
                 "num_workers": 0,
                 "pin_memory": self.pin_memory,
             }
@@ -710,7 +947,7 @@ class PhasedReplayDataloaders:
     def _get_test_stream_loader(self):
         if self._test_stream_loader is None:
             loader_kwargs = {
-                "batch_size": self.batch_size,
+                "batch_size": None,
                 "num_workers": 0,
                 "pin_memory": self.pin_memory,
             }
@@ -730,6 +967,19 @@ class PhasedReplayDataloaders:
                 return next(self._train_stream_iter)
             except StopIteration:
                 return None
+        except RuntimeError as e:
+            # A DataLoader worker process died (OOM or unhandled exception).
+            # Drop the broken loader explicitly so _get_train_stream_loader
+            # spawns a fresh one — safe here because the workers are already dead.
+            print(
+                f"[data] WARNING: train stream worker crashed ({type(e).__name__}: {e}); "
+                "restarting workers and retrying.",
+                flush=True,
+            )
+            self._train_stream_iter = None
+            self._train_stream_loader = None
+            self._train_stream_iter = iter(self._get_train_stream_loader())
+            return next(self._train_stream_iter)
 
     def _next_val_stream_batch(self):
         loader = self._get_val_stream_loader()
@@ -775,9 +1025,7 @@ class PhasedReplayDataloaders:
         max_scan_batches = self.cache_scan_batches or max(30, total_batches * 40)
 
         _t0 = _time.perf_counter()
-        _report_every = max(1, total_batches // 10)
         _batches_read = 0
-        print(f"  [data] Collecting {which}: {target:,} samples ({total_batches} batches) ...", flush=True)
 
         if which == "train":
             next_batch = self._next_train_stream_batch
@@ -823,11 +1071,6 @@ class PhasedReplayDataloaders:
                 agg_out[samples:samples + take].copy_(agg_batch[:take])
                 samples += int(take)
 
-            if _batches_read % _report_every == 0 or samples >= target:
-                elapsed = _time.perf_counter() - _t0
-                pct = 100 * samples / target if target > 0 else 100
-                print(f"  [data]   {samples:>8,}/{target:,} ({pct:4.0f}%)  {elapsed:5.1f}s", flush=True)
-
             if samples >= target:
                 break
 
@@ -836,14 +1079,8 @@ class PhasedReplayDataloaders:
             print(f"  [data] WARNING: no {which} samples collected in {elapsed:.1f}s", flush=True)
             return None, None, None, None
 
-        print(f"  [data] Collected {which}: {samples:,} samples in {elapsed:.1f}s", flush=True)
         return x_out[:samples], meter_out[:samples], ts_out[:samples], agg_out[:samples]
 
-    def _collect_cache(self, target_train: int, target_eval: int):
-        train_x, train_meter, train_timestamps, train_agg = self._collect_stream_cache("train", target_train)
-        # Backwards-compat: "eval" here means validation during training.
-        eval_x, eval_meter, eval_timestamps, eval_agg = self._collect_stream_cache("val", target_eval)
-        return train_x, train_meter, train_timestamps, train_agg, eval_x, eval_meter, eval_timestamps, eval_agg
 
     def _build_eval_loader(self, x_eval, meter_eval, timestamps_eval, agg_eval=None):
         if (
@@ -926,40 +1163,28 @@ class PhasedReplayDataloaders:
             pin_memory=pin_test_memory,
         )
 
-    def get_epoch_loaders(self, steps_per_epoch: int, eval_batches: int, refresh_eval: bool = False):
+    def get_train_epoch_loader(self, steps_per_epoch: int):
+        """Builds ONLY the training cache and returns the loader."""
+        self._stream_epoch_count += 1
+        if self.num_workers > 0 and self._stream_epoch_count % 10 == 0:
+            self._reset_train_stream()
+
         target_train = max(1, int(steps_per_epoch)) * self.batch_size
-        need_eval = int(eval_batches) > 0
-        target_eval = 0
-
-        if need_eval:
-            if self.eval_loader is None or refresh_eval:
-                eval_cache_batches = self.eval_cache_batches if self.eval_cache_batches is not None else eval_batches
-                target_eval = max(1, int(eval_cache_batches)) * self.batch_size
-
-        train_x, train_meter, train_timestamps, train_agg, eval_x, eval_meter, eval_timestamps, eval_agg = self._collect_cache(target_train, target_eval)
+        
+        # Only collect the training stream
+        train_x, train_meter, train_timestamps, train_agg = self._collect_stream_cache("train", target_train)
+        
         if train_x is None or train_meter is None or train_timestamps is None or train_x.shape[0] == 0:
-            return None, self.eval_loader
-
-        # Cache training tensors on GPU if eval_cache_device is set.
-        # This eliminates per-batch CPU→GPU transfers during the training loop.
-        # if self.eval_cache_device is not None:
-        #     try:
-        #         train_x = train_x.to(self.eval_cache_device)
-        #         train_meter = train_meter.to(self.eval_cache_device)
-        #         train_timestamps = train_timestamps.to(self.eval_cache_device)
-        #         train_agg = train_agg.to(self.eval_cache_device)
-        #     except RuntimeError as e:
-        #         if "out of memory" in str(e).lower():
-        #             print("Warning: train cache GPU transfer OOM; keeping train cache on CPU.")
-        #         else:
-        #             raise
+            return None
 
         train_ds = TensorDataset(train_x, train_meter, train_timestamps, train_agg)
         pin_train_memory = self.pin_memory and train_x.device.type == "cpu"
+        
         generator = None
         if self.split_seed is not None:
             generator = torch.Generator()
             generator.manual_seed(int(self.split_seed))
+            
         train_loader = DataLoader(
             train_ds,
             batch_size=self.batch_size,
@@ -968,18 +1193,16 @@ class PhasedReplayDataloaders:
             pin_memory=pin_train_memory,
             generator=generator,
         )
-
-        if target_eval > 0:
-            self._build_eval_loader(eval_x, eval_meter, eval_timestamps, eval_agg)
-
-        return train_loader, self.eval_loader
-
-    def refresh_eval_cache(self, eval_batches: int):
+        return train_loader
+    
+    def get_val_epoch_loader(self, eval_batches: int):
+        """Builds ONLY the validation cache and returns the loader."""
         target_eval = max(1, int(eval_batches)) * self.batch_size
-        _, _, _, _, eval_x, eval_meter, eval_timestamps, eval_agg = self._collect_cache(0, target_eval)
+        
+        # Only collect the validation stream
+        eval_x, eval_meter, eval_timestamps, eval_agg = self._collect_stream_cache("val", target_eval)
+        
         self._build_eval_loader(eval_x, eval_meter, eval_timestamps, eval_agg)
-
-    def get_eval_loader(self):
         return self.eval_loader
 
     def refresh_test_cache(self, test_batches: int):
@@ -991,8 +1214,13 @@ class PhasedReplayDataloaders:
         if self.test_loader is not None:
             return self.test_loader
 
-        self.refresh_test_cache(test_batches=1000)  # default to caching 1000 batches for test if not already cached
+        # Collect eval_cache_batches × 10 test batches.  The old default of 1000
+        # was proportioned for a 100% pass-rate dataset; with a 10% test split
+        # the stream scans 10× more data and hangs on small datasets or slow IO.
+        test_batches = max(5, (self.eval_cache_batches or 5)) * 10
+        self.refresh_test_cache(test_batches=test_batches)
 
         return self.test_loader
+
 
 

@@ -165,7 +165,7 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
 
     # train_loader = None
     # try:
-    #     train_loader, _ = loader_obj.get_epoch_loaders(steps_per_epoch=eval_batches, eval_batches=0)
+    #     train_loader = loader_obj.get_train_epoch_loader(steps_per_epoch=eval_batches)
     # except Exception as e:
     #     print(f"[WARN] Could not build train loader for MIA: {e}")
 

@@ -174,7 +174,7 @@ conditioning:
     decay: 0.95
 
   ev_phase:
-    path: "data/EV_detection_6000_SM.csv"
+    path: "data/EV/EV_detection_reduced_60000_SM.csv"
 
 # ============================================================================
 # HIERARCHICAL LATENT SPACE
@@ -240,10 +240,10 @@ training:
   
   # Model checkpointing
   checkpointing:
-    save_freq: 5 # save checkpoint every N epochs
+    save_freq: 20 # save checkpoint every N epochs
     save_dir: "./models"
     save_best_model: true
-    save_best_after_fraction: 0.25 # start writing "best" checkpoint only after this fraction of total epochs
+    save_best_after_fraction: 0.0 # start writing "best" checkpoint only after this fraction of total epochs
     save_final_model: true
 
 # ============================================================================

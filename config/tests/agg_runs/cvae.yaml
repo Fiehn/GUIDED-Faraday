@@ -1,0 +1,15 @@
+base: base.yaml
+
+model:
+  type: cvae
+  latent_dim: 64
+  encoder:
+    type: mlp
+    hidden_dims: [256, 512, 1024, 256, 128]
+    dropout: 0.2
+  decoder:
+    type: mlp
+    hidden_dims: [128, 256, 512, 1024, 256]
+    dropout: 0.2
+  prior:
+    type: standard_gaussian

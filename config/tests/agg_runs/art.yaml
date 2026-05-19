@@ -1,0 +1,26 @@
+base: base.yaml
+
+model:
+  type: art
+  latent_dim: 64
+  # Encoder configuration
+  encoder:
+    type: "dictionary"  # Options: "dictionary", "mlp", "dictionary_cnn"
+    hidden_dims: [64, 128, 128]
+    dropout: 0.2
+  
+  # Decoder configuration
+  decoder:
+    type: "dictionary"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
+    hidden_dims: [128, 128, 64]
+    dropout: 0.2
+  
+  # Prior configuration
+  prior:
+    type: "learnable_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
+                                 # "learnable_gaussian", "learnable_dictionary", "vampprior"
+  art:
+    num_bins: 128 # Amount of discrete bins to tokenize the data into
+    transformer_num_heads: 16 # Amount of heads in the transformer.
+    transformer_num_layers: 10 # Amount of hidden layers in the transformer structure.
+    d_model: 128

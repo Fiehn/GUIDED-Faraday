@@ -1,0 +1,40 @@
+base: base.yaml
+
+model:
+  type: cvae
+  latent_dim: 64
+
+  # Encoder configuration
+  encoder:
+    type: "dictionary"  # Options: "dictionary", "mlp", "dictionary_cnn"
+    hidden_dims: [1024, 512, 256, 128]
+    dropout: 0.2
+  
+  # Decoder configuration
+  decoder:
+    type: "dictionary"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
+    hidden_dims: [128, 256, 512, 1024]
+    dropout: 0.2
+  
+  prior:
+    type: "learnable_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
+                                 # "learnable_dictionary", "vampprior"
+    dictionary_size: 256         # Must be > input_dim (96 timesteps × 3 phases = 288)
+    vamp_num_components: 40
+    init_from_data: true
+    init_noise_scale: 0.01
+
+hierarchy:
+  enabled: true
+  levels: ["linear", "stochastic", "stochastic"] # eg. ["linear", "StochasticLevel", "VQLevel"]
+  latent_dims: [128,128,128] # latent dimensions for each level
+  top_down: [false, false, true] # whether to use top-down connections for each level
+  bottom_up: [true, false, false] # whether to use bottom-up connections for each level
+  loss_weights: [1.0, 1.0, 1.0] # weights for KL loss at each level
+  
+  aggregation: "concat"
+  bidirectional: true
+  residual_connections: true
+  kl_annealing: true
+  kl_warmup_steps: 1000
+  free_bits: 0.1
