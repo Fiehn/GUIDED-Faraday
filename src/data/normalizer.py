@@ -589,7 +589,7 @@ class Normalizer:
         phased_ds = StreamingParquetBuffer(
             sm_files=filenames, 
             replay_buffer_capacity=10000, 
-            min_buffer_size=0,
+            min_buffer_size=1000,
             window_spec=window_spec,
             num_workers=0,
             feature_cols=feature_cols,
