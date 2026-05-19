@@ -114,6 +114,11 @@ class EvalFramework:
         self.conditioner = conditioner
         self.device = device
 
+        # Preserve secondary model normalizer (if provided) so real data can be
+        # denormalized with the correct feature-dimension when evaluating
+        # phase-aware models.
+        self.secondary_normalizer = getattr(secondary_model, 'normalizer', None) if secondary_model is not None else None
+
         self.generator = SyntheticGenerator(model, conditioner, normalizer, secondary_model, device)
 
         self.window_size = window_size
@@ -243,10 +248,33 @@ class EvalFramework:
 
     def _inverse_transform_for_metrics(self, x: torch.Tensor) -> torch.Tensor:
         """Inverse transform 2D/3D tensors while preserving [B, L, F] or [B, F, L] layout."""
-        if self.normalizer is None or not hasattr(self.normalizer, 'inverse_transform'):
-            return x
+        # Prefer a normalizer whose feature-dimension matches the tensor shape.
+        # Try secondary model normalizer first (if available), then fall back to
+        # the primary normalizer provided to the evaluator.
+        preferred_norm = None
+        for candidate in (self.secondary_normalizer, self.normalizer):
+            if candidate is None or not hasattr(candidate, 'inverse_transform'):
+                continue
+            stats = getattr(candidate, 'mean', None)
+            feat_dim = None
+            try:
+                if stats is not None:
+                    import numpy as _np
+                    feat_dim = int(_np.asarray(stats).reshape(-1).shape[0])
+            except Exception:
+                feat_dim = None
+            # If we can infer a feature dim and it matches the tensor last/second axis, prefer this normalizer.
+            if x.dim() == 3 and feat_dim is not None and (x.shape[-1] == feat_dim or x.shape[1] == feat_dim):
+                preferred_norm = candidate
+                break
 
-        inv = self.normalizer.inverse_transform
+        # If none matched by feature-dim, fall back to primary normalizer if present.
+        if preferred_norm is None:
+            if self.normalizer is None or not hasattr(self.normalizer, 'inverse_transform'):
+                return x
+            preferred_norm = self.normalizer
+
+        inv = preferred_norm.inverse_transform
         
         # 1. Handle 2D tensors [B, D]
         if x.dim() == 2:
