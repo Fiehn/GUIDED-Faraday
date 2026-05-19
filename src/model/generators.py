@@ -125,6 +125,36 @@ class SyntheticGenerator:
         # Fallback for unknown feature dim: preserve existing behavior.
         return fn(x.reshape(-1, x.shape[-1])).reshape_as(x)
 
+    def _apply_normalizer_with(self, x: torch.Tensor, normalizer, inverse: bool = False) -> torch.Tensor:
+        """Apply (inverse) normalization with an explicit normalizer instance."""
+        if normalizer is None:
+            return x
+
+        fn = normalizer.inverse_transform if inverse else normalizer.transform
+        feature_dim = None
+        stats = getattr(normalizer, 'mean', None)
+        if stats is not None:
+            try:
+                feature_dim = int(np.asarray(stats).reshape(-1).shape[0])
+            except Exception:
+                feature_dim = None
+
+        if x.dim() == 2:
+            return fn(x)
+
+        if x.dim() != 3:
+            raise ValueError(f"Expected 2D or 3D tensor for normalization, got shape {tuple(x.shape)}")
+
+        if feature_dim is not None and x.shape[-1] == feature_dim:
+            return fn(x.reshape(-1, feature_dim)).reshape_as(x)
+
+        if feature_dim is not None and x.shape[1] == feature_dim:
+            x_last = x.movedim(1, -1)
+            y_last = fn(x_last.reshape(-1, feature_dim)).reshape_as(x_last)
+            return y_last.movedim(-1, 1)
+
+        return fn(x.reshape(-1, x.shape[-1])).reshape_as(x)
+
     @torch.no_grad()
     def reconstruct(self, input_data: torch.Tensor,
                     num_reconstructions: int = 1,
@@ -169,14 +199,31 @@ class SyntheticGenerator:
                 
         input_data = input_data.to(self.device, dtype=model_dtype)
 
+        phased_input_data = None
+        if self.secondary_model is not None:
+            # Phase-splitter runs consume real 3-phase input. If that input is still
+            # normalized in the secondary model's feature space, bring it back to
+            # real units first so we can aggregate phases correctly.
+            phased_input_data = input_data
+            sec_normalizer = getattr(self.secondary_model, 'normalizer', None)
+            if sec_normalizer is not None and not is_denormalized:
+                phased_input_data = self._apply_normalizer_with(phased_input_data, sec_normalizer, inverse=True)
+
+            # Aggregate across phases before the primary model's normalizer is applied.
+            if phased_input_data.dim() == 3:
+                if phased_input_data.shape[-1] == 3:
+                    input_data = phased_input_data.sum(dim=-1, keepdim=True)
+                elif phased_input_data.shape[1] == 3:
+                    input_data = phased_input_data.sum(dim=1, keepdim=True).transpose(1, 2)
+                else:
+                    input_data = phased_input_data.sum(dim=-1, keepdim=True)
+            else:
+                input_data = phased_input_data
+
         if self.normalizer is not None and not is_denormalized:
             input_data = self._apply_normalizer(input_data, inverse=False)
             # Normalizers may return float64 tensors; align with model dtype for linear layers.
             input_data = input_data.to(self.device, dtype=model_dtype)
-        if self.secondary_model is not None:
-            # For phase-splitter models we run the first model on aggregated data, therefore we sum over phases to get the correct input shape for the first model.
-            phased_input_data = input_data.reshape(input_data.shape[0], 24, -1, self.model.num_features)  # [B, 24, num_phases, F]
-            input_data = input_data.sum(dim=1)  # Sum over phase dimension to get [B, 24, F_agg]
 
         # Get conditions
         conditions = None
@@ -358,16 +405,22 @@ class SyntheticGenerator:
         else:
             output = flat_output.reshape(-1, L, F)
 
+        skip_primary_inverse = False
         if self.secondary_model is not None:
             # If this is a phase-splitter type model, we run reconstruct on the secondary model to get the phases
-            # Pass normalizer=None so it returns normalized phase estimates, which we inverse transform afterward!
-            output = self.secondary_model.reconstruct(x_agg_generated=output, conditions=conditions, normalizer=None, x_phased_real = phased_input_data)
+            # Pass the secondary model's normalizer (if attached) so it can inverse-transform phase outputs
+            sec_norm = getattr(self.secondary_model, 'normalizer', None)
+            output = self.secondary_model.reconstruct(x_agg_generated=output, conditions=conditions, normalizer=sec_norm, x_phased_real = phased_input_data)
             # Secondary model returns [B, 3, 24] (i.e. [N*B, F_split, L]) where F_split is 3 (for our dataset).
-            # It replaces output, and we transpose it to [N*B, L, F_split] so apply_normalizer works (expects trailing feature dim).
+            # It replaces output, and we transpose it to [N*B, L, F_split] so downstream code sees feature-last layout.
             output = output.transpose(1, 2)
+            if sec_norm is not None:
+                # The secondary model already inverse-transformed phases to real units,
+                # so skip applying the primary model's normalizer below.
+                skip_primary_inverse = True
             
         # 2. Apply inverse transform so it's in actual kWh, not Z-scores
-        if self.normalizer is not None and not is_denormalized and not self._is_art_model():
+        if self.normalizer is not None and not is_denormalized and not self._is_art_model() and not skip_primary_inverse:
             output = self._apply_normalizer(output, inverse=True)
 
         # Return as 
@@ -507,16 +560,20 @@ class SyntheticGenerator:
         else:
             output = flat.reshape(N, L, F)  # already [N, L, F]
 
+        skip_primary_inverse = False
         if self.secondary_model is not None:
-            # Run without normalizer so we get normalized phase proportions
-            output = self.secondary_model.sample(x_agg_generated=output, conditions=conditions, normalizer=None)
+            # Run the secondary model and pass its attached normalizer (if present)
+            sec_norm = getattr(self.secondary_model, 'normalizer', None)
+            output = self.secondary_model.sample(x_agg_generated=output, conditions=conditions, normalizer=sec_norm)
             split_cond = conditions
             # Output is [N, F_split, L]. Transpose to [N, L, F_split]
             output = output.transpose(1, 2)
             F = output.shape[-1]
             conditions = split_cond
+            if sec_norm is not None:
+                skip_primary_inverse = True
 
-        if self.normalizer is not None and not self._is_art_model():
+        if self.normalizer is not None and not self._is_art_model() and not skip_primary_inverse:
             output = self._apply_normalizer(output, inverse=True)
 
         # If conditions had a batch size > 1 and S > 1, the returned shape is (S * B, L, F).

@@ -52,10 +52,13 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
     """Build test loader using the phased replay dataloader implementation."""
     data_cfg = config.data
     data_mode = str(getattr(data_cfg, "mode", "csv")).lower()
+    # data_mode = "phased" # hardcode for testing phase splitter
     phased_mode = data_mode in {"phased", "phased_parquet"}
 
     # data_dir = getattr(config, "data_dir", None) or getattr(data_cfg, "data_dir", None) or getattr(data_cfg, "path", "data/_parquet_cache")
     data_dir = getattr(config, "data_dir", None) or getattr(data_cfg, "data_dir", None) or getattr(data_cfg, "path", "/Volumes/USB/parq_hourly")
+    # data_dir = getattr(config, "data_dir", None) or getattr(data_cfg, "data_dir", None) or getattr(data_cfg, "path", "/Volumes/USB/raw_profiles")
+    # data_dir = "/Volumes/USB/raw_profiles" # hardcode for testing phase splitter
     configured_files = list(getattr(config, "data_files", []) or getattr(data_cfg, "data_files", []))
 
     # Match training file selection: walk data_dir and include all .parquet
@@ -106,6 +109,7 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
     hourly_aggregation = bool(getattr(data_cfg.window, "aggregated", False))
     aggregation_energy_unit = str(getattr(data_cfg, "aggregation_energy_unit", "wh")).lower()
     agg_divisor = 1000.0 if hourly_aggregation and aggregation_energy_unit == "kwh" else 1.0
+    # agg_divisor = float(getattr(data_cfg, "aggregation_divisor", 1.0))                        # use this when doing 1-phase models
     cache_scan_batches = int(getattr(data_cfg, "cache_scan_batches", 0)) or None
     max_value_cfg = getattr(data_cfg, "max_value", None)
     max_value = float(max_value_cfg) if max_value_cfg is not None else None
@@ -159,11 +163,11 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
     loader_obj.refresh_test_cache(n_batches)
     test_loader = loader_obj.get_test_loader()
 
-    train_loader = None
-    try:
-        train_loader = loader_obj.get_train_epoch_loader(steps_per_epoch=eval_batches)
-    except Exception as e:
-        print(f"[WARN] Could not build train loader for MIA: {e}")
+    # train_loader = None
+    # try:
+    #     train_loader = loader_obj.get_train_epoch_loader(steps_per_epoch=eval_batches)
+    # except Exception as e:
+    #     print(f"[WARN] Could not build train loader for MIA: {e}")
 
     # Verify data config matches training
     if model_path is not None:
@@ -263,7 +267,7 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
                     pin_memory=(str(device) != "cpu"),
                 )
 
-    return test_loader, train_loader
+    return test_loader #, train_loader
 
 
 def run_evaluation(model, test_loader, normalizer, conditioner, config, output_path, device="cpu", secondary_model=None, train_loader=None):
@@ -428,11 +432,33 @@ def main():
     secondary_model = None
     if args.phase_splitter_path is not None:
         print(f"Loading phase splitter from: {args.phase_splitter_path}")
-        secondary_model, _, _ = load_model(args.phase_splitter_path, device=device)
+        sec_model, sec_normalizer, sec_conditioner = load_model(args.phase_splitter_path, device=device)
+        # Attach the secondary model's normalizer to the model instance so
+        # downstream code can access it during evaluation (e.g. phase-split inverse transform).
+        try:
+            setattr(sec_model, "normalizer", sec_normalizer)
+        except Exception:
+            pass
+        secondary_model = sec_model
     
     # 2. Setup data loader
     print("\nStep 2: Setting up data loader...")
-    test_loader, train_loader = setup_data_loader(config, normalizer, device=device, model_path=model_path)
+    # If a phase splitter was provided, use the splitter's config and normalizer
+    # to build the test loader (real 3-phase data). The generator will still
+    # use the primary model (which may produce 1-phase aggregates) and the
+    # secondary model will be used internally to split generated aggregates.
+    if secondary_model is not None and args.phase_splitter_path is not None:
+        try:
+            sec_cfg = _load_config_for_model(args.phase_splitter_path)
+            print(f"Using phase-splitter data config from: {args.phase_splitter_path}")
+            test_loader = setup_data_loader(sec_cfg, sec_normalizer, device=device, model_path=args.phase_splitter_path)
+        except Exception as e:
+            print(f"[WARN] Could not build test loader from phase-splitter config: {e}")
+            print("Falling back to primary model data loader.")
+            test_loader = setup_data_loader(config, normalizer, device=device, model_path=model_path)
+    else:
+        # Default: use primary model's data config (existing behavior)
+        test_loader = setup_data_loader(config, normalizer, device=device, model_path=model_path)
 
     # 3. Verify test loader is ready
     print("\nStep 3: Verifying test data...")
@@ -469,7 +495,7 @@ def main():
     run_evaluation(
         model=model,
         test_loader=test_loader,
-        train_loader=train_loader,
+        # train_loader=train_loader,
         normalizer=normalizer,
         conditioner=conditioner,
         config=config,
