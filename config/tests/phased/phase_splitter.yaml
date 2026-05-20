@@ -9,3 +9,10 @@ model:
   phase_splitter:
     base_channels: 64
     temperature: 2.0
+
+normalization:
+  method: null
+  cache_dir: null
+  force_recompute: false
+  log1p:
+    epsilon: 1.0e-6
