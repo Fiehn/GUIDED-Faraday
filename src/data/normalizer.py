@@ -605,10 +605,15 @@ class Normalizer:
         )
         train_loader = DataLoader(phased_ds, batch_size=None, num_workers=0, pin_memory=True)
         # The dataloader loops infinitely; cap at max_samples for normalizer fitting.
-        max_batches = max(200, capacity * 20 // batch_size)
-        for X_batch in tqdm(itertools.islice(train_loader, max_batches), desc="Fitting normalizer", total=max_batches):
+        max_batches = max(200, capacity)
+        batches = 0
+        print(f"Fitting normalizer with method '{self.method}' on {len(filenames)} files...")
+        for X_batch in train_loader: #tqdm(itertools.islice(train_loader, max_batches), desc="Fitting normalizer", total=max_batches):
             x_gpu = X_batch[0].to(device)
             self.fit_incremental(x_gpu)
+            batches += 1
+            if batches >= max_batches:
+                break
         self.finalise_fit()
         print(f"Fitted normalizer with method '{self.method}' on {len(filenames)} files.")
 
