@@ -5,7 +5,11 @@
 data:
   mode: phased
   # Edit this path for your machine:
+<<<<<<< HEAD
+  data_dir: "/groups/3phaseinsight/code/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/" #"E:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+=======
   data_dir: "data/raw_profiles_6000"
+>>>>>>> 0f3d29edd8852f9a458325aa740867a43605ce3b
   data_files: []
   columns:
     meter_id: meter_number

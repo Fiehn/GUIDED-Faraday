@@ -152,15 +152,15 @@ training:
     min_delta: 0.001
   checkpointing:
     save_freq: 20
-    save_dir: ./models
+    save_dir: ./models/new/
     save_best_model: true
     save_best_after_fraction: 0.00
     save_final_model: true
 
 logging:
-  log_dir: ./models
+  log_dir: ./models/new/
   save_config: true
-  config_save_dir: ./models
+  config_save_dir: ./models/new/
 
 visualize:
   num_samples: 5
