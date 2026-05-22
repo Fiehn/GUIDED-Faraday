@@ -5,7 +5,7 @@
 data:
   mode: phased
   # Edit this path for your machine:
-  data_dir: "E:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+  data_dir: "data/raw_profiles_6000"
   data_files: []
   columns:
     meter_id: meter_number
