@@ -1,0 +1,25 @@
+base: base.yaml
+
+model:
+  type: cvae
+  latent_dim: 64
+  # Encoder configuration
+  encoder:
+    type: "dictionary_cnn"  # Options: "dictionary", "mlp", "dictionary_cnn"
+    hidden_dims: [256, 128, 64]
+    dropout: 0.2
+  
+  # Decoder configuration
+  decoder:
+    type: "dictionary_cnn"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
+    hidden_dims: [64, 128, 256]
+    dropout: 0.2
+  
+  # Prior configuration
+  prior:
+    type: "learnable_dictionary"  # Options: "standard_gaussian", "standard_dictionary", 
+                                 # "learnable_dictionary", "vampprior"
+    dictionary_size: 256         # Must be > input_dim (96 timesteps × 3 phases = 288)
+    vamp_num_components: 40
+    init_from_data: true
+    init_noise_scale: 0.01

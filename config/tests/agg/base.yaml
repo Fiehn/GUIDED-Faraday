@@ -24,7 +24,7 @@ data:
     aggregated: true
     input_len: 24
     stride: 24
-  batch_size: 4096
+  batch_size: 2048
   shuffle: true
   replay_buffer_capacity: 20000
   min_buffer_size: 2000
@@ -39,6 +39,7 @@ data:
   aggregation_energy_unit: kwh
   output_aggregate_stream: false
   in_memory: true
+  max_passes: 20
 
 normalization:
   method: null
