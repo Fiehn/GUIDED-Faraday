@@ -6,17 +6,17 @@ model:
   # Encoder configuration
   encoder:
     type: "dictionary_cnn"  # Options: "dictionary", "mlp", "dictionary_cnn"
-    hidden_dims: [512, 256, 128, 128]
+    hidden_dims: [256, 128, 64]
     dropout: 0.2
   
   # Decoder configuration
   decoder:
     type: "dictionary_cnn"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
-    hidden_dims: [128, 256, 256, 512]
+    hidden_dims: [64, 128, 256]
     dropout: 0.2
   
   # Next time we want to have mmd loss
-
+  faraday_like: true
   # Prior configuration
   prior:
     type: "vampprior"  # Options: "standard_gaussian", "standard_dictionary", 

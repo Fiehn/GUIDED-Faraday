@@ -536,6 +536,8 @@ class Normalizer:
             feature_cols: list[str] | None = None,
             save_path: str | None = None,
             device: str | torch.device = 'cpu',
+            max_value: float | None = None,
+            max_hour_value: float | None = None,
     ):
         # === Try Cache ===
         window_spec_dict = {
@@ -585,37 +587,58 @@ class Normalizer:
                 print(f"Failed to load normalization stats from cache: {e}. Recomputing stats.")
         
         # === Compute Stats ===
-        from data.dataloader_phased import StreamingParquetBuffer
+        from data.dataloader_phased import StreamingParquetBuffer, InMemoryCSVDataloaders
         from torch.utils.data import DataLoader
-        batch_size = 256
-        capacity = 10000
-        phased_ds = StreamingParquetBuffer(
-            sm_files=filenames,
-            replay_buffer_capacity=capacity,
-            min_buffer_size=batch_size,  # must be >= batch_size so first draw is never empty
-            window_spec=window_spec,
-            num_workers=0,
-            feature_cols=feature_cols,
-            hourly_aggregation=hourly_aggregation,
-            aggregation_divisor=aggregation_divisor,
-            phased_mode=phased,
-            meter_col=meter_col,
-            nan_as_zero=nan_as_zero,
-            batch_size=batch_size,
-        )
-        train_loader = DataLoader(phased_ds, batch_size=None, num_workers=0, pin_memory=True)
-        # The dataloader loops infinitely; cap at max_samples for normalizer fitting.
-        max_batches = max(200, capacity)
-        batches = 0
-        print(f"Fitting normalizer with method '{self.method}' on {len(filenames)} files...")
-        for X_batch in train_loader: #tqdm(itertools.islice(train_loader, max_batches), desc="Fitting normalizer", total=max_batches):
-            x_gpu = X_batch[0].to(device)
-            self.fit_incremental(x_gpu)
-            batches += 1
-            if batches >= max_batches:
-                break
-        self.finalise_fit()
-        print(f"Fitted normalizer with method '{self.method}' on {len(filenames)} files.")
+
+        if phased:
+            batch_size = 256
+            capacity = 10000
+            phased_ds = StreamingParquetBuffer(
+                sm_files=filenames,
+                replay_buffer_capacity=capacity,
+                min_buffer_size=batch_size,  # must be >= batch_size so first draw is never empty
+                window_spec=window_spec,
+                num_workers=0,
+                feature_cols=feature_cols,
+                hourly_aggregation=hourly_aggregation,
+                aggregation_divisor=aggregation_divisor,
+                phased_mode=phased,
+                meter_col=meter_col,
+                nan_as_zero=nan_as_zero,
+                batch_size=batch_size,
+                max_value=max_value,
+                max_hour_value=max_hour_value,
+            )
+            train_loader = DataLoader(phased_ds, batch_size=None, num_workers=0, pin_memory=True)
+            # The dataloader loops infinitely; cap at max_samples for normalizer fitting.
+            max_batches = max(200, capacity)
+            batches = 0
+            print(f"Fitting normalizer with method '{self.method}' on {len(filenames)} files...")
+            for X_batch in train_loader: #tqdm(itertools.islice(train_loader, max_batches), desc="Fitting normalizer", total=max_batches):
+                x_gpu = X_batch[0].to(device)
+                self.fit_incremental(x_gpu)
+                batches += 1
+                if batches >= max_batches:
+                    break
+            self.finalise_fit()
+            print(f"Fitted normalizer with method '{self.method}' on {len(filenames)} files.")
+        else:
+            dataloaders = InMemoryCSVDataloaders(
+                sm_files=filenames,
+                window_len=window_spec.input_len,
+                stride=window_spec.stride,
+                batch_size=1024,
+                max_value = max_value,
+                max_hour_value = max_hour_value,
+                pin_memory=True
+            )
+            train_loader = dataloaders.get_train_epoch_loader(500)
+            print(f"Fitting normalizer with method '{self.method}' on {len(filenames)} files...")
+            for X_batch in tqdm(train_loader, desc="Fitting normalizer"):
+                x_gpu = X_batch[0].to(device)
+                self.fit_incremental(x_gpu)
+            self.finalise_fit()
+            print(f"Fitted normalizer with method '{self.method}' on {len(filenames)} files.")
 
         # === Save Stats ===
         os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)

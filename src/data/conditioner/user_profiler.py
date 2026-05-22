@@ -90,11 +90,6 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         self.is_fitted = False
         self._invalidate_profile_lookup()
 
-    def _clear_cached_user_state(self):
-        self._reset_kmeans_state()
-        self.user_profiles_cache = {}
-        self.gamma_cache = {}
-        self.user_last_seen = {}
 
     def _current_feature_dim(self) -> int | None:
         if self.cluster_centers_ is not None and getattr(self.cluster_centers_, "ndim", 0) == 2:
@@ -129,6 +124,10 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         width when available:
             - D == L: collapse feature/phase axis by summation.
             - D == L*F: flatten after canonicalizing to [B, L, F].
+
+        SHAPER:
+          batch_data : [batch_size, feature_dim] or [batch_size, num_phases, seq_len] or [batch_size, seq_len, num_phases]
+          ->         : [batch_size, feature_dim]
         """
         if isinstance(batch_data, torch.Tensor):
             batch_data = batch_data.detach().cpu().numpy()
@@ -162,8 +161,12 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
     def _get_profile_lookup_for_device(self, device: torch.device):
         key = str(device)
         cached = self._profile_lookup_tensors.get(key)
-        if cached is not None:
+        if cached is not None and cached[0].device == device:
             return cached
+        # Cache miss or stale entry (e.g. DeviceUnpickler remapped tensors to a
+        # different device than the cache key implies) — rebuild for this device.
+        if key in self._profile_lookup_tensors:
+            del self._profile_lookup_tensors[key]
 
         if len(self.user_profiles_cache) == 0:
             empty_lookup = (
@@ -220,8 +223,8 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         total_timesteps = 0
 
         for data, meter_id, _, _ in tqdm(train_loader, desc="Clustering batches"):
-            batch_size, seq_len, num_features = data.shape
-            data_flat = data.cpu().numpy().reshape(batch_size, seq_len * num_features)
+            batch_size, seq_len, num_features = data.shape  # data: [batch_size, seq_len, num_features]
+            data_flat = data.cpu().numpy().reshape(batch_size, seq_len * num_features)  # SHAPER: [batch_size, seq_len * num_features]
 
             valid_mask = ~np.isnan(data_flat).any(axis=1)
             data_fit = data_flat[valid_mask]
@@ -251,8 +254,8 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         meter_corpus = {}
 
         for data, meter_id, _, _ in tqdm(train_loader, desc="Creating corpus batches"):
-            batch_size, seq_len, num_features = data.shape
-            data_batch = data.cpu().numpy().reshape(batch_size, seq_len * num_features)
+            batch_size, seq_len, num_features = data.shape  # data: [batch_size, seq_len, num_features]
+            data_batch = data.cpu().numpy().reshape(batch_size, seq_len * num_features)  # SHAPER: [batch_size, seq_len * num_features]
             meter_id_flat = meter_id.cpu().numpy()
 
             valid_mask = ~np.isnan(data_batch).any(axis=1)
@@ -353,90 +356,6 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
 
         return self._get_cached_profiles(data, meter_id, device=target_device)
 
-    def update_model_incremental(self, x_batch, meter_ids):
-        """Incrementally updates the KMeans clustering and LDA topic model.
-
-        New users are added to the cache; existing users are updated with
-        exponential decay.
-
-        Args:
-            x_batch (torch.Tensor | np.ndarray): Batch data of shape
-                `(batch_size, seq_len, num_features)` or `(batch_size, features)`.
-            meter_ids (torch.Tensor | np.ndarray): Corresponding meter IDs of shape
-                `(batch_size,)`.
-
-        Raises:
-            ValueError: If `x_batch` does not have 2 or 3 dimensions.
-        """
-        if isinstance(meter_ids, torch.Tensor):
-            meter_ids = meter_ids.cpu().numpy()
-
-        x_flat = self._prepare_kmeans_input(x_batch, context="update_model_incremental")
-
-        valid_mask = ~np.isnan(x_flat).any(axis=1)
-        x_valid = x_flat[valid_mask]
-        meter_ids_valid = meter_ids[valid_mask]
-
-        if len(x_valid) == 0:
-            return
-
-        # MiniBatchKMeans requires n_samples >= n_clusters on each partial_fit call.
-        # For small batches, upsample with replacement to avoid runtime failure.
-        if x_valid.shape[0] < self.num_clusters:
-            repeat_factor = int(math.ceil(self.num_clusters / max(1, x_valid.shape[0])))
-            idx = np.tile(np.arange(x_valid.shape[0]), repeat_factor)[:self.num_clusters]
-            x_kmeans = x_valid[idx]
-            meter_ids_kmeans = meter_ids_valid[idx]
-        else:
-            x_kmeans = x_valid
-            meter_ids_kmeans = meter_ids_valid
-
-        self._ensure_kmeans_feature_dim(x_kmeans.shape[1], context="update_model_incremental")
-        self.kmeans.partial_fit(x_kmeans)
-        self.cluster_centers_ = self.kmeans.cluster_centers_
-        self.kmeans_initialized = True
-
-        labels = cdist(x_kmeans, self.cluster_centers_).argmin(axis=1)
-        meter_corpus = {}
-        for m_id, label in zip(meter_ids_kmeans, labels):
-            if m_id not in meter_corpus:
-                meter_corpus[m_id] = np.zeros(self.num_clusters, dtype=np.int32)
-            meter_corpus[m_id][label] += 1
-
-        unique_meters = sorted(meter_corpus.keys())
-        X_corpus = np.array([meter_corpus[m_id] for m_id in unique_meters])
-
-        if self.is_fitted:
-            super().partial_fit(X_corpus)
-            new_gamma = super().transform(X_corpus, normalize=False)
-
-            seen_in_update = set(unique_meters)
-            for m_id in list(self.gamma_cache):
-                if m_id not in seen_in_update:
-                    batches_inactive = self.batch_counter - self.user_last_seen.get(m_id, self.batch_counter)
-                    decay_factor = self.decay ** batches_inactive
-                    if decay_factor < 0.1:
-                        self.gamma_cache[m_id] = np.ones(self.n_topics)
-                    else:
-                        self.gamma_cache[m_id] = (
-                            decay_factor * self.gamma_cache[m_id]
-                            + (1 - decay_factor) * np.ones(self.n_topics)
-                        )
-                    self.resample_user_vector(m_id)
-
-            for m_id, gamma_new in zip(unique_meters, new_gamma):
-                if m_id in self.gamma_cache:
-                    self.gamma_cache[m_id] = self.decay * self.gamma_cache[m_id] + (1 - self.decay) * gamma_new
-                else:
-                    self.gamma_cache[m_id] = gamma_new
-                self.resample_user_vector(m_id)
-        else:
-            super().fit(X_corpus)
-            self.is_fitted = True
-            initial_gamma = super().transform(X_corpus, normalize=False)
-            for m_id, gamma_u in zip(unique_meters, initial_gamma):
-                self.gamma_cache[m_id] = gamma_u
-                self.resample_user_vector(m_id)
 
     def _get_cached_profiles(self, data, meter_ids, device: torch.device = torch.device("cpu")):
         """Assembles profile vectors from cache.
@@ -550,23 +469,19 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
     def fit_on_files(self, parquet_paths: list[str],
                      window_spec=None,
                      feature_cols=None,
-                     hourly_aggregation=False,
-                     aggregation_divisor=1,
-                     phased=True):
-        """Convenience method to fit the model directly on a list of parquet files.
+                     hourly_aggregation: bool = False,
+                     aggregation_divisor: float = 1.0,
+                     phased: bool = True,
+                     meter_col: str = "meter_number",
+                     max_hour_value: float | None = None):
+        """Fit directly from parquet files without a streaming dataloader.
 
-        Args:
-            parquet_paths (list[str]): List of file paths to parquet files containing
-                the training data.
+        Does two explicit passes over files (KMeans then corpus) so the fit
+        terminates cleanly regardless of dataset size.
         """
-        if feature_cols is None:
-            feature_cols = ["hourly_energy_consumption"]
+        import pandas as pd
 
-        import os as _os
-        from data.dataloader_phased import StreamingParquetBuffer, WindowSpec
-        from torch.utils.data import DataLoader
-
-        if self.path and _os.path.exists(self.path):
+        if self.path and os.path.exists(self.path):
             if self.verbose:
                 print(f"[UserProfiler] Loading pre-fitted model from {self.path}")
             self.load(self.path)
@@ -574,37 +489,196 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
 
         if not parquet_paths:
             if self.verbose:
-                print("[UserProfiler] No parquet paths provided for fitting.")
+                print("[UserProfiler] No parquet paths provided.")
             return self
+
+        if feature_cols is None:
+            feature_cols = ["hourly_energy_consumption"]
+
+        window_len = window_spec.input_len if window_spec is not None else 24
+        ts_candidates = ["timestamp_dst", "timestamp", "timestamp_utc"]
+        agg_div = float(aggregation_divisor) if float(aggregation_divisor) > 0 else 1.0
+
+        def _read_file(fpath):
+            """Return (windows [M, D], meter_ids [M]) for one file, or (None, None)."""
+            try:
+                df = pd.read_parquet(fpath)
+            except Exception as e:
+                if self.verbose:
+                    print(f"[UserProfiler] Skipping {fpath}: {e}")
+                return None, None
+
+            if phased:
+                stem = os.path.splitext(os.path.basename(fpath))[0].replace("sm_", "")
+                try:
+                    meter_id = int(stem)
+                except ValueError:
+                    return None, None
+
+                ts_col = next((c for c in ts_candidates if c in df.columns), None)
+                if ts_col is None:
+                    if df.index.name in ts_candidates:
+                        df = df.reset_index()
+                        ts_col = df.columns[0]
+                    else:
+                        return None, None
+
+                present = [c for c in feature_cols if c in df.columns]
+                if not present:
+                    return None, None
+
+                df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+                frame = (
+                    df.set_index(ts_col)[present]
+                    .apply(pd.to_numeric, errors="coerce")
+                    .sort_index()
+                )
+                if hourly_aggregation:
+                    frame = frame.resample("1h").mean()
+                    if agg_div != 1.0:
+                        frame /= agg_div
+
+                vals = frame.to_numpy(dtype=np.float32)  # [T, n_phases]
+                n_windows = len(vals) // window_len
+                if n_windows == 0:
+                    return None, None
+                T = n_windows * window_len
+                # [n_windows, window_len * n_phases] — same layout as fit() expects
+                windows = vals[:T].reshape(n_windows, window_len, vals.shape[1]).reshape(n_windows, -1)
+
+                if max_hour_value is not None:
+                    windows = windows[windows.max(axis=1) <= max_hour_value]
+                if len(windows) == 0:
+                    return None, None
+
+                return windows, np.full(len(windows), meter_id, dtype=np.int64)
+
+            else:
+                present = [c for c in feature_cols if c in df.columns]
+                if not present:
+                    return None, None
+
+                if isinstance(df.index, pd.MultiIndex):
+                    # (meter_id, timestamp) MultiIndex — already sorted by meter
+                    meter_flat = df.index.get_level_values(0).to_numpy()
+                    ts_idx = df.index.get_level_values(1)
+                    if ts_idx.tz is None:
+                        ts_idx = ts_idx.tz_localize("UTC")
+                else:
+                    ts_col = next((c for c in ts_candidates if c in df.columns), None)
+                    m_col = next((c for c in df.columns if c.lower() == meter_col.lower()), None)
+                    if ts_col is None or m_col is None:
+                        return None, None
+                    df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+                    df = df.dropna(subset=[ts_col, m_col]).sort_values([m_col, ts_col])
+                    meter_flat = df[m_col].to_numpy()
+
+                vals_flat = df[present].to_numpy(dtype=np.float32).sum(axis=1)
+
+                unique_m, starts = np.unique(meter_flat, return_index=True)
+                ends = np.append(starts[1:], len(vals_flat))
+
+                win_parts, m_parts = [], []
+                for m_id, s, e in zip(unique_m, starts, ends):
+                    n_w = (e - s) // window_len
+                    if n_w == 0:
+                        continue
+                    T = n_w * window_len
+                    w = vals_flat[s: s + T].reshape(n_w, window_len)
+                    if max_hour_value is not None:
+                        w = w[w.max(axis=1) <= max_hour_value]
+                    if len(w) == 0:
+                        continue
+                    win_parts.append(w)
+                    m_parts.append(np.full(len(w), int(m_id), dtype=np.int64))
+
+                if not win_parts:
+                    return None, None
+                return np.vstack(win_parts), np.concatenate(m_parts)
+
+        # Reset state
+        self.user_profiles_cache = {}
+        self.gamma_cache = {}
+        self.user_last_seen = {}
+        self._invalidate_profile_lookup()
 
         if self.verbose:
             print(f"[UserProfiler] Fitting across {len(parquet_paths)} parquet files...")
 
-        phased_ds = StreamingParquetBuffer(
-            sm_files=parquet_paths,
-            replay_buffer_capacity=10000,
-            min_buffer_size=5184,
-            window_spec=window_spec,
-            num_workers=0,
-            feature_cols=feature_cols,
-            hourly_aggregation=hourly_aggregation,
-            aggregation_divisor=aggregation_divisor,
-            phased_mode=phased,
-            meter_col="meter_number",
-        )
+        # === Phase 1: Incremental KMeans ===
+        total_windows = 0
+        for fpath in tqdm(parquet_paths, desc="[UserProfiler] Phase 1: KMeans"):
+            windows, _ = _read_file(fpath)
+            if windows is None:
+                continue
+            valid = ~np.isnan(windows).any(axis=1)
+            windows = windows[valid]
+            if len(windows) == 0:
+                continue
+            self._ensure_kmeans_feature_dim(windows.shape[1], context="fit_on_files")
+            if windows.shape[0] < self.num_clusters:
+                reps = math.ceil(self.num_clusters / max(1, windows.shape[0]))
+                idx = np.tile(np.arange(windows.shape[0]), reps)[:self.num_clusters]
+                windows = windows[idx]
+            self.kmeans.partial_fit(windows)
+            total_windows += len(windows)
 
-        loader = DataLoader(phased_ds, batch_size=None, num_workers=0)
+        if not hasattr(self.kmeans, "cluster_centers_"):
+            print("[UserProfiler] WARNING: no valid windows found in any file; aborting fit.")
+            return self
 
-        class WrapperLoader:
-            def __init__(self, loader):
-                self.loader = loader
+        self.cluster_centers_ = self.kmeans.cluster_centers_
+        self.kmeans_initialized = True
+        if self.verbose:
+            print(f"[UserProfiler] KMeans done ({total_windows:,} windows).")
 
-            def __iter__(self):
-                for x, meter_id, _, _ in self.loader:
-                    x_time_first = x.transpose(1, 2)
-                    yield x_time_first, meter_id, None, None
+        # === Phase 2: Build per-meter word-count corpus ===
+        meter_corpus: dict[int, np.ndarray] = {}
+        for fpath in tqdm(parquet_paths, desc="[UserProfiler] Phase 2: Corpus"):
+            windows, meter_ids = _read_file(fpath)
+            if windows is None:
+                continue
+            valid = ~np.isnan(windows).any(axis=1)
+            windows, meter_ids = windows[valid], meter_ids[valid]
+            if len(windows) == 0:
+                continue
+            labels = cdist(windows, self.cluster_centers_).argmin(axis=1)
+            for m_id, label in zip(meter_ids, labels):
+                m_id = int(m_id)
+                if m_id not in meter_corpus:
+                    meter_corpus[m_id] = np.zeros(self.num_clusters, dtype=np.int32)
+                meter_corpus[m_id][label] += 1
 
-        self.fit(WrapperLoader(loader))
+        meter_ids_sorted = sorted(meter_corpus.keys())
+        X_corpus = np.array([meter_corpus[m_id] for m_id in meter_ids_sorted])
+
+        # === Phase 3: Fit LDA ===
+        if self.verbose:
+            print(f"[UserProfiler] Phase 3: LDA on {len(meter_ids_sorted):,} meters")
+        self.doc_lengths = X_corpus.sum(axis=1)
+        super(UserProfiler, self).fit(X_corpus)
+        self.lambda_matrix = self.components_
+        self.is_fitted = True
+
+        # === Phase 4: Cache gamma parameters ===
+        if self.verbose:
+            print("[UserProfiler] Phase 4: Caching gamma")
+        self.meter_id_to_idx = {m_id: idx for idx, m_id in enumerate(meter_ids_sorted)}
+        all_gamma = super(UserProfiler, self).transform(X_corpus, normalize=False)
+        for m_id, gamma_u in zip(meter_ids_sorted, all_gamma):
+            self.gamma_cache[int(m_id)] = gamma_u
+            self.user_last_seen[int(m_id)] = self.batch_counter
+            self.resample_user_vector(int(m_id))
+        self._invalidate_profile_lookup()
+
+        if self.path is not None:
+            dir_part = os.path.dirname(self.path)
+            if dir_part:
+                os.makedirs(dir_part, exist_ok=True)
+            self.save(self.path)
+            if self.verbose:
+                print(f"[UserProfiler] Saved to {self.path}")
+
         return self
 
     def resample_user_vector(self, meter_id=None):

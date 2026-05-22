@@ -20,10 +20,10 @@ data:
   #data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
   # data_dir: "data/_parquet_cache"
-  data_dir: "data/_parquet_cache"
+  data_dir: "E:/Data/processed_data/hourly_data/_parquet_cache"
 
   # CSV filename to load
-  data_files: ["test_hourly_subset.parquet"]
+  data_files: []
   
   # CSV column specifications
   columns:
@@ -35,7 +35,7 @@ data:
   # Data loading options
   nan_as_zero: false # Currently only for CSV data mode
   max_value: 200.0 # Set to a positive number to filter out windows with any value above this threshold (e.g., 200 kWh for hourly data)
-  
+  max_hour_value: 20
   # Train/val/test split (by meter ID)
   splits:
     train_ratio: 0.8
@@ -48,12 +48,17 @@ data:
     aggregated: true # whether to aggregate 15-min data to hourly (for phased parquet mode) change the following to 24 hours
     input_len: 24  # 24-hour windows (24 hours * 4 readings per hour) (96)
     stride: 24     # Non-overlapping windows (one per day)
+    
   
+  # Set to true to load the full CSV dataset into RAM at startup (faster epochs,
+  # requires ~500 MB-1 GB free RAM). Only applies when mode: csv.
+  in_memory: false
+
   # DataLoader settings
-  batch_size: 32
+  batch_size: 256
   shuffle: true
-  replay_buffer_capacity: 2000
-  min_buffer_size: 0
+  replay_buffer_capacity: 20000
+  min_buffer_size: 2000
   num_workers: 0
   steps_per_epoch: 500
   eval_batches: 5
@@ -70,7 +75,7 @@ data:
 # ============================================================================
 normalization:
   # Type of normalization: "log1p", "student_t", "zero_preserved_log", "log1p_phase", 
-  method: "log1p"
+  method: null
 
   # Optional cache target for fitted normalization stats:
   # - null/default: use data/normalizations with hashed filenames

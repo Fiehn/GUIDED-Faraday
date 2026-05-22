@@ -85,7 +85,7 @@ def _save_training_config_snapshot(config, log_path: str):
         shutil.copy2(src_path, dst_path)
         base_path = getattr(config, "_base_config_path", None)
         if base_path and os.path.exists(base_path):
-            shutil.copy2(base_path, os.path.join(log_path, "base_config_used.yaml"))
+            shutil.copy2(base_path, os.path.join(log_path, "base.yaml"))
     else:
         print("Warning: could not resolve original config file path; skipping config snapshot save.")
 
@@ -220,6 +220,7 @@ def create_model_from_config(config, device="cpu"):
                     decoder_dropout=decoder_dropout,
                     phased_mode=phased_mode,
                     sequence_length=seq_len,
+                    include_faraday_like=getattr(model_cfg, "faraday_like", False)
                     )
     elif model_type == "set_guide_vae":
         model = SetGuideVAE(
@@ -348,9 +349,12 @@ def create_model_from_config(config, device="cpu"):
                     sequence_length=seq_len,
                     )
     elif model_type == "baseline_average":
-        model = AverageBaselineModel(phased_mode=phased_mode, 
-                                     sequence_length=seq_len, 
-                                     device=device, 
+        model = AverageBaselineModel(phased_mode=phased_mode,
+                                     sequence_length=seq_len,
+                                     device=device,
+                                     conditioner=conditioner,
+                                     min_bucket_samples=getattr(model_cfg, "min_bucket_samples", 120),
+                                     force_global_mean=getattr(model_cfg, "force_global_mean", False),
                                      )
     elif model_type == "baseline_quantile":
         model = QuantileBaselineModel(phased_mode=phased_mode, 

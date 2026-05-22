@@ -240,6 +240,8 @@ def train(config, train_only_user_profile: bool = False):
             force_recompute=norm_force_recompute,
             save_path=norm_cache_dir,
             device=device,
+            max_value=float(getattr(data_cfg, "max_value", 200)),
+            max_hour_value=float(getattr(data_cfg, "max_hour_value", 20))
         )
         normalizer.save(os.path.join(log_path, "normalizer.pt"))
     
@@ -249,7 +251,61 @@ def train(config, train_only_user_profile: bool = False):
 
     eval_cache_device = device if eval_cache_on_gpu and str(device) != "cpu" else None
 
-    data_loader = PhasedReplayDataloaders(
+    in_memory = bool(getattr(data_cfg, "in_memory", False))
+
+    if in_memory and phased_mode:
+        print("Using InMemoryPhasedDataloaders.")
+        _phased_feature_cols = ["active_power_p14_l1", "active_power_p14_l2", "active_power_p14_l3"]
+        data_loader = InMemoryPhasedDataloaders(
+            sm_files=parquet_paths,
+            feature_cols=_phased_feature_cols,
+            window_len=int(config.window.input_len),
+            stride=int(config.window.stride),
+            batch_size=int(data_cfg.batch_size),
+            aggregation=bool(data_cfg.window.aggregated),
+            base_frequency="1h" if data_cfg.window.aggregated else "15min",
+            aggregation_divisor=aggregation_divisor,
+            split_ratios={
+                "train_ratio": float(getattr(data_cfg.splits, "train_ratio", 1.0)),
+                "val_ratio":   float(getattr(data_cfg.splits, "val_ratio",   0.0)),
+                "test_ratio":  float(getattr(data_cfg.splits, "test_ratio",  0.0)),
+            },
+            split_seed=int(getattr(data_cfg.splits, "random_seed", 0)),
+            max_hour_value=float(v) if (v := getattr(data_cfg, "max_hour_value", None)) is not None else None,
+            max_value=float(v) if (v := getattr(data_cfg, "max_value", None)) is not None else None,
+            nan_as_zero=nan_as_zero,
+            normalizer=normalizer,
+            output_aggregate_stream=output_aggregate_stream,
+            pin_memory=(str(device) != "cpu"),
+            eval_cache_device=eval_cache_device,
+        )
+    elif in_memory:
+        print("Using InMemoryCSVDataloaders. Note: this may lead to high memory usage.")
+        data_loader = InMemoryCSVDataloaders(
+            sm_files=parquet_paths,
+            window_len=int(config.window.input_len),
+            stride=int(config.window.stride),
+            batch_size=int(data_cfg.batch_size),
+            split_ratios={
+                "train_ratio": float(getattr(data_cfg.splits, "train_ratio", 1.0)),
+                "val_ratio":   float(getattr(data_cfg.splits, "val_ratio",   0.0)),
+                "test_ratio":  float(getattr(data_cfg.splits, "test_ratio",  0.0)),
+            },
+            split_seed=int(getattr(data_cfg.splits, "random_seed", 0)),
+            max_hour_value=float(v) if (v := getattr(data_cfg, "max_hour_value", None)) is not None else None,
+            max_value=float(v) if (v := getattr(data_cfg, "max_value", None)) is not None else None,
+            nan_as_zero=nan_as_zero,
+            normalizer=normalizer,
+            output_aggregate_stream=output_aggregate_stream,
+            meter_col=data_cfg.columns.meter_id,
+            value_cols=list(data_cfg.columns.value_cols),
+            pin_memory=(str(device) != "cpu"),
+            eval_cache_device=eval_cache_device,
+            max_passes=int(v) if (v := getattr(data_cfg, "max_passes", None)) is not None else None,
+        )
+    else:
+        print(f"Using PhasedReplayDataloaders with replay_capacity={replay_capacity}, min_buffer_size={min_buffer_size}, workers={workers}, eval_batches={eval_batches}, eval_cache_device={eval_cache_device}, cache_scan_batches={cache_scan_batches}, skip_corrupt_files={skip_corrupt_files}, max_skip_warnings={max_skip_warnings}, phased_mode={phased_mode}")
+        data_loader = PhasedReplayDataloaders(
             sm_files=parquet_paths,
             replay_buffer_capacity=replay_capacity,
             min_buffer_size=min_buffer_size,
@@ -275,7 +331,6 @@ def train(config, train_only_user_profile: bool = False):
                 "val_ratio": float(getattr(data_cfg.splits, "val_ratio", 0.0)),
                 "test_ratio": float(getattr(data_cfg.splits, "test_ratio", 0.0)),
             },
-            split_mode=getattr(data_cfg.splits, "split_mode", None),
             max_value=float(v) if (v := getattr(data_cfg, "max_value", None)) is not None else None,
             max_hour_value=float(v) if (v := getattr(data_cfg, "max_hour_value", None)) is not None else None,
         )

@@ -22,12 +22,23 @@ class BaseConditioner(ABC):
         meter_id: torch.Tensor | np.ndarray | None,
         timestamps: torch.Tensor | list | None
     ) -> torch.Tensor | None:
-        """Generates the conditioning tensor based on input"""
+        """Generates the conditioning tensor based on input.
+
+        SHAPER:
+          x          : [batch_size, seq_len, num_features] or [batch_size, seq_len * num_features] or None
+          meter_id   : [batch_size] or None
+          timestamps : [batch_size] or None
+          ->         : [batch_size, condition_dim]
+        """
         pass
 
     @abstractmethod
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
-        """Generates random conditions for testing and validation"""
+        """Generates random conditions for testing and validation.
+
+        SHAPER:
+          -> : [batch_size, condition_dim]
+        """
         pass
 
     def to(self, device: str | torch.device):

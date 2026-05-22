@@ -38,7 +38,7 @@ class GaussianCoder(torch.nn.Module):
     
     def forward(self, inputs):
         param_dict = self.parameterizer(inputs)
-        param_dict["mu"] = torch.clamp(param_dict["mu"], min=0.0, max=12.0)
+        param_dict["mu"] = torch.clamp(param_dict["mu"], min=0.0, max=30.0)
         if self.learn_sigma:
             param_dict["sigma"] = F.softplus(param_dict["sigma"]) + 1e-6 # Ensure positivity 
         else:
@@ -249,7 +249,7 @@ class DictionaryCoder(torch.nn.Module):
         
         param_dict = self.parameterizer(inputs)
         #param_dict["sigma"] = torch.nn.functional.relu(param_dict["sigma"]).clamp(self.sigma_lower_lim, self.sigma_upper_lim)
-        param_dict["mu"] = torch.clamp(param_dict["mu"], min=0.0, max=9.0)
+        param_dict["mu"] = torch.clamp(param_dict["mu"], min=0.0, max=30.0)
 
         # The actual max allowed out of the clamp is (upper - lower)
         max_allowed_softplus = self.sigma_upper_lim - self.sigma_lower_lim

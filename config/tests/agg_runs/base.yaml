@@ -4,7 +4,7 @@
 
 data:
   mode: csv
-  data_dir: "data/_parquet_cache"
+  data_dir: "data/_parquet_cache" # E:/Data/processed_data/hourly_data/_parquet_cache
   data_files: []
   columns:
     meter_id: meter_number
@@ -23,12 +23,12 @@ data:
     aggregated: true
     input_len: 24
     stride: 24
-  batch_size: 512
+  batch_size: 2048
   shuffle: true
   replay_buffer_capacity: 10000
   min_buffer_size: 3000
   num_workers: 8
-  steps_per_epoch: 1000
+  steps_per_epoch: 500
   eval_batches: 5
   eval_cache_on_gpu: true
   eval_cache_refresh: false
@@ -37,6 +37,8 @@ data:
   max_skip_warnings: 20
   aggregation_energy_unit: kwh
   output_aggregate_stream: false
+  in_memory: true
+  max_passes: 20
 
 normalization:
   method: log1p
@@ -143,16 +145,16 @@ training:
     ratio: 0.25
   weighted_loss: 0.2
   early_stopping:
-    enabled: false
-    stop_on_all_files_used: true
+    enabled: true
+    stop_on_all_files_used: false
     min_epochs_before_full_data_stop: 1
-    patience: 7
+    patience: 5
     min_delta: 0.001
   checkpointing:
     save_freq: 20
     save_dir: ./models
     save_best_model: true
-    save_best_after_fraction: 0.0
+    save_best_after_fraction: 0.00
     save_final_model: true
 
 logging:

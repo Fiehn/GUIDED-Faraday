@@ -81,12 +81,6 @@ class EarlyStopping:
     def __call__(self, train_metric, val_metric, epoch=None):
         score = -val_metric if self.mode == 'min' else val_metric
 
-        if train_metric is not None and val_metric is not None:
-            if abs(train_metric - val_metric) < self.min_delta * 10:
-                # Overfitting detected - Stop training
-                self.early_stop = True
-                return False
-
         if self.best_score is None:
             # First time call
             self.best_score = score

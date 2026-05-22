@@ -105,6 +105,22 @@ class _MLP(nn.Module):
         return self.net(x)
 
 
+class _DeterministicDecoderWrapper(nn.Module):
+    """Adapts _MLP to the dict/sample interface expected by Generator's CVAE path."""
+
+    def __init__(self, mlp: _MLP):
+        super().__init__()
+        self.mlp = mlp
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {"mu": self.mlp(x)}
+
+    def sample(self, param_dict: dict[str, torch.Tensor], num_samples: int = 1, temperature: float = 1.0, **_) -> torch.Tensor:
+        """Return [num_samples, B, D] by repeating the mean (deterministic decoder)."""
+        mu = param_dict["mu"]  # [B, D]
+        return mu.unsqueeze(0).expand(num_samples, -1, -1).contiguous()
+
+
 class _FaradayEncoder(nn.Module):
     def __init__(self, input_dim: int, hidden_dims: list[int], latent_dim: int):
         super().__init__()
@@ -117,9 +133,20 @@ class _FaradayEncoder(nn.Module):
         return self.mu_head(h), self.log_var_head(h)
 
     @staticmethod
-    def reparameterize(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+    def reparameterize(mu_or_params, log_var=None, num_samples: int = 1, **_) -> torch.Tensor:
+        """Sample z via reparameterization. Returns [num_samples, B, D].
+
+        Accepts either (mu, log_var) tensors or a (mu, log_var) tuple as
+        first arg so the generic generator interface works with Faraday.
+        """
+        if isinstance(mu_or_params, tuple):
+            mu, log_var = mu_or_params
+        else:
+            mu = mu_or_params
         std = torch.exp(0.5 * log_var)
-        return mu + std * torch.randn_like(std)
+        B, D = mu.shape
+        eps = torch.randn(num_samples, B, D, device=mu.device, dtype=mu.dtype)
+        return mu.unsqueeze(0) + std.unsqueeze(0) * eps
 
 
 class FaradayModel(BaseModel):
@@ -154,11 +181,15 @@ class FaradayModel(BaseModel):
             hidden_dims=enc_dims,
             latent_dim=latent_dim,
         )
-        self.decoder = _MLP(
-            in_dim=latent_dim + self.cond_dim,
-            hidden_dims=dec_dims,
-            out_dim=sequence_length,
+        self.decoder = _DeterministicDecoderWrapper(
+            _MLP(
+                in_dim=latent_dim + self.cond_dim,
+                hidden_dims=dec_dims,
+                out_dim=sequence_length,
+            )
         )
+
+        self.hierarchy = None
 
         # GMM is a registered submodule — its buffers are part of state_dict
         # and follow the model's device automatically via .to(device).
@@ -197,8 +228,8 @@ class FaradayModel(BaseModel):
         c = self._get_conditions(x, meter_id=meter_id, timestamps=timestamps, device=x_flat.device)
 
         mu, log_var = self.encoder(torch.cat([x_flat, c], dim=-1))
-        z = _FaradayEncoder.reparameterize(mu, log_var)
-        x_hat = self.decoder(torch.cat([z, c], dim=-1))
+        z = _FaradayEncoder.reparameterize(mu, log_var).squeeze(0)
+        x_hat = self.decoder(torch.cat([z, c], dim=-1))["mu"]
 
         loss_dict = calculate_training_loss(
             x_hat=x_hat, x=x_flat, z=z,
@@ -231,8 +262,8 @@ class FaradayModel(BaseModel):
             c = self._get_conditions(x, meter_id=meter_id, timestamps=timestamps, device=device)
 
             mu, log_var = self.encoder(torch.cat([x_flat, c], dim=-1))
-            z = _FaradayEncoder.reparameterize(mu, log_var)
-            x_hat = self.decoder(torch.cat([z, c], dim=-1))
+            z = _FaradayEncoder.reparameterize(mu, log_var).squeeze(0)
+            x_hat = self.decoder(torch.cat([z, c], dim=-1))["mu"]
 
             ld = calculate_training_loss(
                 x_hat=x_hat, x=x_flat, z=z,
@@ -277,7 +308,7 @@ class FaradayModel(BaseModel):
         z = z_flat.to(device).reshape(num_prior_samples, B, self.latent_dim)
         c_exp = c.unsqueeze(0).expand(num_prior_samples, -1, -1)
         dec_in = torch.cat([z, c_exp], dim=-1).reshape(num_prior_samples * B, -1)
-        x_hat = self.decoder(dec_in).reshape(num_prior_samples, B, self.sequence_length)
+        x_hat = self.decoder(dec_in)["mu"].reshape(num_prior_samples, B, self.sequence_length)
 
         # [num_x_samples, num_prior_samples, B, D]
         return x_hat.unsqueeze(0).expand(num_x_samples, -1, -1, -1).contiguous()
@@ -291,7 +322,7 @@ class FaradayModel(BaseModel):
         x_flat = self._prep_inputs(x)
         c = self._get_conditions(x, meter_id=meter_id, timestamps=timestamps, device=device)
         mu, _ = self.encoder(torch.cat([x_flat, c], dim=-1))
-        x_hat = self.decoder(torch.cat([mu, c], dim=-1))
+        x_hat = self.decoder(torch.cat([mu, c], dim=-1))["mu"]
         return {"mu": x_hat}
 
     def get_optimizer(self, lr: float = 1e-3, weight_decay: float = 1e-4, **kwargs):
@@ -303,7 +334,7 @@ class FaradayModel(BaseModel):
 
     def _fit_gmm(self, data_loader, device: str = "cpu"):
         """Encode the entire training set and fit the GMM on latent codes."""
-        from data.dataloader_phased import PhasedReplayDataloaders
+        from data.dataloader_phased import PhasedReplayDataloaders, InMemoryCSVDataloaders
 
         self.eval()
         self.to(device)
@@ -312,9 +343,15 @@ class FaradayModel(BaseModel):
         if isinstance(data_loader, PhasedReplayDataloaders):
             loader = data_loader._get_train_stream_loader()
             max_batches = self.gmm_fit_batches
+        elif isinstance(data_loader, InMemoryCSVDataloaders):
+            loader = data_loader.get_train_epoch_loader(self.gmm_fit_batches)
+            max_batches = None  # loader is already capped at gmm_fit_batches steps
         else:
             loader = data_loader
             max_batches = None
+
+        if loader is None:
+            return
 
         with torch.no_grad():
             for i, batch in enumerate(loader):

@@ -17,11 +17,11 @@ def _init_vamp_prior_from_batch(model, batch, device, noise_scale=0.01):
 
     x, meter_id, timestamps, agg = model._unpack_batch(batch)
     x = model.move_to_device(x, device)
-    x_phase_first = model._to_phase_first(x)
-    c = model._build_conditions(x_phase_first, meter_id=meter_id, timestamps=timestamps, device=device)
+    x_phase_first = model._to_phase_first(x)  # SHAPER: [batch_size, num_features, sequence_length]
+    c = model._build_conditions(x_phase_first, meter_id=meter_id, timestamps=timestamps, device=device)  # SHAPER: [batch_size, condition_dim]
 
     with torch.no_grad():
-        z = model.encoder(x_phase_first, c)
+        z = model.encoder(x_phase_first, c)  # SHAPER: [batch_size, latent_dim]
         if isinstance(model.prior, VampPrior):
             model.prior.initialize_pseudo_inputs(z, noise_scale=noise_scale)
 
@@ -122,12 +122,16 @@ class BaseModel(nn.Module, ABC):
             conditioner_state = pickle.dumps(conditioner)
 
         # --- build checkpoint ---
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.parameters())
         checkpoint = {
             "format_version": 2,
             "model_class": self.__class__.__name__,
             "model_state_dict": self.state_dict(),
             "normalizer_state": normalizer_state,
             "conditioner_state": conditioner_state,
+            "trainable_params": trainable_params,
+            "total_params": total_params,
         }
 
         # --- atomic write ---
@@ -341,8 +345,16 @@ class BaseModel(nn.Module, ABC):
             )
             cache_time_s = time.perf_counter() - cache_start_t
             print(f"Epoch [{epoch+1}/{num_epochs}] — data ready in {cache_time_s:.1f}s, training ...", flush=True)
+            file_progress = data_loader.get_file_progress()
+            if "passes" in file_progress:
+                pct_in_pass = (file_progress['seen'] / file_progress['total'] * 100) if file_progress['total'] > 0 else 0.0
+                print(f"Data: pass {file_progress['completed'] + 1}, {pct_in_pass:.1f}% through ({file_progress['passes']:.2f}x total)")
+            else:
+                pct_of_data_seen = (file_progress['seen'] / file_progress['total'] * 100) if file_progress['total'] > 0 else 0.0
+                print(f"Files seen so far: {file_progress['seen']} / {file_progress['total']} ({pct_of_data_seen:.1f}%)")
             if train_loader is None:
-                raise RuntimeError("DataLoader returned None for train_loader. Cannot proceed with training.")
+                print(f"[train] All training windows exhausted after {epoch} epoch(s). Stopping.")
+                break
             
             self.train()
             epoch_loss = 0.0
@@ -500,27 +512,37 @@ class BaseModel(nn.Module, ABC):
         time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"{self.__class__.__name__}_{time_stamp}"
     def _prep_inputs(self, x: torch.Tensor) -> torch.Tensor:
-        """ Flatten [B, L, F] to [B, D] if needed """
+        """
+        SHAPER:
+          x  : [batch_size, sequence_length, num_features] | [batch_size, sequence_length * num_features]
+          ->  : [batch_size, sequence_length * num_features]
+        """
         if x.dim() == 3:
-            return x.reshape(x.shape[0], -1)
+            return x.reshape(x.shape[0], -1)  # SHAPER: [batch_size, sequence_length, num_features] -> [batch_size, sequence_length * num_features]
         return x
     def _to_phase_first(self, x: torch.Tensor) -> torch.Tensor:
-        """Return x as [B, F, L], supporting [B, D], [B, F, L], or [B, L, F]."""
+        """
+        SHAPER:
+          x  : [batch_size, sequence_length * num_features]
+             | [batch_size, num_features, sequence_length]
+             | [batch_size, sequence_length, num_features]
+          ->  : [batch_size, num_features, sequence_length]
+        """
         if x.dim() == 2:
             if x.shape[1] != self.sequence_length * self.num_features:
                 raise ValueError(
                     f"Expected flattened input dim {self.sequence_length * self.num_features}, got {x.shape[1]}"
                 )
-            return x.reshape(x.shape[0], self.num_features, self.sequence_length)
+            return x.reshape(x.shape[0], self.num_features, self.sequence_length)  # SHAPER: [batch_size, sequence_length * num_features] -> [batch_size, num_features, sequence_length]
 
         if x.dim() != 3:
             raise ValueError(f"Expected 2D/3D input, got shape {tuple(x.shape)}")
 
         if x.shape[1] == self.num_features and x.shape[2] == self.sequence_length:
-            return x
+            return x  # SHAPER: [batch_size, num_features, sequence_length] already phase-first
 
         if x.shape[1] == self.sequence_length and x.shape[2] == self.num_features:
-            return x.transpose(1, 2)
+            return x.transpose(1, 2)  # SHAPER: [batch_size, sequence_length, num_features] -> [batch_size, num_features, sequence_length]
 
         raise ValueError(
             f"Could not infer phase/time axes for input shape {tuple(x.shape)} with "
@@ -528,8 +550,12 @@ class BaseModel(nn.Module, ABC):
         )
 
     def _build_condition_input(self, x_phase_first: torch.Tensor) -> torch.Tensor:
-        """Convert [B, F, L] -> [B, L, F] for conditioner compatibility."""
-        return x_phase_first.transpose(1, 2)
+        """
+        SHAPER:
+          x_phase_first : [batch_size, num_features, sequence_length]
+          ->             : [batch_size, sequence_length, num_features]
+        """
+        return x_phase_first.transpose(1, 2)  # SHAPER: [batch_size, num_features, sequence_length] -> [batch_size, sequence_length, num_features]
 
     def move_to_device(self, batch, device):
         if torch.is_tensor(batch):
@@ -570,15 +596,21 @@ class BaseModel(nn.Module, ABC):
         self._condition_dim_checked = True
 
     def _build_conditions(self, x_phase_first, meter_id=None, timestamps=None, device=None):
-        cond_input = self._build_condition_input(x_phase_first)
+        """
+        SHAPER:
+          x_phase_first : [batch_size, num_features, sequence_length]
+          ->             : [batch_size, condition_dim]
+        """
+        cond_input = self._build_condition_input(x_phase_first)  # SHAPER: [batch_size, sequence_length, num_features]
         if meter_id is None and timestamps is None:
             c = self.conditioner.get_conditions(cond_input)
         else:
             c = self.conditioner.get_conditions(cond_input, meter_id=meter_id, timestamps=timestamps)
+        # SHAPER: c = [batch_size, condition_dim]
 
         c = self.move_to_device(c, device=device)
         if c.dim() == 1:
-            c = c.unsqueeze(0)
+            c = c.unsqueeze(0)  # SHAPER: [condition_dim] -> [1, condition_dim]
         c = c.float()
         self._validate_condition_dim(c)
         return c

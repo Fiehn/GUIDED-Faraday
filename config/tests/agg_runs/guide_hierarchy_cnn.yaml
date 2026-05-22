@@ -8,13 +8,13 @@ model:
   # Encoder configuration
   encoder:
     type: "dictionary_cnn"  # Options: "dictionary", "mlp", "dictionary_cnn"
-    hidden_dims: [1024, 512, 256, 128]
+    hidden_dims: [64, 96, 64]
     dropout: 0.2
   
   # Decoder configuration
   decoder:
     type: "dictionary_cnn"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
-    hidden_dims: [128, 256, 512, 1024]
+    hidden_dims: [64, 96, 64]
     dropout: 0.2
   
   # Prior configuration
@@ -28,11 +28,11 @@ model:
 
 hierarchy:
   enabled: true
-  levels: ["linear", "stochastic", "stochastic"] # eg. ["linear", "StochasticLevel", "VQLevel"]
-  latent_dims: [128,128,128] # latent dimensions for each level
-  top_down: [false, false, true] # whether to use top-down connections for each level
-  bottom_up: [true, false, false] # whether to use bottom-up connections for each level
-  loss_weights: [1.0, 1.0, 1.0] # weights for KL loss at each level
+  levels: ["linear", "stochastic"] # eg. ["linear", "StochasticLevel", "VQLevel"]
+  latent_dims: [128,128] # latent dimensions for each level
+  top_down: [false, true] # whether to use top-down connections for each level
+  bottom_up: [true, false] # whether to use bottom-up connections for each level
+  loss_weights: [1.0, 1.0] # weights for KL loss at each level
   
   aggregation: "concat"
   bidirectional: true

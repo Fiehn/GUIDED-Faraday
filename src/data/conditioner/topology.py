@@ -47,12 +47,13 @@ class HeatpumpConditioner(BaseConditioner):
     def _get_lookup(self, device: torch.device):
         key = str(device)
         cached = self._lookup_by_device.get(key)
-        if cached is None:
-            cached = (
-                self._meter_ids_cpu.to(device=device, dtype=torch.long),
-                self._status_cpu.to(device=device, dtype=torch.long),
-            )
-            self._lookup_by_device[key] = cached
+        if cached is not None and cached[0].device == device:
+            return cached
+        cached = (
+            self._meter_ids_cpu.to(device=device, dtype=torch.long),
+            self._status_cpu.to(device=device, dtype=torch.long),
+        )
+        self._lookup_by_device[key] = cached
         return cached
 
     def get_conditions(
@@ -71,6 +72,10 @@ class HeatpumpConditioner(BaseConditioner):
         Returns:
             torch.Tensor: Binary indicators of shape `(batch_size, 1)`. Defaults to
                 0.0 if meter is not found.
+
+        SHAPER:
+          meter_id : [batch_size]
+          ->       : [batch_size, 1]
         """
         if meter_id is None:
             if isinstance(timestamps, torch.Tensor):
@@ -80,10 +85,10 @@ class HeatpumpConditioner(BaseConditioner):
             return torch.zeros((1, 1), dtype=torch.float32)
 
         if isinstance(meter_id, torch.Tensor):
-            meter_ids = meter_id.to(dtype=torch.long)
+            meter_ids = meter_id.to(dtype=torch.long)  # SHAPER: [batch_size]
             device = meter_ids.device
         else:
-            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)
+            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)  # SHAPER: [batch_size]
             device = meter_ids.device
 
         lookup_ids, lookup_status = self._get_lookup(device=device)
@@ -97,14 +102,14 @@ class HeatpumpConditioner(BaseConditioner):
         idx_clamped = idx.clamp(max=lookup_ids.shape[0] - 1)
         valid = (idx < lookup_ids.shape[0]) & (lookup_ids[idx_clamped] == meter_ids)
 
-        status = torch.zeros(meter_ids.shape[0], dtype=torch.float32, device=device)
+        status = torch.zeros(meter_ids.shape[0], dtype=torch.float32, device=device)  # SHAPER: [batch_size]
         if valid.any():
             status[valid] = lookup_status[idx_clamped[valid]].to(dtype=torch.float32)
 
-        return status.unsqueeze(1)
+        return status.unsqueeze(1)  # SHAPER: [batch_size, 1]
 
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
-        random_status = torch.randint(0, 2, (batch_size, 1)).float()
+        random_status = torch.randint(0, 2, (batch_size, 1)).float()  # SHAPER: [batch_size, 1]
         return random_status
 
 
@@ -146,12 +151,13 @@ class SolarPanelConditioner(BaseConditioner):
     def _get_lookup(self, device: torch.device):
         key = str(device)
         cached = self._lookup_by_device.get(key)
-        if cached is None:
-            cached = (
-                self._meter_ids_cpu.to(device=device, dtype=torch.long),
-                self._status_cpu.to(device=device, dtype=torch.long),
-            )
-            self._lookup_by_device[key] = cached
+        if cached is not None and cached[0].device == device:
+            return cached
+        cached = (
+            self._meter_ids_cpu.to(device=device, dtype=torch.long),
+            self._status_cpu.to(device=device, dtype=torch.long),
+        )
+        self._lookup_by_device[key] = cached
         return cached
 
     def get_conditions(
@@ -170,6 +176,10 @@ class SolarPanelConditioner(BaseConditioner):
         Returns:
             torch.Tensor: Binary indicators of shape `(batch_size, 1)`. Defaults to
                 0.0 if meter is not found.
+
+        SHAPER:
+          meter_id : [batch_size]
+          ->       : [batch_size, 1]
         """
         if meter_id is None:
             if isinstance(timestamps, torch.Tensor):
@@ -179,10 +189,10 @@ class SolarPanelConditioner(BaseConditioner):
             return torch.zeros((1, 1), dtype=torch.float32)
 
         if isinstance(meter_id, torch.Tensor):
-            meter_ids = meter_id.to(dtype=torch.long)
+            meter_ids = meter_id.to(dtype=torch.long)  # SHAPER: [batch_size]
             device = meter_ids.device
         else:
-            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)
+            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)  # SHAPER: [batch_size]
             device = meter_ids.device
 
         lookup_ids, lookup_status = self._get_lookup(device=device)
@@ -196,14 +206,14 @@ class SolarPanelConditioner(BaseConditioner):
         idx_clamped = idx.clamp(max=lookup_ids.shape[0] - 1)
         valid = (idx < lookup_ids.shape[0]) & (lookup_ids[idx_clamped] == meter_ids)
 
-        status = torch.zeros(meter_ids.shape[0], dtype=torch.float32, device=device)
+        status = torch.zeros(meter_ids.shape[0], dtype=torch.float32, device=device)  # SHAPER: [batch_size]
         if valid.any():
             status[valid] = lookup_status[idx_clamped[valid]].to(dtype=torch.float32)
 
-        return status.unsqueeze(1)
+        return status.unsqueeze(1)  # SHAPER: [batch_size, 1]
 
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
-        random_status = torch.randint(0, 2, (batch_size, 1)).float()
+        random_status = torch.randint(0, 2, (batch_size, 1)).float()  # SHAPER: [batch_size, 1]
         return random_status
 
 
@@ -274,12 +284,13 @@ class ElectricVehicleConditioner(BaseConditioner):
     def _get_lookup(self, device: torch.device):
         key = str(device)
         cached = self._lookup_by_device.get(key)
-        if cached is None:
-            cached = (
-                self._meter_ids_cpu.to(device=device, dtype=torch.long),
-                self._phase_class_cpu.to(device=device, dtype=torch.long),
-            )
-            self._lookup_by_device[key] = cached
+        if cached is not None and cached[0].device == device:
+            return cached
+        cached = (
+            self._meter_ids_cpu.to(device=device, dtype=torch.long),
+            self._phase_class_cpu.to(device=device, dtype=torch.long),
+        )
+        self._lookup_by_device[key] = cached
         return cached
 
     def get_conditions(
@@ -288,6 +299,11 @@ class ElectricVehicleConditioner(BaseConditioner):
         meter_id: torch.Tensor | np.ndarray | None,
         timestamps: torch.Tensor | list | None
     ) -> torch.Tensor | None:
+        """
+        SHAPER:
+          meter_id : [batch_size]
+          ->       : [batch_size, 4]  (one-hot: no_ev, 1ph, 2ph, 3ph)
+        """
         if meter_id is None:
             if isinstance(timestamps, torch.Tensor):
                 zeros = torch.zeros(timestamps.shape[0], dtype=torch.long, device=timestamps.device)
@@ -295,19 +311,19 @@ class ElectricVehicleConditioner(BaseConditioner):
                 zeros = torch.zeros(timestamps.shape[0], dtype=torch.long)
             else:
                 zeros = torch.zeros(1, dtype=torch.long)
-            return F.one_hot(zeros, num_classes=self.condition_dim).float()
+            return F.one_hot(zeros, num_classes=self.condition_dim).float()  # SHAPER: [batch_size, 4]
 
         if isinstance(meter_id, torch.Tensor):
-            meter_ids = meter_id.to(dtype=torch.long)
+            meter_ids = meter_id.to(dtype=torch.long)  # SHAPER: [batch_size]
             device = meter_ids.device
         else:
-            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)
+            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)  # SHAPER: [batch_size]
             device = meter_ids.device
 
         lookup_ids, lookup_phase_class = self._get_lookup(device=device)
         if lookup_ids.numel() == 0:
-            phase_class = torch.zeros_like(meter_ids, dtype=torch.long)
-            return F.one_hot(phase_class, num_classes=self.condition_dim).float()
+            phase_class = torch.zeros_like(meter_ids, dtype=torch.long)  # SHAPER: [batch_size]
+            return F.one_hot(phase_class, num_classes=self.condition_dim).float()  # SHAPER: [batch_size, 4]
 
         meter_ids = meter_ids.contiguous()
         lookup_ids = lookup_ids.contiguous()
@@ -315,17 +331,17 @@ class ElectricVehicleConditioner(BaseConditioner):
         idx_clamped = idx.clamp(max=lookup_ids.shape[0] - 1)
         valid = (idx < lookup_ids.shape[0]) & (lookup_ids[idx_clamped] == meter_ids)
 
-        phase_class = torch.zeros_like(meter_ids, dtype=torch.long)
+        phase_class = torch.zeros_like(meter_ids, dtype=torch.long)  # SHAPER: [batch_size]
         if valid.any():
             phase_class[valid] = lookup_phase_class[idx_clamped[valid]]
 
-        return F.one_hot(phase_class, num_classes=self.condition_dim).float()
+        return F.one_hot(phase_class, num_classes=self.condition_dim).float()  # SHAPER: [batch_size, 4]
 
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
         # No EV: 70%, 1-phase: 15%, 2-phase: 10%, 3-phase: 5%
         probs = torch.tensor([0.7, 0.15, 0.1, 0.05])
-        random_status = torch.multinomial(probs, batch_size, replacement=True)
-        return F.one_hot(random_status, num_classes=self.condition_dim).float()
+        random_status = torch.multinomial(probs, batch_size, replacement=True)  # SHAPER: [batch_size]
+        return F.one_hot(random_status, num_classes=self.condition_dim).float()  # SHAPER: [batch_size, 4]
 
     def get_conditions_no_data(self, meter_id, timestamps):
         # Backward-compatible helper used in some older call sites.
@@ -384,12 +400,13 @@ class ElectricVehicleConditionerBool(BaseConditioner):
     def _get_lookup(self, device: torch.device):
         key = str(device)
         cached = self._lookup_by_device.get(key)
-        if cached is None:
-            cached = (
-                self._meter_ids_cpu.to(device=device, dtype=torch.long),
-                self._phase_class_cpu.to(device=device, dtype=torch.long),
-            )
-            self._lookup_by_device[key] = cached
+        if cached is not None and cached[0].device == device:
+            return cached
+        cached = (
+            self._meter_ids_cpu.to(device=device, dtype=torch.long),
+            self._phase_class_cpu.to(device=device, dtype=torch.long),
+        )
+        self._lookup_by_device[key] = cached
         return cached
 
     def get_conditions(
@@ -398,6 +415,11 @@ class ElectricVehicleConditionerBool(BaseConditioner):
         meter_id: torch.Tensor | np.ndarray | None,
         timestamps: torch.Tensor | list | None
     ) -> torch.Tensor | None:
+        """
+        SHAPER:
+          meter_id : [batch_size]
+          ->       : [batch_size, 1]  (binary: 0=no_ev, 1=has_ev)
+        """
         if meter_id is None:
             if isinstance(timestamps, torch.Tensor):
                 zeros = torch.zeros(timestamps.shape[0], dtype=torch.float32, device=timestamps.device)
@@ -405,19 +427,19 @@ class ElectricVehicleConditionerBool(BaseConditioner):
                 zeros = torch.zeros(timestamps.shape[0], dtype=torch.float32)
             else:
                 zeros = torch.zeros(1, dtype=torch.float32)
-            return zeros.unsqueeze(1)
+            return zeros.unsqueeze(1)  # SHAPER: [batch_size, 1]
 
         if isinstance(meter_id, torch.Tensor):
-            meter_ids = meter_id.to(dtype=torch.long)
+            meter_ids = meter_id.to(dtype=torch.long)  # SHAPER: [batch_size]
             device = meter_ids.device
         else:
-            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)
+            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)  # SHAPER: [batch_size]
             device = meter_ids.device
 
         lookup_ids, lookup_phase_class = self._get_lookup(device=device)
         if lookup_ids.numel() == 0:
-            phase_class = torch.zeros_like(meter_ids, dtype=torch.float32)
-            return phase_class.unsqueeze(1)
+            phase_class = torch.zeros_like(meter_ids, dtype=torch.float32)  # SHAPER: [batch_size]
+            return phase_class.unsqueeze(1)  # SHAPER: [batch_size, 1]
 
         meter_ids = meter_ids.contiguous()
         lookup_ids = lookup_ids.contiguous()
@@ -425,17 +447,17 @@ class ElectricVehicleConditionerBool(BaseConditioner):
         idx_clamped = idx.clamp(max=lookup_ids.shape[0] - 1)
         valid = (idx < lookup_ids.shape[0]) & (lookup_ids[idx_clamped] == meter_ids)
 
-        phase_class = torch.zeros_like(meter_ids, dtype=torch.float32)
+        phase_class = torch.zeros_like(meter_ids, dtype=torch.float32)  # SHAPER: [batch_size]
         if valid.any():
             phase_class[valid] = lookup_phase_class[idx_clamped[valid]].to(dtype=torch.float32)
 
-        return phase_class.unsqueeze(1)
+        return phase_class.unsqueeze(1)  # SHAPER: [batch_size, 1]
 
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
         # No EV: 86%, Has EV: 14%
         probs = torch.tensor([0.86, 0.14])
-        random_status = torch.multinomial(probs, batch_size, replacement=True)
-        return random_status.unsqueeze(1).float()
+        random_status = torch.multinomial(probs, batch_size, replacement=True)  # SHAPER: [batch_size]
+        return random_status.unsqueeze(1).float()  # SHAPER: [batch_size, 1]
 
     def get_conditions_no_data(self, meter_id, timestamps):
         # Backward-compatible helper used in some older call sites.
@@ -496,12 +518,13 @@ class HeatpumpPhaseConditioner(BaseConditioner):
     def _get_lookup(self, device: torch.device):
         key = str(device)
         cached = self._lookup_by_device.get(key)
-        if cached is None:
-            cached = (
-                self._meter_ids_cpu.to(device=device, dtype=torch.long),
-                self._phase_class_cpu.to(device=device, dtype=torch.long),
-            )
-            self._lookup_by_device[key] = cached
+        if cached is not None and cached[0].device == device:
+            return cached
+        cached = (
+            self._meter_ids_cpu.to(device=device, dtype=torch.long),
+            self._phase_class_cpu.to(device=device, dtype=torch.long),
+        )
+        self._lookup_by_device[key] = cached
         return cached
 
     def get_conditions(
@@ -510,6 +533,11 @@ class HeatpumpPhaseConditioner(BaseConditioner):
         meter_id: torch.Tensor | np.ndarray | None,
         timestamps: torch.Tensor | list | None
     ) -> torch.Tensor | None:
+        """
+        SHAPER:
+          meter_id : [batch_size]
+          ->       : [batch_size, 4]  (one-hot: no_hp, 1ph, 2ph, 3ph)
+        """
         if meter_id is None:
             if isinstance(timestamps, torch.Tensor):
                 zeros = torch.zeros(timestamps.shape[0], dtype=torch.long, device=timestamps.device)
@@ -517,19 +545,19 @@ class HeatpumpPhaseConditioner(BaseConditioner):
                 zeros = torch.zeros(timestamps.shape[0], dtype=torch.long)
             else:
                 zeros = torch.zeros(1, dtype=torch.long)
-            return F.one_hot(zeros, num_classes=self.condition_dim).float()
+            return F.one_hot(zeros, num_classes=self.condition_dim).float()  # SHAPER: [batch_size, 4]
 
         if isinstance(meter_id, torch.Tensor):
-            meter_ids = meter_id.to(dtype=torch.long)
+            meter_ids = meter_id.to(dtype=torch.long)  # SHAPER: [batch_size]
             device = meter_ids.device
         else:
-            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)
+            meter_ids = torch.as_tensor(np.asarray(meter_id, dtype=np.int64), dtype=torch.long)  # SHAPER: [batch_size]
             device = meter_ids.device
 
         lookup_ids, lookup_phase_class = self._get_lookup(device=device)
         if lookup_ids.numel() == 0:
-            phase_class = torch.zeros_like(meter_ids, dtype=torch.long)
-            return F.one_hot(phase_class, num_classes=self.condition_dim).float()
+            phase_class = torch.zeros_like(meter_ids, dtype=torch.long)  # SHAPER: [batch_size]
+            return F.one_hot(phase_class, num_classes=self.condition_dim).float()  # SHAPER: [batch_size, 4]
 
         meter_ids = meter_ids.contiguous()
         lookup_ids = lookup_ids.contiguous()
@@ -537,14 +565,14 @@ class HeatpumpPhaseConditioner(BaseConditioner):
         idx_clamped = idx.clamp(max=lookup_ids.shape[0] - 1)
         valid = (idx < lookup_ids.shape[0]) & (lookup_ids[idx_clamped] == meter_ids)
 
-        phase_class = torch.zeros_like(meter_ids, dtype=torch.long)
+        phase_class = torch.zeros_like(meter_ids, dtype=torch.long)  # SHAPER: [batch_size]
         if valid.any():
             phase_class[valid] = lookup_phase_class[idx_clamped[valid]]
 
-        return F.one_hot(phase_class, num_classes=self.condition_dim).float()
+        return F.one_hot(phase_class, num_classes=self.condition_dim).float()  # SHAPER: [batch_size, 4]
 
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
         # No heat pump: 50%, 1-phase: 20%, 2-phase: 20%, 3-phase: 10%
         probs = torch.tensor([0.5, 0.2, 0.2, 0.1])
-        random_status = torch.multinomial(probs, batch_size, replacement=True)
-        return F.one_hot(random_status, num_classes=self.condition_dim).float()
+        random_status = torch.multinomial(probs, batch_size, replacement=True)  # SHAPER: [batch_size]
+        return F.one_hot(random_status, num_classes=self.condition_dim).float()  # SHAPER: [batch_size, 4]

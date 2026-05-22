@@ -38,6 +38,7 @@ data:
   max_skip_warnings: 20
   aggregation_energy_unit: kwh
   output_aggregate_stream: false
+  in_memory: true
 
 normalization:
   method: null
