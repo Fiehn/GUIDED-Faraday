@@ -3,7 +3,7 @@
 #SBATCH --time 24:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=8
-#SBATCH --output=slurmjobs/outputs/train_all_models2-%j.out
+#SBATCH --output=slurmjobs/outputs/train_all_models3-%j.out
 #SBATCH --job-name=train_all_models
 #SBATCH --mail-user=s204617@dtu.dk
 #SBATCH --mail-type=END,FAIL

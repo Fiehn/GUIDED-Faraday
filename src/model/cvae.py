@@ -28,7 +28,7 @@ class CVAE(VAE):
         self.condition_dim = conditioner.get_condition_dim() + extra_condition_dim
         self.latent_dim = int(latent_dim)
 
-        self.include_faraday_like
+        self.include_faraday_like = include_faraday_like
 
         super().__init__(input_dim=input_dim, 
                          latent_dim=latent_dim, 
