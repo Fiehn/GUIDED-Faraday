@@ -344,7 +344,7 @@ def train(config, train_only_user_profile: bool = False):
                                                                                aggregation_divisor=aggregation_divisor,
                                                                                window_spec=window
                                                                                )
-            conditioner.condition_items.get("user_profile", None).save(os.path.join(log_path, config.conditioning.user_profile.cache_path))
+            conditioner.condition_items.get("user_profile", None).save(config.conditioning.user_profile.cache_path)
             if train_only_user_profile:
                 return
 

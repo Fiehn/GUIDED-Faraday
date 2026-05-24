@@ -89,7 +89,7 @@ def _save_training_config_snapshot(config, log_path: str):
     else:
         print("Warning: could not resolve original config file path; skipping config snapshot save.")
 
-def create_model_from_config(config, device="cpu"):
+def create_model_from_config(config, device ="cpu"):
     """
     Creates and returns a BaseModel subclass and its Conditioner based on the Hydra config.
     Returns:
