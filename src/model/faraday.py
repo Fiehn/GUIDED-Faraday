@@ -166,6 +166,7 @@ class FaradayModel(BaseModel):
         median_quantile_weight: float = 1.0,
         gmm_n_components: int = 300,
         gmm_max_iter: int = 100,
+        gmm_reg_covar: float = 1e-6,
         **kwargs,
     ):
         super().__init__(phased_mode=False, sequence_length=sequence_length)
@@ -196,6 +197,7 @@ class FaradayModel(BaseModel):
         self.gmm = GaussianMixtureModel(
             n_components=gmm_n_components,
             n_features=latent_dim,
+            reg_covar=gmm_reg_covar,
         )
 
         self.mse_weight = mse_weight

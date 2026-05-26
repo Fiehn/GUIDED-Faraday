@@ -357,9 +357,7 @@ class BaseModel(nn.Module, ABC):
                 break
             
             self.train()
-            epoch_loss = 0.0
-            epoch_recon = 0.0
-            epoch_kl = 0.0
+            epoch_sums: dict[str, float] = {}
             n = 0
             eval_time_s = 0.0
             save_time_s = 0.0
@@ -379,31 +377,35 @@ class BaseModel(nn.Module, ABC):
                     weighted_loss=train_cfg.weighted_loss,
                     # TODO
                 )
-                epoch_loss += float(loss_dict["loss"].detach())
-                epoch_recon += float(loss_dict["recon_loglikelihood"].detach())
-                epoch_kl += float(loss_dict["kl_divergence"].detach())
+                for k, v in loss_dict.items():
+                    try:
+                        epoch_sums[k] = epoch_sums.get(k, 0.0) + float(v.detach() if hasattr(v, "detach") else v)
+                    except (TypeError, ValueError):
+                        pass
                 n += 1
             train_time_s = time.perf_counter() - train_start_t
 
             if n == 0:
                 raise RuntimeError("No training batches were processed in this epoch. Cannot compute epoch metrics.")
-            
-            avg_loss = epoch_loss / n
-            avg_recon = epoch_recon / n
-            avg_kl = epoch_kl / n
+
+            avg_metrics = {k: v / n for k, v in epoch_sums.items()}
+            # Keep legacy aliases for checkpointing / early-stopping code below.
+            avg_loss = avg_metrics.get("loss", 0.0)
+            avg_recon = avg_metrics.get("recon_loglikelihood", avg_metrics.get("loglik", 0.0))
+            avg_kl = avg_metrics.get("kl_divergence", avg_metrics.get("mmd", 0.0))
+
             file_progress = data_loader.get_file_progress()
+            metrics_str = " | ".join(f"{k}: {v:.4f}" for k, v in avg_metrics.items())
             print(
-                f"Epoch [{epoch+1}/{num_epochs}] "
-                f"Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | KL: {avg_kl:.4f} | "
+                f"Epoch [{epoch+1}/{num_epochs}] Train — {metrics_str} | "
                 f"data {cache_time_s:.1f}s  train {train_time_s:.1f}s"
             )
 
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
-            writer.add_scalar('train_loss_epoch', avg_loss, epoch)
-            writer.add_scalar('train_recon_loglikelihood_epoch', avg_recon, epoch)
-            writer.add_scalar('train_kl_divergence_epoch', avg_kl, epoch)
+            for k, v in avg_metrics.items():
+                writer.add_scalar(f'train_{k}_epoch', v, epoch)
             writer.add_scalar('stream_files_seen', file_progress['seen'], epoch)
             writer.add_scalar('stream_files_completed', file_progress['completed'], epoch)
             writer.add_scalar('stream_files_skipped', file_progress.get('skipped', 0), epoch)
@@ -423,19 +425,15 @@ class BaseModel(nn.Module, ABC):
                         beta=train_cfg.beta,
                         device=device,
                     )
-                    print(
-                        f"Epoch [{epoch+1:4d}/{num_epochs}] "
-                        f"Eval Loss: {eval_metrics['loss']:.4f} | "
-                        f"Recon: {eval_metrics['recon_loglikelihood']:.4f} | "
-                        f"KL: {eval_metrics['kl_divergence']:.4f}"
-                    )
-                    writer.add_scalar('eval_loss_epoch', eval_metrics['loss'], epoch)
-                    writer.add_scalar('eval_recon_loglikelihood_epoch', eval_metrics['recon_loglikelihood'], epoch)
-                    writer.add_scalar('eval_kl_divergence_epoch', eval_metrics['kl_divergence'], epoch)
-                    # Alias eval metrics to val_* tags for shared visualization.
-                    writer.add_scalar('val_loss_epoch', eval_metrics['loss'], epoch)
-                    writer.add_scalar('val_recon_loglikelihood_epoch', eval_metrics['recon_loglikelihood'], epoch)
-                    writer.add_scalar('val_kl_divergence_epoch', eval_metrics['kl_divergence'], epoch)
+                    eval_str = " | ".join(f"{k}: {v:.4f}" for k, v in eval_metrics.items())
+                    print(f"Epoch [{epoch+1:4d}/{num_epochs}] Eval — {eval_str}")
+                    for k, v in eval_metrics.items():
+                        try:
+                            fv = float(v)
+                        except (TypeError, ValueError):
+                            continue
+                        writer.add_scalar(f'eval_{k}_epoch', fv, epoch)
+                        writer.add_scalar(f'val_{k}_epoch', fv, epoch)
 
                     if eval_metrics['loss'] < best_eval_loss:
                         best_eval_loss = eval_metrics['loss']

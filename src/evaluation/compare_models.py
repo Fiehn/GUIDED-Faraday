@@ -71,8 +71,12 @@ class PhasedModelComparator:
         """Pretty metric names for tables and plots."""
         rename_map = {
             "Flexibility Distance": "Reconstruction Flexibility Distance (FD)",
-            "Avg MinMax Reconstruction Score": "BEST Overall Reconstruction Score",
-            "Avg MinMax Synthetic Score": "BEST Overall Synthetic Score",
+            "Avg MinMax Reconstruction Score": "MinMax Score (Reconstruction)",
+            "Avg MinMax Synthetic Score": "MinMax Score (Synthetic)",
+            "Avg Rank Reconstruction Score": "Rank Score (Reconstruction)",
+            "Avg Rank Synthetic Score": "Rank Score (Synthetic)",
+            "Win Count Reconstruction": "Win Count (Reconstruction)",
+            "Win Count Synthetic": "Win Count (Synthetic)",
             "TSTR (Train on Synthetic, Test on Real)": "Train on Synthetic, Test on Real (TSTR)",
             "Aggregated Profiles (Flexibility Distance)": "FD on Real & Synth Aggregated Profiles",
             "Set-MMD (Permutation Invariant)": "Maximum Mean Discrepancy (MMD)",
@@ -107,6 +111,7 @@ class PhasedModelComparator:
             .replace(" ", "")
             .replace("(", "")
             .replace(")", "")
+            .replace(",", "")
         )
 
 
@@ -145,6 +150,11 @@ class PhasedModelComparator:
             # Summary scores
             "avgminmaxreconstructionscore": "higher",
             "avgminmaxsyntheticscore": "higher",
+            "avgrankреconstructionscore": "higher",
+            "avgrankreconstructionscore": "higher",
+            "avgranksyntheticscore": "higher",
+            "wincountreconstruction": "higher",
+            "wincountsynthetic": "higher",
         }
 
         return goal_map.get(key, "lower")
@@ -179,6 +189,15 @@ class PhasedModelComparator:
             "hourlyconsumptionbyday",
             "peakanalysis"
         }
+
+        summary_metrics = {
+            "avgminmaxreconstructionscore", "avgminmaxsyntheticscore",
+            "avgrankreconstructionscore", "avgranksyntheticscore",
+            "wincountreconstruction", "wincountsynthetic",
+        }
+
+        if key in summary_metrics:
+            return None  # never feed summary metrics back into themselves
 
         if key in reconstruction_metrics:
             return "reconstruction"
@@ -239,6 +258,15 @@ class PhasedModelComparator:
         if not self.models_data[model_name]:
             print(f"No valid evaluation results found in {model_dir} for model {model_name}")
 
+    def _sort_models_by_synthetic_score(self, phase: str) -> list[str]:
+        """Return model names sorted by Avg MinMax Synthetic Score descending (best first)."""
+        score_key = "Avg MinMax Synthetic Score"
+
+        def _score(model_name: str) -> float:
+            return float(self.models_data.get(model_name, {}).get(phase, {}).get(score_key, -1.0))
+
+        return sorted(self.models_data.keys(), key=_score, reverse=True)
+
     def compare(self):
         """Generate comparison tables and plots for each phase."""
         if not self.models_data:
@@ -253,85 +281,105 @@ class PhasedModelComparator:
             if models_with_phase and len(models_with_phase) == len(self.models_data):
                 print(f"\n--- Comparing models for phase: {phase} ---")
                 self._compute_averages(phase)
-                self._generate_table(phase)
-                self._generate_plots(phase)
+                sorted_models = self._sort_models_by_synthetic_score(phase)
+                self._generate_table(phase, sorted_models)
+                self._generate_plots(phase, sorted_models)
             elif models_with_phase:
                 missing = [m for m in self.models_data if phase not in self.models_data[m]]
                 print(f"\n[Skipping phase '{phase}': missing for models {missing}]")
 
     def _compute_averages(self, phase: str):
-        """Compute normalized min-max average scores for reconstruction and synthetic metrics."""
+        """Compute three aggregate scores (min-max, rank, win count) for reconstruction and synthetic metrics."""
         all_metrics = set()
         for model_name, data in self.models_data.items():
             if phase in data:
                 for metric, val in data[phase].items():
                     if isinstance(val, (int, float)) and self._include_metric(metric):
                         all_metrics.add(metric)
-                        
+
         scalar_metrics = list(all_metrics)
         models = list(self.models_data.keys())
 
-        preferred_last = [
-            "Avg Baseline",
-            "Mean Baseline",
-            "Quantile Baseline",
-        ]
+        preferred_last = ["Avg Baseline", "Mean Baseline", "Quantile Baseline"]
         non_last = [m for m in models if m not in preferred_last]
         last = [m for m in preferred_last if m in models]
         models = non_last + last
-        
-        # --- Normalization for Average Plotting ---
-        scores_dict = {m: {} for m in models}
+
+        def _comparable(v: float, goal: str) -> float:
+            """Map to a value where lower is always better."""
+            if goal == "higher":    return -v
+            if goal == "target_1":  return abs(v - 1.0)
+            if goal == "target_0":  return abs(v)
+            return v  # lower
+
+        minmax_scores: dict[str, dict] = {m: {} for m in models}
+        rank_scores:   dict[str, dict] = {m: {} for m in models}
+        win_counts:    dict[str, dict] = {m: {} for m in models}
+
         for metric in scalar_metrics:
             goal = self._metric_goal(metric)
 
-            raw_vals = []
-            for m in models:
-                v = self.models_data[m].get(phase, {}).get(metric, None)
-                raw_vals.append((m, v))
+            valid = {
+                m: float(v)
+                for m in models
+                for v in [self.models_data[m].get(phase, {}).get(metric)]
+                if isinstance(v, (int, float))
+            }
+            if not valid:
+                continue
 
-            mapped_vals = {}
-            for m, v in raw_vals:
-                if isinstance(v, (int, float)):
-                    v = float(v)
+            mapped = {m: _comparable(v, goal) for m, v in valid.items()}
 
-                    # Convert everything so lower is internally better
-                    if goal == "higher":
-                        mapped_vals[m] = -v
-                    elif goal == "target_1":
-                        mapped_vals[m] = abs(v - 1.0)
-                    elif goal == "target_0":
-                        mapped_vals[m] = abs(v - 0.0)
-                    else:  # lower
-                        mapped_vals[m] = v
-                                
-            if mapped_vals:
-                vmin = min(mapped_vals.values())
-                vmax = max(mapped_vals.values())
-                for m, val in mapped_vals.items():
-                    if vmax == vmin:
-                        scores_dict[m][metric] = 1.0
-                    else:
-                        # 1.0 is the best score, 0.0 is the worst score
-                        scores_dict[m][metric] = 1.0 - (val - vmin) / (vmax - vmin)
+            # Min-max: 1.0 = best, 0.0 = worst
+            vmin, vmax = min(mapped.values()), max(mapped.values())
+            for m, c in mapped.items():
+                minmax_scores[m][metric] = 1.0 if vmax == vmin else 1.0 - (c - vmin) / (vmax - vmin)
+
+            # Rank-based: 1.0 = first place, 0.0 = last place (ties share rank)
+            sorted_ms = sorted(mapped, key=mapped.__getitem__)
+            n = len(sorted_ms)
+            i = 0
+            while i < n:
+                j = i + 1
+                while j < n and mapped[sorted_ms[j]] == mapped[sorted_ms[i]]:
+                    j += 1
+                avg_rank = (i + j - 1) / 2  # 0-indexed
+                for k in range(i, j):
+                    rank_scores[sorted_ms[k]][metric] = 1.0 if n == 1 else 1.0 - avg_rank / (n - 1)
+                i = j
+
+            # Win count: 1.0 for sole winner, split equally on ties
+            best = min(mapped.values())
+            winners = [m for m, c in mapped.items() if c == best]
+            share = 1.0 / len(winners)
+            for m in valid:
+                win_counts[m][metric] = share if m in winners else 0.0
 
         recon_metrics = [m for m in scalar_metrics if self._metric_group(m) == "reconstruction"]
         synth_metrics = [m for m in scalar_metrics if self._metric_group(m) == "synthetic"]
-        
+
         for m in models:
             if phase not in self.models_data[m]:
                 continue
-            recon_scores = [scores_dict[m][met] for met in recon_metrics if met in scores_dict[m]]
-            synth_scores = [scores_dict[m][met] for met in synth_metrics if met in scores_dict[m]]
-            
-            if recon_scores:
-                self.models_data[m][phase]['Avg MinMax Reconstruction Score'] = float(np.mean(recon_scores))
-            if synth_scores:
-                self.models_data[m][phase]['Avg MinMax Synthetic Score'] = float(np.mean(synth_scores))
 
-    def _generate_table(self, phase: str):
+            r_mm   = [minmax_scores[m][met] for met in recon_metrics if met in minmax_scores[m]]
+            s_mm   = [minmax_scores[m][met] for met in synth_metrics  if met in minmax_scores[m]]
+            r_rank = [rank_scores[m][met]   for met in recon_metrics  if met in rank_scores[m]]
+            s_rank = [rank_scores[m][met]   for met in synth_metrics  if met in rank_scores[m]]
+            r_wins = [win_counts[m][met]    for met in recon_metrics  if met in win_counts[m]]
+            s_wins = [win_counts[m][met]    for met in synth_metrics  if met in win_counts[m]]
+
+            if r_mm:   self.models_data[m][phase]['Avg MinMax Reconstruction Score'] = float(np.mean(r_mm))
+            if s_mm:   self.models_data[m][phase]['Avg MinMax Synthetic Score']      = float(np.mean(s_mm))
+            if r_rank: self.models_data[m][phase]['Avg Rank Reconstruction Score']   = float(np.mean(r_rank))
+            if s_rank: self.models_data[m][phase]['Avg Rank Synthetic Score']         = float(np.mean(s_rank))
+            if r_wins: self.models_data[m][phase]['Win Count Reconstruction']         = float(sum(r_wins))
+            if s_wins: self.models_data[m][phase]['Win Count Synthetic']              = float(sum(s_wins))
+
+    def _generate_table(self, phase: str, sorted_models: list[str] | None = None):
         """Generate and print a comparison table of scalar metrics for a given phase."""
-        headers = ["Metric"] + list(self.models_data.keys())
+        models_order = sorted_models if sorted_models is not None else list(self.models_data.keys())
+        headers = ["Metric"] + models_order
         
         # Collect all unique metric names
         all_metrics = set()
@@ -344,24 +392,47 @@ class PhasedModelComparator:
         # scalar_metrics = sorted(list(all_metrics))
         scalar_metrics = sorted(all_metrics, key=lambda m: (0 if "Reconstruction" in m or "Flexibility" in m else 1, m))
         
-        # Move averages to the end
-        averages = [m for m in scalar_metrics if m.startswith('Avg MinMax')]
-        non_averages = [m for m in scalar_metrics if not m.startswith('Avg MinMax')]
-        scalar_metrics = non_averages + averages
+        # Move all summary metrics to the end
+        _SUMMARY = {'Avg MinMax Reconstruction Score', 'Avg MinMax Synthetic Score',
+                    'Avg Rank Reconstruction Score',   'Avg Rank Synthetic Score',
+                    'Win Count Reconstruction',        'Win Count Synthetic'}
+        summaries    = [m for m in scalar_metrics if m in _SUMMARY]
+        non_summary  = [m for m in scalar_metrics if m not in _SUMMARY]
+        scalar_metrics = non_summary + summaries
                 
         table_data = []
         for metric in scalar_metrics:
-            # row = [metric]
+            goal = self._metric_goal(metric)
+
+            # Find the winning model for this metric
+            model_vals = {
+                m: float(self.models_data[m][phase][metric])
+                for m in models_order
+                if phase in self.models_data[m] and metric in self.models_data[m][phase]
+                and isinstance(self.models_data[m][phase][metric], (int, float))
+            }
+            best_model = None
+            if model_vals:
+                if goal == "target_1":
+                    best_model = min(model_vals, key=lambda m: abs(model_vals[m] - 1.0))
+                elif goal == "target_0":
+                    best_model = min(model_vals, key=lambda m: abs(model_vals[m]))
+                elif goal == "higher":
+                    best_model = max(model_vals, key=model_vals.__getitem__)
+                else:
+                    best_model = min(model_vals, key=model_vals.__getitem__)
+
             row = [self._display_metric_name(metric)]
-            for model_name, data in self.models_data.items():
+            for model_name in models_order:
+                data = self.models_data[model_name]
                 if phase in data and metric in data[phase]:
                     val = data[phase][metric]
-                    if isinstance(val, float):
-                        row.append(f"{val:.4f}")
-                    else:
-                        row.append(str(val))
+                    formatted = f"{val:.4f}" if isinstance(val, float) else str(val)
+                    if model_name == best_model:
+                        formatted = f"★ {formatted}"
                 else:
-                    row.append("N/A")
+                    formatted = "N/A"
+                row.append(formatted)
             table_data.append(row)
             
         table_str = tabulate(table_data, headers=headers, tablefmt="grid")
@@ -371,11 +442,11 @@ class PhasedModelComparator:
         phase_output_dir = os.path.join(self.output_dir, phase)
         os.makedirs(phase_output_dir, exist_ok=True)
         table_path = os.path.join(phase_output_dir, "comparison_table.txt")
-        with open(table_path, "w") as f:
+        with open(table_path, "w", encoding="utf-8") as f:
             f.write(table_str)
         print(f"\nTable saved to {table_path}")
 
-    def _generate_plots(self, phase: str):
+    def _generate_plots(self, phase: str, sorted_models: list[str] | None = None):
         """Generate bar charts for scalar metrics for a given phase, split by reconstruction and synthetic metrics."""
         all_metrics = set()
         for model_name, data in self.models_data.items():
@@ -383,37 +454,35 @@ class PhasedModelComparator:
                 for metric, val in data[phase].items():
                     if isinstance(val, (int, float)) and self._include_metric(metric):
                         all_metrics.add(metric)
-                
+
         scalar_metrics = list(all_metrics)
         if not scalar_metrics:
             return
-        
+
         # Separate metrics by group
         reconstruction_metrics = [m for m in scalar_metrics if self._metric_group(m) == "reconstruction"]
         synthetic_metrics = [m for m in scalar_metrics if self._metric_group(m) == "synthetic"]
-        
-        # Add their respective BEST metrics at the end
-        reconstruction_best = "Avg MinMax Reconstruction Score"
-        synthetic_best = "Avg MinMax Synthetic Score"
-        
-        if reconstruction_best in scalar_metrics:
-            reconstruction_metrics.append(reconstruction_best)
-        if synthetic_best in scalar_metrics:
-            synthetic_metrics.append(synthetic_best)
-        
-        # Sort each group (BEST metrics come last)
-        reconstruction_metrics = sorted(reconstruction_metrics, key=lambda m: (1 if m == reconstruction_best else 0, m))
-        synthetic_metrics = sorted(synthetic_metrics, key=lambda m: (1 if m == synthetic_best else 0, m))
-        
-        models = list(self.models_data.keys())
-        preferred_last = [
-            "Avg Baseline",
-            "Mean Baseline",
-            "Quantile Baseline",
+
+        # Append summary metrics at the end of each group in a fixed order
+        _RECON_SUMMARY = [
+            "Avg MinMax Reconstruction Score",
+            "Avg Rank Reconstruction Score",
+            "Win Count Reconstruction",
         ]
-        non_last = [m for m in models if m not in preferred_last]
-        last = [m for m in preferred_last if m in models]
-        models = non_last + last
+        _SYNTH_SUMMARY = [
+            "Avg MinMax Synthetic Score",
+            "Avg Rank Synthetic Score",
+            "Win Count Synthetic",
+        ]
+        reconstruction_metrics = sorted(
+            [m for m in scalar_metrics if self._metric_group(m) == "reconstruction"]
+        ) + [m for m in _RECON_SUMMARY if m in scalar_metrics]
+
+        synthetic_metrics = sorted(
+            [m for m in scalar_metrics if self._metric_group(m) == "synthetic"]
+        ) + [m for m in _SYNTH_SUMMARY if m in scalar_metrics]
+
+        models = sorted_models if sorted_models is not None else list(self.models_data.keys())
         
         # Generate plots for each metric group
         plot_style = PlotStyle()
@@ -873,6 +942,78 @@ if __name__ == "__main__":
             "val_ratio": 0.1 if args.val_ratio is None else float(args.val_ratio),
             "test_ratio": 0.1 if args.test_ratio is None else float(args.test_ratio),
         }
+
+    args.models = [#"E:/models/new1/CVAE_20260521_234622_guide",
+                   "E:/models/new1/CVAE_20260522_013003_cvae",  "E:/models/new1/CVAE_20260522_041326_guide_cnn",
+                   "E:/models/new1/CVAE_20260522_051533_h_guide_cnn", 
+                   "E:/models/new1/QuantileBaselineModel_20260522_034728", 
+                #    "E:/models/old/Guide Vamp", "E:/models/old/Guide Hierarchy", "E:/models/old/Guide CNN Hierarchy",
+                #     "E:/models/old/AverageBaselineModel",
+                #    "E:/models/old/AutoRegressiveTransformerVAE",
+                   "E:/models/new1/DiffusionModel_20260522_070459",
+                   "C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_113725",
+                   "E:/models/new1/FaradayModel_20260522_083016",
+                   "C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_134604",
+                   #"C:/Users/rasmu/Desktop/Thesis/models/new/CVAE_20260525_143604",
+                   #"C:/Users/rasmu/Desktop/Thesis/models/new/CVAE_20260525_154532",
+                   "C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_165636",
+                   #"C:/Users/rasmu/Desktop/Thesis/models/new/CVAE_20260525_175145",
+                   "C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_205135",
+                   "C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_213329",
+                   "C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_222016",
+                   "E:/models/new2/CVAE_20260525_233836","E:/models/new2/CVAE_20260526_011125","E:/models/new2/CVAE_20260526_024444",
+                   "E:/models/new2/CVAE_20260526_053436","E:/models/new2/CVAE_20260526_091116","E:/models/new2/DiffusionModel_20260526_070858",
+                   "E:/models/new2/CVAE_20260526_154037", "E:/models/new2/FaradayModel_20260526_102007", "E:/models/new2/GuidedFaradayModel_20260526_110124",
+                   "E:/models/new2/GuidedFaradayModel_20260526_114407", "E:/models/new2/GuidedFaradayModel_20260526_122401"
+                   ]
+    args.names = [#"Guide", 
+                  "CVAE", "Guide-CNN",
+                    "H-Guide-CNN", 
+                    "Quantiles Baseline",
+                #   "Guide Vamp", "Guide Hierarchy", "Guide CNN Hierarchy",  "Average Baseline",
+                #     "AutoRegressiveTransformerVAE", 
+                    "Diffusion",    
+                    "Guided-Faraday 2", 
+                    "Faraday",
+                    "Guided-Faraday 3", 
+                    # "Guide CNN", 
+                    # "Guide CNN 2",
+                    "Guided-Faraday 4",
+                    #"Guide CNN 3",
+                    "Guided-Faraday 5",
+                    "Guided-Faraday 6",
+                    "Guided-Faraday 7",
+                    "H-Guide-n", "Guide-n", "Guide-CNN-n", 
+                  "H-Guide-CNN-n", "CVAE-n", "Diffusion-n", 
+                  "Guide-Vamp-n", "Faraday-n", "Guided-Faraday-n", 
+                  "Guided-Faraday-CNN-n", "Guided-Faraday-CNN-2-n"
+                  ]
+    # Guided-Faraday 2: used the tanh. 
+    # Guided-Faraday 3: used softplus with beta=10. Non-stochastic loss  (2,363,544 params)
+    # Guide-Faraday 4: will be stochastic in the loss (see loss function)
+    # Guide-Faraday 5: using mu activaton = none, still stochastic in the loss
+    #                   Using larger pdcc average max std (4) (2,363,544 params)
+    # Guide-Faraday 6: using mu activation = None, still stochastic in the loss, User-Profiles included (2,363,544 params)
+    # Guide-Faraday 7: using mu activation = None, non-stochastic, User-profiles (2,363,544 params)
+    # Guide-Faraday 8: Will not early stop before 15 patience. Using mu activation = None, stochastic (2,363,544 params)
+
+    # Guide-CNN: used the tanh activation in forward (see git)
+    # Guide CNN: used softplus but with beta=1. 
+    # Guide CNN 2: used softplus with beta=15. (1,153,153 params)
+    # Guide CNN 3: is scaled up to the other models size and used softplus with beta=100 in sampling and None in forward. (2,114,433 params
+    # Guide CNN 4: using tanh in forward like back in the day but with actual parameter count (2,114,433 params)
+
+    # args.models = ["E:/models/new2/CVAE_20260525_233836","E:/models/new2/CVAE_20260526_011125","E:/models/new2/CVAE_20260526_024444",
+    #                "E:/models/new2/CVAE_20260526_053436","E:/models/new2/CVAE_20260526_091116","E:/models/new2/DiffusionModel_20260526_070858",
+    #                "E:/models/new2/CVAE_20260526_154037", "E:/models/new2/FaradayModel_20260526_102007", "E:/models/new2/GuidedFaradayModel_20260526_110124",
+    #                "E:/models/new2/GuidedFaradayModel_20260526_114407", "E:/models/new2/GuidedFaradayModel_20260526_122401"
+    #                ]
+
+    # args.names = ["H-Guide", "Guide", "Guide-CNN", 
+    #               "H-Guide-CNN", "CVAE", "Diffusion", 
+    #               "Guide-Vamp", "Faraday", "Guided-Faraday", 
+    #               "Guided-Faraday-CNN", "Guided-Faraday-CNN-2"]
+
 
     compare_models(
         model_paths=args.models,

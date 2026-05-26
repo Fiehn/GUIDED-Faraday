@@ -257,9 +257,10 @@ class SyntheticGenerator:
                 conditions = encode_conditions.to(self.device, dtype=model_dtype)  # SHAPER: [batch_size, num_conditions]
 
         is_sequential_phase_vae = self.model.__class__.__name__ == 'SequentialPhaseVAE'
+        is_guided_faraday = self.model.__class__.__name__ == 'GuidedFaradayModel'
 
         if self._is_baseline_model():
-            flat_output = self.model.reconstruct(input_data)
+            flat_output = self.model.reconstruct(input_data, meter_id=meter_id, timestamps=timestamp)  # SHAPER: [batch_size, seq_len * num_features]
         elif self._is_diffusion:
             flat_output = self.model.reconstruct(
                 input_data,
@@ -298,6 +299,15 @@ class SyntheticGenerator:
             flat_recon = phased_recon.reshape(phased_recon.shape[0], -1)  # SHAPER: [batch_size, num_phases, seq_len] | [batch_size, seq_len, num_phases] -> [batch_size, num_phases * seq_len]
             # Add reconstruction count dimension to get [1, B, 72]
             flat_output = flat_recon.unsqueeze(0)  # SHAPER: [batch_size, num_phases * seq_len] -> [1, batch_size, num_phases * seq_len]
+        elif is_guided_faraday:
+            # GuidedFaradayModel encoder takes (x_flat, c) separately — cannot use the CVAE path
+            # which passes a single concatenated tensor.
+            x_flat = self.model._prep_inputs(input_data.to(self.device))
+            c = self.model._get_conditions(
+                input_data, meter_id=meter_id, timestamps=timestamp, device=self.device
+            )
+            mu, _ = self.model.encoder(x_flat, c)
+            recon_params = self.model.decoder(torch.cat([mu, c], dim=-1))  # {"mu": [B,D], "sigma": [B,D]}
         # Conditions for the encoding are always based on the original meter_id and timestamp, to get the correct latent representation.
         elif self._is_cvae:
             # Ensure input_data is flattened appropriately
@@ -482,7 +492,7 @@ class SyntheticGenerator:
         needed = num_samples
 
         if self._is_baseline_model() and not self._is_cvae:
-            samples = self.model.sample(num_samples=num_samples)
+            samples = self.model.sample(num_samples=num_samples, conditions=conditions)
             # Baseline returns [N, 1, 1, D], already correctly laid out (F-first if phased)
             final_samples = samples.reshape(num_samples, -1)  # SHAPER: [num_samples, 1, 1, seq_len * num_features] -> [num_samples, seq_len * num_features]
             valid_samples.append(final_samples)

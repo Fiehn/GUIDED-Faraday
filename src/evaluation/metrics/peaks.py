@@ -203,6 +203,10 @@ class PeakAnalysis(SyntheticMetric):
             self.plot_load_duration_curve()
             magnitude_metric = self._EMD1()
             timing_metric = self.timing_analysis()
+
+            window_size = self._infer_window_size(self.real_data)
+
+            timing_metric = timing_metric / (window_size / 2) 
             
             # Save individual metrics
             _save_standalone_metric_result(

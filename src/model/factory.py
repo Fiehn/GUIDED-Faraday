@@ -218,6 +218,8 @@ def create_model_from_config(config, device ="cpu"):
                     decoder_hidden_dims=decoder_hidden_dims,
                     encoder_dropout=encoder_dropout,
                     decoder_dropout=decoder_dropout,
+                    encoder_average_max_std=getattr(encoder_cfg, "average_max_std", 1.0),
+                    decoder_average_max_std=getattr(decoder_cfg, "average_max_std", 1.0),
                     phased_mode=phased_mode,
                     sequence_length=seq_len,
                     include_faraday_like=getattr(model_cfg, "faraday_like", False)
@@ -386,6 +388,31 @@ def create_model_from_config(config, device ="cpu"):
             decoder_dropout=decoder_dropout,
             phased_mode=phased_mode,
         )
+    elif model_type == "guided_faraday":
+        from src.model.guided_faraday import GuidedFaradayModel
+        faraday_cfg = getattr(model_cfg, "faraday", SimpleNamespace())
+        gf_cfg = getattr(model_cfg, "guided_faraday", SimpleNamespace())
+        gmm_cfg = getattr(model_cfg, "gmm", SimpleNamespace())
+        model = GuidedFaradayModel(
+            sequence_length=seq_len,
+            num_features=int(getattr(gf_cfg, "num_features", 3)),
+            latent_dim=model_cfg.latent_dim,
+            conditioner=conditioner,
+            encoder_type=encoder_cfg.type,
+            encoder_hidden_dims=encoder_hidden_dims,
+            decoder_hidden_dims=decoder_hidden_dims,
+            dictionary_size=int(getattr(gf_cfg, "dictionary_size", 100)),
+            pdcc_average_max_std=float(getattr(gf_cfg, "pdcc_average_max_std", 1.0)),
+            mse_weight=float(getattr(faraday_cfg, "mse_weight", 0.0)),
+            mmd_weight=float(getattr(faraday_cfg, "mmd_weight", 100.0)),
+            upper_quantile_weight=float(getattr(faraday_cfg, "upper_quantile_weight", 0.0)),
+            lower_quantile_weight=float(getattr(faraday_cfg, "lower_quantile_weight", 0.0)),
+            median_quantile_weight=float(getattr(faraday_cfg, "median_quantile_weight", 0.0)),
+            gmm_n_components=int(getattr(gmm_cfg, "n_components", 300)),
+            gmm_max_iter=int(getattr(gmm_cfg, "max_iter", 100)),
+            gmm_reg_covar=float(getattr(gmm_cfg, "reg_covar", 1e-6)),
+            stochastic_loss=bool(getattr(gf_cfg, "stochastic_loss", True)),
+        )
     elif model_type == "faraday":
         from src.model.faraday import FaradayModel
         faraday_cfg = getattr(model_cfg, "faraday", SimpleNamespace())
@@ -404,6 +431,7 @@ def create_model_from_config(config, device ="cpu"):
             gmm_n_components=int(getattr(gmm_cfg, "n_components", 300)),
             gmm_covariance_type=str(getattr(gmm_cfg, "covariance_type", "full")),
             gmm_max_iter=int(getattr(gmm_cfg, "max_iter", 100)),
+            gmm_reg_covar=float(getattr(gmm_cfg, "reg_covar", 1e-6)),
         )
     else:
         raise ValueError(f"Unknown model type '{model_type}' specified in config.")

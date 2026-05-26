@@ -24,3 +24,6 @@ model:
     vamp_num_components: 40
     init_from_data: true
     init_noise_scale: 0.01
+
+data:
+  batch_size: 1024

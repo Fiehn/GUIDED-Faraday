@@ -17,6 +17,8 @@ class CVAE(VAE):
         sequence_length: int = 24,
         extra_condition_dim: int = 0,
         include_faraday_like: bool = False,
+        encoder_average_max_std: float = 1.0,
+        decoder_average_max_std: float = 1.0,
         **kwargs,
     ):
         if distribution_dict is None:
@@ -80,6 +82,9 @@ class CVAE(VAE):
             input_dim=input_dim + self.condition_dim,
             latent_dim=latent_dim,
             type=kwargs.get("encoder_type", "dictionary"),
+            cond_dim=self.condition_dim,  # CNN encoders inject conditions at bottleneck
+            average_max_std=encoder_average_max_std,
+            mu_activation="none", # TODO: !!! consider making this configurable: maybe tanh for this????
             **encoder_model_kwargs,
             **base_kwargs,
         )
@@ -89,6 +94,7 @@ class CVAE(VAE):
             latent_dim=self.decoder_input_dim + self.condition_dim,
             output_dim=input_dim,
             type=kwargs.get("decoder_type", "dictionary"),
+            average_max_std=decoder_average_max_std,
             **decoder_model_kwargs,
             **base_kwargs,
         )
