@@ -2,8 +2,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import json
+import time
 from typing import Dict, List, Any, Optional
-from datetime import datetime 
+from datetime import datetime
 
 import os
 import sys
@@ -344,23 +345,31 @@ class EvalFramework:
                 self._train_reconstructed_data = _sanitize_numeric_array(np.asarray(train_recon))
             return
 
-        if self.verbose:
-            print("Preparing data for evaluation metrics...")
+        print("  [1/3] Collecting reconstructions from dataloader...", end='', flush=True)
+        t_recon = time.time()
         real_batches = []
         recon_batches = []
         condition_batches = []
         meter_id_batches = []
         timestamp_batches = []
 
+        # Cap real-data collection at n_synthetic_samples so we never run more
+        # encoder forward-passes than we have synthetic samples to compare against.
+        n_to_collect = self.n_synthetic_samples
+        n_collected = 0
+
         self.model.eval()
         with torch.no_grad():
             for batch in self.dataloader:
+                if n_collected >= n_to_collect:
+                    break
+
                 data, meter_ids, timestamps, agg = self._unpack_batch(batch)
-                
+
                 data = data.to(self.device)
                 if self._is_cvae() and self.conditioner is not None:
                     cond_input = self._prepare_condition_input(data)
-                    
+
                     c = self.conditioner.get_conditions(cond_input, meter_id=meter_ids, timestamps=timestamps)
                     if isinstance(c, np.ndarray):
                         c = torch.tensor(c, dtype=torch.float32)
@@ -369,7 +378,7 @@ class EvalFramework:
 
                 # Denormalize with robust axis handling for [B, L, F] and [B, F, L].
                 data_denorm = self._inverse_transform_for_metrics(data)
-                
+
                 x_flat = self._flatten_for_metrics(data_denorm)
                 real_batches.append(x_flat.cpu().numpy())
 
@@ -386,30 +395,47 @@ class EvalFramework:
 
                 recon = self._reconstruct(data, meter_id=meter_ids, timestamps=timestamps)
                 recon_batches.append(recon.cpu().numpy())
+                n_collected += len(data)
 
-        self._real_data = _sanitize_numeric_array(np.concatenate(real_batches, axis=0))  # SHAPER: [n_windows, n_features * seq_len]
-        self._reconstructed_data = _sanitize_numeric_array(np.concatenate(recon_batches, axis=0))  # SHAPER: [n_windows, n_features * seq_len]
-        self._meter_ids = np.concatenate(meter_id_batches, axis=0) if meter_id_batches else None  # SHAPER: [n_windows]
-        self._timestamps = np.concatenate(timestamp_batches, axis=0) if timestamp_batches else None  # SHAPER: [n_windows]
+        # Trim to exactly n_to_collect (last batch may overshoot by up to batch_size - 1)
+        self._real_data = _sanitize_numeric_array(np.concatenate(real_batches, axis=0)[:n_to_collect])  # SHAPER: [n_to_collect, n_features * seq_len]
+        self._reconstructed_data = _sanitize_numeric_array(np.concatenate(recon_batches, axis=0)[:n_to_collect])  # SHAPER: [n_to_collect, n_features * seq_len]
+        self._meter_ids = np.concatenate(meter_id_batches, axis=0)[:n_to_collect] if meter_id_batches else None  # SHAPER: [n_to_collect]
+        self._timestamps = np.concatenate(timestamp_batches, axis=0)[:n_to_collect] if timestamp_batches else None  # SHAPER: [n_to_collect]
+        print(f" done — {len(self._real_data)} windows ({time.time() - t_recon:.1f}s)")
 
         if self._is_cvae() and condition_batches:
             all_conditions = torch.cat(condition_batches, dim=0)  # SHAPER: [n_windows, condition_dim]
+            # Build parallel metadata arrays so secondary models (e.g. HierarchicalSplitter)
+            # can construct their own conditions from the same real-data windows.
+            all_meter_ids  = np.concatenate(meter_id_batches,  axis=0) if meter_id_batches  else None
+            all_timestamps = np.concatenate(timestamp_batches, axis=0) if timestamp_batches else None
             n = self.n_synthetic_samples
             if len(all_conditions) >= n:
                 idx = torch.randperm(len(all_conditions))[:n]
                 self._synthetic_conditions = all_conditions[idx]  # SHAPER: [n_synthetic_samples, condition_dim]
+                idx_np = idx.numpy()
+                self._synthetic_meter_ids  = all_meter_ids[idx_np]  if all_meter_ids  is not None else None
+                self._synthetic_timestamps = all_timestamps[idx_np] if all_timestamps is not None else None
             else:
                 repeats = (n // len(all_conditions)) + 1
                 self._synthetic_conditions = all_conditions.repeat(repeats, 1)[:n]  # SHAPER: [n_synthetic_samples, condition_dim]
+                self._synthetic_meter_ids  = np.tile(all_meter_ids,  repeats)[:n] if all_meter_ids  is not None else None
+                self._synthetic_timestamps = np.tile(all_timestamps, repeats)[:n] if all_timestamps is not None else None
         else:
             self._synthetic_conditions = None
+            self._synthetic_meter_ids  = None
+            self._synthetic_timestamps = None
 
+        print(f"  [2/3] Generating {self.n_synthetic_samples} synthetic samples...", end='', flush=True)
+        t_synth = time.time()
         self._synthetic_data = _sanitize_numeric_array(self._generate_synthetic(self.n_synthetic_samples))
+        print(f" done ({time.time() - t_synth:.1f}s)")
 
         # Collect member windows (training data) for MIA privacy metrics.
         if self.train_dataloader is not None and self.privacy_metrics:
-            if self.verbose:
-                print("Collecting member windows for MIA...")
+            print("  [3/3] Collecting member windows for MIA...", end='', flush=True)
+            t_mia = time.time()
             train_real_batches = []
             train_recon_batches = []
             n_collected = 0
@@ -439,6 +465,7 @@ class EvalFramework:
                 self._train_reconstructed_data = _sanitize_numeric_array(
                     np.concatenate(train_recon_batches, axis=0)[:self.n_member_samples]
                 )
+            print(f" done — {n_collected} member windows ({time.time() - t_mia:.1f}s)")
 
     def _reconstruct(self, x: torch.Tensor, 
                      meter_id: torch.Tensor | int | None = None, 
@@ -532,7 +559,14 @@ class EvalFramework:
             if self._synthetic_conditions is None:
                 raise ValueError("CVAE synthetic generation requires prepared conditions, but none were found.")
             conditions = self._synthetic_conditions.to(self.device)
-            synthetic, _ = self.generator.generate(n_samples, conditions=conditions)
+            synthetic, _ = self.generator.generate(
+                n_samples,
+                conditions=conditions,
+                # Pass window-aligned metadata so secondary models (e.g. HierarchicalSplitter)
+                # can build their own conditions without sharing the primary's condition space.
+                meter_ids=getattr(self, '_synthetic_meter_ids', None),
+                timestamps=getattr(self, '_synthetic_timestamps', None),
+            )
         else:
             synthetic, _ = self.generator.generate(n_samples)
 
@@ -664,50 +698,45 @@ class EvalFramework:
         Returns:
             Dict[str, float]: Dictionary mapping metric names to their computed values
         """
-        print(f"[{self.evaluation_title}] Running evaluation...")
-        
+        t_total = time.time()
+        print(f"\n{'='*60}")
+        print(f"  {self.evaluation_title}")
+        print(f"{'='*60}")
+
         # Prepare data for metrics that need it (reconstructions, synthetic samples)
         self._prepare_data()
         self._inject_data_into_metrics()
 
-        if self.verbose:
-            n_real = 0 if self._real_data is None else int(len(self._real_data))
-            n_synth = 0 if self._synthetic_data is None else int(len(self._synthetic_data))
-            print(f"Prepared data: real={n_real}, synthetic={n_synth}")
+        n_real  = 0 if self._real_data  is None else int(len(self._real_data))
+        n_synth = 0 if self._synthetic_data is None else int(len(self._synthetic_data))
+        print(f"  Data ready: {n_real} real windows, {n_synth} synthetic samples\n")
 
         self.results = {}
-        
-        # Run reconstruction metrics
-        if self.reconstruction_metrics:
-            for name, metric in self.reconstruction_metrics.items():
-                try:
-                    value = metric.compute()
-                    self.results[name] = value
-                except Exception as e:
-                    if self.verbose:
-                        import traceback; traceback.print_exc(); print(f"Warning: metric '{name}' failed: {e}")
-                    self.results[name] = None
-        
-        # Run synthetic metrics
-        if self.synthetic_metrics:
-            for name, metric in self.synthetic_metrics.items():
-                try:
-                    value = metric.compute()
-                    self.results[name] = value
-                except Exception as e:
-                    import traceback; traceback.print_exc(); print(f"Warning: metric '{name}' failed: {e}")
-                    self.results[name] = None
 
-        # Run privacy metrics
-        if self.privacy_metrics:
-            for name, metric in self.privacy_metrics.items():
-                try:
-                    value = metric.compute()
-                    self.results[name] = value
-                except Exception as e:
-                    import traceback; traceback.print_exc(); print(f"Warning: metric '{name}' failed: {e}")
-                    self.results[name] = None
+        all_metrics = (
+            list(self.reconstruction_metrics.items())
+            + list(self.synthetic_metrics.items())
+            + list(self.privacy_metrics.items())
+        )
+        n_total = len(all_metrics)
 
+        for i, (name, metric) in enumerate(all_metrics, 1):
+            print(f"  [{i:>{len(str(n_total))}}/{n_total}] {name}...", end='', flush=True)
+            t_metric = time.time()
+            try:
+                value = metric.compute()
+                self.results[name] = value
+                elapsed = time.time() - t_metric
+                value_str = f"{float(value):.4f}" if isinstance(value, (float, int, np.floating, np.integer)) else str(value)
+                print(f" {value_str}  ({elapsed:.1f}s)")
+            except Exception as e:
+                elapsed = time.time() - t_metric
+                print(f" ERROR ({elapsed:.1f}s): {e}")
+                if self.verbose:
+                    import traceback; traceback.print_exc()
+                self.results[name] = None
+
+        print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
         self._print_results_table()
 
         return self.results
@@ -717,19 +746,32 @@ class EvalFramework:
         Returns:
             Dict[str, float]: Dictionary mapping reconstruction metric names to their computed values
         """
+        t_total = time.time()
+        print(f"\n{'='*60}")
+        print(f"  {self.evaluation_title}  [reconstruction only]")
+        print(f"{'='*60}")
 
         self.results = {}
-        for name, metric in self.reconstruction_metrics.items():
+        n_total = len(self.reconstruction_metrics)
+        for i, (name, metric) in enumerate(self.reconstruction_metrics.items(), 1):
+            print(f"  [{i:>{len(str(n_total))}}/{n_total}] {name}...", end='', flush=True)
+            t_metric = time.time()
             try:
                 value = metric.compute()
                 self.results[name] = value
+                elapsed = time.time() - t_metric
+                value_str = f"{float(value):.4f}" if isinstance(value, (float, int, np.floating, np.integer)) else str(value)
+                print(f" {value_str}  ({elapsed:.1f}s)")
             except Exception as e:
+                elapsed = time.time() - t_metric
+                print(f" ERROR ({elapsed:.1f}s): {e}")
                 if self.verbose:
-                    import traceback; traceback.print_exc(); print(f"Warning: metric '{name}' failed: {e}")
+                    import traceback; traceback.print_exc()
                 self.results[name] = None
 
         self.baseline_results = self._compute_mean_baseline_results(reconstruction_only=True) if self.include_mean_baseline else {}
 
+        print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
         self._print_interpretation_guide()
         self._print_results_table()
         return self.results
@@ -739,19 +781,32 @@ class EvalFramework:
         Returns:
             Dict[str, float]: Dictionary mapping synthetic metric names to their computed values
         """
+        t_total = time.time()
+        print(f"\n{'='*60}")
+        print(f"  {self.evaluation_title}  [synthetic only]")
+        print(f"{'='*60}")
 
         self.results = {}
-        for name, metric in self.synthetic_metrics.items():
+        n_total = len(self.synthetic_metrics)
+        for i, (name, metric) in enumerate(self.synthetic_metrics.items(), 1):
+            print(f"  [{i:>{len(str(n_total))}}/{n_total}] {name}...", end='', flush=True)
+            t_metric = time.time()
             try:
                 value = metric.compute()
                 self.results[name] = value
+                elapsed = time.time() - t_metric
+                value_str = f"{float(value):.4f}" if isinstance(value, (float, int, np.floating, np.integer)) else str(value)
+                print(f" {value_str}  ({elapsed:.1f}s)")
             except Exception as e:
+                elapsed = time.time() - t_metric
+                print(f" ERROR ({elapsed:.1f}s): {e}")
                 if self.verbose:
-                    import traceback; traceback.print_exc(); print(f"Warning: metric '{name}' failed: {e}")
+                    import traceback; traceback.print_exc()
                 self.results[name] = None
 
         self.baseline_results = self._compute_mean_baseline_results(synthetic_only=True) if self.include_mean_baseline else {}
 
+        print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
         self._print_interpretation_guide()
         self._print_results_table()
         return self.results

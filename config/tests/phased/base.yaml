@@ -81,22 +81,22 @@ training:
     ratio: 0.5
   weighted_loss: 0.2
   early_stopping:
-    enabled: false
+    enabled: true
     stop_on_all_files_used: false
     min_epochs_before_full_data_stop: 1
     patience: 5
     min_delta: 0.01
   checkpointing:
     save_freq: 20
-    save_dir: E:/models
+    save_dir: E:/models/phased/
     save_best_model: true
     save_best_after_fraction: 0.15
     save_final_model: true
 
 logging:
-  log_dir: E:/models
+  log_dir: E:/models/phased/
   save_config: true
-  config_save_dir: E:/models
+  config_save_dir: E:/models/phased/
 
 visualize:
   num_samples: 5

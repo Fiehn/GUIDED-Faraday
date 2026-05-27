@@ -255,6 +255,11 @@ class PerConditionEval(SyntheticMetric):
         self.acf_calculator.synthetic_data = synthetic_subset
         return float(self.acf_calculator.compute())
 
+    # Maximum training-set size passed to TSTR per condition group.
+    # A linear model converges well below this; the cap prevents O(N) wall-time
+    # growth when group sizes are large (e.g. 14k windows per day at 100k scale).
+    _TSTR_MAX_SAMPLES_PER_GROUP: int = 2000
+
     def _compute_subset_tstr(self, real_subset: np.ndarray, synthetic_subset: np.ndarray,
                              group_label: str = None) -> float:
         """Compute TSTR ratio for one subset using the TSTR metric; return None if too few samples."""
@@ -262,6 +267,13 @@ class PerConditionEval(SyntheticMetric):
             if self.verbose and group_label is not None:
                 print(f"\n  [TSTR] {group_label} -> insufficient samples (real={len(real_subset)}, synthetic={len(synthetic_subset)})")
             return None
+
+        # Cap per-group training data so wall-time stays bounded regardless of N.
+        cap = self._TSTR_MAX_SAMPLES_PER_GROUP
+        if len(real_subset) > cap:
+            real_subset = real_subset[:cap]
+        if len(synthetic_subset) > cap:
+            synthetic_subset = synthetic_subset[:cap]
 
         try:
             if self.verbose and group_label is not None:
@@ -678,14 +690,10 @@ class PerConditionEval(SyntheticMetric):
         if self.verbose:
             self._print_input_debug(real_data, synthetic_data, timestamps)
 
-        days_of_week = []
-        months_of_year = []
-        for ts in timestamps:
-            dt = datetime.utcfromtimestamp(ts)
-            days_of_week.append(dt.weekday())
-            months_of_year.append(dt.month)
-        days_of_week = np.array(days_of_week)
-        months_of_year = np.array(months_of_year)
+        import pandas as pd
+        _dts = pd.to_datetime(timestamps.astype(np.int64), unit='s', utc=True)
+        days_of_week = _dts.day_of_week.to_numpy(dtype=int)
+        months_of_year = _dts.month.to_numpy(dtype=int)
 
         # Resolve feeder IDs if available
         feeder_ids = self._resolve_feeder_ids(len(real_data))

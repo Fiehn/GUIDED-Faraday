@@ -203,62 +203,20 @@ class HourlyProfilesByMonth(SyntheticMetric):
     
     
     def _extract_months(self) -> np.ndarray:
-        """Extract month from timestamps with robust handling for multiple formats.
-        
-        Handles:
-        - Unix timestamps (int/float seconds since epoch)
-        - ISO datetime strings
-        - datetime objects
-        - numpy.datetime64
-        - pandas.Timestamp
-        
-        Falls back gracefully if timestamps are unavailable or unparseable.
+        """Extract month (1–12) from timestamps via a single vectorised call.
+
+        Handles both Unix-integer arrays (the normal dataloader path) and
+        datetime-object arrays (the None-fallback path in compute()).
         """
         if self.timestamps is None:
-            return np.ones(len(self.real_data), dtype=int)  # Default to month 1 if no timestamps
-        
-        months = []
-        for i, ts in enumerate(self.timestamps):
-            try:
-                # Try different timestamp formats
-                if ts is None:
-                    months.append(1)  # Default to January
-                elif isinstance(ts, datetime):
-                    months.append(ts.month)
-                elif isinstance(ts, str):
-                    # Try ISO format, then fallback to pandas parsing
-                    try:
-                        dt = datetime.fromisoformat(ts)
-                    except (ValueError, TypeError):
-                        import pandas as pd
-                        dt = pd.to_datetime(ts, utc=True).to_pydatetime()
-                    months.append(dt.month)
-                elif isinstance(ts, (int, np.integer)):
-                    # Unix timestamp (seconds since epoch)
-                    dt = datetime.utcfromtimestamp(ts)
-                    months.append(dt.month)
-                elif isinstance(ts, float):
-                    # Unix timestamp (seconds since epoch)
-                    dt = datetime.utcfromtimestamp(ts)
-                    months.append(dt.month)
-                elif hasattr(ts, 'month'):
-                    # numpy.datetime64 or pandas.Timestamp
-                    months.append(int(ts.month))
-                elif isinstance(ts, np.datetime64):
-                    # Convert numpy datetime64 to datetime
-                    import pandas as pd
-                    dt = pd.Timestamp(ts).to_pydatetime()
-                    months.append(dt.month)
-                else:
-                    # Last resort: try to convert to string and parse
-                    dt = datetime.fromisoformat(str(ts))
-                    months.append(dt.month)
-            except Exception:
-                # If all parsing fails, default to month 1
-                months.append(1)
-        
-        result = np.array(months)
-        return result
+            return np.ones(len(self.real_data), dtype=int)
+        import pandas as pd
+        ts = np.asarray(self.timestamps)
+        if ts.dtype.kind in ('i', 'u', 'f'):          # Unix seconds
+            dts = pd.to_datetime(ts.astype(np.int64), unit='s', utc=True)
+        else:                                          # datetime objects / datetime64
+            dts = pd.to_datetime(ts, utc=True)
+        return dts.month.to_numpy(dtype=int)
     
 
     def _plot_hourly_profiles(self, real_data, synthetic_data, months, 
@@ -545,55 +503,20 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
             raise  # Re-raise so framework sees the error
     
     def _extract_days_of_week(self) -> np.ndarray:
-        """Extract day of week from timestamps (0=Monday, 6=Sunday).
-        
-        Handles multiple timestamp formats with robust error handling.
+        """Extract day of week (0=Monday, 6=Sunday) from timestamps via a single vectorised call.
+
+        Handles both Unix-integer arrays (the normal dataloader path) and
+        datetime-object arrays (the None-fallback path in compute()).
         """
         if self.timestamps is None:
-            return np.zeros(len(self.real_data), dtype=int)  # Default to Monday if no timestamps
-        
-        days = []
-        for ts in self.timestamps:
-            try:
-                # Try different timestamp formats
-                if ts is None:
-                    days.append(0)  # Default to Monday
-                elif isinstance(ts, datetime):
-                    days.append(ts.weekday())  # 0=Monday, 6=Sunday
-                elif isinstance(ts, str):
-                    # Try ISO format, then fallback to pandas parsing
-                    try:
-                        dt = datetime.fromisoformat(ts)
-                    except (ValueError, TypeError):
-                        import pandas as pd
-                        dt = pd.to_datetime(ts, utc=True).to_pydatetime()
-                    days.append(dt.weekday())
-                elif isinstance(ts, (int, np.integer)):
-                    # Unix timestamp (seconds since epoch)
-                    dt = datetime.utcfromtimestamp(ts)
-                    days.append(dt.weekday())
-                elif isinstance(ts, float):
-                    # Unix timestamp (seconds since epoch)
-                    dt = datetime.utcfromtimestamp(ts)
-                    days.append(dt.weekday())
-                elif hasattr(ts, 'weekday'):
-                    # numpy.datetime64 or pandas.Timestamp
-                    days.append(int(ts.weekday()))
-                elif isinstance(ts, np.datetime64):
-                    # Convert numpy datetime64 to datetime
-                    import pandas as pd
-                    dt = pd.Timestamp(ts).to_pydatetime()
-                    days.append(dt.weekday())
-                else:
-                    # Last resort: try to convert to string and parse
-                    dt = datetime.fromisoformat(str(ts))
-                    days.append(dt.weekday())
-            except Exception:
-                # If all parsing fails, default to Monday
-                days.append(0)
-        
-        result = np.array(days)
-        return result
+            return np.zeros(len(self.real_data), dtype=int)
+        import pandas as pd
+        ts = np.asarray(self.timestamps)
+        if ts.dtype.kind in ('i', 'u', 'f'):          # Unix seconds
+            dts = pd.to_datetime(ts.astype(np.int64), unit='s', utc=True)
+        else:                                          # datetime objects / datetime64
+            dts = pd.to_datetime(ts, utc=True)
+        return dts.day_of_week.to_numpy(dtype=int)
     
     def _plot_hourly_profiles(self, real_data, synthetic_data, days_of_week, 
                              flexibility_distances_by_day, global_min=None):

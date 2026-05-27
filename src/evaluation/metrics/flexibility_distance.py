@@ -24,6 +24,12 @@ class FlexibilityDistance(ReconstructionMetric):
     reconstructed_data: np.ndarray = None
     output_path: str = None
 
+    # Maximum number of windows evaluated per compute() call.
+    # The Hungarian assignment is O(L³) per window; capping keeps wall-time
+    # predictable regardless of dataset size while the score stays stable
+    # above ~500 pairs.
+    MAX_SAMPLES: int = 2000
+
     def __init__(self, tau: str = 'auto', normalize: bool = True):
         self.tau = tau
         self.normalize = normalize
@@ -105,14 +111,20 @@ class FlexibilityDistance(ReconstructionMetric):
 
         if real_np.ndim != 2 or recon_np.ndim != 2:
             raise ValueError(f"Expected 2D arrays [N, D], got real={real_np.shape}, reconstructed={recon_np.shape}")
-        
+
         # Ensure shapes match
         if real_np.shape != recon_np.shape:
             min_samples = min(real_np.shape[0], recon_np.shape[0])
             min_features = min(real_np.shape[1], recon_np.shape[1])
             real_np = real_np[:min_samples, :min_features]
             recon_np = recon_np[:min_samples, :min_features]
-        
+
+        # Cap to MAX_SAMPLES: Hungarian is O(L³) per window so this keeps
+        # wall-time bounded; the score is statistically stable well below this.
+        if real_np.shape[0] > self.MAX_SAMPLES:
+            real_np = real_np[:self.MAX_SAMPLES]
+            recon_np = recon_np[:self.MAX_SAMPLES]
+
         # Compute FD per sample using assignment-based cost
         num_samples, series_len = real_np.shape
         fd_values = []

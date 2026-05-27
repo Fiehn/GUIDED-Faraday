@@ -349,32 +349,83 @@ class HierarchicalSplitter(BaseModel):
         }
 
     @torch.no_grad()
-    def sample(self, x_agg_generated, conditions, normalizer = None, device="cpu", **_):
-        """
-        Pass the Aggregated Synthetic data into here.
+    def sample(
+        self,
+        x_agg_generated,
+        conditions,
+        normalizer=None,
+        x_phased_real=None,
+        meter_id=None,
+        timestamps=None,
+        timestamp=None,
+        device="cpu",
+        **_,
+    ):
+        """Split aggregated generated data into 3 phases.
+
+        Conditions are always built fresh from the splitter's own conditioner so
+        that the condition dimension matches what the SplitterCNN was trained on.
+
+        Priority for building conditions:
+          1. ``x_phased_real`` — real phased input (reconstruction path).
+          2. ``meter_id`` / ``timestamps`` — metadata only (generation path).
+          3. ``conditions`` — fallback only when the splitter has no conditioner.
+
+        ``meter_id=None`` is not supported when the splitter has a conditioner; a
+        clear ValueError is raised rather than silently producing garbage outputs.
         """
         self.eval()
         self.to(device)
-        
+
         x_agg = self.move_to_device(x_agg_generated, device)
         if x_agg.dim() == 3 and x_agg.shape[2] == 1:
             x_agg = x_agg.transpose(1, 2)
-        
-        c = self.move_to_device(conditions, device)
-        c = c.float()
-        
-        # Predict Proportions
-        proportions = self.model(x_agg, c)
 
-        # Always return phase values in the same scale as x_agg.
+        ts = timestamps if timestamps is not None else timestamp
+
+        if self.conditioner is not None:
+            # Build conditions using the splitter's own conditioner so the
+            # condition dimension always matches SplitterCNN's expectation.
+            has_signal = x_phased_real is not None
+            has_meta   = meter_id is not None or ts is not None
+
+            if not has_signal and not has_meta:
+                raise ValueError(
+                    "HierarchicalSplitter.sample: conditioner is set but neither "
+                    "x_phased_real nor meter_id/timestamps were provided.  "
+                    "Cannot build conditions — pass at least one."
+                )
+
+            cond_x = None
+            if has_signal:
+                xp = self.move_to_device(x_phased_real, device).float()
+                cond_x = self._build_condition_input(self._to_phase_first(xp))  # [B, T, F]
+
+            c = self.conditioner.get_conditions(cond_x, meter_id=meter_id, timestamps=ts)
+            c = self.move_to_device(c, device).float()
+        else:
+            # No conditioner — use whatever was passed in (e.g. zero vector).
+            c = self.move_to_device(conditions, device).float()
+
+        # Predict proportions and scale by aggregate.
+        proportions = self.model(x_agg, c)
         x_pred = proportions * x_agg
+
         if normalizer is not None and hasattr(normalizer, "inverse_transform"):
             try:
                 return normalizer.inverse_transform(x_pred)
             except Exception:
-                print("[Warning]: Normalizer inverse_transform failed. Returning normalized phase values instead.")
+                print("[Warning]: Normalizer inverse_transform failed. Returning phase values in input scale.")
 
         return x_pred
 
-    def reconstruct(self, x_agg_generated, conditions, normalizer=None, x_phased_real = None, device="cpu", **kwargs):
-        return self.sample(x_agg_generated, conditions, normalizer=normalizer, device=device, **kwargs)
+    def reconstruct(self, x_agg_generated, conditions, normalizer=None, x_phased_real=None, device="cpu", **kwargs):
+        """Reconstruct by splitting; forwards x_phased_real and metadata to sample."""
+        return self.sample(
+            x_agg_generated,
+            conditions,
+            normalizer=normalizer,
+            x_phased_real=x_phased_real,
+            device=device,
+            **kwargs,
+        )

@@ -38,77 +38,66 @@ class ACFDistribution(SyntheticMetric):
     def name(self) -> str:
         return "ACF Distribution Match (KS)"
     
-    def _compute_acf(self, time_series, max_lag):
-        """
-        Compute autocorrelation function for a single time series.
-        
-        Args:
-            time_series (np.ndarray): 1D array of length T
-            max_lag (int): Maximum lag to compute
-            
-        Returns:
-            np.ndarray: Array of ACF values for lags 1 to max_lag
-        """
-        time_series = _sanitize_numeric_array(time_series).reshape(-1)
-        n = len(time_series)
-        if n == 0:
-            return np.zeros(max_lag, dtype=np.float64)
+    def _compute_acf_matrix(self, ts_matrix: np.ndarray, max_lag: int) -> np.ndarray:
+        """Vectorized ACF computation for a batch of time series.
 
-        mean = float(np.mean(time_series))
-        centered = time_series - mean
-        c0 = float(np.mean(centered * centered))
-        if not np.isfinite(c0) or c0 <= 1e-12:
-            return np.zeros(max_lag, dtype=np.float64)
-        
-        acf_values = []
-        for lag in range(1, max_lag + 1):
-            if lag >= n:
-                acf_values.append(0.0)
-                continue
-            c_lag = float(np.mean(centered[:-lag] * centered[lag:]))
-            if not np.isfinite(c_lag):
-                acf_values.append(0.0)
-            else:
-                acf_values.append(float(np.clip(c_lag / c0, -1.0, 1.0)))
-        
-        return np.array(acf_values)
-    
+        Args:
+            ts_matrix: [N, L] array of N time series each of length L
+            max_lag: Maximum lag to compute
+
+        Returns:
+            [N, max_lag] array of ACF values clipped to [-1, 1].
+            Rows for zero-variance series are all zeros.
+        """
+        ts_matrix = np.asarray(ts_matrix, dtype=np.float64)
+        N, L = ts_matrix.shape
+
+        # Centre each series                          [N, L]
+        centered = ts_matrix - ts_matrix.mean(axis=1, keepdims=True)
+
+        # Per-series variance                         [N]
+        c0 = np.mean(centered ** 2, axis=1)
+        valid = np.isfinite(c0) & (c0 > 1e-12)      # boolean mask [N]
+
+        acf_matrix = np.zeros((N, max_lag), dtype=np.float64)
+
+        for lag in range(1, min(max_lag + 1, L)):
+            # dot product for all series at once      [N]
+            c_lag = np.mean(centered[:, :-lag] * centered[:, lag:], axis=1)
+            acf_matrix[valid, lag - 1] = np.clip(
+                c_lag[valid] / c0[valid], -1.0, 1.0
+            )
+
+        # Guard against any remaining non-finite values
+        np.nan_to_num(acf_matrix, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        return acf_matrix
+
     def compute(self) -> float:
         """
         Compute ACF distribution matching metric.
-        
+
         Returns:
             float: Average KS statistic across all lags (lower is better, 0 = perfect match)
         """
-        
+
         # Reshape data to separate time series
         # Assuming data is [N, window_size * n_features], reshape to [N * n_features, window_size]
         self.real_data = _sanitize_numeric_array(self.real_data)
         self.synthetic_data = _sanitize_numeric_array(self.synthetic_data)
 
         n_features = self.real_data.shape[1] // self.window_size
-        
+
         real_reshaped = self.real_data.reshape(-1, self.window_size, n_features)
         synthetic_reshaped = self.synthetic_data.reshape(-1, self.window_size, n_features)
-        
+
         # Flatten to get all time series across all features
         # Shape: [N * n_features, window_size]
         real_ts = real_reshaped.reshape(-1, self.window_size)
         synthetic_ts = synthetic_reshaped.reshape(-1, self.window_size)
-        
-        # Compute ACF for each time series
-        real_acfs = []
-        for i in range(len(real_ts)):
-            acf = self._compute_acf(real_ts[i], self.max_lag)
-            real_acfs.append(acf)
-        
-        synthetic_acfs = []
-        for i in range(len(synthetic_ts)):
-            acf = self._compute_acf(synthetic_ts[i], self.max_lag)
-            synthetic_acfs.append(acf)
-        
-        real_acfs = np.array(real_acfs)  # Shape: [N * n_features, max_lag]
-        synthetic_acfs = np.array(synthetic_acfs)  # Shape: [M * n_features, max_lag]
+
+        # Vectorised ACF computation — replaces per-series Python loop
+        real_acfs = self._compute_acf_matrix(real_ts, self.max_lag)           # [N*F, max_lag]
+        synthetic_acfs = self._compute_acf_matrix(synthetic_ts, self.max_lag) # [M*F, max_lag]
         
         # For each lag, compare distributions using KS test
         ks_statistics = []

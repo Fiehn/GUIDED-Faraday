@@ -260,7 +260,7 @@ class SyntheticGenerator:
         is_guided_faraday = self.model.__class__.__name__ == 'GuidedFaradayModel'
 
         if self._is_baseline_model():
-            flat_output = self.model.reconstruct(input_data, meter_id=meter_id, timestamps=timestamp)  # SHAPER: [batch_size, seq_len * num_features]
+            flat_output = self.model.reconstruct(input_data, meter_ids=meter_id, timestamps=timestamp)  # SHAPER: [batch_size, seq_len * num_features]
         elif self._is_diffusion:
             flat_output = self.model.reconstruct(
                 input_data,
@@ -431,11 +431,19 @@ class SyntheticGenerator:
 
         skip_primary_inverse = False
         if self.secondary_model is not None:
-            # Convert primary model output to real units before the splitter sees it.
-            # The splitter (Option A) is trained on real-unit aggregates and returns real-unit phases.
+            # Denormalise primary output to real units before the splitter sees it.
+            # The splitter is trained on real-unit aggregates and returns real-unit phases.
+            # It builds its own conditions from x_phased_real + meter_id/timestamp.
             if self.normalizer is not None and not is_denormalized:
                 output = self._apply_normalizer(output, inverse=True)  # SHAPER: [num_reconstructions * batch_size, seq_len, num_features]
-            output = self.secondary_model.reconstruct(x_agg_generated=output, conditions=conditions, normalizer=None, x_phased_real=phased_input_data)
+            output = self.secondary_model.reconstruct(
+                x_agg_generated=output,
+                conditions=conditions,
+                normalizer=None,
+                x_phased_real=phased_input_data,
+                meter_id=meter_id,
+                timestamp=timestamp,
+            )
             # Secondary model returns [N*B, F_split, L]. Transpose to [N*B, L, F_split].
             output = output.transpose(1, 2)  # SHAPER: [num_reconstructions * batch_size, num_phases, seq_len] -> [num_reconstructions * batch_size, seq_len, num_phases]
             skip_primary_inverse = True
@@ -457,7 +465,9 @@ class SyntheticGenerator:
         temperature: float | None = None,
         use_rejection: bool = False,
         max_safe_z: float = 4.5,
-        max_retries: int = 10
+        max_retries: int = 10,
+        meter_ids: "np.ndarray | torch.Tensor | None" = None,
+        timestamps: "np.ndarray | torch.Tensor | None" = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
         Generate samples from the model for a single day with given conditions.
@@ -514,6 +524,21 @@ class SyntheticGenerator:
                 repeats = (num_samples // conditions.shape[0]) + 1
                 conditions = conditions.repeat(repeats, 1)  # SHAPER: [batch_size * repeats, num_conditions]
             conditions = conditions[:num_samples]  # SHAPER: [num_samples, num_conditions]
+
+        # Align per-sample metadata for the secondary model (e.g. HierarchicalSplitter
+        # needs its own meter_id/timestamps to build its own conditions).
+        _sec_meter_ids  = None
+        _sec_timestamps = None
+        if meter_ids is not None:
+            arr = np.asarray(meter_ids)
+            if len(arr) < num_samples:
+                arr = np.tile(arr, (num_samples // len(arr)) + 1)
+            _sec_meter_ids = torch.tensor(arr[:num_samples], dtype=torch.long)
+        if timestamps is not None:
+            arr = np.asarray(timestamps)
+            if len(arr) < num_samples:
+                arr = np.tile(arr, (num_samples // len(arr)) + 1)
+            _sec_timestamps = torch.tensor(arr[:num_samples], dtype=torch.long)
 
 
         # --- Batched Rejection Sampling ---
@@ -590,12 +615,20 @@ class SyntheticGenerator:
 
         skip_primary_inverse = False
         if self.secondary_model is not None:
-            # Convert primary model output to real units before the splitter sees it.
-            # The splitter (Option A) is trained on real-unit aggregates and returns real-unit phases.
+            # Denormalise primary output to real units before the splitter sees it.
+            # The splitter builds its own conditions from meter_id/timestamp.
             if self.normalizer is not None:
                 output = self._apply_normalizer(output, inverse=True)  # SHAPER: [num_samples, seq_len, num_features]
             split_cond = conditions
-            output = self.secondary_model.sample(x_agg_generated=output, conditions=conditions, normalizer=None)
+            output = self.secondary_model.sample(
+                x_agg_generated=output,
+                conditions=conditions,
+                normalizer=None,
+                # Prefer batched metadata from the eval framework; fall back to
+                # the single meter_id / date used for primary-model conditioning.
+                meter_id=_sec_meter_ids if _sec_meter_ids is not None else meter_id,
+                timestamp=_sec_timestamps if _sec_timestamps is not None else date,
+            )
             # Output is [N, F_split, L]. Transpose to [N, L, F_split].
             output = output.transpose(1, 2)  # SHAPER: [num_samples, num_phases, seq_len] -> [num_samples, seq_len, num_phases]
             F = output.shape[-1]

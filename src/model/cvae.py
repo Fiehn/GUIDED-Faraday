@@ -82,7 +82,7 @@ class CVAE(VAE):
             input_dim=input_dim + self.condition_dim,
             latent_dim=latent_dim,
             type=kwargs.get("encoder_type", "dictionary"),
-            cond_dim=self.condition_dim,  # CNN encoders inject conditions at bottleneck
+            cond_dim=0,  # CNN encoders: full-input injection; cat([x_flat, c]) enters CNN trunk
             average_max_std=encoder_average_max_std,
             mu_activation="none", # TODO: !!! consider making this configurable: maybe tanh for this????
             **encoder_model_kwargs,

@@ -33,11 +33,18 @@ from model.encoder_decoder_model import TemporalCNNEncoder, DictionaryCoder
 
 
 class _GuidedFaradayCNNEncoder(nn.Module):
-    """CNN encoder with bottleneck condition injection.
+    """CNN encoder with full-input condition injection.
 
-    Conditions are concatenated to the flattened CNN output, NOT to the raw
-    input.  This prevents the TemporalCNNEncoder from treating condition
-    dimensions as extra time-steps (the guide_cnn bug described in ADR-0006).
+    Conditions are concatenated to the flattened signal BEFORE the CNN trunk
+    (``cat([x_flat, c])``).  Every convolutional layer therefore sees condition
+    information, allowing the model to learn condition-specific temporal feature
+    detectors.
+
+    The original bottleneck-injection design — conditions concatenated only
+    after CNN downsampling — was reverted after empirical evidence showed the
+    CNN failing to outperform an MLP encoder across nearly all metrics.  With
+    bottleneck injection the CNN trunk receives zero condition gradient; the
+    parameter heads alone cannot compensate.  See ADR-0006 amendment.
     """
 
     def __init__(
@@ -49,24 +56,25 @@ class _GuidedFaradayCNNEncoder(nn.Module):
         hidden_dims: list[int] | None = None,
     ):
         super().__init__()
-        # Pure CNN trunk — sees only time-series, never conditions
+        full_dim = num_features * seq_len + cond_dim
+        # TemporalCNNEncoder receives the full [signal, conditions] flat vector.
+        # num_features=1, seq_len=full_dim treats the entire flat vector as a
+        # single-channel sequence — no cond stripping, no bottleneck injection.
         self.cnn = TemporalCNNEncoder(
-            input_dim=num_features * seq_len,
+            input_dim=full_dim,
             output_dim=latent_dim,
-            seq_len=seq_len,
-            num_features=num_features,
-            dist_parameters=["bottleneck"],
-            param_output_dims={"bottleneck": _infer_cnn_flat_size(num_features, seq_len, hidden_dims)},
+            seq_len=full_dim,
+            num_features=1,
+            dist_parameters=["mu", "log_var"],
+            param_output_dims={"mu": latent_dim, "log_var": latent_dim},
             hidden_dims=hidden_dims,
+            cond_dim=0,
         )
-        flat_size = _infer_cnn_flat_size(num_features, seq_len, hidden_dims)
-        self.mu_head = nn.Linear(flat_size + cond_dim, latent_dim)
-        self.log_var_head = nn.Linear(flat_size + cond_dim, latent_dim)
 
     def forward(self, x_flat: torch.Tensor, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        h = self.cnn(x_flat)["bottleneck"]          # [B, flat_size]
-        hc = torch.cat([h, c], dim=-1)              # bottleneck injection
-        return self.mu_head(hc), self.log_var_head(hc)
+        xc = torch.cat([x_flat, c], dim=-1)         # [B, signal_dim + cond_dim]
+        out = self.cnn(xc)
+        return out["mu"], out["log_var"]
 
 
 class _GuidedFaradayMLPEncoder(nn.Module):
@@ -95,23 +103,6 @@ class _GuidedFaradayMLPEncoder(nn.Module):
     def forward(self, x_flat: torch.Tensor, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.encoder(torch.cat([x_flat, c], dim=-1))
 
-
-def _infer_cnn_flat_size(num_features: int, seq_len: int, hidden_dims=None) -> int:
-    """Compute the flattened size after the CNN downsample stack."""
-    dummy_cnn = TemporalCNNEncoder(
-        input_dim=num_features * seq_len,
-        output_dim=1,
-        seq_len=seq_len,
-        num_features=num_features,
-        dist_parameters=["out"],
-        hidden_dims=hidden_dims,
-    )
-    with torch.no_grad():
-        dummy = torch.zeros(1, num_features * seq_len)
-        B = 1
-        x = dummy.view(B, num_features, -1)
-        h = dummy_cnn.downsample_blocks(x)
-        return int(h.reshape(1, -1).shape[1])
 
 
 class GuidedFaradayModel(BaseModel):
@@ -164,6 +155,7 @@ class GuidedFaradayModel(BaseModel):
             hidden_dims=dec_dims,
             layer_type="MLP",
             average_max_std=pdcc_average_max_std,
+            mu_activation="none",
         )
 
         self.hierarchy = None

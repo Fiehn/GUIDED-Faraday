@@ -114,9 +114,9 @@ class PeakAnalysis(SyntheticMetric):
             ax.set_title(title, fontsize=14, fontweight='bold')
             ax.set_xlabel('Percentage of 24h (%)', fontsize=12, fontweight='bold')
             ax.set_ylabel('Load (kWh)', fontsize=12, fontweight='bold')
-            ax.legend(fontsize=11)
+            ax.legend(fontsize=11, loc='upper right')
             ax.grid(True, alpha=0.3)
-            
+
             plt.tight_layout()
             os.makedirs(output_dir, exist_ok=True)
             plot_path = os.path.join(output_dir, 'duration_curve.pdf')

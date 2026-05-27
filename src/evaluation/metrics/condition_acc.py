@@ -6,17 +6,21 @@ from src.evaluation.metrics.base.base import SyntheticMetric
 
 class EVConditionAccuracy(SyntheticMetric):
     """Evaluate if synthetic profiles correctly represent their generation EV condition.
-    
+
     This metric:
     1. Reads the conditional tensor used for generation mapping to [No EV, 1ph, 2ph, 3ph]
     2. Modifies scale (kW -> W) if needed so thresholds match original Jupyter notebooks
     3. Runs detect_platos_unified_dP2_std on each profile
     4. Computes accuracy of correct EV classification.
     """
-    
+
+    # Per-call sample cap. Accuracy is stable for a 4-class problem well below
+    # this count; the detection function is a pure Python loop so O(N) cost is high.
+    MAX_SAMPLES: int = 4000
+
     synthetic_data: np.ndarray = None
     synthetic_conditions: Any = None
-    
+
     def __init__(self, window_size: int = 24, interval_minutes: int = 60):
         self.window_size = window_size
         self.interval_minutes = interval_minutes
@@ -51,7 +55,7 @@ class EVConditionAccuracy(SyntheticMetric):
         else:
             conds = np.asarray(self.synthetic_conditions)
             
-        n_samples = min(len(self.synthetic_data), len(conds))
+        n_samples = min(len(self.synthetic_data), len(conds), self.MAX_SAMPLES)
         if n_samples == 0:
             return 0.0
 

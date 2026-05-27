@@ -232,6 +232,14 @@ class StreamingParquetBuffer(IterableDataset):
         self.ptr = 0
         self.current_size = 0
 
+        # Lock lives on the object so it survives across __iter__ calls
+        # (persistent_workers=True calls __iter__ again without forking).
+        self._buffer_lock = threading.Lock()
+        # Monotonically-increasing epoch counter. Background threads capture
+        # their generation at start; on mismatch they exit cleanly instead of
+        # writing into a buffer that was reset for a new epoch.
+        self._generation = 0
+
         self.window_spec = window_spec
         self.normalizer = normalizer
         self.num_workers = num_workers
@@ -528,18 +536,27 @@ class StreamingParquetBuffer(IterableDataset):
         if not files_for_this_worker:
             return
         
-        self._buffer_lock = threading.Lock()
-        
-        self.buffer = [None] * self.replay_buffer_capacity
-        self.ptr = 0
-        self.current_size = 0
-        
-        self._push_count = 0
-        self._yield_count = 0
+        # Reset buffer state while holding the shared lock so that any
+        # background thread still alive from a previous epoch cannot write
+        # a stale ptr value after we set ptr=0 (the root cause of the
+        # "NoneType not subscriptable" crash on epoch 2+).
+        with self._buffer_lock:
+            self._generation += 1          # signal old threads to exit
+            my_generation = self._generation
+
+            self.buffer = [None] * self.replay_buffer_capacity
+            self.ptr = 0
+            self.current_size = 0
+
+            self._push_count = 0
+            self._yield_count = 0
 
         def background_file_reader():
-            while True:
+            while my_generation == self._generation:
                 for file in files_for_this_worker:
+                    # Exit immediately if a newer epoch has started.
+                    if my_generation != self._generation:
+                        return
                     self._mark_file_seen(file)
                     try:
                         if self.phased_mode:
@@ -555,12 +572,19 @@ class StreamingParquetBuffer(IterableDataset):
                         for chunk_df, chunk_m_id, chunk_m_col in chunks:
                             # If the GPU hasn't caught up, go to sleep and free the CPU/RAM.
                             while self._push_count - self._yield_count >= self.replay_buffer_capacity:
+                                if my_generation != self._generation:
+                                    return
                                 time.sleep(0.05)
 
                             sequences = self._extract_sequences(chunk_df, meter_id=chunk_m_id, meter_col_name=chunk_m_col)
-                            
-                            # Lock ONCE per chunk to minimize CPU contention
+
+                            # Lock ONCE per chunk to minimize CPU contention.
+                            # Re-check generation inside the lock: if __iter__ reset the
+                            # buffer while we were outside the lock, bail out immediately
+                            # rather than writing stale data at a mismatched ptr.
                             with self._buffer_lock:
+                                if my_generation != self._generation:
+                                    return
                                 pushed = 0
                                 for seq, meter_id_t, timestamp_t in sequences:
                                     if not self._keep_window(

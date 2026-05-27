@@ -281,11 +281,20 @@ class DictionaryCoder(torch.nn.Module):
         return z
     
     def sample(self, param_dict=None, num_samples=1, temperature: float = 1.0, **_):
-        """Sample from the distribution. If return_mean is True, ignores noise."""
+        """Sample from the distribution.
+
+        Returns raw reparameterised samples in the model's output space (normalised
+        when a Normalizer is in use).  Non-negativity in original (kWh) space is
+        guaranteed by the Normalizer's own ``torch.clamp(..., min=0.0)`` in
+        ``inverse_transform``; applying softplus here is wrong because it floors the
+        *normalised* output at ~0, which after inverse-transform maps to
+        ``expm1(normalizer_mean) > 0`` rather than 0.  See regression test
+        ``test_dictionary_coder_sample_floor.py``.
+        """
         if param_dict is None:
             raise ValueError("param_dict must be provided for sampling")
-            
-        return F.softplus(self.reparameterize(param_dict, num_samples=num_samples, temperature=temperature),beta=100.0) 
+
+        return self.reparameterize(param_dict, num_samples=num_samples, temperature=temperature)
     
     def loglikelihood(self, inputs, param_dict,**_):
         """Compute log likelihood under multivariate Gaussian with PDCC covariance."""

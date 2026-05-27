@@ -73,8 +73,8 @@ class PhasedModelComparator:
             "Flexibility Distance": "Reconstruction Flexibility Distance (FD)",
             "Avg MinMax Reconstruction Score": "MinMax Score (Reconstruction)",
             "Avg MinMax Synthetic Score": "MinMax Score (Synthetic)",
-            "Avg Rank Reconstruction Score": "Rank Score (Reconstruction)",
-            "Avg Rank Synthetic Score": "Rank Score (Synthetic)",
+            "Avg Rank Reconstruction Score": "Avg Rank (Reconstruction)",
+            "Avg Rank Synthetic Score": "Avg Rank (Synthetic)",
             "Win Count Reconstruction": "Win Count (Reconstruction)",
             "Win Count Synthetic": "Win Count (Synthetic)",
             "TSTR (Train on Synthetic, Test on Real)": "Train on Synthetic, Test on Real (TSTR)",
@@ -150,9 +150,9 @@ class PhasedModelComparator:
             # Summary scores
             "avgminmaxreconstructionscore": "higher",
             "avgminmaxsyntheticscore": "higher",
-            "avgrankреconstructionscore": "higher",
-            "avgrankreconstructionscore": "higher",
-            "avgranksyntheticscore": "higher",
+            "avgrankреconstructionscore": "lower",
+            "avgrankreconstructionscore": "lower",
+            "avgranksyntheticscore": "lower",
             "wincountreconstruction": "higher",
             "wincountsynthetic": "higher",
         }
@@ -259,13 +259,14 @@ class PhasedModelComparator:
             print(f"No valid evaluation results found in {model_dir} for model {model_name}")
 
     def _sort_models_by_synthetic_score(self, phase: str) -> list[str]:
-        """Return model names sorted by Avg MinMax Synthetic Score descending (best first)."""
-        score_key = "Avg MinMax Synthetic Score"
+        """Return model names sorted by Avg Rank Synthetic Score ascending (rank 1 = best first)."""
+        score_key = "Avg Rank Synthetic Score"
 
         def _score(model_name: str) -> float:
-            return float(self.models_data.get(model_name, {}).get(phase, {}).get(score_key, -1.0))
+            # Missing entries sort to the end (worst)
+            return float(self.models_data.get(model_name, {}).get(phase, {}).get(score_key, float("inf")))
 
-        return sorted(self.models_data.keys(), key=_score, reverse=True)
+        return sorted(self.models_data.keys(), key=_score)
 
     def compare(self):
         """Generate comparison tables and plots for each phase."""
@@ -335,7 +336,7 @@ class PhasedModelComparator:
             for m, c in mapped.items():
                 minmax_scores[m][metric] = 1.0 if vmax == vmin else 1.0 - (c - vmin) / (vmax - vmin)
 
-            # Rank-based: 1.0 = first place, 0.0 = last place (ties share rank)
+            # Rank-based: 1 = first place (best), ties share the midrank position
             sorted_ms = sorted(mapped, key=mapped.__getitem__)
             n = len(sorted_ms)
             i = 0
@@ -343,9 +344,9 @@ class PhasedModelComparator:
                 j = i + 1
                 while j < n and mapped[sorted_ms[j]] == mapped[sorted_ms[i]]:
                     j += 1
-                avg_rank = (i + j - 1) / 2  # 0-indexed
+                avg_rank = (i + j - 1) / 2  # 0-indexed midrank; +1 gives 1-indexed position
                 for k in range(i, j):
-                    rank_scores[sorted_ms[k]][metric] = 1.0 if n == 1 else 1.0 - avg_rank / (n - 1)
+                    rank_scores[sorted_ms[k]][metric] = avg_rank + 1.0  # 1-indexed (lower = better)
                 i = j
 
             # Win count: 1.0 for sole winner, split equally on ties
@@ -404,23 +405,29 @@ class PhasedModelComparator:
         for metric in scalar_metrics:
             goal = self._metric_goal(metric)
 
-            # Find the winning model for this metric
+            # Find the winning model(s) for this metric — ties share ★
             model_vals = {
                 m: float(self.models_data[m][phase][metric])
                 for m in models_order
                 if phase in self.models_data[m] and metric in self.models_data[m][phase]
                 and isinstance(self.models_data[m][phase][metric], (int, float))
             }
-            best_model = None
+            best_models: set = set()
             if model_vals:
                 if goal == "target_1":
-                    best_model = min(model_vals, key=lambda m: abs(model_vals[m] - 1.0))
+                    best_raw = min(abs(v - 1.0) for v in model_vals.values())
+                    best_models = {m for m, v in model_vals.items() if abs(abs(v - 1.0) - best_raw) <= 1e-9}
                 elif goal == "target_0":
-                    best_model = min(model_vals, key=lambda m: abs(model_vals[m]))
+                    best_raw = min(abs(v) for v in model_vals.values())
+                    best_models = {m for m, v in model_vals.items() if abs(abs(v) - best_raw) <= 1e-9}
                 elif goal == "higher":
-                    best_model = max(model_vals, key=model_vals.__getitem__)
-                else:
-                    best_model = min(model_vals, key=model_vals.__getitem__)
+                    best_raw = max(model_vals.values())
+                    tol = abs(best_raw) * 1e-9 + 1e-12
+                    best_models = {m for m, v in model_vals.items() if abs(v - best_raw) <= tol}
+                else:  # lower
+                    best_raw = min(model_vals.values())
+                    tol = abs(best_raw) * 1e-9 + 1e-12
+                    best_models = {m for m, v in model_vals.items() if abs(v - best_raw) <= tol}
 
             row = [self._display_metric_name(metric)]
             for model_name in models_order:
@@ -428,7 +435,7 @@ class PhasedModelComparator:
                 if phase in data and metric in data[phase]:
                     val = data[phase][metric]
                     formatted = f"{val:.4f}" if isinstance(val, float) else str(val)
-                    if model_name == best_model:
+                    if model_name in best_models:
                         formatted = f"★ {formatted}"
                 else:
                     formatted = "N/A"
@@ -669,8 +676,31 @@ def _has_existing_eval_outputs(model_output_dir: str, phased: bool) -> bool:
             return True
     return os.path.exists(os.path.join(model_output_dir, "eval_results.json"))
 
-def compare_models(model_paths: list[str], 
-                   model_names: list[str], 
+class _DenormalizingLoader:
+    """Wraps a normalized DataLoader and inverse-transforms x on each batch.
+
+    Used so Faraday-family models (trained on raw kWh, normalizer=None) receive
+    the same test windows as every other model while seeing un-normalized values.
+    """
+
+    def __init__(self, loader, normalizer):
+        self.loader = loader
+        self.normalizer = normalizer
+
+    def __iter__(self):
+        for x, meter_id, timestamps, agg in self.loader:
+            yield self.normalizer.inverse_transform(x), meter_id, timestamps, agg
+
+    def __len__(self):
+        return len(self.loader)
+
+    @property
+    def dataset(self):
+        return self.loader.dataset
+
+
+def compare_models(model_paths: list[str],
+                   model_names: list[str],
                    secondary_model_paths: list[str] | None = None,
                    eval_result_dirs: list[str] | None = None,
                    data_dir: str = "data/_parquet_cache",
@@ -697,12 +727,25 @@ def compare_models(model_paths: list[str],
             source for comparison (for example rerun_evaluation_YYYYMMDD_HHMMSS folders).
     """
 
+    # Names-only mode: when no model_paths are given, resolve each name to output_dir/<name>.
+    if not model_paths:
+        model_paths = [os.path.join(output_dir, name) for name in model_names]
+        if not recompute:
+            missing = [name for name, p in zip(model_names, model_paths) if not os.path.isdir(p)]
+            if missing:
+                raise FileNotFoundError(
+                    f"Pre-computed results not found for: {missing}. "
+                    f"Expected directories under '{output_dir}'."
+                )
+
     if eval_result_dirs is not None and len(eval_result_dirs) < len(model_paths):
         eval_result_dirs = list(eval_result_dirs) + [None] * (len(model_paths) - len(eval_result_dirs))
 
-    # 1. Prepare evaluation data
-    if data_files is None:
+    # 1. Prepare evaluation data — skip file discovery when not recomputing
+    if data_files is None and recompute:
         data_files = get_eval_files(data_dir)
+    elif data_files is None:
+        data_files = []
 
     # 2. Pick a single global test split definition so all models see identical windows.
     if split_seed is None or split_ratios is None:
@@ -712,161 +755,179 @@ def compare_models(model_paths: list[str],
     split_seed = int(split_seed)
     split_ratios = dict(split_ratios)
 
-    # Track which folders should be consumed by comparator for each model.
-    used_eval_dirs: list[str] = []
-    
-    # 4. Loop through models and evaluate
-    for i, (path, name, secondary) in enumerate(zip(model_paths, model_names, secondary_model_paths if secondary_model_paths is not None else [None]*len(model_paths))):
-        print(f"\nEvaluating model: {name}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    window = WindowSpec(input_len=24, stride=24)
+
+    # 3. Pre-scan: decide which models need recomputation and resolve output dirs.
+    #    This lets us build the shared test loader exactly once, before the eval loop.
+    secondaries = (
+        secondary_model_paths
+        if secondary_model_paths is not None
+        else [None] * len(model_paths)
+    )
+    eval_plan: list[dict] = []
+    for i, (path, name, secondary) in enumerate(zip(model_paths, model_names, secondaries)):
         model_output_dir = os.path.join(output_dir, name)
-        os.makedirs(model_output_dir, exist_ok=True)
-        requested_eval_dir = None
-        if eval_result_dirs is not None:
-            requested_eval_dir = eval_result_dirs[i]
+        requested_eval_dir = eval_result_dirs[i] if eval_result_dirs is not None else None
         eval_source_dir = requested_eval_dir if requested_eval_dir else path
+        skip = (
+            (not recompute)
+            and _has_existing_eval_outputs(eval_source_dir, phased=phased)
+            and secondary is None
+        )
+        eval_plan.append({
+            "path": path,
+            "name": name,
+            "secondary": secondary,
+            "model_output_dir": model_output_dir,
+            "eval_source_dir": eval_source_dir,
+            "skip": skip,
+        })
 
-        if (not recompute) and _has_existing_eval_outputs(eval_source_dir, phased=phased) and secondary is None:
-            print(f"Found existing evaluation outputs in {eval_source_dir}; skipping recompute.")
-            used_eval_dirs.append(eval_source_dir)
-            continue
+    # 4. Build ONE shared test loader for all models that need recomputation.
+    #    Uses the first recomputing model's normalizer (same "infer from first model"
+    #    convention already used for split_seed above).  All models are expected to
+    #    have been trained on the same dataset with a compatible normalizer.
+    shared_test_loader = None
+    loader_obj = None
+    # Cache (model, normalizer, conditioner) for the first recomputing model so we
+    # don't load its weights twice (once here for the normalizer, once in the loop).
+    _first_model_cache: dict[int, tuple] = {}
 
-        model, normalizer, conditioner = load_model(path, device="cuda" if torch.cuda.is_available() else "cpu")
-        sec_model = None
-        if secondary is not None:
-            sec_model, normalizer, conditioner = load_model(secondary, device="cuda" if torch.cuda.is_available() else "cpu")
+    needs_recompute_indices = [i for i, p in enumerate(eval_plan) if not p["skip"]]
+    if needs_recompute_indices:
+        first_idx = needs_recompute_indices[0]
+        _first_model, _first_norm, _first_cond = load_model(
+            eval_plan[first_idx]["path"], device=device
+        )
+        _first_model_cache[first_idx] = (_first_model, _first_norm, _first_cond)
 
-        # 2. Load Data
-        window = WindowSpec(input_len=24, stride=24)
+        # replay_buffer_capacity sized to num_samples: the circular buffer can hold
+        # all requested unique test windows without evicting earlier ones.
+        # This loader is evaluation-only, so a large buffer is safe.
         loader_obj = PhasedReplayDataloaders(
             sm_files=data_files,
             window_spec=window,
-            batch_size=32,
-            replay_buffer_capacity=1000,
+            batch_size=1024,
+            replay_buffer_capacity=num_samples,
             min_buffer_size=0,
-            normalizer=normalizer,
+            normalizer=_first_norm,
             num_workers=0,
             phased_mode=phased,
-            # Deterministic test selection + ordering.
-            sample_random=False,
-            feature_cols=["hourly_energy_consumption",],
-            meter_col = "meter_number",
+            sample_random=False,          # deterministic test selection + ordering
+            feature_cols=["hourly_energy_consumption"],
+            meter_col="meter_number",
             aggregation_divisor=agg_divisor,
-            hourly_aggregation=True if agg_divisor > 1.0 else False,
+            hourly_aggregation=agg_divisor > 1.0,
             split_seed=split_seed,
             split_ratios=split_ratios,
             max_value=max_value,
-            pin_memory=False
+            pin_memory=False,
         )
-        
-        # 3. Grab a fixed number of samples for evaluation
-        n_batches = max(1, num_samples // 32)
-        # True held-out test split (not used during training).
-        loader_obj.refresh_test_cache(n_batches)
-        test_loader = loader_obj.get_test_loader()
 
-        if test_loader is None and hasattr(loader_obj, "test_dataset"):
-            print("[WARN] get_test_loader() returned None, constructing DataLoader from test_dataset directly.")
-            from torch.utils.data import DataLoader
-            test_loader = DataLoader(
+        n_batches = max(1, num_samples // 32)
+        loader_obj.refresh_test_cache(n_batches)
+        shared_test_loader = loader_obj.get_test_loader()
+
+        if shared_test_loader is None and hasattr(loader_obj, "test_dataset"):
+            print("[WARN] get_test_loader() returned None; constructing DataLoader from test_dataset directly.")
+            from torch.utils.data import DataLoader as _DL
+            shared_test_loader = _DL(
                 loader_obj.test_dataset,
-                batch_size=32,
+                batch_size=1024,
                 shuffle=False,
                 num_workers=0,
                 pin_memory=False,
             )
 
+        if shared_test_loader is None:
+            print("[ERROR] Could not build a test loader. No evaluation will be run.")
+        else:
+            n_test = len(shared_test_loader.dataset)  # type: ignore[arg-type]
+            print(f"\nShared test loader ready: {n_test} windows "
+                  f"({n_test * 32 // 32} samples, batch_size=1024).")
+
+    # 5. Loop through models and evaluate, reusing the shared test loader.
+    used_eval_dirs: list[str] = []
+
+    for i, plan in enumerate(eval_plan):
+        path             = plan["path"]
+        name             = plan["name"]
+        secondary        = plan["secondary"]
+        model_output_dir = plan["model_output_dir"]
+        eval_source_dir  = plan["eval_source_dir"]
+
+        print(f"\nEvaluating model: {name}")
+        os.makedirs(model_output_dir, exist_ok=True)
+
+        if plan["skip"]:
+            print(f"  Found existing evaluation outputs in {eval_source_dir}; skipping recompute.")
+            used_eval_dirs.append(eval_source_dir)
+            continue
+
+        if shared_test_loader is None:
+            print(f"  [ERROR] No test data available; skipping '{name}'.")
+            used_eval_dirs.append(model_output_dir)
+            continue
+
+        # Reuse cached weights for the first model; load fresh for all others.
+        if i in _first_model_cache:
+            model, normalizer, conditioner = _first_model_cache[i]
+        else:
+            model, normalizer, conditioner = load_model(path, device=device)
+
+        sec_model = None
+        if secondary is not None:
+            # Only the model object is needed from the secondary load; the secondary
+            # model carries its own conditioner and normalizer internally and will
+            # build its own conditions from real phased data / metadata at inference
+            # time.  Overwriting normalizer/conditioner here was causing the primary
+            # model's encoder to receive wrong-dimensioned condition vectors.
+            sec_model, *_ = load_model(secondary, device=device)
+
+        # Faraday-family models have no normalizer and were trained on raw kWh.
+        # The shared loader yields normalized data, so wrap it to denormalize on the fly.
+        _loader_norm = getattr(loader_obj, 'normalizer', None)
+        dataloader = (
+            _DenormalizingLoader(shared_test_loader, _loader_norm)
+            if normalizer is None and _loader_norm is not None
+            else shared_test_loader
+        )
+
         if phased:
             # Phased models use PhasedEvaluationSuite which creates sub-phase directories
             evaluator = PhasedEvaluationSuite(
                 model=model,
-                dataloader=test_loader,
+                dataloader=dataloader,  # type: ignore[arg-type]
                 normalizer=normalizer,
                 conditioner=conditioner,
-                device="cuda" if torch.cuda.is_available() else "cpu",
+                device=device,
                 window_size=window.input_len,
                 output_path=model_output_dir,
-                secondary_model=sec_model
+                secondary_model=sec_model,
+                n_synthetic_samples=num_samples,
             )
             evaluator.evaluate()
         else:
-            print("\nDEBUG BEFORE EVAL")
-            print("model_name:", name)
-            print("model_path:", path)
-            print("loaded_model_type:", type(model))
-            print("data_dir:", data_dir)
-            print("data_files:", data_files)
-            print("phased:", phased)
-            print("recompute:", recompute)
-            print("n_batches:", n_batches)
-            print("loader_obj_type:", type(loader_obj))
-            print("test_loader:", test_loader)
-            print("type(test_loader):", type(test_loader))
-
             # Unphased models use EvalFramework directly
             evaluator = EvalFramework(
                 model=model,
-                dataloader=test_loader,
+                dataloader=dataloader,  # type: ignore[arg-type]
                 normalizer=normalizer,
                 conditioner=conditioner,
-                device="cuda" if torch.cuda.is_available() else "cpu",
+                device=device,
                 window_size=window.input_len,
                 output_path=os.path.join(model_output_dir, "eval_results.json"),
-                secondary_model=sec_model
+                secondary_model=sec_model,
+                n_synthetic_samples=num_samples,
             )
-            # evaluator.register_all(phased=False)
-            # evaluator.evaluate()
-            # evaluator.save_results(os.path.join(model_output_dir, "eval_results.json"))
             evaluator.register_all(phased=False)
             evaluator.evaluate()
-
-            # ------------------------------------------------------------
-            # DEBUG: print example real / reconstructed / synthetic data
-            # ------------------------------------------------------------
-            print("\n" + "=" * 80)
-            print(f"DATA EXAMPLES USED IN EVALUATION: {name}")
-            print("=" * 80)
-
-            for attr in [
-                "_real_data",
-                "_reconstructed_data",
-                "_synthetic_data",
-                "real_data",
-                "reconstructed_data",
-                "synthetic_data",
-            ]:
-                if hasattr(evaluator, attr):
-                    arr = getattr(evaluator, attr)
-
-                    if arr is None:
-                        print(f"{attr}: None")
-                        continue
-
-                    try:
-                        print(f"\n{attr}")
-                        print("type:", type(arr))
-                        print("shape:", arr.shape)
-
-                        # Print first sample
-                        example = arr[0]
-                        print("first sample shape:", example.shape if hasattr(example, "shape") else type(example))
-                        print(example)
-
-                        # If it is long, also print only first 24 values flattened
-                        flat = np.asarray(example).reshape(-1)
-                        print("first sample flattened first 24 values:")
-                        print(flat[:24])
-
-                    except Exception as e:
-                        print(f"{attr}: could not print, error={e}")
-
-            print("=" * 80 + "\n")
-
             evaluator.save_results(os.path.join(model_output_dir, "eval_results.json"))
 
-        # If we reached here, evaluation was recomputed into model_output_dir.
         used_eval_dirs.append(model_output_dir)
     
-    # 5. Use PhasedModelComparator to generate comparison tables and plots
+    # 6. Use PhasedModelComparator to generate comparison tables and plots
     print("\n" + "="*50)
     print("GENERATING COMPARISON")
     print("="*50)
@@ -897,7 +958,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--data-dir", type=str, default="data/_parquet_cache", help="Directory with parquet files.")
     parser.add_argument("--data-files", nargs="*", default=None, help="Optional explicit parquet files (relative to --data-dir unless absolute).")
-    parser.add_argument("--num-samples", type=int, default=100, help="Approx number of windows to evaluate per model.")
+    parser.add_argument("--num-samples", type=int, default=10000, help="Approx number of windows to evaluate per model.")
     parser.add_argument("--output-dir", type=str, default="evaluation_comparison", help="Where to write/read evaluation outputs.")
     parser.add_argument("--phased", action="store_true", help="Use phased evaluation suite.")
     parser.add_argument("--recompute", action="store_true", help="Recompute evaluation even if outputs already exist.")
@@ -908,10 +969,42 @@ if __name__ == "__main__":
     parser.add_argument("--max-value", type=float, default=200.0, help="Maximum value for filtering windows.")
     args = parser.parse_args()
 
-    if not args.models or not args.names:
-        raise ValueError("Provide --models and --names when running compare_models.py")
-    if len(args.models) != len(args.names):
+    # args.models = ["E:/models/new2/AverageBaselineModel_20260526_234356",
+    #     "E:/models/new1/CVAE_20260522_041326_guide_cnn", "E:/models/new1/CVAE_20260522_051533_h_guide_cnn",
+    #                "E:/models/new2/CVAE_20260526_154037", "E:/models/new2/FaradayModel_20260526_102007", #"E:/models/new2/GuidedFaradayModel_20260526_110124",
+    #                "E:/models/new2/DiffusionModel_20260526_070858", "E:/models/new1/DiffusionModel_20260522_070459", 
+    #                #"E:/models/new2/GuidedFaradayModel_20260526_114407", #"E:/models/new2/GuidedFaradayModel_20260526_122401",
+    #                 "E:/models/new2/QuantileBaselineModel_20260527_000045", 
+    #                "E:/models/new2/CVAE_20260525_233836","E:/models/new2/CVAE_20260526_011125",
+    #                 "E:/models/new2/CVAE_20260526_091116",
+    #                "E:/models/new2/GuidedFaradayModel_20260527_152449", "E:/models/new2/GuidedFaradayModel_20260527_162635"
+    #                #"E:/models/new2/GuidedFaradayModel_20260527_141620",
+    #                ]
+
+    args.names = ["Baseline-Average",
+        "Guide-CNN", "H-Guide-CNN",
+                  "Guide-Vamp", "Faraday", #"Guided-Faraday", 
+                  "Diffusion", "Diffusion Old",
+                  #"Guided-Faraday-CNN", #"Guided-Faraday-CNN-Deterministic",
+                   "Baseline Quantile",
+                  "H-Guide", "Guide", 
+                   "CVAE", 
+                  "Guided-Faraday-CNN-FIX", "Guided-Faraday"
+                  #"Guided-Faraday-cnn-new", 
+                  ]
+    
+    # args.models = ["E:/models/new2/FaradayModel_20260526_102007","E:/models/new2/GuidedFaradayModel_20260527_152449", "E:/models/new2/GuidedFaradayModel_20260527_162635"
+    #                ]
+    # args.names = ["Faraday", "Guided-Faraday-CNN-FIX", "Guided-Faraday"]
+
+    if not args.names:
+        raise ValueError("--names is required.")
+    if args.models and len(args.models) != len(args.names):
         raise ValueError("--models and --names must have the same length.")
+    if not args.models and args.recompute:
+        raise ValueError("--models is required when --recompute is set.")
+    if not args.models:
+        args.models = []
     
     secondary_model_paths = None
     if args.secondary_models is not None and len(args.secondary_models) > 0:
@@ -943,51 +1036,57 @@ if __name__ == "__main__":
             "test_ratio": 0.1 if args.test_ratio is None else float(args.test_ratio),
         }
 
-    args.models = [#"E:/models/new1/CVAE_20260521_234622_guide",
-                   "E:/models/new1/CVAE_20260522_013003_cvae",  "E:/models/new1/CVAE_20260522_041326_guide_cnn",
-                   "E:/models/new1/CVAE_20260522_051533_h_guide_cnn", 
-                   "E:/models/new1/QuantileBaselineModel_20260522_034728", 
-                #    "E:/models/old/Guide Vamp", "E:/models/old/Guide Hierarchy", "E:/models/old/Guide CNN Hierarchy",
-                #     "E:/models/old/AverageBaselineModel",
-                #    "E:/models/old/AutoRegressiveTransformerVAE",
-                   "E:/models/new1/DiffusionModel_20260522_070459",
-                   "C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_113725",
-                   "E:/models/new1/FaradayModel_20260522_083016",
-                   "C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_134604",
-                   #"C:/Users/rasmu/Desktop/Thesis/models/new/CVAE_20260525_143604",
-                   #"C:/Users/rasmu/Desktop/Thesis/models/new/CVAE_20260525_154532",
-                   "C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_165636",
-                   #"C:/Users/rasmu/Desktop/Thesis/models/new/CVAE_20260525_175145",
-                   "C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_205135",
-                   "C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_213329",
-                   "C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_222016",
-                   "E:/models/new2/CVAE_20260525_233836","E:/models/new2/CVAE_20260526_011125","E:/models/new2/CVAE_20260526_024444",
-                   "E:/models/new2/CVAE_20260526_053436","E:/models/new2/CVAE_20260526_091116","E:/models/new2/DiffusionModel_20260526_070858",
-                   "E:/models/new2/CVAE_20260526_154037", "E:/models/new2/FaradayModel_20260526_102007", "E:/models/new2/GuidedFaradayModel_20260526_110124",
-                   "E:/models/new2/GuidedFaradayModel_20260526_114407", "E:/models/new2/GuidedFaradayModel_20260526_122401"
-                   ]
-    args.names = [#"Guide", 
-                  "CVAE", "Guide-CNN",
-                    "H-Guide-CNN", 
-                    "Quantiles Baseline",
-                #   "Guide Vamp", "Guide Hierarchy", "Guide CNN Hierarchy",  "Average Baseline",
-                #     "AutoRegressiveTransformerVAE", 
-                    "Diffusion",    
-                    "Guided-Faraday 2", 
-                    "Faraday",
-                    "Guided-Faraday 3", 
-                    # "Guide CNN", 
-                    # "Guide CNN 2",
-                    "Guided-Faraday 4",
-                    #"Guide CNN 3",
-                    "Guided-Faraday 5",
-                    "Guided-Faraday 6",
-                    "Guided-Faraday 7",
-                    "H-Guide-n", "Guide-n", "Guide-CNN-n", 
-                  "H-Guide-CNN-n", "CVAE-n", "Diffusion-n", 
-                  "Guide-Vamp-n", "Faraday-n", "Guided-Faraday-n", 
-                  "Guided-Faraday-CNN-n", "Guided-Faraday-CNN-2-n"
-                  ]
+    # args.models = [#"E:/models/new1/CVAE_20260521_234622_guide",
+    #                #"E:/models/new1/CVAE_20260522_013003_cvae",  
+    #                "E:/models/new1/CVAE_20260522_041326_guide_cnn",
+    #                "E:/models/new1/CVAE_20260522_051533_h_guide_cnn", 
+    #                "E:/models/new1/QuantileBaselineModel_20260522_034728", 
+    #             #    "E:/models/old/Guide Vamp", "E:/models/old/Guide Hierarchy", "E:/models/old/Guide CNN Hierarchy",
+    #             #     "E:/models/old/AverageBaselineModel",
+    #             #    "E:/models/old/AutoRegressiveTransformerVAE",
+    #                "E:/models/new1/DiffusionModel_20260522_070459",
+    #                #"C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_113725",
+    #                "E:/models/new1/FaradayModel_20260522_083016",
+    #                "C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_134604",
+    #                #"C:/Users/rasmu/Desktop/Thesis/models/new/CVAE_20260525_143604",
+    #                #"C:/Users/rasmu/Desktop/Thesis/models/new/CVAE_20260525_154532",
+    #                #"C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_165636",
+    #                #"C:/Users/rasmu/Desktop/Thesis/models/new/CVAE_20260525_175145",
+    #                #"C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_205135",
+    #                #"C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_213329",
+    #                #"C:/Users/rasmu/Desktop/Thesis/models/new/GuidedFaradayModel_20260525_222016",
+    #                "E:/models/new2/CVAE_20260525_233836","E:/models/new2/CVAE_20260526_011125","E:/models/new2/CVAE_20260526_024444",
+    #                "E:/models/new2/CVAE_20260526_053436","E:/models/new2/CVAE_20260526_091116","E:/models/new2/DiffusionModel_20260526_070858",
+    #                "E:/models/new2/CVAE_20260526_154037", "E:/models/new2/FaradayModel_20260526_102007", "E:/models/new2/GuidedFaradayModel_20260526_110124",
+    #                "E:/models/new2/GuidedFaradayModel_20260526_114407", "E:/models/new2/GuidedFaradayModel_20260526_122401",
+    #                "E:/models/new2/GuidedFaradayModel_20260527_080406_maybe_tanh", "E:/models/new2/GuidedFaradayModel_20260527_090218",
+    #                "E:/models/new2/GuidedFaradayModel_20260527_100405"
+    #                ]
+    # args.names = [#"Guide", 
+    #               #"CVAE", 
+    #               "Guide-CNN",
+    #                 "H-Guide-CNN", 
+    #                 "Quantiles Baseline",
+    #             #   "Guide Vamp", "Guide Hierarchy", "Guide CNN Hierarchy",  "Average Baseline",
+    #             #     "AutoRegressiveTransformerVAE", 
+    #                 "Diffusion",    
+    #                 #"Guided-Faraday 2", 
+    #                 "Faraday",
+    #                 "Guided-Faraday 3", 
+    #                 # "Guide CNN", 
+    #                 # "Guide CNN 2",
+    #                 #"Guided-Faraday 4",
+    #                 #"Guide CNN 3",
+    #                 #"Guided-Faraday 5",
+    #                 #"Guided-Faraday 6",
+    #                 #"Guided-Faraday 7",
+    #                 "H-Guide-n", "Guide-n", "Guide-CNN-n", 
+    #               "H-Guide-CNN-n", "CVAE-n", "Diffusion-n", 
+    #               "Guide-Vamp-n", "Faraday-n", "Guided-Faraday-n", 
+    #               "Guided-Faraday-CNN-n", "Guided-Faraday-CNN-2-n",
+    #               "Guided-Faraday-CNN-3-n", "Guided-Faraday-CNN-TanH-n",
+    #               "Guided-Faraday-CNN-4-n-100PDCC"
+    #               ]
     # Guided-Faraday 2: used the tanh. 
     # Guided-Faraday 3: used softplus with beta=10. Non-stochastic loss  (2,363,544 params)
     # Guide-Faraday 4: will be stochastic in the loss (see loss function)
@@ -997,23 +1096,15 @@ if __name__ == "__main__":
     # Guide-Faraday 7: using mu activation = None, non-stochastic, User-profiles (2,363,544 params)
     # Guide-Faraday 8: Will not early stop before 15 patience. Using mu activation = None, stochastic (2,363,544 params)
 
+    # E:/models/new2/GuidedFaradayModel_20260527_141620, cnn concat on input (2,838,640 params)
+
     # Guide-CNN: used the tanh activation in forward (see git)
     # Guide CNN: used softplus but with beta=1. 
     # Guide CNN 2: used softplus with beta=15. (1,153,153 params)
     # Guide CNN 3: is scaled up to the other models size and used softplus with beta=100 in sampling and None in forward. (2,114,433 params
     # Guide CNN 4: using tanh in forward like back in the day but with actual parameter count (2,114,433 params)
 
-    # args.models = ["E:/models/new2/CVAE_20260525_233836","E:/models/new2/CVAE_20260526_011125","E:/models/new2/CVAE_20260526_024444",
-    #                "E:/models/new2/CVAE_20260526_053436","E:/models/new2/CVAE_20260526_091116","E:/models/new2/DiffusionModel_20260526_070858",
-    #                "E:/models/new2/CVAE_20260526_154037", "E:/models/new2/FaradayModel_20260526_102007", "E:/models/new2/GuidedFaradayModel_20260526_110124",
-    #                "E:/models/new2/GuidedFaradayModel_20260526_114407", "E:/models/new2/GuidedFaradayModel_20260526_122401"
-    #                ]
-
-    # args.names = ["H-Guide", "Guide", "Guide-CNN", 
-    #               "H-Guide-CNN", "CVAE", "Diffusion", 
-    #               "Guide-Vamp", "Faraday", "Guided-Faraday", 
-    #               "Guided-Faraday-CNN", "Guided-Faraday-CNN-2"]
-
+    
 
     compare_models(
         model_paths=args.models,
