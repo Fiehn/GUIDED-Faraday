@@ -155,7 +155,7 @@ class GuidedFaradayModel(BaseModel):
             hidden_dims=dec_dims,
             layer_type="MLP",
             average_max_std=pdcc_average_max_std,
-            mu_activation="none",
+            mu_activation="softplus", #TODO : TEST THIS FIRST! afterwards RELU
         )
 
         self.hierarchy = None
@@ -324,7 +324,7 @@ class GuidedFaradayModel(BaseModel):
         x_samples = self.decoder.sample(param_dict, num_samples=num_x_samples, temperature=temperature)
         # x_samples: [num_x_samples, num_prior_samples*B, seq_len]
         x_out = x_samples.reshape(num_x_samples, num_prior_samples, B, self.sequence_length)
-        return x_out.contiguous()
+        return torch.clamp(x_out.contiguous(),min=0.0)
 
     @torch.no_grad()
     def reconstruct(self, batch) -> dict[str, torch.Tensor]:
