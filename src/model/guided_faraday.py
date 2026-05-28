@@ -419,6 +419,8 @@ class GuidedFaradayModel(BaseModel):
                 device=device,
                 normalizer=getattr(self, "normalizer", None),
             )
+    def get_SigmaMapper(self):
+        return self.decoder.get_SigmaMapper()
 
 
 def _find_best_checkpoint(model_dir: str) -> str:
