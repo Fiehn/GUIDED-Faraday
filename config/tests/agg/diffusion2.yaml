@@ -1,0 +1,26 @@
+base: base.yaml
+
+model:
+  type: diffusion
+  diffusion:
+    num_timesteps: 200
+    schedule_type: "cosine"
+    cosine_s: 0.008
+    max_beta: 0.999
+    beta_start: 1.0e-4
+    beta_end: 0.02
+    time_dim: 128
+    base_channels: 128
+    num_blocks: 16
+    self_attention_heads: 16
+    use_condition_cross_attention: true
+    condition_cross_attention_heads: 16
+    condition_tokens: 16
+    condition_dropout_prob: 0.10
+    reconstruction_noise_fraction: 0.30
+    deterministic_reconstruction: true
+  lr_scheduler:
+    enabled: true
+    scheduler_type: seq
+    step_size: 10
+    gamma: 0.9

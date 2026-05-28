@@ -17,11 +17,11 @@ def _init_vamp_prior_from_batch(model, batch, device, noise_scale=0.01):
 
     x, meter_id, timestamps, agg = model._unpack_batch(batch)
     x = model.move_to_device(x, device)
-    x_phase_first = model._to_phase_first(x)
-    c = model._build_conditions(x_phase_first, meter_id=meter_id, timestamps=timestamps, device=device)
+    x_phase_first = model._to_phase_first(x)  # SHAPER: [batch_size, num_features, sequence_length]
+    c = model._build_conditions(x_phase_first, meter_id=meter_id, timestamps=timestamps, device=device)  # SHAPER: [batch_size, condition_dim]
 
     with torch.no_grad():
-        z = model.encoder(x_phase_first, c)
+        z = model.encoder(x_phase_first, c)  # SHAPER: [batch_size, latent_dim]
         if isinstance(model.prior, VampPrior):
             model.prior.initialize_pseudo_inputs(z, noise_scale=noise_scale)
 
@@ -122,12 +122,16 @@ class BaseModel(nn.Module, ABC):
             conditioner_state = pickle.dumps(conditioner)
 
         # --- build checkpoint ---
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.parameters())
         checkpoint = {
             "format_version": 2,
             "model_class": self.__class__.__name__,
             "model_state_dict": self.state_dict(),
             "normalizer_state": normalizer_state,
             "conditioner_state": conditioner_state,
+            "trainable_params": trainable_params,
+            "total_params": total_params,
         }
 
         # --- atomic write ---
@@ -341,13 +345,19 @@ class BaseModel(nn.Module, ABC):
             )
             cache_time_s = time.perf_counter() - cache_start_t
             print(f"Epoch [{epoch+1}/{num_epochs}] — data ready in {cache_time_s:.1f}s, training ...", flush=True)
+            file_progress = data_loader.get_file_progress()
+            if "passes" in file_progress:
+                pct_in_pass = (file_progress['seen'] / file_progress['total'] * 100) if file_progress['total'] > 0 else 0.0
+                print(f"Data: pass {file_progress['completed'] + 1}, {pct_in_pass:.1f}% through ({file_progress['passes']:.2f}x total)")
+            else:
+                pct_of_data_seen = (file_progress['seen'] / file_progress['total'] * 100) if file_progress['total'] > 0 else 0.0
+                print(f"Files seen so far: {file_progress['seen']} / {file_progress['total']} ({pct_of_data_seen:.1f}%)")
             if train_loader is None:
-                raise RuntimeError("DataLoader returned None for train_loader. Cannot proceed with training.")
+                print(f"[train] All training windows exhausted after {epoch} epoch(s). Stopping.")
+                break
             
             self.train()
-            epoch_loss = 0.0
-            epoch_recon = 0.0
-            epoch_kl = 0.0
+            epoch_sums: dict[str, float] = {}
             n = 0
             eval_time_s = 0.0
             save_time_s = 0.0
@@ -367,31 +377,35 @@ class BaseModel(nn.Module, ABC):
                     weighted_loss=train_cfg.weighted_loss,
                     # TODO
                 )
-                epoch_loss += float(loss_dict["loss"].detach())
-                epoch_recon += float(loss_dict["recon_loglikelihood"].detach())
-                epoch_kl += float(loss_dict["kl_divergence"].detach())
+                for k, v in loss_dict.items():
+                    try:
+                        epoch_sums[k] = epoch_sums.get(k, 0.0) + float(v.detach() if hasattr(v, "detach") else v)
+                    except (TypeError, ValueError):
+                        pass
                 n += 1
             train_time_s = time.perf_counter() - train_start_t
 
             if n == 0:
                 raise RuntimeError("No training batches were processed in this epoch. Cannot compute epoch metrics.")
-            
-            avg_loss = epoch_loss / n
-            avg_recon = epoch_recon / n
-            avg_kl = epoch_kl / n
+
+            avg_metrics = {k: v / n for k, v in epoch_sums.items()}
+            # Keep legacy aliases for checkpointing / early-stopping code below.
+            avg_loss = avg_metrics.get("loss", 0.0)
+            avg_recon = avg_metrics.get("recon_loglikelihood", avg_metrics.get("loglik", 0.0))
+            avg_kl = avg_metrics.get("kl_divergence", avg_metrics.get("mmd", 0.0))
+
             file_progress = data_loader.get_file_progress()
+            metrics_str = " | ".join(f"{k}: {v:.4f}" for k, v in avg_metrics.items())
             print(
-                f"Epoch [{epoch+1}/{num_epochs}] "
-                f"Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | KL: {avg_kl:.4f} | "
+                f"Epoch [{epoch+1}/{num_epochs}] Train — {metrics_str} | "
                 f"data {cache_time_s:.1f}s  train {train_time_s:.1f}s"
             )
 
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
-            writer.add_scalar('train_loss_epoch', avg_loss, epoch)
-            writer.add_scalar('train_recon_loglikelihood_epoch', avg_recon, epoch)
-            writer.add_scalar('train_kl_divergence_epoch', avg_kl, epoch)
+            for k, v in avg_metrics.items():
+                writer.add_scalar(f'train_{k}_epoch', v, epoch)
             writer.add_scalar('stream_files_seen', file_progress['seen'], epoch)
             writer.add_scalar('stream_files_completed', file_progress['completed'], epoch)
             writer.add_scalar('stream_files_skipped', file_progress.get('skipped', 0), epoch)
@@ -411,19 +425,15 @@ class BaseModel(nn.Module, ABC):
                         beta=train_cfg.beta,
                         device=device,
                     )
-                    print(
-                        f"Epoch [{epoch+1:4d}/{num_epochs}] "
-                        f"Eval Loss: {eval_metrics['loss']:.4f} | "
-                        f"Recon: {eval_metrics['recon_loglikelihood']:.4f} | "
-                        f"KL: {eval_metrics['kl_divergence']:.4f}"
-                    )
-                    writer.add_scalar('eval_loss_epoch', eval_metrics['loss'], epoch)
-                    writer.add_scalar('eval_recon_loglikelihood_epoch', eval_metrics['recon_loglikelihood'], epoch)
-                    writer.add_scalar('eval_kl_divergence_epoch', eval_metrics['kl_divergence'], epoch)
-                    # Alias eval metrics to val_* tags for shared visualization.
-                    writer.add_scalar('val_loss_epoch', eval_metrics['loss'], epoch)
-                    writer.add_scalar('val_recon_loglikelihood_epoch', eval_metrics['recon_loglikelihood'], epoch)
-                    writer.add_scalar('val_kl_divergence_epoch', eval_metrics['kl_divergence'], epoch)
+                    eval_str = " | ".join(f"{k}: {v:.4f}" for k, v in eval_metrics.items())
+                    print(f"Epoch [{epoch+1:4d}/{num_epochs}] Eval — {eval_str}")
+                    for k, v in eval_metrics.items():
+                        try:
+                            fv = float(v)
+                        except (TypeError, ValueError):
+                            continue
+                        writer.add_scalar(f'eval_{k}_epoch', fv, epoch)
+                        writer.add_scalar(f'val_{k}_epoch', fv, epoch)
 
                     if eval_metrics['loss'] < best_eval_loss:
                         best_eval_loss = eval_metrics['loss']
@@ -500,27 +510,37 @@ class BaseModel(nn.Module, ABC):
         time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"{self.__class__.__name__}_{time_stamp}"
     def _prep_inputs(self, x: torch.Tensor) -> torch.Tensor:
-        """ Flatten [B, L, F] to [B, D] if needed """
+        """
+        SHAPER:
+          x  : [batch_size, sequence_length, num_features] | [batch_size, sequence_length * num_features]
+          ->  : [batch_size, sequence_length * num_features]
+        """
         if x.dim() == 3:
-            return x.reshape(x.shape[0], -1)
+            return x.reshape(x.shape[0], -1)  # SHAPER: [batch_size, sequence_length, num_features] -> [batch_size, sequence_length * num_features]
         return x
     def _to_phase_first(self, x: torch.Tensor) -> torch.Tensor:
-        """Return x as [B, F, L], supporting [B, D], [B, F, L], or [B, L, F]."""
+        """
+        SHAPER:
+          x  : [batch_size, sequence_length * num_features]
+             | [batch_size, num_features, sequence_length]
+             | [batch_size, sequence_length, num_features]
+          ->  : [batch_size, num_features, sequence_length]
+        """
         if x.dim() == 2:
             if x.shape[1] != self.sequence_length * self.num_features:
                 raise ValueError(
                     f"Expected flattened input dim {self.sequence_length * self.num_features}, got {x.shape[1]}"
                 )
-            return x.reshape(x.shape[0], self.num_features, self.sequence_length)
+            return x.reshape(x.shape[0], self.num_features, self.sequence_length)  # SHAPER: [batch_size, sequence_length * num_features] -> [batch_size, num_features, sequence_length]
 
         if x.dim() != 3:
             raise ValueError(f"Expected 2D/3D input, got shape {tuple(x.shape)}")
 
         if x.shape[1] == self.num_features and x.shape[2] == self.sequence_length:
-            return x
+            return x  # SHAPER: [batch_size, num_features, sequence_length] already phase-first
 
         if x.shape[1] == self.sequence_length and x.shape[2] == self.num_features:
-            return x.transpose(1, 2)
+            return x.transpose(1, 2)  # SHAPER: [batch_size, sequence_length, num_features] -> [batch_size, num_features, sequence_length]
 
         raise ValueError(
             f"Could not infer phase/time axes for input shape {tuple(x.shape)} with "
@@ -528,8 +548,12 @@ class BaseModel(nn.Module, ABC):
         )
 
     def _build_condition_input(self, x_phase_first: torch.Tensor) -> torch.Tensor:
-        """Convert [B, F, L] -> [B, L, F] for conditioner compatibility."""
-        return x_phase_first.transpose(1, 2)
+        """
+        SHAPER:
+          x_phase_first : [batch_size, num_features, sequence_length]
+          ->             : [batch_size, sequence_length, num_features]
+        """
+        return x_phase_first.transpose(1, 2)  # SHAPER: [batch_size, num_features, sequence_length] -> [batch_size, sequence_length, num_features]
 
     def move_to_device(self, batch, device):
         if torch.is_tensor(batch):
@@ -570,15 +594,21 @@ class BaseModel(nn.Module, ABC):
         self._condition_dim_checked = True
 
     def _build_conditions(self, x_phase_first, meter_id=None, timestamps=None, device=None):
-        cond_input = self._build_condition_input(x_phase_first)
+        """
+        SHAPER:
+          x_phase_first : [batch_size, num_features, sequence_length]
+          ->             : [batch_size, condition_dim]
+        """
+        cond_input = self._build_condition_input(x_phase_first)  # SHAPER: [batch_size, sequence_length, num_features]
         if meter_id is None and timestamps is None:
             c = self.conditioner.get_conditions(cond_input)
         else:
             c = self.conditioner.get_conditions(cond_input, meter_id=meter_id, timestamps=timestamps)
+        # SHAPER: c = [batch_size, condition_dim]
 
         c = self.move_to_device(c, device=device)
         if c.dim() == 1:
-            c = c.unsqueeze(0)
+            c = c.unsqueeze(0)  # SHAPER: [condition_dim] -> [1, condition_dim]
         c = c.float()
         self._validate_condition_dim(c)
         return c

@@ -1,0 +1,42 @@
+base: base.yaml
+
+normalization:
+  method: null
+
+model:
+  type: guided_faraday
+  latent_dim: 128
+  encoder:
+    type: cnn
+    hidden_dims: [64, 128, 256, 256]   # 4 conv layers, downsample every 2nd
+  decoder:
+    type: mlp
+    hidden_dims: [128, 256, 512, 512]
+
+  faraday:
+    mse_weight: 10.0
+    mmd_weight: 1000.0
+    upper_quantile_weight: 100.0
+    lower_quantile_weight: 100.0
+    median_quantile_weight: 100.0
+
+  guided_faraday:
+    dictionary_size: 256
+    pdcc_average_max_std: 0.75 # scales PDCC noise; ~0.5 * sqrt(24/100) * 10 is ca 4.9 std in output space'
+    stochastic_loss: true
+
+  gmm:
+    n_components: 300      # 300 causes degenerate components when MMD regularization is strong
+    covariance_type: full
+    max_iter: 100
+    reg_covar: 1e-3        # raise from default 1e-6; latent space near N(0,I) needs more jitter
+
+early_stopping:
+    enabled: true
+    stop_on_all_files_used: false
+    min_epochs_before_full_data_stop: 1
+    patience: 20
+    min_delta: 0.001
+
+conditioning:
+  tags: [day_of_week, month_of_year, heatpump_phase, ev, pv]

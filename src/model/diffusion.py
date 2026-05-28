@@ -350,7 +350,7 @@ class DiffusionModel(BaseModel):
             x_0_pred = (x - torch.sqrt(1.0 - alpha_t_bar) * predicted_noise) / torch.sqrt(alpha_t_bar)
             
             # 2. clamp x_0 to a reasonable range to prevent numerical issues in mean calculation
-            x_0_pred = torch.clamp(x_0_pred, min=-5.0, max=5.0)
+            x_0_pred = torch.clamp(x_0_pred, min=-10.0, max=10.0)
             
             # 3. Calculate the stable mean using the clamped x_0
             coef1 = self.noise_scheduler.posterior_mean_coef1[t].view(-1, 1, 1)

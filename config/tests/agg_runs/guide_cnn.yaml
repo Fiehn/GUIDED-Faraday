@@ -2,18 +2,20 @@ base: base.yaml
 
 model:
   type: cvae
-  latent_dim: 64
+  latent_dim: 128
   # Encoder configuration
   encoder:
     type: "dictionary_cnn"  # Options: "dictionary", "mlp", "dictionary_cnn"
-    hidden_dims: [512, 256, 128, 128]
+    hidden_dims: [256, 256, 256, 128]
     dropout: 0.2
+    average_max_std: 2.0
   
   # Decoder configuration
   decoder:
     type: "dictionary_cnn"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
     hidden_dims: [128, 256, 256, 512]
     dropout: 0.2
+    average_max_std: 2.0
   
   # Prior configuration
   prior:

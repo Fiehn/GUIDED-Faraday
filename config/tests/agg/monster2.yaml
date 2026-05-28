@@ -1,0 +1,28 @@
+base: base.yaml
+
+model:
+  type: cvae
+  latent_dim: 128
+  # Encoder configuration
+  encoder:
+    type: "dictionary_cnn"  # Options: "dictionary", "mlp", "dictionary_cnn"
+    hidden_dims: [512, 512, 256, 128]
+    dropout: 0.2
+  
+  # Decoder configuration
+  decoder:
+    type: "dictionary_cnn"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
+    hidden_dims: [128, 256, 512, 512]
+    dropout: 0.2
+  
+  # Next time we want to have mmd loss
+  faraday_like: true
+  # Prior configuration
+  prior:
+    type: "vampprior"  # Options: "standard_gaussian", "standard_dictionary", 
+                                 # "learnable_dictionary", "vampprior"
+    dictionary_size: 256         # Must be > input_dim (96 timesteps × 3 phases = 288)
+    vamp_num_components: 80
+    init_from_data: true
+    init_noise_scale: 0.01
+

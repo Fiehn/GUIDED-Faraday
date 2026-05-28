@@ -6,7 +6,7 @@ data:
   num_workers: 8
 
 training:
-  num_epochs: 2
+  num_epochs: 100
 
 model:
   type: baseline_average

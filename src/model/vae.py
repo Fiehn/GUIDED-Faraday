@@ -247,7 +247,7 @@ class VAE(BaseModel):
             hierarchy_loss = self._last_hierarchy_results["loss"]
             loss = loss + hierarchy_loss
 
-        # TODO: MMD (mean maximum discrepancy) has been shown to be useful for smart meter data by one of the papers
+        # TODO: MMD (mean maximum discrepancy) has been shown to be useful for smart meter data by faraday
         return {"loss": loss, "recon_loglikelihood": recon_loglikelihood, "kl_divergence": kl_div}
 
     def train_core(self, batch, optim, gradient_clip=None, gradient_clip_kwargs=None, beta=1.0, weighted_loss =0.0, **_):

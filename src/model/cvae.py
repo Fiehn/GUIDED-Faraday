@@ -16,6 +16,9 @@ class CVAE(VAE):
         phased_mode: bool = False,
         sequence_length: int = 24,
         extra_condition_dim: int = 0,
+        include_faraday_like: bool = False,
+        encoder_average_max_std: float = 1.0,
+        decoder_average_max_std: float = 1.0,
         **kwargs,
     ):
         if distribution_dict is None:
@@ -26,6 +29,8 @@ class CVAE(VAE):
         self.conditioner = conditioner
         self.condition_dim = conditioner.get_condition_dim() + extra_condition_dim
         self.latent_dim = int(latent_dim)
+
+        self.include_faraday_like = include_faraday_like
 
         super().__init__(input_dim=input_dim, 
                          latent_dim=latent_dim, 
@@ -77,6 +82,9 @@ class CVAE(VAE):
             input_dim=input_dim + self.condition_dim,
             latent_dim=latent_dim,
             type=kwargs.get("encoder_type", "dictionary"),
+            cond_dim=0,  # CNN encoders: full-input injection; cat([x_flat, c]) enters CNN trunk
+            average_max_std=encoder_average_max_std,
+            mu_activation="none", # TODO: !!! consider making this configurable: maybe tanh for this????
             **encoder_model_kwargs,
             **base_kwargs,
         )
@@ -86,6 +94,7 @@ class CVAE(VAE):
             latent_dim=self.decoder_input_dim + self.condition_dim,
             output_dim=input_dim,
             type=kwargs.get("decoder_type", "dictionary"),
+            average_max_std=decoder_average_max_std,
             **decoder_model_kwargs,
             **base_kwargs,
         )
@@ -143,15 +152,24 @@ class CVAE(VAE):
 
         return recon_params, q_params 
 
-    def loss(self, x: torch.Tensor, recon_params, posterior_params, beta=1.0, weighted_loss=0.0,**_):
+    def loss(self, x: torch.Tensor, recon_params, posterior_params, beta=1.0, weighted_loss=0.0, **_):
         """Compute ELBO loss."""
         # recon_params: dict of [S, B, D] -> use first sample for training
         if recon_params["mu"].dim() == 3:
             recon_params_squeezed = {k: v[0] for k, v in recon_params.items()}
         else:
             recon_params_squeezed = recon_params
+        
+        loss = super().loss(x, recon_params_squeezed, posterior_params, beta=beta, weighted_loss=weighted_loss)
 
-        return super().loss(x, recon_params_squeezed, posterior_params, beta=beta, weighted_loss=weighted_loss)
+        if self.include_faraday_like:
+            from src.model.faraday import calculate_training_loss
+            faraday_loss = calculate_training_loss(x_hat=recon_params_squeezed["mu"], x=x, z=posterior_params["mu"], 
+                                                   mse_weight=1.0, upper_quantile_weight=1.0, lower_quantile_weight=1.0,
+                                                   median_quantile_weight=1.0, mmd_weight=20.0)["loss"]
+            loss["loss"] = loss["loss"] + faraday_loss
+        
+        return loss
 
     def train_core(self, batch, optim, beta=1.0,weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
         self.train()
@@ -186,6 +204,7 @@ class CVAE(VAE):
             x, meter_id, timestamps, _agg = self._unpack_batch(batch)
                 
             c = self._build_conditions(x_phase_first=self._to_phase_first(x), meter_id=meter_id, timestamps=timestamps)
+            c = c.to(device)
 
             # Keep original 3D shape for conditioning
             x_3d = x.to(device)

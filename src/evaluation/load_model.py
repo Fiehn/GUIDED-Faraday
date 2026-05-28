@@ -51,31 +51,23 @@ def load_model(model_path: str, device: str = "cpu", ev_path: str | None = None)
     # 3. Load the model
     model = create_model_from_config(config, device)
 
-    # 4. Load the checkpoint
-    # Prefer checkpoints with a numeric epoch identifier (last numeric token in filename).
-    # If multiple checkpoints contain numbers, pick the one with the highest number.
-    # If no numeric tokens are present in any .pt file, fall back to the most recently
-    # modified .pt file in the directory.
+    # 4. Load the checkpoint — prefer best_model_* with highest epoch number
     import re
 
     checkpoint_path = None
     max_epoch = -1
     pt_files = [f for f in os.listdir(model_path) if f.endswith('.pt')]
 
+    # best_model_<type>_<ts1>_<ts2>_<epoch>.pt — take the one with the largest epoch
     for file in pt_files:
-        # Find all integer tokens in the filename and take the last one as epoch candidate
-        nums = re.findall(r"(\d+)", file)
-        if nums:
-            try:
-                epoch = int(nums[-1])
-                if epoch > max_epoch:
-                    max_epoch = epoch
-                    checkpoint_path = os.path.join(model_path, file)
-            except Exception:
-                # ignore parse errors and continue
-                continue
+        m = re.match(r"best_model_.+_(\d+)\.pt$", file)
+        if m:
+            epoch = int(m.group(1))
+            if epoch > max_epoch:
+                max_epoch = epoch
+                checkpoint_path = os.path.join(model_path, file)
 
-    # If no numeric epochs found, fall back to the most recently modified .pt file
+    # Fall back to the most recently modified .pt file if no best_model_ found
     if checkpoint_path is None and pt_files:
         pt_files_full = [os.path.join(model_path, f) for f in pt_files]
         checkpoint_path = max(pt_files_full, key=os.path.getmtime)

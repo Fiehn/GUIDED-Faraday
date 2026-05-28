@@ -110,6 +110,7 @@ class GMMConfig(BaseModel):
     n_components: int = 300
     covariance_type: str = "full"
     max_iter: int = 100
+    reg_covar: float = 1e-6
 
 
 class FaradayModelConfig(BaseModel):
@@ -118,6 +119,21 @@ class FaradayModelConfig(BaseModel):
     encoder: EncoderConfig
     decoder: DecoderConfig
     faraday: FaradayLossConfig = Field(default_factory=FaradayLossConfig)
+    gmm: GMMConfig = Field(default_factory=GMMConfig)
+
+
+class GuidedFaradayConfig(BaseModel):
+    model_config = {"extra": "allow"}
+    dictionary_size: int = 100
+
+
+class GuidedFaradayModelConfig(BaseModel):
+    type: Literal["guided_faraday"]
+    latent_dim: int
+    encoder: EncoderConfig
+    decoder: DecoderConfig
+    faraday: FaradayLossConfig = Field(default_factory=FaradayLossConfig)
+    guided_faraday: GuidedFaradayConfig = Field(default_factory=GuidedFaradayConfig)
     gmm: GMMConfig = Field(default_factory=GMMConfig)
 
 
@@ -143,6 +159,7 @@ ModelConfig = Annotated[
         DiffusionModelConfig,
         PhaseSplitterModelConfig,
         FaradayModelConfig,
+        GuidedFaradayModelConfig,
         BaselineAverageModelConfig,
         BaselineQuantileModelConfig,
         BaselineMeanModelConfig,

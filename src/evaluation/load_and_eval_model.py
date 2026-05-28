@@ -28,7 +28,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from src.model.factory import _load_train_config
-from src.data.dataloader_phased import PhasedReplayDataloaders, WindowSpec
+from src.data.dataloader_phased import PhasedReplayDataloaders, InMemoryCSVDataloaders, WindowSpec
 from src.evaluation.load_model import load_model
 from src.evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
  
@@ -49,7 +49,15 @@ def _load_config_for_model(model_path: str):
 
 
 def setup_data_loader(config, normalizer, device="cpu", model_path=None):
-    """Build test loader using the phased replay dataloader implementation."""
+    """Build test loader using the phased replay dataloader implementation.
+
+    SHAPER:
+      returns DataLoader yielding 4-tuples per batch:
+        x   : [batch_size, num_phases, input_len]   phase power windows (3 phases or 1 for aggregate-only)
+        m   : [batch_size]                           meter IDs (long)
+        t   : [batch_size]                           time indices (long)
+        agg : [batch_size, 1, input_len]             aggregate power window
+    """
     data_cfg = config.data
     data_mode = str(getattr(data_cfg, "mode", "csv")).lower()
     # data_mode = "phased" # hardcode for testing phase splitter
@@ -108,8 +116,9 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
     output_aggregate_stream = bool(getattr(data_cfg, "output_aggregate_stream", False))
     hourly_aggregation = bool(getattr(data_cfg.window, "aggregated", False))
     aggregation_energy_unit = str(getattr(data_cfg, "aggregation_energy_unit", "wh")).lower()
-    agg_divisor = 1000.0 if hourly_aggregation and aggregation_energy_unit == "kwh" else 1.0
-    # agg_divisor = float(getattr(data_cfg, "aggregation_divisor", 1.0))                        # use this when doing 1-phase models
+    #agg_divisor = 1000.0 if hourly_aggregation and aggregation_energy_unit == "kwh" else 1.0
+    agg_divisor = 1000.0 if phased_mode and aggregation_energy_unit == "kwh" and hourly_aggregation else 1.0
+    #agg_divisor = float(getattr(data_cfg, "aggregation_divisor", 1.0))                        # use this when doing 1-phase models !
     cache_scan_batches = int(getattr(data_cfg, "cache_scan_batches", 0)) or None
     max_value_cfg = getattr(data_cfg, "max_value", None)
     max_value = float(max_value_cfg) if max_value_cfg is not None else None
@@ -126,43 +135,76 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
         val_ratio = val_ratio / total
         test_ratio = test_ratio / total
 
-    loader_obj = PhasedReplayDataloaders(
-        sm_files=parquet_files,
-        replay_buffer_capacity=replay_capacity,
-        min_buffer_size=min_buffer_size,
-        window_spec=window,
-        normalizer=normalizer,
-        num_workers=workers,
-        hourly_aggregation=hourly_aggregation,
-        aggregation_divisor=agg_divisor,
-        batch_size=int(data_cfg.batch_size),
-        eval_cache_device=None,
-        eval_cache_batches=eval_batches,
-        cache_scan_batches=cache_scan_batches,
-        pin_memory=(str(device) != "cpu"),
-        output_aggregate_stream=output_aggregate_stream,
-        skip_corrupt_files=skip_corrupt_files,
-        max_skip_warnings=max_skip_warnings,
-        phased_mode=phased_mode,
-        feature_cols=data_cfg.columns.value_cols,
-        meter_col=data_cfg.columns.meter_id,
-        split_seed=int(getattr(data_cfg.splits, "random_seed", 0)),
-        split_ratios={
-            "train_ratio": train_ratio,
-            "val_ratio": val_ratio,
-            "test_ratio": test_ratio,
-        },
-        max_value=max_value,
-        max_hour_value=float(getattr(data_cfg, "max_hour_value", 20.0)) or None,
-    )
+    in_memory = bool(getattr(data_cfg, "in_memory", False)) and not phased_mode
+    if in_memory:
+        print("Using in-memory data loader (all data loaded at once).")
+        loader_obj = InMemoryCSVDataloaders(
+            sm_files=parquet_files,
+            window_len=int(data_cfg.window.input_len),
+            stride=int(getattr(data_cfg.window, "stride", 1)),
+            batch_size=int(data_cfg.batch_size),
+            split_ratios={
+                "train_ratio": train_ratio,
+                "val_ratio": val_ratio,
+                "test_ratio": test_ratio,
+            },
+            split_seed=int(getattr(data_cfg.splits, "random_seed", 0)),
+            max_hour_value=float(getattr(data_cfg, "max_hour_value", 20.0)) or None,
+            max_value=max_value,
+            nan_as_zero=bool(getattr(data_cfg, "nan_as_zero", False)),
+            normalizer=normalizer,
+            output_aggregate_stream=output_aggregate_stream,
+            meter_col=data_cfg.columns.meter_id,
+            value_cols=list(data_cfg.columns.value_cols),
+            pin_memory=False,
+            eval_cache_device=torch.device("cpu") if device == "cpu" else torch.device("cuda:0"),
+        )
+    else:
+        print("normalizer:", normalizer)
+        loader_obj = PhasedReplayDataloaders(
+            sm_files=parquet_files,
+            replay_buffer_capacity=replay_capacity,
+            min_buffer_size=min_buffer_size,
+            window_spec=window,
+            normalizer=normalizer,
+            num_workers=workers,
+            hourly_aggregation=hourly_aggregation,
+            aggregation_divisor=agg_divisor,
+            batch_size=int(data_cfg.batch_size),
+            eval_cache_device=None,
+            eval_cache_batches=eval_batches,
+            cache_scan_batches=cache_scan_batches,
+            pin_memory=(str(device) != "cpu"),
+            output_aggregate_stream=output_aggregate_stream,
+            skip_corrupt_files=skip_corrupt_files,
+            max_skip_warnings=max_skip_warnings,
+            phased_mode=phased_mode,
+            feature_cols=data_cfg.columns.value_cols,
+            meter_col=data_cfg.columns.meter_id,
+            split_seed=int(getattr(data_cfg.splits, "random_seed", 0)),
+            split_ratios={
+                "train_ratio": train_ratio,
+                "val_ratio": val_ratio,
+                "test_ratio": test_ratio,
+            },
+            max_value=max_value,
+            max_hour_value=float(getattr(data_cfg, "max_hour_value", 20.0)) or None,
+        )
 
     if phased_mode:
         print(f"Phased aggregation unit: {aggregation_energy_unit} (divisor={agg_divisor:g})")
 
-    n_batches = max(1, eval_batches)
-    loader_obj.refresh_test_cache(n_batches)
-    test_loader = loader_obj.get_test_loader()
+    n_batches = max(5, eval_batches) * 10
+    if in_memory:
+        print(f"Preparing in-memory test loader with {n_batches} batches (full dataset).")
+        # In-memory: get_test_loader() returns the full test dataset directly.
+        test_loader = loader_obj.get_test_loader()
+    else:
+        # Streaming: match train.py's cache size (eval_batches * 10).
+        loader_obj.refresh_test_cache(n_batches)
+        test_loader = loader_obj.get_test_loader()
 
+    print(f"Test loader prepared with batch size {data_cfg.batch_size} and up to {n_batches} batches for evaluation.")
     # train_loader = None
     # try:
     #     train_loader = loader_obj.get_train_epoch_loader(steps_per_epoch=eval_batches)
@@ -222,7 +264,7 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
             batch_size=int(data_cfg.batch_size),
             shuffle=False,
             num_workers=0,
-            pin_memory=(str(device) != "cpu"),
+            pin_memory=False,
         )
 
     # If split-based test stream is empty, force all data into test split for rerun evaluation.
@@ -273,7 +315,13 @@ def setup_data_loader(config, normalizer, device="cpu", model_path=None):
 def run_evaluation(model, test_loader, normalizer, conditioner, config, output_path, device="cpu", secondary_model=None, train_loader=None):
     """
     Run the evaluation framework on the test loader.
-    
+
+    SHAPER (test_loader batch format):
+      x   : [batch_size, num_phases, input_len]   phase power windows
+      m   : [batch_size]                           meter IDs (long)
+      t   : [batch_size]                           time indices (long)
+      agg : [batch_size, 1, input_len]             aggregate power window
+
     Args:
         model: Trained model
         test_loader: DataLoader for test data
@@ -286,13 +334,14 @@ def run_evaluation(model, test_loader, normalizer, conditioner, config, output_p
     os.makedirs(output_path, exist_ok=True)
     
     eval_cfg = getattr(config, "evaluation", SimpleNamespace())
-    eval_device = str(getattr(eval_cfg, "device", device))
+    eval_device = device
     default_synth_samples = 1000
     n_synth_samples = int(getattr(eval_cfg, "n_synthetic_samples", default_synth_samples))
 
     eval_normalizer = copy.deepcopy(normalizer) if normalizer is not None else None
     if eval_normalizer is not None and hasattr(eval_normalizer, "to"):
         eval_normalizer = eval_normalizer.to(eval_device)
+    print(f"eval_normalizer exists: {eval_normalizer is not None}, device: {eval_device}")
 
     data_mode = str(getattr(config.data, "mode", "csv")).lower()
     phased_mode = data_mode in {"phased", "phased_parquet"}
@@ -307,6 +356,7 @@ def run_evaluation(model, test_loader, normalizer, conditioner, config, output_p
         print(f"  MIA enabled (K={mia_k} reconstruction samples)")
 
     if phased_mode:
+        print("phased??")
         evaluator = PhasedEvaluationSuite(
             model,
             test_loader,
@@ -345,6 +395,7 @@ def run_evaluation(model, test_loader, normalizer, conditioner, config, output_p
             else:
                 raise
     else:
+        print("aggregate??")
         evaluator = EvalFramework(
             model,
             test_loader,
@@ -432,13 +483,7 @@ def main():
     secondary_model = None
     if args.phase_splitter_path is not None:
         print(f"Loading phase splitter from: {args.phase_splitter_path}")
-        sec_model, sec_normalizer, sec_conditioner = load_model(args.phase_splitter_path, device=device)
-        # Attach the secondary model's normalizer to the model instance so
-        # downstream code can access it during evaluation (e.g. phase-split inverse transform).
-        try:
-            setattr(sec_model, "normalizer", sec_normalizer)
-        except Exception:
-            pass
+        sec_model, _, _ = load_model(args.phase_splitter_path, device=device)
         secondary_model = sec_model
     
     # 2. Setup data loader
@@ -451,7 +496,7 @@ def main():
         try:
             sec_cfg = _load_config_for_model(args.phase_splitter_path)
             print(f"Using phase-splitter data config from: {args.phase_splitter_path}")
-            test_loader = setup_data_loader(sec_cfg, sec_normalizer, device=device, model_path=args.phase_splitter_path)
+            test_loader = setup_data_loader(sec_cfg, None, device=device, model_path=args.phase_splitter_path)
         except Exception as e:
             print(f"[WARN] Could not build test loader from phase-splitter config: {e}")
             print("Falling back to primary model data loader.")

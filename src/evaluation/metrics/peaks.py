@@ -114,9 +114,9 @@ class PeakAnalysis(SyntheticMetric):
             ax.set_title(title, fontsize=14, fontweight='bold')
             ax.set_xlabel('Percentage of 24h (%)', fontsize=12, fontweight='bold')
             ax.set_ylabel('Load (kWh)', fontsize=12, fontweight='bold')
-            ax.legend(fontsize=11)
+            ax.legend(fontsize=11, loc='upper right')
             ax.grid(True, alpha=0.3)
-            
+
             plt.tight_layout()
             os.makedirs(output_dir, exist_ok=True)
             plot_path = os.path.join(output_dir, 'duration_curve.pdf')
@@ -203,6 +203,10 @@ class PeakAnalysis(SyntheticMetric):
             self.plot_load_duration_curve()
             magnitude_metric = self._EMD1()
             timing_metric = self.timing_analysis()
+
+            window_size = self._infer_window_size(self.real_data)
+
+            timing_metric = timing_metric / (window_size / 2) 
             
             # Save individual metrics
             _save_standalone_metric_result(

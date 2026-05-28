@@ -82,7 +82,7 @@ class Visualizer:
     def _safe_inverse_transform(self, x: torch.Tensor) -> torch.Tensor:
         """Run inverse transform on feature-last tensors, preserving shape."""
         if self.normalizer is None:
-            raise RuntimeError("The normalizer and god hates me.")
+            return x
         x_cpu = x.detach().cpu()
 
         return self.normalizer.inverse_transform(x_cpu)

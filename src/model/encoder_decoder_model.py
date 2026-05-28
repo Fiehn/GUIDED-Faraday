@@ -38,9 +38,9 @@ class GaussianCoder(torch.nn.Module):
     
     def forward(self, inputs):
         param_dict = self.parameterizer(inputs)
-        param_dict["mu"] = torch.clamp(param_dict["mu"], min=0.0, max=12.0)
+        param_dict["mu"] = torch.clamp(param_dict["mu"], min=0.0, max=30.0)
         if self.learn_sigma:
-            param_dict["sigma"] = F.softplus(param_dict["sigma"]) + 1e-6 # Ensure positivity 
+            param_dict["sigma"] = F.softplus(param_dict["sigma"], beta=15.0) + 1e-6 # Ensure positivity 
         else:
             param_dict["sigma"] = torch.ones_like(param_dict["mu"]) * self.sigma_fixed # Fixed sigma
         return param_dict
@@ -151,6 +151,7 @@ class DictionaryCoder(torch.nn.Module):
                  batch_norm=False,
                  layer_type='MLP',
                  learn_sigma=False,
+                 mu_activation: str = "tanh", # Options: "softplus", "tanh", "none"
                  **kwargs):
         super(DictionaryCoder, self).__init__()
         if dictionary_size <= output_dim:
@@ -164,6 +165,7 @@ class DictionaryCoder(torch.nn.Module):
         self.sigma_upper_lim = (output_dim/self.dictionary_size)**0.5 * (average_max_std - self.marginal_std_lim) # TODO: UNderstand this step
         self.input_dim = input_dim
         self.output_dim = output_dim
+        self.mu_activation = mu_activation
 
         layer_type_key = str(layer_type).lower()
         seq_len = int(kwargs.get("seq_len", kwargs.get("sequence_length", 24)))
@@ -187,13 +189,15 @@ class DictionaryCoder(torch.nn.Module):
                 hidden_dim=hidden_dims,
             )
         elif layer_type_key in {"conv1d_encoder", "cnn_encoder"}:
+            cond_dim = int(kwargs.get("cond_dim", 0))
+            signal_dim = input_dim - cond_dim
             num_features = kwargs.get("num_features", None)
             if num_features is None:
-                if input_dim % seq_len == 0:
-                    num_features = max(1, input_dim // seq_len)
+                if signal_dim % seq_len == 0:
+                    num_features = max(1, signal_dim // seq_len)
                 else:
                     num_features = 1
-                    seq_len = int(input_dim)
+                    seq_len = int(signal_dim)
             self.parameterizer = TemporalCNNEncoder(
                 input_dim=input_dim,
                 output_dim=output_dim,
@@ -202,6 +206,7 @@ class DictionaryCoder(torch.nn.Module):
                 dist_parameters=["mu", "sigma"] if learn_sigma else ["mu"],
                 param_output_dims={"mu": output_dim, "sigma": dictionary_size} if learn_sigma else None,
                 hidden_dims=hidden_dims,
+                cond_dim=cond_dim,
             )
         else:
             self.parameterizer = Parameterizer(
@@ -231,31 +236,21 @@ class DictionaryCoder(torch.nn.Module):
         # The sigmaMapper is normalized to have unit norm
         return self.SigmaMapper / torch.norm(self.SigmaMapper, dim=0, keepdim=True)
     
-    def forward(self, inputs, test=True):
-        if test:
-            param_dict = self.parameterizer(inputs)
-            
-            # 1. Smoothly bound the Mean (mu) between -5.0 and +5.0
-            # No dead gradients, no infinite predictions.
-            param_dict["mu"] = torch.tanh(param_dict["mu"]) * 5.0 
-
-            # 2. Smoothly bound the Variance (sigma) 
-            # Sigmoid maps to [0, 1]. This maps sigma smoothly between lower_lim and ~2.0
-            # No softplus exploding into infinity.
-            max_sigma_range = 2.0 - self.sigma_lower_lim
-            param_dict["sigma"] = self.sigma_lower_lim + (torch.sigmoid(param_dict["sigma"]) * max_sigma_range)
-            
-            return param_dict
-        
+    def forward(self, inputs):
         param_dict = self.parameterizer(inputs)
-        #param_dict["sigma"] = torch.nn.functional.relu(param_dict["sigma"]).clamp(self.sigma_lower_lim, self.sigma_upper_lim)
-        param_dict["mu"] = torch.clamp(param_dict["mu"], min=0.0, max=9.0)
 
-        # The actual max allowed out of the clamp is (upper - lower)
-        max_allowed_softplus = self.sigma_upper_lim - self.sigma_lower_lim
-        # The upper limit is kinda not nessecary except as a safety precaution against collapse
-        # The lower limit is implemented here by a constant added to the softplus output, which ensures that sigma is always above the lower limit (since softplus is always positive)
-        param_dict["sigma"] = F.softplus(param_dict["sigma"]).clamp(max=max_allowed_softplus) + self.sigma_lower_lim
+        if self.mu_activation == "softplus":
+            # Non-negative outputs — correct for log1p-normalised or raw non-negative data
+            param_dict["mu"] = F.softplus(param_dict["mu"], beta = 15.0)
+        elif self.mu_activation == "tanh":
+            # Symmetric [-5, 5] — use for z-score normalised data or latent encoder codes
+            param_dict["mu"] = torch.tanh(param_dict["mu"]) * 5.0
+        # else "none": unbounded, trust the optimizer
+
+        
+        max_sigma_range = self.sigma_upper_lim - self.sigma_lower_lim
+        param_dict["sigma"] = self.sigma_lower_lim + torch.sigmoid(param_dict["sigma"]) * max_sigma_range
+
         return param_dict
 
     def reparameterize(self, param_dict, num_samples=1, temperature: float = 1.0, **_):
@@ -286,10 +281,19 @@ class DictionaryCoder(torch.nn.Module):
         return z
     
     def sample(self, param_dict=None, num_samples=1, temperature: float = 1.0, **_):
-        """Sample from the distribution. If return_mean is True, ignores noise."""
+        """Sample from the distribution.
+
+        Returns raw reparameterised samples in the model's output space (normalised
+        when a Normalizer is in use).  Non-negativity in original (kWh) space is
+        guaranteed by the Normalizer's own ``torch.clamp(..., min=0.0)`` in
+        ``inverse_transform``; applying softplus here is wrong because it floors the
+        *normalised* output at ~0, which after inverse-transform maps to
+        ``expm1(normalizer_mean) > 0`` rather than 0.  See regression test
+        ``test_dictionary_coder_sample_floor.py``.
+        """
         if param_dict is None:
             raise ValueError("param_dict must be provided for sampling")
-            
+
         return self.reparameterize(param_dict, num_samples=num_samples, temperature=temperature)
     
     def loglikelihood(self, inputs, param_dict,**_):
@@ -681,20 +685,23 @@ class TemporalCNNEncoder(nn.Module):
     Reads a 24-hour time series, detects temporal patterns (spikes), 
     and compresses it down to a flat vector for the latent space bottleneck.
     """
-    def __init__(self, input_dim, 
-                 output_dim, 
-                 seq_len=24, 
-                 num_features=3, 
-                 dist_parameters=["mu", "sigma"], 
+    def __init__(self, input_dim,
+                 output_dim,
+                 seq_len=24,
+                 num_features=3,
+                 dist_parameters=["mu", "sigma"],
                  param_output_dims=None,
                  hidden_dims=None,
+                 cond_dim=0,
                  **_):
         super().__init__()
         self.dist_parameters = dist_parameters
         self.param_output_dims = param_output_dims or {}
+        self.cond_dim = int(cond_dim)
+        # CNN trunk sees only the signal; conditions are injected at the bottleneck.
         self.num_features = int(num_features)
         self.seq_len = int(seq_len)
-        
+
         self.downsample_blocks = nn.Sequential()
 
         if hidden_dims:
@@ -714,53 +721,65 @@ class TemporalCNNEncoder(nn.Module):
                 nn.Conv1d(in_channels=num_features, out_channels=32, kernel_size=5, stride=1, padding=2),
                 nn.BatchNorm1d(32),
                 nn.GELU(),
-                
+
                 nn.Conv1d(in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=1),
                 nn.BatchNorm1d(64),
                 nn.GELU(),
-                
+
                 nn.Conv1d(in_channels=64, out_channels=128, kernel_size=4, stride=2, padding=1),
                 nn.BatchNorm1d(128),
                 nn.GELU(),
             )
-        
+
         # Infer flattened size from the actual downsampling stack.
         with torch.no_grad():
             dummy = torch.zeros(1, self.num_features, self.seq_len)
             flattened_size = int(self.downsample_blocks(dummy).reshape(1, -1).shape[1])
-        
-        # Parameter-specific heads (Outputting the latent z params)
+
+        # Parameter heads receive [CNN bottleneck + conditions].
+        head_input_size = flattened_size + self.cond_dim
         self.param_heads = nn.ModuleDict()
         for param in dist_parameters:
             head_output_dim = self.param_output_dims.get(param)
             if head_output_dim is None:
                 head_output_dim = output_dim
             self.param_heads[param] = nn.Sequential(
-                nn.Linear(flattened_size, 256),
+                nn.Linear(head_input_size, 256),
                 nn.GELU(),
                 nn.Linear(256, int(head_output_dim))
             )
 
     def forward(self, x):
         B = x.shape[0]
-        
-        # If input is flat [B, 72], reshape to [B, Channels, Time]
+
+        if self.cond_dim > 0:
+            # Split signal and conditions; only signal enters the CNN trunk.
+            c = x[:, -self.cond_dim:]
+            x = x[:, :-self.cond_dim]
+        else:
+            c = None
+
+        # If input is flat [B, signal_dim], reshape to [B, num_features, seq_len]
         if x.dim() == 2:
             if x.shape[1] % self.num_features != 0:
                 raise ValueError(
-                    f"TemporalCNNEncoder expected flattened dim divisible by num_features={self.num_features}, got {x.shape[1]}"
+                    f"TemporalCNNEncoder expected flattened signal dim divisible by num_features={self.num_features}, got {x.shape[1]}"
                 )
             x = x.view(B, self.num_features, -1)
         elif x.dim() == 3 and x.shape[1] != self.num_features and x.shape[2] == self.num_features:
             x = x.transpose(1, 2)
-            
+
         h = self.downsample_blocks(x)
-        h = h.view(B, -1) # Flatten to [B, 768]
-        
+        h = h.view(B, -1)
+
+        # Inject conditions at the bottleneck (after CNN, before parameter heads).
+        if c is not None:
+            h = torch.cat([h, c], dim=-1)
+
         param_dict = {}
         for param in self.dist_parameters:
             param_dict[param] = self.param_heads[param](h)
-            
+
         return param_dict
 
     def _num_parameters(self):
@@ -880,12 +899,16 @@ class NNBlock(nn.Module):
         return nn.Sequential(*layers)
 
     
-def get_encoder_model(input_dim, latent_dim, type, hidden_dims=None, **kwargs):
+def get_encoder_model(input_dim, latent_dim, type, average_max_std=1.0, hidden_dims=None, **kwargs):
+    # Encoder latent codes must be unconstrained — force mu_activation off
+    # so softplus/tanh don't push the posterior away from a symmetric prior.
+    kwargs.setdefault("mu_activation", "none")
     if type == "dictionary":
         return DictionaryCoder(
             input_dim=input_dim,
             output_dim=latent_dim,
             hidden_dims=hidden_dims,
+            average_max_std=average_max_std,
             **kwargs
         )
     elif type == "dictionary_cnn":
@@ -895,6 +918,7 @@ def get_encoder_model(input_dim, latent_dim, type, hidden_dims=None, **kwargs):
             layer_type='Conv1D_encoder',
             learn_sigma=True,
             hidden_dims=hidden_dims,
+            average_max_std=average_max_std,
             **kwargs
         )
     else:
@@ -905,12 +929,13 @@ def get_encoder_model(input_dim, latent_dim, type, hidden_dims=None, **kwargs):
             hidden_dims=hidden_dims,
             **kwargs
         )
-def get_decoder_model(latent_dim, output_dim, type, hidden_dims=None, **kwargs):
+def get_decoder_model(latent_dim, output_dim, type, average_max_std=1.0, hidden_dims=None, **kwargs):
     if type == "dictionary":
         return DictionaryCoder(
             input_dim=latent_dim,
             output_dim=output_dim,
             hidden_dims=hidden_dims,
+            average_max_std=average_max_std,
             **kwargs
         )
     elif type == "dictionary_cnn":
@@ -919,6 +944,7 @@ def get_decoder_model(latent_dim, output_dim, type, hidden_dims=None, **kwargs):
             output_dim=output_dim,
             layer_type='Conv1D',
             hidden_dims=hidden_dims,
+            average_max_std=average_max_std,
             **kwargs
         )
     elif type == "ART":

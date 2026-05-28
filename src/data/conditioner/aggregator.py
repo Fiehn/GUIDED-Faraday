@@ -72,6 +72,12 @@ class Conditioner:
             torch.Tensor | None: Concatenated condition tensor of shape
                 `(batch_size, total_condition_dim)`. Returns None if no conditions
                 are registered.
+
+        SHAPER:
+          x          : [batch_size, seq_len, num_features] or None
+          meter_id   : [batch_size] or None
+          timestamps : [batch_size] or None
+          ->         : [batch_size, total_condition_dim]  (cat of each conditioner's output)
         """
         conditions = []
         target_device = None
@@ -104,7 +110,7 @@ class Conditioner:
             else:
                 return torch.empty((x.shape[0] if x is not None else 1, 0))
 
-        return torch.cat(conditions, dim=-1)
+        return torch.cat(conditions, dim=-1)  # SHAPER: [batch_size, total_condition_dim]
 
     def get_random_conditions(self, batch_size: int):
         """Generates random conditions concatenated from all active items for testing.
@@ -123,7 +129,7 @@ class Conditioner:
 
         if len(conditions) == 0:
             return torch.empty((batch_size, 0))
-        return torch.cat(conditions, dim=-1)
+        return torch.cat(conditions, dim=-1)  # SHAPER: [batch_size, total_condition_dim]
 
     def get_condition_dim(self):
         """Returns the total aggregated condition dimension.

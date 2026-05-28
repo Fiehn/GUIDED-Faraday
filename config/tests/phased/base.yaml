@@ -5,7 +5,7 @@
 data:
   mode: phased
   # Edit this path for your machine:
-  data_dir: "E:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
+  data_dir: "E:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles" #"/groups/3phaseinsight/code/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/" #"E:/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles"
   data_files: []
   columns:
     meter_id: meter_number
@@ -20,12 +20,11 @@ data:
     val_ratio: 0.1
     test_ratio: 0.05
     random_seed: 42
-    split_mode: "new"
   window:
     aggregated: true
     input_len: 24
     stride: 24
-  batch_size: 2048
+  batch_size: 512
   shuffle: true
   replay_buffer_capacity: 20000
   min_buffer_size: 2000
@@ -39,6 +38,8 @@ data:
   max_skip_warnings: 20
   aggregation_energy_unit: kwh
   output_aggregate_stream: false
+  in_memory: false
+  max_passes: 20
 
 normalization:
   method: log1p
@@ -76,26 +77,26 @@ training:
   beta: 1.0
   beta_annealing:
     enabled: true
-    n_cycles: 1
-    ratio: 0.25
+    n_cycles: 4
+    ratio: 0.5
   weighted_loss: 0.2
   early_stopping:
-    enabled: false
-    stop_on_all_files_used: true
+    enabled: true
+    stop_on_all_files_used: false
     min_epochs_before_full_data_stop: 1
-    patience: 7
-    min_delta: 0.001
+    patience: 5
+    min_delta: 0.01
   checkpointing:
-    save_freq: 5
-    save_dir: ./models
+    save_freq: 20
+    save_dir: E:/models/phased/
     save_best_model: true
-    save_best_after_fraction: 0.25
+    save_best_after_fraction: 0.15
     save_final_model: true
 
 logging:
-  log_dir: ./models
+  log_dir: E:/models/phased/
   save_config: true
-  config_save_dir: ./models
+  config_save_dir: E:/models/phased/
 
 visualize:
   num_samples: 5

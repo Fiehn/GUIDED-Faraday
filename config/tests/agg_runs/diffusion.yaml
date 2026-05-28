@@ -24,3 +24,10 @@ model:
     scheduler_type: seq
     step_size: 10
     gamma: 0.9
+
+early_stopping:
+    enabled: true
+    stop_on_all_files_used: false
+    min_epochs_before_full_data_stop: 1
+    patience: 15
+    min_delta: 0.001

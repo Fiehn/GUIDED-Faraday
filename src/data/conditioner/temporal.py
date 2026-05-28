@@ -34,6 +34,10 @@ class DayOfWeekConditioner(BaseConditioner):
         Returns:
             torch.Tensor: One-hot encoded days of shape `(batch_size, 7)`. Respects
                 input tensor device if applicable.
+
+        SHAPER:
+          timestamps : [batch_size] (Unix seconds) or list[Timestamp]
+          ->         : [batch_size, 7]
         """
         if timestamps is None:
             return None
@@ -62,7 +66,7 @@ class DayOfWeekConditioner(BaseConditioner):
             days_of_week = torch.tensor(days_list, dtype=torch.long)
             device = "cpu"
 
-        dow_onehot = F.one_hot(days_of_week, num_classes=7).float().to(device)
+        dow_onehot = F.one_hot(days_of_week, num_classes=7).float().to(device)  # SHAPER: [batch_size, 7]
         return dow_onehot
 
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
@@ -73,9 +77,12 @@ class DayOfWeekConditioner(BaseConditioner):
 
         Returns:
             torch.Tensor: Random one-hot tensor of shape `(batch_size, 7)`.
+
+        SHAPER:
+          -> : [batch_size, 7]
         """
-        random_days = torch.randint(0, 7, (batch_size,))
-        dow_onehot = F.one_hot(random_days, num_classes=7).float()
+        random_days = torch.randint(0, 7, (batch_size,))  # SHAPER: [batch_size]
+        dow_onehot = F.one_hot(random_days, num_classes=7).float()  # SHAPER: [batch_size, 7]
         return dow_onehot
 
 
@@ -103,6 +110,10 @@ class MonthOfYearConditioner(BaseConditioner):
 
         Returns:
             torch.Tensor: One-hot encoded months of shape `(batch_size, 12)`.
+
+        SHAPER:
+          timestamps : [batch_size] (Unix seconds) or list[Timestamp]
+          ->         : [batch_size, 12]
         """
         if timestamps is None:
             return None
@@ -132,7 +143,7 @@ class MonthOfYearConditioner(BaseConditioner):
             months = torch.tensor(months_list, dtype=torch.long)
             device = "cpu"
 
-        moy_onehot = F.one_hot(months, num_classes=12).float().to(device)
+        moy_onehot = F.one_hot(months, num_classes=12).float().to(device)  # SHAPER: [batch_size, 12]
         return moy_onehot
 
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
@@ -143,9 +154,12 @@ class MonthOfYearConditioner(BaseConditioner):
 
         Returns:
             torch.Tensor: Random one-hot tensor of shape `(batch_size, 12)`.
+
+        SHAPER:
+          -> : [batch_size, 12]
         """
-        random_months = torch.randint(0, 12, (batch_size,))
-        moy_onehot = F.one_hot(random_months, num_classes=12).float()
+        random_months = torch.randint(0, 12, (batch_size,))  # SHAPER: [batch_size]
+        moy_onehot = F.one_hot(random_months, num_classes=12).float()  # SHAPER: [batch_size, 12]
         return moy_onehot
 
 
@@ -177,9 +191,10 @@ class HolidayConditioner(BaseConditioner):
     def _get_holiday_days(self, device: torch.device) -> torch.Tensor:
         key = str(device)
         cached = self._holiday_days_by_device.get(key)
-        if cached is None:
-            cached = self.holiday_days_cpu.to(device=device, dtype=torch.long)
-            self._holiday_days_by_device[key] = cached
+        if cached is not None and cached.device == device:
+            return cached
+        cached = self.holiday_days_cpu.to(device=device, dtype=torch.long)
+        self._holiday_days_by_device[key] = cached
         return cached
 
     @staticmethod
@@ -219,6 +234,10 @@ class HolidayConditioner(BaseConditioner):
 
         Returns:
             torch.Tensor: Binary holiday indicators of shape `(batch_size, 1)`.
+
+        SHAPER:
+          timestamps : [batch_size] (Unix seconds) or list[Timestamp]
+          ->         : [batch_size, 1]
         """
         device = timestamps.device if isinstance(timestamps, torch.Tensor) else torch.device('cpu')
         if timestamps is None:
@@ -228,15 +247,15 @@ class HolidayConditioner(BaseConditioner):
                 return torch.zeros((meter_id.shape[0], 1), dtype=torch.float32, device=device)
             return torch.zeros((1, 1), dtype=torch.float32, device=device)
 
-        unix_seconds = self._timestamps_to_unix_seconds(timestamps, device=device)
-        day_numbers = torch.div(unix_seconds, 86400, rounding_mode='floor').to(dtype=torch.long, device=device)
+        unix_seconds = self._timestamps_to_unix_seconds(timestamps, device=device)  # SHAPER: [batch_size]
+        day_numbers = torch.div(unix_seconds, 86400, rounding_mode='floor').to(dtype=torch.long, device=device)  # SHAPER: [batch_size]
 
         holidays = self._get_holiday_days(device=device)
         if holidays.numel() == 0:
             return torch.zeros((day_numbers.shape[0], 1), dtype=torch.float32, device=device)
 
-        is_holiday = torch.isin(day_numbers, holidays).to(dtype=torch.float32, device=device)
-        return is_holiday.unsqueeze(1)
+        is_holiday = torch.isin(day_numbers, holidays).to(dtype=torch.float32, device=device)  # SHAPER: [batch_size]
+        return is_holiday.unsqueeze(1)  # SHAPER: [batch_size, 1]
 
     def get_random_conditions(self, batch_size: int) -> torch.Tensor | None:
         """Generates random holiday conditions for testing.
@@ -247,5 +266,5 @@ class HolidayConditioner(BaseConditioner):
         Returns:
             torch.Tensor: Binary tensor of shape `(batch_size, 1)`.
         """
-        random_holiday = torch.randint(0, 2, (batch_size, 1)).float()
+        random_holiday = torch.randint(0, 2, (batch_size, 1)).float()  # SHAPER: [batch_size, 1]
         return random_holiday

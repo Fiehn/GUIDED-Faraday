@@ -7,13 +7,13 @@ model:
   # Encoder configuration
   encoder:
     type: "dictionary"  # Options: "dictionary", "mlp", "dictionary_cnn"
-    hidden_dims: [1024, 512, 256, 128]
+    hidden_dims: [1024, 512, 256, 256]
     dropout: 0.2
   
   # Decoder configuration
   decoder:
     type: "dictionary"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
-    hidden_dims: [128, 256, 512, 1024]
+    hidden_dims: [256, 256, 512, 1024]
     dropout: 0.2
   
   prior:

@@ -149,14 +149,33 @@ class QuantileBaselineModel(BaseModel):
 
 class AverageBaselineModel(BaseModel):
     def __init__(self, phased_mode: bool = False,
-                    sequence_length: int = 24,
-                        device: str = "cpu",
-                    **kwargs):
+                 sequence_length: int = 24,
+                 device: str = "cpu",
+                 conditioner=None,
+                 min_bucket_samples: int = 120,
+                 force_global_mean: bool = False,
+                 **kwargs):
         super().__init__(phased_mode=phased_mode, sequence_length=sequence_length, **kwargs)
         self.device = device
         self.normalizer = None  # injected at inference time by SyntheticGenerator
-        self.tag = "baseline_average" + str("_phased" if phased_mode else "")
+        self.conditioner = conditioner
+        self.min_bucket_samples = min_bucket_samples
+        self.force_global_mean = force_global_mean
 
+        if conditioner is not None:
+            self._bucket_tags, self._bucket_slices, self._bucket_cardinalities = \
+                self._compute_bucket_metadata(conditioner)
+            self._num_buckets = 1
+            for c in self._bucket_cardinalities:
+                self._num_buckets *= c
+            self._num_buckets = max(self._num_buckets, 1)
+            self.tag = "baseline_average_conditional" + ("_phased" if phased_mode else "")
+        else:
+            self._bucket_tags = []
+            self._bucket_slices = []
+            self._bucket_cardinalities = []
+            self._num_buckets = 0
+            self.tag = "baseline_average" + ("_phased" if phased_mode else "")
 
         self.register_buffer(
             "running_sum",
@@ -167,43 +186,99 @@ class AverageBaselineModel(BaseModel):
             torch.zeros((sequence_length, self.num_features), dtype=torch.long, device=device)
         )
 
+        if self._num_buckets > 0:
+            self.register_buffer(
+                "bucket_sum",
+                torch.zeros((self._num_buckets, sequence_length, self.num_features), dtype=torch.float64, device=device)
+            )
+            self.register_buffer(
+                "bucket_count",
+                torch.zeros((self._num_buckets, sequence_length, self.num_features), dtype=torch.long, device=device)
+            )
+
+    @staticmethod
+    def _compute_bucket_metadata(conditioner):
+        """Extract (tags, slices, cardinalities) for all non-user-profile conditions."""
+        tags = [t for t in conditioner.get_condition_tags() if 'user_profile' not in t.lower()]
+        slices, cardinalities = [], []
+        for tag in tags:
+            start, end = conditioner.get_condition_indexes(tag)
+            dim = end - start
+            # one-hot → cardinality = dim; binary scalar → cardinality = 2
+            cardinalities.append(dim if dim > 1 else 2)
+            slices.append((start, end))
+        return tags, slices, cardinalities
+
+    def _conditions_to_bucket_indices(self, conditions: torch.Tensor) -> torch.Tensor:
+        """Convert [B, D] conditions tensor to [B] mixed-radix bucket indices."""
+        B = conditions.shape[0]
+        device = conditions.device
+        indices = torch.zeros(B, dtype=torch.long, device=device)
+        n = len(self._bucket_slices)
+        for i, ((start, end), cardinality) in enumerate(zip(self._bucket_slices, self._bucket_cardinalities)):
+            sliced = conditions[:, start:end]
+            disc = sliced.argmax(dim=-1) if (end - start) > 1 else (sliced[:, 0] >= 0.5).long()
+            stride = 1
+            for j in range(i + 1, n):
+                stride *= self._bucket_cardinalities[j]
+            indices = indices + disc * stride
+        return indices.clamp(0, self._num_buckets - 1)
+
     @torch.no_grad()
     def update(self, batch: torch.Tensor):
-        """Processes a new batch and updates the global sum and count."""
+        """Processes a new batch and updates global and per-bucket statistics."""
         x, meter_id, timestamp, agg = self._unpack_batch(batch)
         x = x.transpose(1, 2).to(device=self.running_sum.device, dtype=self.running_sum.dtype)  # (B, F, T) -> (B, T, F)
-        
-        batch_sum = x.sum(dim=0)
-        batch_count = x.shape[0] * torch.ones_like(batch_sum, dtype=self.running_count.dtype, device=self.running_count.device)
-        
-        # 4. Add to the global tracking buffers
-        self.running_sum += batch_sum
-        self.running_count += batch_count
-    
+
+        # Global stats (always kept for fallback)
+        self.running_sum += x.sum(dim=0)
+        self.running_count += x.shape[0] * torch.ones_like(
+            self.running_count, dtype=self.running_count.dtype)
+
+        # Per-bucket stats
+        if self.conditioner is not None and self._num_buckets > 0:
+            conditions = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamp)
+            conditions = self.move_to_device(conditions, device=self.running_sum.device).float()
+            bucket_indices = self._conditions_to_bucket_indices(conditions)  # [B]
+
+            B = x.shape[0]
+            idx = bucket_indices.view(B, 1, 1).expand(B, self.sequence_length, self.num_features)
+            self.bucket_sum.scatter_add_(0, idx, x)
+            ones = torch.ones(B, self.sequence_length, self.num_features,
+                              dtype=self.bucket_count.dtype, device=self.bucket_count.device)
+            self.bucket_count.scatter_add_(0, idx, ones)
+
     @torch.no_grad()
     def get_global_mean(self) -> torch.Tensor:
         """Computes the exact global average across the dataset."""
-        # Prevent division by zero by clamping the denominator to 1
         safe_counts = torch.clamp(self.running_count, min=1)
         mean = self.running_sum / safe_counts
-        
-        # If a feature/timestep was entirely unseen across all data, set to 0.0
         mean[self.running_count == 0] = 0.0
-        
         return mean.to(torch.float32)
-    
+
+    @torch.no_grad()
+    def get_bucket_mean(self, bucket_indices: torch.Tensor) -> torch.Tensor:
+        """Returns per-bucket mean [B, L, F], falling back to global mean if count < min_bucket_samples or force_global_mean is set."""
+        global_mean = self.get_global_mean()  # [L, F]
+        result = global_mean.unsqueeze(0).expand(len(bucket_indices), -1, -1).clone()
+        if self.force_global_mean:
+            return result
+        for i, b_idx in enumerate(bucket_indices.tolist()):
+            if self.bucket_count[b_idx, 0, 0].item() >= self.min_bucket_samples:
+                safe_count = self.bucket_count[b_idx].clamp(min=1).float()
+                result[i] = (self.bucket_sum[b_idx] / safe_count).float()
+        return result
+
     def get_optimizer(self, lr, weight_decay, *args, **kwargs):
-        # Dummy optimizer to prevent the PyTorch optimizer crash in fit()
         dummy_param = torch.nn.Parameter(torch.zeros(1))
         return torch.optim.Adam([dummy_param], lr=lr)
-    
+
     def train_core(self, batch,
                    optim=None,
                    gradient_clip=0.0,
                    gradient_clip_max_norm=0.0,
                    beta=0.0,
                    weighted_loss=0.0):
-        # Update the running global mean in a streaming fashion
         self.update(batch)
         return {
             "loss": torch.tensor(0.0, device=self.running_sum.device, requires_grad=False),
@@ -213,61 +288,52 @@ class AverageBaselineModel(BaseModel):
 
     def validate(self, valloader, num_samples=1, beta=1, device="cpu", **kwargs):
         buffer_device = self.running_sum.device
-        return {"loss": torch.tensor(0.0, device=device, requires_grad=False), "recon_loglikelihood": torch.tensor(0.0, device=buffer_device, requires_grad=False), "kl_divergence": torch.tensor(0.0, device=buffer_device, requires_grad=False)}
-
-    def _log1p_bias_correction(self, shape_lf: torch.Size) -> torch.Tensor:
-        """Return per-feature Jensen correction (+σ/2 in z-space) for log1p normalization.
-
-        For log1p normalization inverse_transform(0) = expm1(μ) = geometric mean, not
-        the arithmetic mean.  Adding σ/2 in z-space gives
-        expm1(σ/2 * σ + μ) = expm1(μ + σ²/2) ≈ E[x], recovering the true mean.
-        Returns a [L, F] zero tensor when no correction is needed.
-        """
-        L, F = shape_lf
-        zero = torch.zeros(L, F, dtype=torch.float32)
-        if self.normalizer is None:
-            return zero
-        log_methods = getattr(self.normalizer, 'LOG_METHODS', set())
-        if getattr(self.normalizer, 'method', None) not in log_methods:
-            return zero
-        std = getattr(self.normalizer, 'std', None)
-        if std is None:
-            return zero
-        # std is [1, F]; correction is σ/2 per feature, broadcast to [L, F]
-        correction_f = (std.reshape(-1).float() / 2.0).cpu()  # [F]
-        return correction_f.unsqueeze(0).expand(L, F)  # [L, F]
+        return {
+            "loss": torch.tensor(0.0, device=device, requires_grad=False),
+            "recon_loglikelihood": torch.tensor(0.0, device=buffer_device, requires_grad=False),
+            "kl_divergence": torch.tensor(0.0, device=buffer_device, requires_grad=False),
+        }
 
     @torch.no_grad()
-    def sample(self, num_samples_prior=1, num_samples_posterior=1, **kwargs):
-        # Sampling simply returns the mean profile expanded to the requested size
-        num_samples = kwargs.get('num_samples', num_samples_prior)
+    def sample(self, conditions=None, num_prior_samples=1, num_samples_prior=1,
+               num_x_samples=1, device='cpu', **kwargs):
+        if self.conditioner is not None and conditions is not None:
+            # Conditioned path — returns [1, 1, B, D] to match CVAE contract
+            conditions = self.move_to_device(conditions, device=self.running_sum.device).float()
+            bucket_indices = self._conditions_to_bucket_indices(conditions)
+            means = self.get_bucket_mean(bucket_indices)  # [B, L, F]
+            if self.phased_mode:
+                means = means.transpose(1, 2)  # [B, F, L]
+            B, d1, d2 = means.shape
+            return means.reshape(1, 1, B, d1 * d2)
+
+        # Unconditional path — returns [N, 1, 1, D]
+        num_samples = kwargs.get('num_samples', max(num_prior_samples, num_samples_prior))
         global_mean = self.get_global_mean()  # [L, F]
-
-        # Correct Jensen's inequality bias introduced by log1p normalization
-        correction = self._log1p_bias_correction(global_mean.shape).to(global_mean.device)
-        global_mean = global_mean + correction
-
-        # Consistent with CVAE: return [S, num_x_samples, B, D]
         if self.phased_mode:
             global_mean = global_mean.transpose(0, 1)  # [F, L]
-
         return global_mean.reshape(1, 1, 1, -1).expand(num_samples, -1, -1, -1)
 
     @torch.no_grad()
     def reconstruct(self, x, meter_ids=None, timestamps=None, num_samples=1, **kwargs):
-        # Reconstructions ignore the input values and return the dataset-wide mean
+        if self.conditioner is not None:
+            x_phase_first = self._to_phase_first(x)
+            cond_input = self._build_condition_input(x_phase_first)  # [B, L, F]
+            conditions = self.conditioner.get_conditions(cond_input, meter_id=meter_ids, timestamps=timestamps)
+            conditions = self.move_to_device(conditions, device=self.running_sum.device).float()
+            bucket_indices = self._conditions_to_bucket_indices(conditions)
+            means = self.get_bucket_mean(bucket_indices)  # [B, L, F]
+            if self.phased_mode:
+                means = means.transpose(1, 2)  # [B, F, L]
+            B, d1, d2 = means.shape
+            return means.reshape(1, B, d1 * d2).expand(num_samples, -1, -1)
+
+        # Unconditional path
         global_mean = self.get_global_mean()  # [L, F]
-
-        correction = self._log1p_bias_correction(global_mean.shape).to(global_mean.device)
-        global_mean = global_mean + correction
-
         if self.phased_mode:
             global_mean = global_mean.transpose(0, 1)  # [F, L]
-
         batch_size = x.shape[0]
-        # Return shape [S, B, D]
-        reconstruction = global_mean.reshape(1, 1, -1).expand(num_samples, batch_size, -1)
-        return reconstruction
+        return global_mean.reshape(1, 1, -1).expand(num_samples, batch_size, -1)
 
 class FlatMeanBaselineModel(BaseModel):
     """
@@ -309,28 +375,10 @@ class FlatMeanBaselineModel(BaseModel):
         buffer_device = self.running_sum.device
         return {"loss": torch.tensor(0.0, device=device, requires_grad=False), "recon_loglikelihood": torch.tensor(0.0, device=buffer_device, requires_grad=False), "kl_divergence": torch.tensor(0.0, device=buffer_device, requires_grad=False)}
     
-    def _log1p_bias_correction(self, shape_lf: torch.Size) -> torch.Tensor:
-        """See AverageBaselineModel._log1p_bias_correction for details."""
-        L, F = shape_lf
-        zero = torch.zeros(L, F, dtype=torch.float32)
-        if self.normalizer is None:
-            return zero
-        log_methods = getattr(self.normalizer, 'LOG_METHODS', set())
-        if getattr(self.normalizer, 'method', None) not in log_methods:
-            return zero
-        std = getattr(self.normalizer, 'std', None)
-        if std is None:
-            return zero
-        correction_f = (std.reshape(-1).float() / 2.0).cpu()
-        return correction_f.unsqueeze(0).expand(L, F)
-
     @torch.no_grad()
     def reconstruct(self, x, meter_ids=None, timestamps=None, num_samples=1, **kwargs):
         # Reconstructions ignore the input values and return the dataset-wide mean
         global_mean = self.get_global_mean()  # [L, F]
-
-        correction = self._log1p_bias_correction(global_mean.shape).to(global_mean.device)
-        global_mean = global_mean + correction
 
         if self.phased_mode:
             global_mean = global_mean.transpose(0, 1)  # [F, L]
@@ -370,9 +418,6 @@ class FlatMeanBaselineModel(BaseModel):
         # Sampling simply returns the mean profile expanded to the requested size
         num_samples = kwargs.get('num_samples', num_samples_prior)
         global_mean = self.get_global_mean()  # [L, F]
-
-        correction = self._log1p_bias_correction(global_mean.shape).to(global_mean.device)
-        global_mean = global_mean + correction
 
         if self.phased_mode:
             global_mean = global_mean.transpose(0, 1)  # [F, L]
