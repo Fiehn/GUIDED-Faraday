@@ -22,7 +22,8 @@ model:
 
   guided_faraday:
     dictionary_size: 256
-    pdcc_average_max_std: 0.75 # scales PDCC noise; ~0.5 * sqrt(24/100) * 10 is ca 4.9 std in output space'
+    pdcc_average_max_std: 0.75 # scales PDCC noise; ~0.5 * sqrt(24/100) * 10 is ca 4.9 std in output
+    encoder_exclude_tags: [user_profiles]
 
   gmm:
     n_components: 300      # 300 causes degenerate components when MMD regularization is strong

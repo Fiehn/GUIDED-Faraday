@@ -412,6 +412,7 @@ def create_model_from_config(config, device ="cpu"):
             gmm_max_iter=int(getattr(gmm_cfg, "max_iter", 100)),
             gmm_reg_covar=float(getattr(gmm_cfg, "reg_covar", 1e-6)),
             stochastic_loss=bool(getattr(gf_cfg, "stochastic_loss", True)),
+            encoder_exclude_tags=list(getattr(gf_cfg, "encoder_exclude_tags", [])) or None,
         )
     elif model_type == "faraday":
         from src.model.faraday import FaradayModel

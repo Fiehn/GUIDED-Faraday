@@ -243,8 +243,8 @@ class DictionaryCoder(torch.nn.Module):
             # Non-negative outputs — correct for log1p-normalised or raw non-negative data
             param_dict["mu"] = F.softplus(param_dict["mu"], beta = 15.0)
         elif self.mu_activation == "tanh":
-            # Symmetric [-5, 5] — use for z-score normalised data or latent encoder codes
-            param_dict["mu"] = torch.tanh(param_dict["mu"]) * 5.0
+            # Symmetric [-10, 10] — use for z-score normalised data or latent encoder codes
+            param_dict["mu"] = torch.tanh(param_dict["mu"]) * 10.0
         # else "none": unbounded, trust the optimizer
 
         

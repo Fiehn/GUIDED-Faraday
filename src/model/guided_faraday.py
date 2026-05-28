@@ -128,6 +128,7 @@ class GuidedFaradayModel(BaseModel):
         gmm_reg_covar: float = 1e-6,
         phased_mode: bool = False,
         stochastic_loss: bool = True,
+        encoder_exclude_tags: list[str] | None = None,
         **kwargs,
     ):
         super().__init__(phased_mode=phased_mode, sequence_length=sequence_length)
@@ -136,6 +137,25 @@ class GuidedFaradayModel(BaseModel):
         # self.num_features is set by BaseModel: 1 for aggregated, 3 for phased
         self.cond_dim = conditioner.get_condition_dim() if conditioner is not None else 0
 
+        # Compute which condition indices enter the encoder (and therefore the GMM latent
+        # space) vs those that bypass the encoder and reach only the decoder.
+        # `encoder_exclude_tags` names condition tags (e.g. "user_profiles") that should
+        # stay out of the encoder to keep the GMM distribution tighter.
+        if conditioner is not None and encoder_exclude_tags:
+            exclude = set()
+            for tag in encoder_exclude_tags:
+                try:
+                    start, end = conditioner.get_condition_indexes(tag)
+                    exclude.update(range(start, end))
+                except ValueError:
+                    pass
+            enc_indices = [i for i in range(self.cond_dim) if i not in exclude]
+        else:
+            enc_indices = list(range(self.cond_dim))
+
+        self.register_buffer("_enc_cond_indices", torch.tensor(enc_indices, dtype=torch.long))
+        self.gmm_cond_dim = len(enc_indices)
+
         self.stochastic_loss = stochastic_loss
 
         encoder_cls = _GuidedFaradayMLPEncoder if encoder_type == "mlp" else _GuidedFaradayCNNEncoder
@@ -143,7 +163,7 @@ class GuidedFaradayModel(BaseModel):
             seq_len=sequence_length,
             num_features=self.num_features,
             latent_dim=latent_dim,
-            cond_dim=self.cond_dim,
+            cond_dim=self.gmm_cond_dim,
             hidden_dims=encoder_hidden_dims,
         )
 
@@ -184,6 +204,12 @@ class GuidedFaradayModel(BaseModel):
         x_pf = self._to_phase_first(x)
         return self._build_conditions(x_pf, meter_id=meter_id, timestamps=timestamps, device=device)
 
+    def _enc_conditions(self, c: torch.Tensor) -> torch.Tensor:
+        """Slice conditions to the subset that enters the encoder (and GMM)."""
+        if self.gmm_cond_dim == self.cond_dim:
+            return c
+        return c[:, self._enc_cond_indices]
+
     # ------------------------------------------------------------------
     # BaseModel interface
     # ------------------------------------------------------------------
@@ -196,7 +222,7 @@ class GuidedFaradayModel(BaseModel):
         x_flat = self._prep_inputs(x)
         c = self._get_conditions(x, meter_id=meter_id, timestamps=timestamps, device=device)
 
-        mu, log_var = self.encoder(x_flat, c)
+        mu, log_var = self.encoder(x_flat, self._enc_conditions(c))
         z = _FaradayEncoder.reparameterize(mu, log_var).squeeze(0)   # [B, latent_dim]
 
         dec_in = torch.cat([z, c], dim=-1)
@@ -261,7 +287,7 @@ class GuidedFaradayModel(BaseModel):
             x_flat = self._prep_inputs(x)
             c = self._get_conditions(x, meter_id=meter_id, timestamps=timestamps, device=device)
 
-            mu, log_var = self.encoder(x_flat, c)
+            mu, log_var = self.encoder(x_flat, self._enc_conditions(c))
             z = _FaradayEncoder.reparameterize(mu, log_var).squeeze(0)
             dec_in = torch.cat([z, c], dim=-1)
             param_dict = self.decoder(dec_in)
@@ -333,7 +359,7 @@ class GuidedFaradayModel(BaseModel):
         x = self.move_to_device(x, device)
         x_flat = self._prep_inputs(x)
         c = self._get_conditions(x, meter_id=meter_id, timestamps=timestamps, device=device)
-        mu, _ = self.encoder(x_flat, c)
+        mu, _ = self.encoder(x_flat, self._enc_conditions(c))
         param_dict = self.decoder(torch.cat([mu, c], dim=-1))
         return {"mu": param_dict["mu"]}
 
@@ -372,7 +398,7 @@ class GuidedFaradayModel(BaseModel):
                 x, meter_id, timestamps, _ = self._unpack_batch(batch)
                 x_flat = self._prep_inputs(x)
                 c = self._get_conditions(x, meter_id=meter_id, timestamps=timestamps, device=device)
-                mu, _ = self.encoder(x_flat, c)
+                mu, _ = self.encoder(x_flat, self._enc_conditions(c))
                 z_list.append(mu)
 
         if not z_list:
