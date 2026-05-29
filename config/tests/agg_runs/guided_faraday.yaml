@@ -8,10 +8,10 @@ model:
   latent_dim: 128
   encoder:
     type: mlp
-    hidden_dims: [64, 128, 256, 256]
+    hidden_dims: [128, 256, 512, 512, 512, 512]
   decoder:
     type: mlp
-    hidden_dims: [128, 256, 512, 512]
+    hidden_dims: [128, 256, 512, 512, 512, 512]
 
   faraday:
     mse_weight: 10.0

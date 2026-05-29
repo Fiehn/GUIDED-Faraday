@@ -23,6 +23,7 @@ from src.visualization.writer import Writer
 from evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
 from src.visualization.plot_styling import PlotStyle
 from src.model.factory import _load_train_config, _save_training_config_snapshot, create_model_from_config
+from data.feeder_holdout import plot_feeder_holdout_analysis, run_coincidence_factor_analysis
 
 def _run_evaluation_and_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, phased_mode: bool, secondary_model = None,
                                       train_loader = None):
@@ -141,7 +142,16 @@ def train(config, train_only_user_profile: bool = False):
 
     data_mode = str(getattr(config.data, "mode", "csv")).lower()
     phased_mode = data_mode in {"phased", "phased_parquet"}
-    
+
+    _holdout_feeder_id = getattr(config.data, "holdout_feeder_id", None)
+    if _holdout_feeder_id is not None and not getattr(config.data, "topology_path", None):
+        raise ValueError(
+            f"data.holdout_feeder_id={_holdout_feeder_id!r} is set but "
+            "data.topology_path is missing or null. "
+            "Provide the topology JSON path in data.topology_path, "
+            "or set data.holdout_feeder_id to null to disable feeder holdout."
+        )
+
     model = create_model_from_config(config, device)
     conditioner = getattr(model, "conditioner", None)
     
@@ -186,7 +196,9 @@ def train(config, train_only_user_profile: bool = False):
         raise ValueError(f"No data files (.parquet) found in: {data_dir}")
     
     data_cfg = getattr(config, "data", SimpleNamespace())
-    
+    holdout_feeder_id = getattr(data_cfg, "holdout_feeder_id", None)
+    topology_path = getattr(data_cfg, "topology_path", None)
+
     if phased_mode:
         print(f"Data is Phased.")
         aggregation_energy_unit = str(getattr(data_cfg, "aggregation_energy_unit", "wh")).lower()
@@ -278,6 +290,8 @@ def train(config, train_only_user_profile: bool = False):
             output_aggregate_stream=output_aggregate_stream,
             pin_memory=(str(device) != "cpu"),
             eval_cache_device=eval_cache_device,
+            holdout_feeder_id=holdout_feeder_id,
+            topology_path=topology_path,
         )
     elif in_memory:
         print("Using InMemoryCSVDataloaders. Note: this may lead to high memory usage.")
@@ -302,6 +316,8 @@ def train(config, train_only_user_profile: bool = False):
             pin_memory=(str(device) != "cpu"),
             eval_cache_device=eval_cache_device,
             max_passes=int(v) if (v := getattr(data_cfg, "max_passes", None)) is not None else None,
+            holdout_feeder_id=holdout_feeder_id,
+            topology_path=topology_path,
         )
     else:
         print(f"Using PhasedReplayDataloaders with replay_capacity={replay_capacity}, min_buffer_size={min_buffer_size}, workers={workers}, eval_batches={eval_batches}, eval_cache_device={eval_cache_device}, cache_scan_batches={cache_scan_batches}, skip_corrupt_files={skip_corrupt_files}, max_skip_warnings={max_skip_warnings}, phased_mode={phased_mode}")
@@ -333,8 +349,10 @@ def train(config, train_only_user_profile: bool = False):
             },
             max_value=float(v) if (v := getattr(data_cfg, "max_value", None)) is not None else None,
             max_hour_value=float(v) if (v := getattr(data_cfg, "max_hour_value", None)) is not None else None,
+            holdout_feeder_id=holdout_feeder_id,
+            topology_path=topology_path,
         )
-    
+
     if conditioner is not None:
         if conditioner.condition_items.get("user_profile") is not None:
             conditioner.condition_items.get("user_profile", None).fit_on_files(parquet_paths, 
@@ -411,6 +429,125 @@ def train(config, train_only_user_profile: bool = False):
                 print(f"Saved phase splitter evaluation to {split_metrics_path}")
             except Exception as e:
                 print(f"Warning: phase_splitter quality evaluation failed: {e}")
+
+    # Holdout feeder eval pass — uses EvalFramework regardless of phased_mode.
+    # Skipped silently when holdout_feeder_id is not configured or the loader is empty.
+    _holdout_loader = None
+    if holdout_feeder_id is not None and model_type != "phase_splitter":
+        _get_ho = getattr(data_loader, "get_holdout_loader", None)
+        if _get_ho is not None:
+            _holdout_loader = _get_ho()
+    if _holdout_loader is not None:
+        _eval_cfg = getattr(config, "evaluation", SimpleNamespace())
+        _eval_device = str(getattr(_eval_cfg, "device", device))
+        _holdout_n_draws = int(getattr(_eval_cfg, "holdout_n_draws", 1))
+        # Use the full holdout dataset so every calendar date and meter is
+        # represented in the feeder-level aggregated profile plot.
+        _n_holdout = len(_holdout_loader.dataset)
+        print(f"Holdout eval: {_n_holdout} real windows from feeder {holdout_feeder_id}, {_holdout_n_draws} synthetic draw(s).")
+        _eval_norm = copy.deepcopy(normalizer) if normalizer is not None else None
+        if _eval_norm is not None and hasattr(_eval_norm, "to"):
+            _eval_norm = _eval_norm.to(_eval_device)
+        holdout_evaluator = EvalFramework(
+            model,
+            _holdout_loader,
+            _eval_norm,
+            conditioner=conditioner,
+            device=_eval_device,
+            n_synthetic_samples=_n_holdout,
+            output_path=log_path,
+            train_dataloader=train_loader,
+            preserve_condition_order=True,
+        )
+        holdout_evaluator.register_all()
+        try:
+            holdout_evaluator.evaluate_averaged(n_draws=_holdout_n_draws)
+        except RuntimeError as e:
+            if _eval_device != "cpu" and "out of memory" in str(e).lower():
+                print("Warning: GPU OOM during holdout evaluation. Retrying on CPU.")
+                _cpu_norm = copy.deepcopy(normalizer) if normalizer is not None else None
+                if _cpu_norm is not None and hasattr(_cpu_norm, "to"):
+                    _cpu_norm = _cpu_norm.to("cpu")
+                holdout_evaluator = EvalFramework(
+                    model,
+                    _holdout_loader,
+                    _cpu_norm,
+                    conditioner=conditioner,
+                    device="cpu",
+                    n_synthetic_samples=_n_holdout,
+                    output_path=log_path,
+                    train_dataloader=train_loader,
+                    preserve_condition_order=True,
+                )
+                holdout_evaluator.register_all()
+                holdout_evaluator.evaluate_averaged(n_draws=_holdout_n_draws)
+            else:
+                raise
+        holdout_evaluator.save_results(os.path.join(log_path, "eval_results_feeder_holdout.json"))
+        _real_w = getattr(holdout_evaluator, '_real_data', None)
+        _synth_w = getattr(holdout_evaluator, '_synthetic_data', None)
+        _real_ts = getattr(holdout_evaluator, '_timestamps', None)
+        _real_mids = getattr(holdout_evaluator, '_meter_ids', None)
+        _missing = [n for n, v in [("_real_data", _real_w), ("_synthetic_data", _synth_w), ("_timestamps", _real_ts), ("_meter_ids", _real_mids)] if v is None]
+        if _missing:
+            print(f"Warning: feeder holdout profile plot skipped — EvalFramework did not populate: {_missing}")
+        if all(x is not None for x in [_real_w, _synth_w, _real_ts, _real_mids]):
+            import numpy as _np
+            _rw = _np.asarray(_real_w)
+            _sw = _np.asarray(_synth_w)
+            _rt = _np.asarray(_real_ts)
+            _rm = _np.asarray(_real_mids)
+            # For non-CVAE models EvalFramework does not track per-synthetic timestamps;
+            # tile real timestamps/meter_ids to cover the synthetic count so the
+            # feeder-level aggregation can still group windows by calendar date.
+            _raw_st = getattr(holdout_evaluator, '_synthetic_timestamps', None)
+            _raw_sm = getattr(holdout_evaluator, '_synthetic_meter_ids', None)
+            if _raw_st is not None:
+                _st = _np.asarray(_raw_st)
+                _sm = _np.asarray(_raw_sm) if _raw_sm is not None else _np.tile(_rm, (_sw.shape[0] // _rm.shape[0]) + 1)[:_sw.shape[0]]
+            else:
+                _n = _sw.shape[0]
+                _reps = (_n // _rt.shape[0]) + 1
+                _st = _np.tile(_rt, _reps)[:_n]
+                _sm = _np.tile(_rm, _reps)[:_n]
+            # For the profile plot, pool daily aggregates across K independent draws
+            # (not pixel-wise averaged), so bands reflect inter-draw AND inter-day variance.
+            _plot_extra_draws = None
+            if _holdout_n_draws > 1:
+                import torch as _torch_ho
+                with _torch_ho.no_grad():
+                    _fresh = [
+                        _np.asarray(holdout_evaluator._generate_synthetic(_n_holdout))
+                        for _ in range(_holdout_n_draws)
+                    ]
+                _sw = _fresh[0]
+                _plot_extra_draws = _fresh[1:]
+
+            _holdout_analysis_dir = os.path.join(log_path, "holdout_analysis")
+            plot_feeder_holdout_analysis(
+                real_windows=_rw, real_timestamps=_rt, real_meter_ids=_rm,
+                synth_windows=_sw, synth_timestamps=_st, synth_meter_ids=_sm,
+                output_dir=_holdout_analysis_dir,
+                conditioner=conditioner,
+                synth_extra_draws=_plot_extra_draws,
+            )
+            print(f"Feeder holdout analysis plots saved to: {_holdout_analysis_dir}")
+            _cf_scalars = run_coincidence_factor_analysis(
+                real_windows=_rw, real_meter_ids=_rm, real_timestamps=_rt,
+                synth_windows=_sw, synth_meter_ids=_sm, synth_timestamps=_st,
+                output_dir=_holdout_analysis_dir,
+            )
+            if _cf_scalars:
+                _holdout_json = os.path.join(log_path, "eval_results_feeder_holdout.json")
+                try:
+                    with open(_holdout_json) as _f:
+                        _holdout_results = json.load(_f)
+                    _holdout_results.update(_cf_scalars)
+                    with open(_holdout_json, "w") as _f:
+                        json.dump(_holdout_results, _f, indent=2)
+                except Exception as _e:
+                    print(f"Warning: could not merge CF scalars into holdout JSON: {_e}")
+                    import traceback as _tb; _tb.print_exc()
 
     if writer is not None:
         writer.close()

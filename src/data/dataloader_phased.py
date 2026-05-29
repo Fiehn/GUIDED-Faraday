@@ -27,6 +27,16 @@ class WindowSpec:
     stride: int = 1 # how many hours to move the window each step
 
 
+def _extract_meter_id_from_filename(fname: str) -> int:
+    """Extract meter ID from a filename by collecting digit characters.
+
+    Works for 'sm_1001.parquet', 'meter_1001.parquet', '1001.parquet'.
+    Falls back to a stable hash when the filename contains no digits.
+    """
+    digits = "".join(c for c in fname if c.isdigit())
+    return int(digits) if digits else hash(fname) & 0x7FFFFFFF
+
+
 def _impute_to_base_frequency(
     df: pd.DataFrame,
     aggregation: bool = False,
@@ -272,6 +282,16 @@ class StreamingParquetBuffer(IterableDataset):
         self.output_aggregate_stream = bool(output_aggregate_stream)
         self.sample_random = bool(sample_random)
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # threading.Lock is not picklable on Windows; drop it and recreate in the worker
+        del state['_buffer_lock']
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._buffer_lock = threading.Lock()
+
     def _mark_file_seen(self, file_path: str):
         if self.file_seen_map is not None:
             try:
@@ -339,15 +359,7 @@ class StreamingParquetBuffer(IterableDataset):
     def _extract_meter_id(self, file_path: str) -> int:
         if not self.phased_mode:
             raise ValueError("_extract_meter_id is only valid when phased_mode=True")
-        basename = os.path.basename(file_path)
-        stem = os.path.splitext(basename)[0].replace('sm_', '')
-        try:
-            return int(stem)
-        except ValueError as e:
-            raise ValueError(
-                f"Could not parse phased meter id from filename '{basename}'. "
-                "Expected pattern like 'sm_<id>.parquet' or '<id>.parquet'."
-            ) from e
+        return _extract_meter_id_from_filename(os.path.basename(file_path))
 
     def _select_columns(self, file_cols):
         cols_to_load = []
@@ -781,6 +793,8 @@ class PhasedReplayDataloaders:
             split_ratios: dict | None = None,
                 max_value: float | None = None,
                 max_hour_value: float | None = 20.0,
+                holdout_feeder_id: int | None = None,
+                topology_path: str | None = None,
     ):
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
@@ -794,9 +808,27 @@ class PhasedReplayDataloaders:
         self.split_seed = None if split_seed is None else int(split_seed)
         self.split_ratios = split_ratios or {}
         self.max_hour_value = float(max_hour_value) if max_hour_value is not None else None
+        self._holdout_feeder_id = holdout_feeder_id
+        self._topology_path = topology_path
 
         sm_files = list(sm_files)
         self.total_files = len(set(sm_files))
+
+        if holdout_feeder_id is not None:
+            if topology_path is None:
+                raise ValueError("topology_path is required when holdout_feeder_id is set")
+            from data.feeder_holdout import resolve_holdout_meter_ids
+            _holdout_ids = resolve_holdout_meter_ids(topology_path, holdout_feeder_id)
+            self._holdout_files = [
+                f for f in sm_files
+                if _extract_meter_id_from_filename(os.path.basename(f)) in _holdout_ids
+            ]
+            sm_files = [
+                f for f in sm_files
+                if _extract_meter_id_from_filename(os.path.basename(f)) not in _holdout_ids
+            ]
+        else:
+            self._holdout_files = []
 
         # Regular dicts — per-process copies in DataLoader workers (logging only).
         # mp.Manager().dict() proxies fail to reconnect on Windows+Python 3.13 when
@@ -904,6 +936,31 @@ class PhasedReplayDataloaders:
             max_hour_value=self.max_hour_value,
             batch_size=self.batch_size,
         )
+
+    def get_holdout_loader(self):
+        """Return a DataLoader over holdout-feeder windows, or None if not configured."""
+        if not self._holdout_files:
+            return None
+        ds = self.train_dataset
+        holdout_ds = InMemoryPhasedDataset(
+            sm_files=self._holdout_files,
+            split="holdout",
+            feature_cols=ds.feature_cols,
+            split_ratios=self.split_ratios,
+            split_seed=self.split_seed,
+            window_len=ds.window_spec.input_len,
+            stride=ds.window_spec.stride,
+            aggregation=ds.aggregation,
+            aggregation_divisor=ds.aggregation_divisor,
+            max_hour_value=self.max_hour_value,
+            max_value=ds.max_value,
+            nan_as_zero=ds.nan_as_zero,
+            normalizer=ds.normalizer,
+            output_aggregate_stream=self.output_aggregate_stream,
+            holdout_feeder_id=self._holdout_feeder_id,
+            topology_path=self._topology_path,
+        )
+        return DataLoader(holdout_ds, batch_size=self.batch_size, shuffle=False)
 
     def get_file_progress(self):
         self.files_seen = len(self._file_seen_map)
@@ -1297,8 +1354,22 @@ class InMemoryCSVDataset(Dataset):
         value_cols: list[str],
         window_len: int = 24,
         stride: int = 24,
+        holdout_feeder_id: int | None = None,
+        topology_path: str | None = None,
     ):
         split = str(split).lower()
+
+        if split == "holdout" and holdout_feeder_id is None:
+            raise ValueError("split='holdout' requires holdout_feeder_id to be configured")
+        if holdout_feeder_id is not None and topology_path is None:
+            raise ValueError("topology_path is required when holdout_feeder_id is set")
+
+        _holdout_meter_ids: frozenset[int]
+        if holdout_feeder_id is not None:
+            from data.feeder_holdout import resolve_holdout_meter_ids
+            _holdout_meter_ids = resolve_holdout_meter_ids(topology_path, holdout_feeder_id)
+        else:
+            _holdout_meter_ids = frozenset()
 
         ts_candidates = ["timestamp_dst", "timestamp_utc", "timestamp"]
 
@@ -1346,6 +1417,12 @@ class InMemoryCSVDataset(Dataset):
             meter_ends = np.append(meter_starts[1:], len(vals_flat))
 
             for meter_id_val, m_start, m_end in zip(unique_meters, meter_starts, meter_ends):
+                m_int_pre = int(meter_id_val)
+                if split in ("train", "val") and m_int_pre in _holdout_meter_ids:
+                    continue
+                if split == "holdout" and m_int_pre not in _holdout_meter_ids:
+                    continue
+
                 m_vals = vals_flat[m_start:m_end].copy()
                 m_ts   = ts_unix_all[m_start:m_end]
                 n_rows = len(m_vals)
@@ -1390,12 +1467,16 @@ class InMemoryCSVDataset(Dataset):
                 if len(windows) == 0:
                     continue
 
-                # Split assignment via SHA1(seed|meter|timestamp)
+                # Split assignment via SHA1(seed|meter|timestamp).
+                # Holdout split bypasses SHA1 — all windows from holdout meters are kept.
                 m_int = int(meter_id_val)
-                keep = np.array([
-                    csv_split_bucket(split_seed, split_ratios, m_int, int(t)) == split
-                    for t in ts_wins
-                ])
+                if split == "holdout":
+                    keep = np.ones(len(ts_wins), dtype=bool)
+                else:
+                    keep = np.array([
+                        csv_split_bucket(split_seed, split_ratios, m_int, int(t)) == split
+                        for t in ts_wins
+                    ])
 
                 windows = windows[keep]
                 ts_wins = ts_wins[keep]
@@ -1476,12 +1557,16 @@ class InMemoryCSVDataloaders:
         pin_memory: bool = True,
         eval_cache_device: Optional[torch.device] = None,
         max_passes: int | None = None,
+        holdout_feeder_id: int | None = None,
+        topology_path: str | None = None,
     ):
         self.batch_size        = int(batch_size)
         self.pin_memory        = bool(pin_memory)
         self.eval_cache_device = eval_cache_device
         self.split_seed        = None if split_seed is None else int(split_seed)
         self.max_passes        = None if max_passes is None else int(max_passes)
+        self._holdout_feeder_id = holdout_feeder_id
+        self._topology_path     = topology_path
 
         split_ratios = split_ratios or {}
         value_cols   = value_cols or ["hourly_energy_consumption"]
@@ -1499,8 +1584,11 @@ class InMemoryCSVDataloaders:
             value_cols=value_cols,
             window_len=window_len,
             stride=stride,
+            holdout_feeder_id=holdout_feeder_id,
+            topology_path=topology_path,
         )
 
+        self._common = _common  # stored for get_holdout_loader
         self.train_dataset = InMemoryCSVDataset(split="train", **_common)
         self.val_dataset   = InMemoryCSVDataset(split="val",   **_common)
         self.test_dataset  = InMemoryCSVDataset(split="test",  **_common)
@@ -1567,6 +1655,17 @@ class InMemoryCSVDataloaders:
             )
         return self._test_loader
 
+    def get_holdout_loader(self) -> Optional[DataLoader]:
+        """Return a DataLoader over holdout-feeder windows, or None if not configured."""
+        if self._holdout_feeder_id is None:
+            return None
+        ds = InMemoryCSVDataset(split="holdout", **self._common)
+        if len(ds) == 0:
+            print(f"Warning: holdout_feeder_id={self._holdout_feeder_id} is configured but no windows were found in the data files. Check that the feeder ID matches the topology and that the parquet files contain meters from this feeder.")
+            return None
+        return DataLoader(ds, batch_size=self.batch_size, shuffle=False,
+                          num_workers=0, pin_memory=self.pin_memory)
+
     def refresh_test_cache(self, test_batches: int = 0):
         pass  # in-memory: test data already loaded; no streaming cache to fill
 
@@ -1609,8 +1708,23 @@ class InMemoryPhasedDataset(Dataset):
         nan_as_zero: bool = False,
         normalizer: Optional[Normalizer] = None,
         output_aggregate_stream: bool = False,
+        holdout_feeder_id: int | None = None,
+        topology_path: str | None = None,
     ):
         split = str(split).lower()
+
+        if split == "holdout" and holdout_feeder_id is None:
+            raise ValueError("split='holdout' requires holdout_feeder_id to be configured")
+        if holdout_feeder_id is not None and topology_path is None:
+            raise ValueError("topology_path is required when holdout_feeder_id is set")
+
+        if holdout_feeder_id is not None:
+            from data.feeder_holdout import resolve_holdout_meter_ids
+            self._holdout_meter_ids: frozenset[int] = resolve_holdout_meter_ids(
+                topology_path, holdout_feeder_id
+            )
+        else:
+            self._holdout_meter_ids = frozenset()
 
         all_x:          list[np.ndarray] = []  # each: [window_len, num_phases]
         all_agg:        list[np.ndarray] = []  # each: [window_len] (sum of phases)
@@ -1632,10 +1746,13 @@ class InMemoryPhasedDataset(Dataset):
             if getattr(df.index, "tz", None) is None:
                 df.index = df.index.tz_localize("UTC")
 
-            # Extract meter_id from filename (matches StreamingParquetBuffer logic)
-            fname = os.path.basename(fpath)
-            digits = "".join(c for c in fname if c.isdigit())
-            meter_id = int(digits) if digits else hash(fname) & 0x7FFFFFFF
+            meter_id = _extract_meter_id_from_filename(os.path.basename(fpath))
+
+            # Holdout filtering: skip holdout meters in train/val; skip non-holdout in holdout split
+            if split in ("train", "val") and meter_id in self._holdout_meter_ids:
+                continue
+            if split == "holdout" and meter_id not in self._holdout_meter_ids:
+                continue
 
             # Select and type-cast feature columns
             for feat in feature_cols:
@@ -1657,7 +1774,7 @@ class InMemoryPhasedDataset(Dataset):
                 nan_as_zero=nan_as_zero,
                 split_seed=split_seed,
                 split_ratios=split_ratios,
-                split=split,
+                split=None if split == "holdout" else split,
             )
 
             for window_t, meter_id_t, ts_t in seqs:
@@ -1739,15 +1856,18 @@ class InMemoryPhasedDataloaders:
         output_aggregate_stream: bool = False,
         pin_memory: bool = True,
         eval_cache_device: Optional[torch.device] = None,
+        holdout_feeder_id: Optional[int] = None,
+        topology_path: Optional[str] = None,
     ):
         self.batch_size        = int(batch_size)
         self.pin_memory        = bool(pin_memory)
         self.eval_cache_device = eval_cache_device
         self.split_seed        = None if split_seed is None else int(split_seed)
+        self._holdout_feeder_id = holdout_feeder_id
 
         split_ratios = split_ratios or {}
 
-        _common = dict(
+        self._common = dict(
             sm_files=list(sm_files),
             feature_cols=list(feature_cols),
             split_ratios=split_ratios,
@@ -1762,11 +1882,13 @@ class InMemoryPhasedDataloaders:
             nan_as_zero=nan_as_zero,
             normalizer=normalizer,
             output_aggregate_stream=output_aggregate_stream,
+            holdout_feeder_id=holdout_feeder_id,
+            topology_path=topology_path,
         )
 
-        self.train_dataset = InMemoryPhasedDataset(split="train", **_common)
-        self.val_dataset   = InMemoryPhasedDataset(split="val",   **_common)
-        self.test_dataset  = InMemoryPhasedDataset(split="test",  **_common)
+        self.train_dataset = InMemoryPhasedDataset(split="train", **self._common)
+        self.val_dataset   = InMemoryPhasedDataset(split="val",   **self._common)
+        self.test_dataset  = InMemoryPhasedDataset(split="test",  **self._common)
         self._test_loader: Optional[DataLoader] = None
 
         self._base_seed: int = self.split_seed if self.split_seed is not None else 0
@@ -1812,6 +1934,15 @@ class InMemoryPhasedDataloaders:
                                            shuffle=False, num_workers=0,
                                            pin_memory=self.pin_memory)
         return self._test_loader
+
+    def get_holdout_loader(self) -> Optional[DataLoader]:
+        if self._holdout_feeder_id is None:
+            return None
+        ds = InMemoryPhasedDataset(split="holdout", **self._common)
+        if len(ds) == 0:
+            return None
+        return DataLoader(ds, batch_size=self.batch_size, shuffle=False,
+                          num_workers=0, pin_memory=self.pin_memory)
 
     def refresh_test_cache(self, test_batches: int = 0):
         pass  # in-memory: test data already loaded; no streaming cache to fill

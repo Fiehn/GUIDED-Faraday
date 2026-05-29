@@ -8,10 +8,10 @@ model:
   latent_dim: 128
   encoder:
     type: cnn
-    hidden_dims: [64, 128, 256, 256]   # 4 conv layers, downsample every 2nd
+    hidden_dims: [64, 128, 256, 192]   # 4 conv layers, downsample every 2nd
   decoder:
     type: mlp
-    hidden_dims: [128, 256, 512, 512]
+    hidden_dims: [128, 256, 256, 512]
 
   faraday:
     mse_weight: 10.0
@@ -24,6 +24,7 @@ model:
     dictionary_size: 256
     pdcc_average_max_std: 0.75 # scales PDCC noise; ~0.5 * sqrt(24/100) * 10 is ca 4.9 std in output space'
     stochastic_loss: true
+    encoder_exclude_tags: [user_profiles]
 
   gmm:
     n_components: 300      # 300 causes degenerate components when MMD regularization is strong

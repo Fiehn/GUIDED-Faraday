@@ -39,6 +39,8 @@ data:
   output_aggregate_stream: false
   in_memory: true
   max_passes: 20
+  holdout_feeder_id: 291556   # n=42   ev=28.6%   hp=31.0%    avg?=9.70    cover?=100.0%
+  topology_path: data/topology/cleaned/Cleaned_SM_Topology_mapping.json       # path to topology JSON; required when holdout_feeder_id is set
 
 normalization:
   method: log1p
@@ -98,6 +100,20 @@ model:
     reconstruction_noise_fraction: 0.30
     deterministic_reconstruction: true
 
+  hierarchy:
+    enabled: false
+    levels: [linear, linear, linear]
+    latent_dims: [64, 32, 16]
+    top_down: [false, false, false]
+    bottom_up: [false, false, false]
+    loss_weights: [1.0, 1.0, 1.0]
+    aggregation: concat
+    bidirectional: false
+    residual_connections: false
+    kl_annealing: true
+    kl_warmup_steps: 1000
+    free_bits: 0.1
+
 conditioning:
   tags: [day_of_week, month_of_year, user_profile, heatpump_phase, ev, pv]
   user_profile:
@@ -111,20 +127,6 @@ conditioning:
     decay: 0.95
   ev_phase:
     path: data/EV/EV_detection_reduced_60000_SM.csv
-
-hierarchy:
-  enabled: false
-  levels: [linear, linear, linear]
-  latent_dims: [64, 32, 16]
-  top_down: [false, false, false]
-  bottom_up: [false, false, false]
-  loss_weights: [1.0, 1.0, 1.0]
-  aggregation: concat
-  bidirectional: false
-  residual_connections: false
-  kl_annealing: true
-  kl_warmup_steps: 1000
-  free_bits: 0.1
 
 training:
   optimizer: adam
@@ -152,15 +154,15 @@ training:
     min_delta: 0.001
   checkpointing:
     save_freq: 20
-    save_dir: E:/models/new2/
+    save_dir: E:/models/new3/
     save_best_model: true
     save_best_after_fraction: 0.00
     save_final_model: true
 
 logging:
-  log_dir: E:/models/new2/
+  log_dir: E:/models/new3/
   save_config: true
-  config_save_dir: E:/models/new2/
+  config_save_dir: E:/models/new3/
 
 visualize:
   num_samples: 5

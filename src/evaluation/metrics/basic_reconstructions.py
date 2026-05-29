@@ -2,7 +2,7 @@
 import numpy as np
 
 from src.evaluation.metrics.base.base import ReconstructionMetric, _save_standalone_metric_result
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ============================================================================
 # Reconstruction Evaluation Metrics 
@@ -50,7 +50,7 @@ class ReconstructionMSE(ReconstructionMetric):
                 'value': mse,
                 'n_samples': int(real.shape[0]),
                 'n_features': int(real.shape[1]),
-                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+                'updated_at_utc': datetime.now(timezone.utc).isoformat(),
             },
             output_file=self.output_path or 'models/eval_results.json'
         )
@@ -100,7 +100,7 @@ class ReconstructionRMSE(ReconstructionMetric):
                 'value': rmse,
                 'n_samples': int(real.shape[0]),
                 'n_features': int(real.shape[1]),
-                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+                'updated_at_utc': datetime.now(timezone.utc).isoformat(),
             },
             output_file=self.output_path or 'models/eval_results.json'
         )
@@ -171,7 +171,7 @@ class ReconstructionLogLikelihood(ReconstructionMetric):
                 'sigma2_estimate': sigma2,
                 'n_samples': int(real.shape[0]),
                 'n_features': int(real.shape[1]),
-                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+                'updated_at_utc': datetime.now(timezone.utc).isoformat(),
             },
             output_file=self.output_path or 'models/eval_results.json'
         )

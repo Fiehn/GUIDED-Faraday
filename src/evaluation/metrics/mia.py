@@ -21,7 +21,7 @@ outlier-injected arrays (as in 2407.11785) before calling ``compute()`` to
 run the improved attack without any code changes to this class.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -132,7 +132,7 @@ class MembershipInferenceAttack(PrivacyMetric):
                     "train/test windows rather than genuine privacy. "
                     "See arXiv:2407.11785."
                 ),
-                "updated_at_utc": datetime.utcnow().isoformat() + "Z",
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
             },
             output_file=self.output_path or "models/eval_results.json",
         )

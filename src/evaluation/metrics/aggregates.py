@@ -5,7 +5,7 @@ import json
 from typing import Dict, Any, List
 from matplotlib.ticker import AutoMinorLocator
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.evaluation.metrics.base.base import SyntheticMetric, _save_standalone_metric_result, _sanitize_numeric_array, _resolve_output_directory, _to_json_serializable
 from src.evaluation.metrics.flexibility_distance import FlexibilityDistance
@@ -118,7 +118,7 @@ class AggregatedProfiles(SyntheticMetric):
                 'tau': self.tau,
                 'real_aggregated': real_aggregated,
                 'synthetic_aggregated': synth_aggregated,
-                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+                'updated_at_utc': datetime.now(timezone.utc).isoformat(),
             },
             output_file=self.output_path or 'models/eval_results.json'
         )

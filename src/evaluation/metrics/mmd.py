@@ -2,7 +2,7 @@ import numpy as np
 from scipy.spatial.distance import cdist
 
 from src.evaluation.metrics.base.base import SyntheticMetric, _save_standalone_metric_result, _sanitize_numeric_array
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class MaximumMeanDiscrepancy(SyntheticMetric):
@@ -154,7 +154,7 @@ class MaximumMeanDiscrepancy(SyntheticMetric):
                 'max_samples': int(self.max_samples),
                 'n_real_used': int(len(real)),
                 'n_synthetic_used': int(len(synthetic)),
-                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+                'updated_at_utc': datetime.now(timezone.utc).isoformat(),
             },
             output_file=self.output_path or 'models/eval_results.json'
         )

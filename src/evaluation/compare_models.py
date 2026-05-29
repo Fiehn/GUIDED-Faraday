@@ -2,6 +2,7 @@
 
 import os
 import sys
+import shutil
 import torch
 import json
 import numpy as np
@@ -20,9 +21,10 @@ if str(SRC_DIR) not in sys.path:
 
 from src.evaluation.load_model import load_model
 from src.model.factory import _load_train_config
-from src.data.dataloader_phased import PhasedReplayDataloaders, WindowSpec
+from src.data.dataloader_phased import PhasedReplayDataloaders, WindowSpec, InMemoryCSVDataloaders
 from src.evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
 from src.visualization.plot_styling import PlotStyle
+from src.data.feeder_holdout import plot_feeder_aggregated_profile, plot_feeder_holdout_analysis, run_coincidence_factor_analysis
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -145,7 +147,8 @@ class PhasedModelComparator:
             "mmd": "target_0",
             "hourlyconsumptionbymonth": "lower",
             "hourlyconsumptionbyday": "lower",
-            "peakanalysis": "lower",
+            "peakmagnitude": "lower",
+            "peaktiming": "lower",
 
             # Summary scores
             "avgminmaxreconstructionscore": "higher",
@@ -187,7 +190,7 @@ class PhasedModelComparator:
             "acfdistributionmatchks",
             "hourlyconsumptionbymonth",
             "hourlyconsumptionbyday",
-            "peakanalysis"
+            "peakmagnitude"
         }
 
         summary_metrics = {
@@ -255,6 +258,23 @@ class PhasedModelComparator:
             except Exception as e:
                 print(f"Error loading {root_eval_path}: {e}")
         
+        # 3. Check for feeder holdout results — stored as a separate 'holdout_eval' key,
+        #    never injected into regular phase dicts.
+        holdout_path = os.path.join(model_dir, "eval_results_feeder_holdout.json")
+        if os.path.exists(holdout_path):
+            import traceback as _tb
+            try:
+                with open(holdout_path, 'r') as f:
+                    holdout_data = json.load(f)
+                scalar_holdout = {k: v for k, v in holdout_data.items() if isinstance(v, (int, float))}
+                if scalar_holdout:
+                    self.models_data[model_name]['holdout_eval'] = scalar_holdout
+                else:
+                    print(f"Warning: {holdout_path} contains no scalar metrics.")
+            except Exception as e:
+                print(f"Error loading {holdout_path}: {e}")
+                _tb.print_exc()
+
         if not self.models_data[model_name]:
             print(f"No valid evaluation results found in {model_dir} for model {model_name}")
 
@@ -288,6 +308,92 @@ class PhasedModelComparator:
             elif models_with_phase:
                 missing = [m for m in self.models_data if phase not in self.models_data[m]]
                 print(f"\n[Skipping phase '{phase}': missing for models {missing}]")
+
+        self._compare_holdout()
+
+    def _compare_holdout(self):
+        """Generate a separate comparison table and plots for feeder holdout results.
+
+        Models without holdout results are shown as N/A — they are not excluded.
+        No aggregate scores (MinMax/Rank/WinCount) are computed because not all
+        models are guaranteed to have holdout data.
+        """
+        models_with_holdout = [m for m in self.models_data if 'holdout_eval' in self.models_data[m]]
+        if not models_with_holdout:
+            print("\n[No holdout eval results found for any model; skipping holdout comparison.]")
+            return
+
+        missing = [m for m in self.models_data if 'holdout_eval' not in self.models_data[m]]
+        if missing:
+            print(f"\n--- Holdout comparison (N/A for: {missing}) ---")
+        else:
+            print(f"\n--- Holdout comparison ({len(models_with_holdout)} models) ---")
+
+        # Collect all scalar metrics present in any model's holdout results.
+        all_metrics: set[str] = set()
+        for m in models_with_holdout:
+            all_metrics.update(self.models_data[m]['holdout_eval'].keys())
+
+        if not all_metrics:
+            print("  [holdout] No scalar metrics to compare.")
+            return
+
+        all_models = list(self.models_data.keys())
+        scalar_metrics = sorted(all_metrics, key=lambda x: (0 if "Reconstruction" in x or "Flexibility" in x else 1, x))
+
+        # --- Table ---
+        headers = ["Metric"] + all_models
+        table_data = []
+        for metric in scalar_metrics:
+            goal = self._metric_goal(metric)
+            model_vals = {
+                m: float(self.models_data[m]['holdout_eval'][metric])
+                for m in models_with_holdout
+                if metric in self.models_data[m]['holdout_eval']
+            }
+            best_models: set = set()
+            if model_vals:
+                if goal == "target_1":
+                    best_raw = min(abs(v - 1.0) for v in model_vals.values())
+                    best_models = {m for m, v in model_vals.items() if abs(abs(v - 1.0) - best_raw) <= 1e-9}
+                elif goal == "target_0":
+                    best_raw = min(abs(v) for v in model_vals.values())
+                    best_models = {m for m, v in model_vals.items() if abs(abs(v) - best_raw) <= 1e-9}
+                elif goal == "higher":
+                    best_raw = max(model_vals.values())
+                    best_models = {m for m, v in model_vals.items() if abs(v - best_raw) <= abs(best_raw) * 1e-9 + 1e-12}
+                else:
+                    best_raw = min(model_vals.values())
+                    best_models = {m for m, v in model_vals.items() if abs(v - best_raw) <= abs(best_raw) * 1e-9 + 1e-12}
+
+            row = [self._display_metric_name(metric)]
+            for m in all_models:
+                if 'holdout_eval' in self.models_data[m] and metric in self.models_data[m]['holdout_eval']:
+                    val = self.models_data[m]['holdout_eval'][metric]
+                    fmt = f"{val:.4f}" if isinstance(val, float) else str(val)
+                    row.append(f"★ {fmt}" if m in best_models else fmt)
+                else:
+                    row.append("N/A")
+            table_data.append(row)
+
+        table_str = tabulate(table_data, headers=headers, tablefmt="grid")
+        print(f"\nHoldout Comparison Table:")
+        print(table_str)
+
+        holdout_dir = os.path.join(self.output_dir, "holdout_eval")
+        os.makedirs(holdout_dir, exist_ok=True)
+        table_path = os.path.join(holdout_dir, "comparison_table.txt")
+        with open(table_path, "w", encoding="utf-8") as f:
+            f.write(table_str)
+        print(f"Holdout table saved to {table_path}")
+
+        # --- Plots (only models with holdout data) ---
+        plot_style = PlotStyle()
+        reconstruction_metrics = sorted(m for m in scalar_metrics if self._metric_group(m) == "reconstruction")
+        synthetic_metrics = sorted(m for m in scalar_metrics if self._metric_group(m) == "synthetic")
+        for metric_group, group_name in [(reconstruction_metrics, "Reconstruction"), (synthetic_metrics, "Synthetic")]:
+            if metric_group:
+                self._generate_metric_group_plot("holdout_eval", metric_group, group_name, models_with_holdout, plot_style)
 
     def _compute_averages(self, phase: str):
         """Compute three aggregate scores (min-max, rank, win count) for reconstruction and synthetic metrics."""
@@ -699,6 +805,143 @@ class _DenormalizingLoader:
         return self.loader.dataset
 
 
+def _run_holdout_eval(
+    model,
+    normalizer,
+    conditioner,
+    data_files: list[str],
+    holdout_feeder_id: int,
+    topology_path: str,
+    split_seed: int,
+    split_ratios: dict,
+    max_value: float | None,
+    num_samples: int,
+    device: str,
+    window_size: int,
+    model_output_dir: str,
+    n_synthetic_draws: int = 1,
+) -> None:
+    """Run EvalFramework on the holdout feeder and save results + profile plot.
+
+    n_synthetic_draws: how many independent synthetic draws to average for the
+    profile plot. Metrics are computed on the first draw only; the averaged
+    synthetic is used exclusively for the feeder-level profile plot.
+    """
+    import copy
+    loader = InMemoryCSVDataloaders(
+        sm_files=data_files,
+        window_len=window_size,
+        stride=window_size,
+        batch_size=1024,
+        split_ratios=split_ratios,
+        split_seed=split_seed,
+        max_value=max_value,
+        normalizer=normalizer,
+        holdout_feeder_id=holdout_feeder_id,
+        topology_path=topology_path,
+        pin_memory=False,
+    )
+    holdout_loader = loader.get_holdout_loader()
+    if holdout_loader is None:
+        print(f"  [holdout] No windows found for feeder {holdout_feeder_id}; skipping.")
+        return
+
+    # Use the full holdout dataset as the collection target so every calendar date
+    # and every meter is represented in the feeder-level aggregated profile plot.
+    n_holdout_windows = len(holdout_loader.dataset)
+    print(f"  [holdout] {n_holdout_windows} real windows from feeder {holdout_feeder_id}.")
+
+    eval_norm = copy.deepcopy(normalizer)
+    evaluator = EvalFramework(
+        model=model,
+        dataloader=holdout_loader,
+        normalizer=eval_norm,
+        conditioner=conditioner,
+        device=device,
+        window_size=window_size,
+        output_path=model_output_dir,
+        n_synthetic_samples=n_holdout_windows,
+        preserve_condition_order=True,
+    )
+    evaluator.register_all(phased=False)
+    try:
+        evaluator.evaluate_averaged(n_draws=n_synthetic_draws)
+    except RuntimeError as e:
+        if device != "cpu" and "out of memory" in str(e).lower():
+            print("  [holdout] GPU OOM — retrying on CPU.")
+            cpu_norm = copy.deepcopy(normalizer)
+            evaluator = EvalFramework(
+                model=model, dataloader=holdout_loader, normalizer=cpu_norm,
+                conditioner=conditioner, device="cpu", window_size=window_size,
+                output_path=model_output_dir, n_synthetic_samples=n_holdout_windows,
+                preserve_condition_order=True,
+            )
+            evaluator.register_all(phased=False)
+            evaluator.evaluate_averaged(n_draws=n_synthetic_draws)
+        else:
+            raise
+
+    holdout_json = os.path.join(model_output_dir, "eval_results_feeder_holdout.json")
+    evaluator.save_results(holdout_json)
+    print(f"  [holdout] Metrics saved to {holdout_json}")
+
+    _rw = getattr(evaluator, '_real_data', None)
+    _sw = getattr(evaluator, '_synthetic_data', None)
+    _rt = getattr(evaluator, '_timestamps', None)
+    _rm = getattr(evaluator, '_meter_ids', None)
+    _missing_plot = [n for n, v in [("_real_data", _rw), ("_synthetic_data", _sw), ("_timestamps", _rt), ("_meter_ids", _rm)] if v is None]
+    if _missing_plot:
+        print(f"  [holdout] Profile plots skipped — EvalFramework did not populate: {_missing_plot}")
+    if all(x is not None for x in [_rw, _sw, _rt, _rm]):
+        _rw, _sw = np.asarray(_rw), np.asarray(_sw)
+        _rt, _rm = np.asarray(_rt), np.asarray(_rm)
+        _raw_st = getattr(evaluator, '_synthetic_timestamps', None)
+        _raw_sm = getattr(evaluator, '_synthetic_meter_ids', None)
+        if _raw_st is not None:
+            _st = np.asarray(_raw_st)
+            _sm = np.asarray(_raw_sm) if _raw_sm is not None else np.tile(_rm, (_sw.shape[0] // max(_rm.shape[0], 1)) + 1)[:_sw.shape[0]]
+        else:
+            _n, _reps = _sw.shape[0], (_sw.shape[0] // max(_rt.shape[0], 1)) + 1
+            _st = np.tile(_rt, _reps)[:_n]
+            _sm = np.tile(_rm, _reps)[:_n]
+
+        # For the profile plot, pool daily aggregates across K independent draws
+        # (not pixel-wise averaged), so bands reflect inter-draw AND inter-day variance.
+        _plot_extra_draws = None
+        if n_synthetic_draws > 1:
+            with torch.no_grad():
+                _fresh = [
+                    np.asarray(evaluator._generate_synthetic(n_holdout_windows))
+                    for _ in range(n_synthetic_draws)
+                ]
+            _sw = _fresh[0]
+            _plot_extra_draws = _fresh[1:]
+
+        _holdout_analysis_dir = os.path.join(model_output_dir, "holdout_analysis")
+        plot_feeder_holdout_analysis(
+            real_windows=_rw, real_timestamps=_rt, real_meter_ids=_rm,
+            synth_windows=_sw, synth_timestamps=_st, synth_meter_ids=_sm,
+            output_dir=_holdout_analysis_dir,
+            conditioner=conditioner,
+            synth_extra_draws=_plot_extra_draws,
+        )
+        _cf_scalars = run_coincidence_factor_analysis(
+            real_windows=_rw, real_meter_ids=_rm, real_timestamps=_rt,
+            synth_windows=_sw, synth_meter_ids=_sm, synth_timestamps=_st,
+            output_dir=_holdout_analysis_dir,
+        )
+        if _cf_scalars:
+            try:
+                with open(holdout_json) as _f:
+                    _holdout_results = json.load(_f)
+                _holdout_results.update(_cf_scalars)
+                with open(holdout_json, "w") as _f:
+                    json.dump(_holdout_results, _f, indent=2)
+            except Exception as _e:
+                print(f"  [holdout] Warning: could not merge CF scalars into holdout JSON: {_e}")
+                import traceback as _tb; _tb.print_exc()
+
+
 def compare_models(model_paths: list[str],
                    model_names: list[str],
                    secondary_model_paths: list[str] | None = None,
@@ -713,6 +956,7 @@ def compare_models(model_paths: list[str],
                    split_seed: int | None = None,
                    split_ratios: dict | None = None,
                    max_value: float | None = 200.0,
+                   holdout_n_draws: int = 1,
                    ):
     """
     Run evaluation for multiple models and compare results.
@@ -925,8 +1169,51 @@ def compare_models(model_paths: list[str],
             evaluator.evaluate()
             evaluator.save_results(os.path.join(model_output_dir, "eval_results.json"))
 
+        # Run holdout eval if the model's training config has holdout_feeder_id set.
+        # When recompute=True, always re-run (overwrites JSON + plot).
+        # When recompute=False, copy from training dir if available; only run if still missing.
+        _holdout_dst = os.path.join(model_output_dir, "eval_results_feeder_holdout.json")
+        _holdout_src = os.path.join(path, "eval_results_feeder_holdout.json")
+        if not recompute and os.path.exists(_holdout_src) and not os.path.exists(_holdout_dst):
+            shutil.copy2(_holdout_src, _holdout_dst)
+        if (recompute or not os.path.exists(_holdout_dst)) and data_files:
+            _cfg_path = _find_model_config_path(path)
+            if _cfg_path is None:
+                print(f"  [holdout] No training config found in {path}; cannot run holdout eval.")
+            else:
+                import traceback as _tb
+                try:
+                    _mcfg = _load_train_config(_cfg_path)
+                    _hid = getattr(getattr(_mcfg, "data", None), "holdout_feeder_id", None)
+                    _topo = getattr(getattr(_mcfg, "data", None), "topology_path", None)
+                    if _hid is None:
+                        print(f"  [holdout] holdout_feeder_id not set in {_cfg_path}; skipping holdout eval.")
+                    elif _topo is None:
+                        print(f"  [holdout] holdout_feeder_id={_hid} is set but topology_path is missing in {_cfg_path}; skipping holdout eval.")
+                    else:
+                        print(f"  Running holdout eval (feeder {_hid})...")
+                        _run_holdout_eval(
+                            model=model,
+                            normalizer=normalizer,
+                            conditioner=conditioner,
+                            data_files=data_files,
+                            holdout_feeder_id=int(_hid),
+                            topology_path=str(_topo),
+                            split_seed=split_seed,
+                            split_ratios=split_ratios,
+                            max_value=max_value,
+                            num_samples=num_samples,
+                            device=device,
+                            window_size=window.input_len,
+                            model_output_dir=model_output_dir,
+                            n_synthetic_draws=holdout_n_draws,
+                        )
+                except Exception as _e:
+                    print(f"  [holdout] FAILED with exception: {_e}")
+                    _tb.print_exc()
+
         used_eval_dirs.append(model_output_dir)
-    
+
     # 6. Use PhasedModelComparator to generate comparison tables and plots
     print("\n" + "="*50)
     print("GENERATING COMPARISON")
@@ -967,7 +1254,12 @@ if __name__ == "__main__":
     parser.add_argument("--val-ratio", type=float, default=None, help="Val ratio for split (defaults to first model's training config).")
     parser.add_argument("--test-ratio", type=float, default=None, help="Test ratio for split (defaults to first model's training config).")
     parser.add_argument("--max-value", type=float, default=200.0, help="Maximum value for filtering windows.")
+    parser.add_argument("--holdout-n-draws", type=int, default=1, help="Number of synthetic draws to average for holdout feeder profile plot.")
     args = parser.parse_args()
+    holdout_n_draws = int(args.holdout_n_draws)
+
+    args.models = ["E:/models/new3/FaradayModel_20260529_021321", "E:/models/new3/GuidedFaradayModel_20260529_000300"]
+    args.names = ["Faraday-NEW", "Guided-Faraday-NEW"]
 
     # args.models = ["E:/models/new2/AverageBaselineModel_20260526_234356",
     #     "E:/models/new1/CVAE_20260522_041326_guide_cnn", "E:/models/new1/CVAE_20260522_051533_h_guide_cnn",
@@ -981,17 +1273,17 @@ if __name__ == "__main__":
     #                #"E:/models/new2/GuidedFaradayModel_20260527_141620",
     #                ]
 
-    args.names = ["Baseline-Average",
-        "Guide-CNN", "H-Guide-CNN",
-                  "Guide-Vamp", "Faraday", #"Guided-Faraday", 
-                  "Diffusion", "Diffusion Old",
-                  #"Guided-Faraday-CNN", #"Guided-Faraday-CNN-Deterministic",
-                   "Baseline Quantile",
-                  "H-Guide", "Guide", 
-                   "CVAE", 
-                  "Guided-Faraday-CNN-FIX", "Guided-Faraday"
-                  #"Guided-Faraday-cnn-new", 
-                  ]
+    # args.names = ["Baseline-Average",
+    #     "Guide-CNN", "H-Guide-CNN",
+    #               "Guide-Vamp", "Faraday", #"Guided-Faraday", 
+    #               "Diffusion", "Diffusion Old",
+    #               #"Guided-Faraday-CNN", #"Guided-Faraday-CNN-Deterministic",
+    #                "Baseline Quantile",
+    #               "H-Guide", "Guide", 
+    #                "CVAE", 
+    #               "Guided-Faraday-CNN-FIX", "Guided-Faraday"
+    #               #"Guided-Faraday-cnn-new", 
+    #               ]
     
     # args.models = ["E:/models/new2/FaradayModel_20260526_102007","E:/models/new2/GuidedFaradayModel_20260527_152449", "E:/models/new2/GuidedFaradayModel_20260527_162635"
     #                ]
@@ -1121,6 +1413,8 @@ if __name__ == "__main__":
         split_ratios=split_ratios,
         max_value=args.max_value,
         agg_divisor=1000.0 if args.phased else 1.0,
+        holdout_n_draws=holdout_n_draws,
+        
     )
 
 # Example run in CLI: 

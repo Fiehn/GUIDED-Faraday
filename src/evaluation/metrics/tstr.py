@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 
 from src.evaluation.metrics.base.base import SyntheticMetric, _save_standalone_metric_result, _sanitize_numeric_array
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class TSTR(SyntheticMetric):
@@ -215,7 +215,7 @@ class TSTR(SyntheticMetric):
                 'n_real_train': int(len(real_train)),
                 'n_real_test': int(len(real_test)),
                 'n_synthetic_train': int(len(synthetic_train)),
-                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+                'updated_at_utc': datetime.now(timezone.utc).isoformat(),
             },
             output_file=self.output_path or 'models/eval_results.json'
         )

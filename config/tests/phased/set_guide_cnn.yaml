@@ -1,27 +1,28 @@
 base: base.yaml
 
 data:
-  batch_size: 2048
+  batch_size: 256
+  eval_cache_on_gpu: false
 
 model:
   type: set_guide_vae
   latent_dim: 128
   encoder:
     type: dictionary_cnn
-    hidden_dims: [256, 512, 256, 128]
+    hidden_dims: [128, 256, 128]
     dropout: 0.2
   decoder:
     type: dictionary_cnn
-    hidden_dims: [128, 256, 512, 256]
+    hidden_dims: [128, 256, 128]
     dropout: 0.2
   prior:
     type: learnable_dictionary
-    dictionary_size: 512
-    vamp_num_components: 40
+    dictionary_size: 256
+    vamp_num_components: 20
     init_from_data: true
     init_noise_scale: 0.01
   set:
-    hidden_dim: 256
+    hidden_dim: 128
     num_heads: 4
     num_inds: 16
     num_blocks: 2

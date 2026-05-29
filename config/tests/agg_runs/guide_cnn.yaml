@@ -6,14 +6,14 @@ model:
   # Encoder configuration
   encoder:
     type: "dictionary_cnn"  # Options: "dictionary", "mlp", "dictionary_cnn"
-    hidden_dims: [256, 256, 256, 128]
+    hidden_dims: [64, 128, 192, 96]
     dropout: 0.2
     average_max_std: 2.0
   
   # Decoder configuration
   decoder:
     type: "dictionary_cnn"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
-    hidden_dims: [128, 256, 256, 512]
+    hidden_dims: [128, 256, 128, 512]
     dropout: 0.2
     average_max_std: 2.0
   

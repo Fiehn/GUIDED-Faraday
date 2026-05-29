@@ -4,7 +4,7 @@ import torch.nn as nn
 import json
 import time
 from typing import Dict, List, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 import os
 import sys
@@ -27,7 +27,7 @@ from src.evaluation.metrics.tstr import TSTR
 from src.evaluation.metrics.mmd import MaximumMeanDiscrepancy, SetMaximumMeanDiscrepancy
 from src.evaluation.metrics.hourly_avg import HourlyProfilesByMonth, HourlyProfilesByDayofWeek
 from src.evaluation.metrics.aggregates import AggregatedProfiles, PerConditionEval
-from src.evaluation.metrics.peaks import PeakAnalysis
+from src.evaluation.metrics.peaks import PeakMagnitude, PeakTiming
 from src.evaluation.metrics.condition_acc import EVConditionAccuracy
 from src.evaluation.metrics.basic_reconstructions import ReconstructionRMSE, ReconstructionLogLikelihood
 
@@ -96,6 +96,7 @@ class EvalFramework:
         train_dataloader: Optional[torch.utils.data.DataLoader] = None,
         n_member_samples: int = 1000,
         mia_reconstruction_samples: int = 1,
+        preserve_condition_order: bool = False,
     ):
         """Initialize evaluation framework.
 
@@ -110,6 +111,10 @@ class EvalFramework:
             n_member_samples: Maximum number of member windows to collect for MIA.
             mia_reconstruction_samples: Reconstruction passes averaged per member
                 window.  Set to 1 for VAE-family, higher (e.g. 5) for diffusion.
+            preserve_condition_order: When True, synthetic samples are generated
+                using the exact same condition vectors in the same order as the
+                collected real windows (no shuffling). Use for holdout eval where
+                direct 1-to-1 condition matching is required.
         """
         self.model = model.to(device).eval()
         self.dataloader = dataloader
@@ -141,6 +146,7 @@ class EvalFramework:
         self.train_dataloader = train_dataloader
         self.n_member_samples = int(n_member_samples)
         self.mia_reconstruction_samples = int(mia_reconstruction_samples)
+        self.preserve_condition_order = bool(preserve_condition_order)
 
         # Metrics storage
         self.reconstruction_metrics: Dict[str, ReconstructionMetric] = {}
@@ -167,7 +173,8 @@ class EvalFramework:
             ClassicalStatistics(),
             TSTR(),
             AggregatedProfiles(),
-            PeakAnalysis(),
+            PeakMagnitude(),
+            PeakTiming(),
             HourlyProfilesByMonth(),
             HourlyProfilesByDayofWeek(),
             PerConditionEval(),
@@ -411,7 +418,19 @@ class EvalFramework:
             all_meter_ids  = np.concatenate(meter_id_batches,  axis=0) if meter_id_batches  else None
             all_timestamps = np.concatenate(timestamp_batches, axis=0) if timestamp_batches else None
             n = self.n_synthetic_samples
-            if len(all_conditions) >= n:
+            if self.preserve_condition_order:
+                # Holdout eval: use conditions in collection order so synthetic sample i
+                # is generated from the same condition as real sample i.
+                if len(all_conditions) >= n:
+                    self._synthetic_conditions = all_conditions[:n]
+                    self._synthetic_meter_ids  = all_meter_ids[:n]  if all_meter_ids  is not None else None
+                    self._synthetic_timestamps = all_timestamps[:n] if all_timestamps is not None else None
+                else:
+                    repeats = (n // len(all_conditions)) + 1
+                    self._synthetic_conditions = all_conditions.repeat(repeats, 1)[:n]
+                    self._synthetic_meter_ids  = np.tile(all_meter_ids,  repeats)[:n] if all_meter_ids  is not None else None
+                    self._synthetic_timestamps = np.tile(all_timestamps, repeats)[:n] if all_timestamps is not None else None
+            elif len(all_conditions) >= n:
                 idx = torch.randperm(len(all_conditions))[:n]
                 self._synthetic_conditions = all_conditions[idx]  # SHAPER: [n_synthetic_samples, condition_dim]
                 idx_np = idx.numpy()
@@ -739,6 +758,73 @@ class EvalFramework:
         print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
         self._print_results_table()
 
+        return self.results
+
+    def evaluate_averaged(self, n_draws: int = 1) -> Dict[str, float]:
+        """Like evaluate(), but averages n_draws independent synthetic draws before
+        running metrics. All metrics — not just the profile plot — see the averaged
+        synthetic. n_draws=1 is identical to evaluate().
+        """
+        if n_draws < 1:
+            raise ValueError(f"n_draws must be >= 1, got {n_draws}")
+
+        t_total = time.time()
+        print(f"\n{'='*60}")
+        print(f"  {self.evaluation_title}")
+        print(f"{'='*60}")
+
+        self._prepare_data()
+
+        actual_draws = 1
+        if n_draws > 1 and self._synthetic_data is not None:
+            print(f"  Averaging {n_draws} synthetic draws...", end='', flush=True)
+            draws = [np.asarray(self._synthetic_data)]
+            with torch.no_grad():
+                for draw_idx in range(1, n_draws):
+                    try:
+                        extra = self._generate_synthetic(self.n_synthetic_samples)
+                        draws.append(np.asarray(extra))
+                    except Exception as e:
+                        print(f"\n  WARNING: draw {draw_idx + 1}/{n_draws} failed: {e}. Using {len(draws)} draw(s).")
+                        import traceback; traceback.print_exc()
+                        break
+            actual_draws = len(draws)
+            self._synthetic_data = _sanitize_numeric_array(np.mean(np.stack(draws, axis=0), axis=0))
+            print(f" done — averaged {actual_draws} draw(s).")
+        elif n_draws > 1:
+            print(f"  WARNING: n_draws={n_draws} requested but no synthetic data was generated; cannot average.")
+
+        self._inject_data_into_metrics()
+
+        n_real  = 0 if self._real_data  is None else int(len(self._real_data))
+        n_synth = 0 if self._synthetic_data is None else int(len(self._synthetic_data))
+        print(f"  Data ready: {n_real} real windows, {n_synth} synthetic samples (avg of {actual_draws} draw(s))\n")
+
+        self.results = {}
+        all_metrics = (
+            list(self.reconstruction_metrics.items())
+            + list(self.synthetic_metrics.items())
+            + list(self.privacy_metrics.items())
+        )
+        n_total = len(all_metrics)
+        for i, (name, metric) in enumerate(all_metrics, 1):
+            print(f"  [{i:>{len(str(n_total))}}/{n_total}] {name}...", end='', flush=True)
+            t_metric = time.time()
+            try:
+                value = metric.compute()
+                self.results[name] = value
+                elapsed = time.time() - t_metric
+                value_str = f"{float(value):.4f}" if isinstance(value, (float, int, np.floating, np.integer)) else str(value)
+                print(f" {value_str}  ({elapsed:.1f}s)")
+            except Exception as e:
+                elapsed = time.time() - t_metric
+                print(f" ERROR ({elapsed:.1f}s): {e}")
+                if self.verbose:
+                    import traceback; traceback.print_exc()
+                self.results[name] = None
+
+        print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
+        self._print_results_table()
         return self.results
 
     def evaluate_reconstruction_only(self) -> Dict[str, float]:
@@ -1273,7 +1359,7 @@ class ClassicalStatistics(SyntheticMetric):
                 },
                 'real': real_stats,
                 'synthetic': synthetic_stats,
-                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+                'updated_at_utc': datetime.now(timezone.utc).isoformat(),
             },
             output_file=self.output_path or 'models/eval_results.json'
         )

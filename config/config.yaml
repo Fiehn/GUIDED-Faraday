@@ -67,6 +67,8 @@ data:
   cache_scan_batches: 0
   skip_corrupt_files: true
   max_skip_warnings: 20
+  holdout_feeder_id: null   # integer Feeder ID to exclude from train/val; null = no holdout
+  topology_path: null       # path to topology JSON; required when holdout_feeder_id is set
   aggregation_energy_unit: "kwh" # "wh" keeps raw hourly sum scale, "kwh" divides hourly sums by 1000
   output_aggregate_stream: false # when true, phased loader emits (x, cond, agg) for splitter-model pipelines
 
@@ -159,6 +161,25 @@ model:
 # ============================================================================
 # CONDITIONING CONFIGURATION (for CVAE)
 # ============================================================================
+  hierarchy:
+    enabled: false
+    levels: ["linear", "linear", "linear"] # eg. ["linear", "stochastic", "vq", "information_bottleneck"]
+    latent_dims: [64, 32, 16] # latent dimensions for each level
+    top_down: [false, false, false] # whether to use top-down connections for each level
+    bottom_up: [false, false, false] # whether to use bottom-up connections for each level
+    loss_weights: [1.0, 1.0, 1.0] # weights for KL loss at each level
+  
+    aggregation: "concat"
+    bidirectional: false
+    residual_connections: false
+    kl_annealing: true
+    kl_warmup_steps: 1000
+    free_bits: 0.1
+
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+
 conditioning:
   # Enable/disable conditioning
 
@@ -183,24 +204,6 @@ conditioning:
 
 # ============================================================================
 # HIERARCHICAL LATENT SPACE
-# ============================================================================
-hierarchy:
-  enabled: false
-  levels: ["linear", "linear", "linear"] # eg. ["linear", "stochastic", "vq", "information_bottleneck"]
-  latent_dims: [64, 32, 16] # latent dimensions for each level
-  top_down: [false, false, false] # whether to use top-down connections for each level
-  bottom_up: [false, false, false] # whether to use bottom-up connections for each level
-  loss_weights: [1.0, 1.0, 1.0] # weights for KL loss at each level
-  
-  aggregation: "concat"
-  bidirectional: false
-  residual_connections: false
-  kl_annealing: true
-  kl_warmup_steps: 1000
-  free_bits: 0.1
-
-# ============================================================================
-# TRAINING CONFIGURATION
 # ============================================================================
 training:
   # Optimization settings

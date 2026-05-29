@@ -1,5 +1,9 @@
 base: base.yaml
 
+data:
+  batch_size: 256
+  eval_cache_on_gpu: false
+
 training:
   checkpointing:
     save_best_after_fraction: 0.0

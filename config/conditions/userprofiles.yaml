@@ -154,6 +154,25 @@ model:
 # ============================================================================
 # CONDITIONING CONFIGURATION (for CVAE)
 # ============================================================================
+  hierarchy:
+    enabled: true
+    levels: ["stochastic", "stochastic", "stochastic"] # eg. ["linear", "StochasticLevel", "VQLevel"]
+    latent_dims: [256, 128, 64] # latent dimensions for each level
+    top_down: [true, true, true] # whether to use top-down connections for each level
+    bottom_up: [true, true, true] # whether to use bottom-up connections for each level
+    loss_weights: [1.0, 1.0, 1.0] # weights for KL loss at each level
+  
+    aggregation: "concat"
+    bidirectional: true
+    residual_connections: true
+    kl_annealing: true
+    kl_warmup_steps: 1000
+    free_bits: 0.1
+
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+
 conditioning:
   # Enable/disable conditioning
 
@@ -178,24 +197,6 @@ conditioning:
 
 # ============================================================================
 # HIERARCHICAL LATENT SPACE
-# ============================================================================
-hierarchy:
-  enabled: true
-  levels: ["stochastic", "stochastic", "stochastic"] # eg. ["linear", "StochasticLevel", "VQLevel"]
-  latent_dims: [256, 128, 64] # latent dimensions for each level
-  top_down: [true, true, true] # whether to use top-down connections for each level
-  bottom_up: [true, true, true] # whether to use bottom-up connections for each level
-  loss_weights: [1.0, 1.0, 1.0] # weights for KL loss at each level
-  
-  aggregation: "concat"
-  bidirectional: true
-  residual_connections: true
-  kl_annealing: true
-  kl_warmup_steps: 1000
-  free_bits: 0.1
-
-# ============================================================================
-# TRAINING CONFIGURATION
 # ============================================================================
 training:
   # Optimization settings

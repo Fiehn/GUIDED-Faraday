@@ -1,5 +1,5 @@
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import matplotlib.pyplot as plt
 
@@ -190,7 +190,7 @@ class HourlyProfilesByMonth(SyntheticMetric):
                     'n_months': len(unique_months),
                     'mean_fd': mean_fd,
                     'fd_by_month': {int(m): float(v) for m, v in flexibility_distances_by_month.items()},
-                    'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+                    'updated_at_utc': datetime.now(timezone.utc).isoformat(),
                 },
                 output_file=self.output_path or 'models/eval_results.json'
             )
@@ -491,7 +491,7 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
                     'n_days': len(unique_days),
                     'mean_fd': mean_fd,
                     'fd_by_day': {int(d): float(v) for d, v in flexibility_distances_by_day.items()},
-                    'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+                    'updated_at_utc': datetime.now(timezone.utc).isoformat(),
                 },
                 output_file=self.output_path or 'models/eval_results.json'
             )

@@ -1,7 +1,7 @@
 import numpy as np
 from scipy import stats
 from src.evaluation.metrics.base.base import SyntheticMetric, _save_standalone_metric_result, _sanitize_numeric_array
-from datetime import datetime
+from datetime import datetime, timezone
 
 class ACFDistribution(SyntheticMetric):
     """
@@ -130,7 +130,7 @@ class ACFDistribution(SyntheticMetric):
                 'ks_by_lag': [float(v) for v in ks_statistics],
                 'n_real_series': int(len(real_ts)),
                 'n_synthetic_series': int(len(synthetic_ts)),
-                'updated_at_utc': datetime.utcnow().isoformat() + 'Z',
+                'updated_at_utc': datetime.now(timezone.utc).isoformat(),
             },
             output_file=self.output_path or 'models/eval_results.json'
         )

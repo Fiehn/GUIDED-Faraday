@@ -2,3 +2,18 @@ base: base.yaml
 
 model:
   type: baseline_quantile
+
+training:
+  num_epochs: 50
+  checkpointing:
+    save_freq: 20
+    save_dir: E:/models/new3/
+    save_best_model: true
+    save_best_after_fraction: 0.00
+    save_final_model: true
+  early_stopping:
+    enabled: false
+    stop_on_all_files_used: true
+    min_epochs_before_full_data_stop: 1
+    patience: 7
+    min_delta: 0.001

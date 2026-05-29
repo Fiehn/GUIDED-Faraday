@@ -377,6 +377,11 @@ class BaseModel(nn.Module, ABC):
                     weighted_loss=train_cfg.weighted_loss,
                     # TODO
                 )
+
+                if epoch == 0 and step == 1 and torch.cuda.is_available():
+                    alloc_gb = torch.cuda.memory_allocated() / 1024**3
+                    reserv_gb = torch.cuda.memory_reserved() / 1024**3
+                    print(f"[GPU MEM] allocated={alloc_gb:.2f} GB  reserved={reserv_gb:.2f} GB  (after first batch, epoch 1)")
                 for k, v in loss_dict.items():
                     try:
                         epoch_sums[k] = epoch_sums.get(k, 0.0) + float(v.detach() if hasattr(v, "detach") else v)

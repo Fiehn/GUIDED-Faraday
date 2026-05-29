@@ -26,7 +26,7 @@ data:
     stride: 24
   batch_size: 512
   shuffle: true
-  replay_buffer_capacity: 20000
+  replay_buffer_capacity: 10000
   min_buffer_size: 2000
   num_workers: 2
   steps_per_epoch: 500

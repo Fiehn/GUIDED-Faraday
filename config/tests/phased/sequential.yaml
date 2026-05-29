@@ -1,6 +1,8 @@
 base: base.yaml
 
 data:
+  batch_size: 256
+  eval_cache_on_gpu: false
   columns:
     value_cols: [phase_1, phase_2, phase_3]
 
@@ -22,18 +24,18 @@ logging:
 
 model:
   type: sequential_vae
-  latent_dim: 128
+  latent_dim: 256
   encoder:
     type: dictionary
-    hidden_dims: [256, 512, 256, 128]
+    hidden_dims: [128, 256, 128]
     dropout: 0.2
   decoder:
     type: dictionary
-    hidden_dims: [128, 256, 512, 256]
+    hidden_dims: [128, 256, 128]
     dropout: 0.2
   prior:
     type: learnable_dictionary
-    dictionary_size: 256
-    vamp_num_components: 40
+    dictionary_size: 128
+    vamp_num_components: 20
     init_from_data: true
     init_noise_scale: 0.01
