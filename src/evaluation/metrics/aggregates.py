@@ -229,13 +229,15 @@ class PerConditionEval(SyntheticMetric):
 
         self.mmd_calculator = MaximumMeanDiscrepancy(sigma=None, seed=42, max_samples=2000)
         self.acf_calculator = ACFDistribution(window_size=window_size, max_lag=max_lag)
+        tstr_horizon = 24 if window_size > 24 else max(1, window_size - 1)
         self.tstr_calculator = TSTR(
             task='next_step',
             window_size=window_size,
             n_features=1,
             predictor_type=predictor_type,
             epochs=tstr_epochs,
-            random_state=42
+            random_state=42,
+            horizon=tstr_horizon,
         )
         self.aggregated_profiles_calculator = AggregatedProfiles(
             n_samples=100,
