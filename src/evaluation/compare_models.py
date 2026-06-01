@@ -1448,8 +1448,10 @@ def compare_models(model_paths: list[str],
     if eval_result_dirs is not None and len(eval_result_dirs) < len(model_paths):
         eval_result_dirs = list(eval_result_dirs) + [None] * (len(model_paths) - len(eval_result_dirs))
 
-    # 1. Prepare evaluation data — skip file discovery when not recomputing
-    if data_files is None and recompute:
+    # 1. Prepare evaluation data — always discover files when data_dir is provided,
+    #    regardless of recompute flag; we may need to compute even without --recompute
+    #    when no cached outputs exist yet.
+    if data_files is None and data_dir:
         data_files = get_eval_files(data_dir)
     elif data_files is None:
         data_files = []
@@ -1556,9 +1558,13 @@ def compare_models(model_paths: list[str],
         if shared_test_loader is None:
             print("[ERROR] Could not build a test loader. No evaluation will be run.")
         else:
-            n_test = len(shared_test_loader.dataset)  # type: ignore[arg-type]
-            print(f"\nShared test loader ready: {n_test} windows "
-                  f"({n_test * 32 // 32} samples, batch_size=1024).")
+            try:
+                n_test = len(shared_test_loader.dataset)  # type: ignore[arg-type]
+                size_str = f"{n_test} windows"
+            except TypeError:
+                n_test = num_samples
+                size_str = f"~{n_test} samples (streaming, no len)"
+            print(f"\nShared test loader ready: {size_str}, batch_size=1024.")
 
         shared_train_loader = _build_mia_train_loader(
             data_files=data_files,
