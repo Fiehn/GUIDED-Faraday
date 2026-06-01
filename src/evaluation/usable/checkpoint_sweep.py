@@ -109,6 +109,7 @@ _SYNTHETIC_METRIC_KEYS = {
     "peakanalysis",
     "hourlyprofilesbydayofweek",
     "hourlyprofilesbymonth",
+    "hourlyprofilesbymonthanddayofweek",
 }
 
 _RECONSTRUCTION_METRIC_KEYS = {
@@ -139,6 +140,7 @@ _GOAL_MAP = {
     "peakanalysis": "lower",
     "hourlyprofilesbydayofweek": "lower",
     "hourlyprofilesbymonth": "lower",
+    "hourlyprofilesbymonthanddayofweek": "lower",
     "classicalstatistics": "lower",
 }
 

@@ -1,9 +1,20 @@
+import os
+from datetime import datetime, timezone
+
 import numpy as np
 import torch
 import torch.nn as nn
+import matplotlib
 
-from src.evaluation.metrics.base.base import SyntheticMetric, _save_standalone_metric_result, _sanitize_numeric_array
-from datetime import datetime, timezone
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from src.evaluation.metrics.base.base import (
+    SyntheticMetric,
+    _resolve_output_directory,
+    _save_standalone_metric_result,
+    _sanitize_numeric_array,
+)
 
 
 class TSTR(SyntheticMetric):
@@ -31,15 +42,19 @@ class TSTR(SyntheticMetric):
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None
     output_path: str = None
+    timestamps: np.ndarray = None
     
     def __init__(self, task: str = 'next_step', window_size: int = 24, n_features: int = 1, 
-                 predictor_type: str = 'linear', epochs: int = 50, random_state: int = 42):
+                 predictor_type: str = 'linear', epochs: int = 50, random_state: int = 42,
+                 horizon: int = 24):
         self.task = task
         self.window_size = window_size
         self.n_features = n_features
         self.predictor_type = predictor_type
         self.epochs = epochs
         self.random_state = random_state
+        # Number of timesteps ahead to predict (multi-step). Default 24 hours.
+        self.horizon = int(horizon)
         
         np.random.seed(random_state)
         torch.manual_seed(random_state)
@@ -73,12 +88,21 @@ class TSTR(SyntheticMetric):
         data_reshaped = data.reshape(-1, self.window_size, inferred_n_features)
         data_consumption = data_reshaped[:, :, 0]  # [N, window_size]
         
-        # TODO: maybe predict several days ahead based on several previous days instead of just hours 
-
+        # Support multi-step prediction: predict the last `horizon` timesteps
+        # from the preceding values in the window. This requires
+        # window_size > horizon so there is at least one input feature.
         if self.task == 'next_step':
-            # Predict last hour from first 23 hours
-            X = data_consumption[:, :-1]  # [N, 23]
-            y = data_consumption[:, -1:]  # [N, 1]
+            target_len = int(self.horizon)
+            if target_len <= 0:
+                raise ValueError("horizon must be >= 1")
+            if target_len >= self.window_size:
+                raise ValueError(
+                    f"window_size ({self.window_size}) must be greater than horizon ({target_len})."
+                )
+            # X: all timesteps before the last `target_len` values
+            X = data_consumption[:, : self.window_size - target_len]
+            # y: the last `target_len` values in the window
+            y = data_consumption[:, self.window_size - target_len :]
         else:
             raise ValueError(f"Unknown task: {self.task}")
         
@@ -92,14 +116,14 @@ class TSTR(SyntheticMetric):
             nn.Module: PyTorch model
         """
         if self.predictor_type == 'linear':
-            model = nn.Linear(input_dim, 1)
+            model = nn.Linear(input_dim, self.horizon)
         elif self.predictor_type == 'mlp':
             model = nn.Sequential(
                 nn.Linear(input_dim, 64),
                 nn.ReLU(),
                 nn.Linear(64, 32),
                 nn.ReLU(),
-                nn.Linear(32, 1)
+                nn.Linear(32, self.horizon)
             )
         else:
             raise ValueError(f"Unknown predictor type: {self.predictor_type}")
@@ -149,6 +173,76 @@ class TSTR(SyntheticMetric):
             mse = nn.MSELoss()(y_pred, y_tensor).item()
         
         return mse
+
+    def _format_prediction_date(self, index: int) -> str:
+        """Format an available timestamp for the plot title."""
+        if self.timestamps is None:
+            return "unknown"
+
+        ts = np.asarray(self.timestamps)
+        if index < 0 or index >= len(ts):
+            return "unknown"
+
+        value = ts[index]
+        try:
+            if isinstance(value, np.datetime64):
+                return np.datetime_as_string(value, unit='D')
+            if hasattr(value, 'strftime'):
+                return value.strftime('%Y-%m-%d')
+            if isinstance(value, (np.integer, int, float)):
+                return datetime.fromtimestamp(float(value), tz=timezone.utc).strftime('%Y-%m-%d')
+            parsed = np.datetime64(value)
+            return np.datetime_as_string(parsed, unit='D')
+        except Exception:
+            return str(value)
+
+    def _plot_prediction_comparison(
+        self,
+        X_real_test: np.ndarray,
+        y_real_test: np.ndarray,
+        model_real: nn.Module,
+        model_synth: nn.Module,
+        tstr_ratio: float,
+        split_idx: int,
+    ) -> None:
+        """Plot the predicted horizon for the real-trained and synthetic-trained models."""
+        output_dir = _resolve_output_directory(self.output_path)
+        if not output_dir:
+            return
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        plot_idx = 0
+        x_sample = torch.FloatTensor(X_real_test[plot_idx:plot_idx + 1])
+        with torch.no_grad():
+            y_real_pred = model_real(x_sample).squeeze(0).cpu().numpy()
+            y_synth_pred = model_synth(x_sample).squeeze(0).cpu().numpy()
+
+        y_true = np.asarray(y_real_test[plot_idx]).reshape(-1)
+        hours = np.arange(1, len(y_true) + 1)
+        date_label = self._format_prediction_date(split_idx + plot_idx)
+
+        fig, ax = plt.subplots(figsize=(11, 6))
+        ax.plot(hours, y_true, color='black', linestyle='--', linewidth=2, marker='o', label='Real data')
+        ax.plot(hours, y_real_pred, color='#1f77b4', linewidth=2.5, marker='o', label='Predicted by real model')
+        ax.plot(hours, y_synth_pred, color='#ff7f0e', linewidth=2.5, marker='o', label='Predicted by synthetic model')
+
+        ax.set_title(
+            f'TSTR Prediction Comparison | TSTR Ratio: {tstr_ratio:.4f} | Predicted data date: {date_label}',
+            fontsize=13,
+            fontweight='bold',
+        )
+        ax.set_xlabel('Hours', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Consumption [kWh]', fontsize=12, fontweight='bold')
+        ax.set_xticks(hours)
+        ax.set_xlim(hours[0] - 0.5, hours[-1] + 0.5)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='best')
+        plt.tight_layout()
+
+        plot_path = os.path.join(output_dir, 'tstr_prediction_comparison.pdf')
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight', format='pdf')
+        plt.close(fig)
     
     def compute(self) -> float:
         """
@@ -200,6 +294,15 @@ class TSTR(SyntheticMetric):
         
         # Compute ratio (ideal: 1.0, higher = synthetic is worse)
         tstr_ratio = tstr_mse / trtr_mse if trtr_mse > 0 else float('inf')
+
+        self._plot_prediction_comparison(
+            X_real_test=X_real_test,
+            y_real_test=y_real_test,
+            model_real=model_real,
+            model_synth=model_synth,
+            tstr_ratio=tstr_ratio,
+            split_idx=split_idx,
+        )
         
         _save_standalone_metric_result(
             metric_key='TSTR',
@@ -207,6 +310,7 @@ class TSTR(SyntheticMetric):
                 'value': float(tstr_ratio),
                 'trtr_mse': float(trtr_mse),
                 'tstr_mse': float(tstr_mse),
+                'horizon': int(self.horizon),
                 'task': self.task,
                 'window_size': int(self.window_size),
                 'predictor_type': self.predictor_type,

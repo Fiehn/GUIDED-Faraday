@@ -25,7 +25,7 @@ from src.evaluation.metrics.flexibility_distance import FlexibilityDistance
 from src.evaluation.metrics.acf import ACFDistribution
 from src.evaluation.metrics.tstr import TSTR
 from src.evaluation.metrics.mmd import MaximumMeanDiscrepancy, SetMaximumMeanDiscrepancy
-from src.evaluation.metrics.hourly_avg import HourlyProfilesByMonth, HourlyProfilesByDayofWeek
+from src.evaluation.metrics.hourly_avg import HourlyProfilesByMonth, HourlyProfilesByDayofWeek, HourlyProfilesByMonthAndDayofWeek
 from src.evaluation.metrics.aggregates import AggregatedProfiles, PerConditionEval
 from src.evaluation.metrics.peaks import PeakMagnitude, PeakTiming
 from src.evaluation.metrics.condition_acc import EVConditionAccuracy
@@ -84,7 +84,7 @@ class EvalFramework:
         normalizer = None,
         conditioner = None,
         device: str = 'cpu',
-        window_size: int = 24,
+        window_size: Optional[int] = None,
         n_synthetic_samples: int = 1000,
         output_path: str = 'models/eval_results.json',
         prepared_data: Dict[str, Any] = None,
@@ -129,7 +129,11 @@ class EvalFramework:
 
         self.generator = SyntheticGenerator(model, conditioner, normalizer, secondary_model, device)
 
-        self.window_size = window_size
+        if window_size is None:
+            inferred_window_size = int(getattr(self.model, 'sequence_length', 24) or 24)
+        else:
+            inferred_window_size = int(window_size)
+        self.window_size = inferred_window_size
         self.n_synthetic_samples = n_synthetic_samples
         self.output_path = output_path
         self.prepared_data = prepared_data
@@ -166,18 +170,20 @@ class EvalFramework:
 
     def register_all(self, phased: bool = False) -> None:
         """Convenience method to register all default metrics."""
+        tstr_horizon = 24 if self.window_size > 24 else max(1, self.window_size - 1)
         self.register_metrics([
             ReconstructionRMSE(),
             ReconstructionLogLikelihood(),
             FlexibilityDistance(),
             ACFDistribution(),
             ClassicalStatistics(),
-            TSTR(),
+            TSTR(window_size=self.window_size, horizon=tstr_horizon),
             AggregatedProfiles(),
             PeakMagnitude(),
             PeakTiming(),
             HourlyProfilesByMonth(),
             HourlyProfilesByDayofWeek(),
+            HourlyProfilesByMonthAndDayofWeek(),
             PerConditionEval(),
             EVConditionAccuracy(),
         ])

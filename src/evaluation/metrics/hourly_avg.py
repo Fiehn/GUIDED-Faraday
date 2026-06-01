@@ -602,3 +602,269 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
         except Exception as e:
             import traceback
             traceback.print_exc()
+
+
+class HourlyProfilesByMonthAndDayofWeek(HourlyProfilesByDayofWeek):
+    """
+    Analyze hourly consumption profiles by month and day of week.
+
+    For each available month, creates a 7-panel figure matching the layout from
+    HourlyProfilesByDayofWeek. The result is one figure per month, each with
+    Monday-Sunday subplots showing real vs synthetic hourly profiles and
+    10th-90th percentile bands.
+    """
+
+    def __init__(self, window_size: int = 24, plot_filename: str = 'hourly_profiles_by_month_and_dayofweek.pdf'):
+        super().__init__(window_size=window_size, plot_filename=plot_filename)
+
+    @property
+    def name(self) -> str:
+        return "Hourly Profiles by Month and Day of Week (Flexibility Distance)"
+
+    def _extract_months(self) -> np.ndarray:
+        """Extract month (1-12) from timestamps via a vectorised call."""
+        if self.timestamps is None:
+            return np.ones(len(self.real_data), dtype=int)
+        import pandas as pd
+        ts = np.asarray(self.timestamps)
+        if ts.dtype.kind in ('i', 'u', 'f'):
+            dts = pd.to_datetime(ts.astype(np.int64), unit='s', utc=True)
+        else:
+            dts = pd.to_datetime(ts, utc=True)
+        return dts.month.to_numpy(dtype=int)
+
+    def compute(self) -> float:
+        """Compute hourly profiles by month and day of week."""
+        try:
+            if self.real_data is None or self.synthetic_data is None:
+                raise ValueError(f"Data not injected: real_data={self.real_data is not None}, synthetic_data={self.synthetic_data is not None}")
+
+            real_data = self._extract_consumption_feature(self.real_data)
+            synthetic_data = self._extract_consumption_feature(self.synthetic_data)
+
+            n = min(len(real_data), len(synthetic_data))
+            real_data = real_data[:n]
+            synthetic_data = synthetic_data[:n]
+
+            verbose = getattr(self, 'verbose', False)
+            if self.timestamps is None:
+                if verbose:
+                    print("[WARN] HourlyProfilesByMonthAndDayofWeek: No timestamps available, using fallback sequence")
+                self.timestamps = np.array([datetime(2023, 1, 1) + timedelta(hours=i) for i in range(n)])
+            else:
+                self.timestamps = np.asarray(self.timestamps)[:n]
+
+            months = self._extract_months()
+            days_of_week = self._extract_days_of_week()
+
+            if len(months) != n or len(days_of_week) != n:
+                raise ValueError(f"Array length mismatch: months={len(months)}, days_of_week={len(days_of_week)}, data={n}")
+
+            unique_months = sorted(m for m in np.unique(months) if 1 <= m <= 12)
+            unique_days = list(range(7))
+
+            if len(unique_months) == 0:
+                if verbose:
+                    print("[WARN] HourlyProfilesByMonthAndDayofWeek: No valid months extracted, defaulting to January")
+                months = np.ones(n, dtype=int)
+                unique_months = [1]
+
+            if len(unique_days) == 0:
+                if verbose:
+                    print("[WARN] HourlyProfilesByMonthAndDayofWeek: No valid days extracted, defaulting to Monday")
+                days_of_week = np.zeros(n, dtype=int)
+                unique_days = [0]
+
+            month_day_counts = {}
+            for month in unique_months:
+                for day in unique_days:
+                    month_day_mask = (months == month) & (days_of_week == day)
+                    real_group = real_data[month_day_mask]
+                    synth_group = synthetic_data[month_day_mask]
+                    group_count = min(len(real_group), len(synth_group))
+                    month_day_counts[(month, day)] = group_count
+
+            # Compute per-month minimum across days within that month
+            month_mins = {}
+            for month in unique_months:
+                days_in_month = []
+                for day in unique_days:
+                    group_count = month_day_counts.get((month, day), 0)
+                    if group_count > 0:
+                        days_in_month.append(group_count)
+                
+                if days_in_month:
+                    month_mins[month] = min(days_in_month)
+                else:
+                    month_mins[month] = 0
+
+            if not month_mins or all(v == 0 for v in month_mins.values()):
+                raise ValueError("No month/day groups with both real and synthetic samples")
+
+            if verbose:
+                print(f"[INFO] HourlyProfilesByMonthAndDayofWeek: Using per-month equalization")
+                print(f"[INFO] HourlyProfilesByMonthAndDayofWeek: Month minimums: {month_mins}")
+
+            flexibility_distances_by_month_day = {}
+
+            for month in unique_months:
+                for day in unique_days:
+                    month_day_mask = (months == month) & (days_of_week == day)
+                    real_group = real_data[month_day_mask]
+                    synth_group = synthetic_data[month_day_mask]
+
+                    if len(real_group) < 1 or len(synth_group) < 1:
+                        continue
+
+                    sample_count = month_mins.get(month, 0)
+                    if sample_count < 1:
+                        continue
+                    real_group = real_group[:sample_count]
+                    synth_group = synth_group[:sample_count]
+
+                    if len(real_group) < 1 or len(synth_group) < 1:
+                        continue
+
+                    real_avg = np.mean(real_group, axis=0)
+                    synth_avg = np.mean(synth_group, axis=0)
+
+                    try:
+                        fd = FlexibilityDistance.compute_fd_between_series(
+                            real_avg, synth_avg, tau='auto', normalize=True
+                        )
+                        flexibility_distances_by_month_day[(month, day)] = fd
+                    except Exception:
+                        flexibility_distances_by_month_day[(month, day)] = np.nan
+
+            if not flexibility_distances_by_month_day:
+                raise ValueError("No flexibility distances computed")
+
+            all_fds = np.array([v for v in flexibility_distances_by_month_day.values()])
+            mean_fd = float(np.nanmean(all_fds))
+
+            self._plot_hourly_profiles_by_month_and_day(
+                real_data,
+                synthetic_data,
+                months,
+                days_of_week,
+                flexibility_distances_by_month_day,
+                unique_months,
+                unique_days,
+                month_mins=month_mins,
+            )
+
+            _save_standalone_metric_result(
+                metric_key='HourlyProfilesByMonthAndDayofWeek',
+                payload={
+                    'value': mean_fd,
+                    'unique_months': list(unique_months),
+                    'unique_days': list(unique_days),
+                    'n_months': len(unique_months),
+                    'n_days': len(unique_days),
+                    'mean_fd': mean_fd,
+                    'fd_by_month_day': {f'{int(month)}-{int(day)}': float(v) for (month, day), v in flexibility_distances_by_month_day.items()},
+                    'updated_at_utc': datetime.now(timezone.utc).isoformat(),
+                },
+                output_file=self.output_path or 'models/eval_results.json'
+            )
+
+            return mean_fd
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            raise
+
+    def _plot_hourly_profiles_by_month_and_day(self, real_data, synthetic_data, months, days_of_week,
+                                               flexibility_distances_by_month_day, unique_months,
+                                               unique_days, month_mins=None):
+        """Plot hourly profiles as one figure per month with 7 day-of-week subplots."""
+        try:
+            output_dir = _resolve_output_directory(self.output_path)
+            if not output_dir:
+                return
+
+            month_names = {
+                1: 'January', 2: 'February', 3: 'March', 4: 'April',
+                5: 'May', 6: 'June', 7: 'July', 8: 'August',
+                9: 'September', 10: 'October', 11: 'November', 12: 'December'
+            }
+            day_names = {
+                0: 'Monday', 1: 'Tuesday', 2: 'Wednesday', 3: 'Thursday',
+                4: 'Friday', 5: 'Saturday', 6: 'Sunday'
+            }
+
+            num_days = len(unique_days)
+            for month in unique_months:
+                fig, axes = plt.subplots(num_days, 1, figsize=(12, 4 * num_days), sharex=True)
+                if num_days == 1:
+                    axes = [axes]
+
+                for day_idx, day in enumerate(unique_days):
+                    ax = axes[day_idx]
+                    month_day_mask = (months == month) & (days_of_week == day)
+                    real_group = real_data[month_day_mask]
+                    synth_group = synthetic_data[month_day_mask]
+                    
+                    # Store original counts before truncation
+                    n_real_available = len(real_group)
+                    n_synth_available = len(synth_group)
+
+                    if len(real_group) < 1 or len(synth_group) < 1:
+                        ax.axis('off')
+                        continue
+
+                    sample_count = month_mins.get(month, 0) if month_mins is not None else min(len(real_group), len(synth_group))
+                    if sample_count < 1:
+                        ax.axis('off')
+                        continue
+                    real_group = real_group[:sample_count]
+                    synth_group = synth_group[:sample_count]
+
+                    if len(real_group) < 1 or len(synth_group) < 1:
+                        ax.axis('off')
+                        continue
+
+                    real_avg = np.mean(real_group, axis=0)
+                    synth_avg = np.mean(synth_group, axis=0)
+
+                    hours_list = np.arange(self.window_size)
+                    real_p10 = np.percentile(real_group, 10, axis=0)
+                    real_p90 = np.percentile(real_group, 90, axis=0)
+                    synth_p10 = np.percentile(synth_group, 10, axis=0)
+                    synth_p90 = np.percentile(synth_group, 90, axis=0)
+
+                    ax.fill_between(hours_list, real_p10, real_p90, alpha=0.2, color='#1f77b4', label='Real (10th-90th %ile)')
+                    ax.fill_between(hours_list, synth_p10, synth_p90, alpha=0.2, color='#ff7f0e', label='Synthetic (10th-90th %ile)')
+                    ax.plot(hours_list, real_avg, '-o', label='Real (avg)', color='#1f77b4', linewidth=2, markersize=6)
+                    ax.plot(hours_list, synth_avg, '-o', label='Synthetic (avg)', color='#ff7f0e', linewidth=2, markersize=6)
+
+                    fd_value = flexibility_distances_by_month_day.get((month, day), np.nan)
+                    month_name = month_names.get(month, f'Month {month}')
+                    day_name = day_names.get(day, f'Day {day}')
+                    ax.set_title(
+                        f'{day_name} (FD={fd_value:.4f}, {n_real_available} available, n_real={len(real_group)}, n_synthetic={len(synth_group)})',
+                        fontsize=11,
+                        fontweight='bold'
+                    )
+                    ax.set_xticks(hours_list)
+                    ax.grid(True, alpha=0.3)
+                    ax.set_xlim(-0.5, 23.5)
+                    ax.legend(fontsize=8, loc='best')
+
+                    if day_idx == num_days - 1:
+                        ax.set_xlabel('Hour of Day', fontsize=11, fontweight='bold')
+                    if day_idx == 0:
+                        ax.set_ylabel('Consumption (kWh)', fontsize=11, fontweight='bold')
+
+                fig.suptitle(f'{month_name} - Hourly Consumption Profiles', fontsize=14, fontweight='bold')
+                plt.tight_layout(rect=[0, 0, 1, 0.98])
+                os.makedirs(output_dir, exist_ok=True)
+                base_name, ext = os.path.splitext(self.plot_filename)
+                if not ext:
+                    ext = '.pdf'
+                plot_path = os.path.join(output_dir, f'{base_name}_{month:02d}_{month_name.lower().replace(" ", "_")}{ext}')
+                plt.savefig(plot_path, dpi=150, bbox_inches='tight', format='pdf')
+                plt.close(fig)
+        except Exception:
+            import traceback
+            traceback.print_exc()
