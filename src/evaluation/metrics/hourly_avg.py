@@ -684,26 +684,15 @@ class HourlyProfilesByMonthAndDayofWeek(HourlyProfilesByDayofWeek):
                     group_count = min(len(real_group), len(synth_group))
                     month_day_counts[(month, day)] = group_count
 
-            # Compute per-month minimum across days within that month
-            month_mins = {}
-            for month in unique_months:
-                days_in_month = []
-                for day in unique_days:
-                    group_count = month_day_counts.get((month, day), 0)
-                    if group_count > 0:
-                        days_in_month.append(group_count)
-                
-                if days_in_month:
-                    month_mins[month] = min(days_in_month)
-                else:
-                    month_mins[month] = 0
+            # Compute one global minimum across all non-empty month/day groups
+            valid_group_counts = [v for v in month_day_counts.values() if v > 0]
+            global_min = min(valid_group_counts) if valid_group_counts else 0
 
-            if not month_mins or all(v == 0 for v in month_mins.values()):
+            if global_min < 1:
                 raise ValueError("No month/day groups with both real and synthetic samples")
 
             if verbose:
-                print(f"[INFO] HourlyProfilesByMonthAndDayofWeek: Using per-month equalization")
-                print(f"[INFO] HourlyProfilesByMonthAndDayofWeek: Month minimums: {month_mins}")
+                print(f"[INFO] HourlyProfilesByMonthAndDayofWeek: Equalizing all month/day groups to global minimum={global_min}")
 
             flexibility_distances_by_month_day = {}
 
@@ -716,7 +705,7 @@ class HourlyProfilesByMonthAndDayofWeek(HourlyProfilesByDayofWeek):
                     if len(real_group) < 1 or len(synth_group) < 1:
                         continue
 
-                    sample_count = month_mins.get(month, 0)
+                    sample_count = global_min
                     if sample_count < 1:
                         continue
                     real_group = real_group[:sample_count]
@@ -750,7 +739,7 @@ class HourlyProfilesByMonthAndDayofWeek(HourlyProfilesByDayofWeek):
                 flexibility_distances_by_month_day,
                 unique_months,
                 unique_days,
-                month_mins=month_mins,
+                global_min=global_min,
             )
 
             _save_standalone_metric_result(
@@ -776,7 +765,7 @@ class HourlyProfilesByMonthAndDayofWeek(HourlyProfilesByDayofWeek):
 
     def _plot_hourly_profiles_by_month_and_day(self, real_data, synthetic_data, months, days_of_week,
                                                flexibility_distances_by_month_day, unique_months,
-                                               unique_days, month_mins=None):
+                                               unique_days, global_min=None):
         """Plot hourly profiles as one figure per month with 7 day-of-week subplots."""
         try:
             output_dir = _resolve_output_directory(self.output_path)
@@ -813,7 +802,7 @@ class HourlyProfilesByMonthAndDayofWeek(HourlyProfilesByDayofWeek):
                         ax.axis('off')
                         continue
 
-                    sample_count = month_mins.get(month, 0) if month_mins is not None else min(len(real_group), len(synth_group))
+                    sample_count = global_min if global_min is not None else min(len(real_group), len(synth_group))
                     if sample_count < 1:
                         ax.axis('off')
                         continue
