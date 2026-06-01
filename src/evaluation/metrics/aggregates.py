@@ -150,10 +150,10 @@ class AggregatedProfiles(SyntheticMetric):
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
 
-        base_dir = _resolve_output_directory(self.output_path)
-        os.makedirs(base_dir, exist_ok=True)
+        plots_dir = os.path.join(_resolve_output_directory(self.output_path), 'aggregated_profiles')
+        os.makedirs(plots_dir, exist_ok=True)
         plot_filename = self.plot_filename or 'aggregated_profiles_comparison.pdf'
-        plt.savefig(os.path.join(base_dir, plot_filename), dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(plots_dir, plot_filename), dpi=150, bbox_inches='tight')
         plt.close()
         
 
@@ -504,9 +504,7 @@ class PerConditionEval(SyntheticMetric):
         real_data = _sanitize_numeric_array(real_data)
         synthetic_data = _sanitize_numeric_array(synthetic_data)
 
-        base_dir = _resolve_output_directory(self.output_path)
-        # plots_dir = os.path.join(base_dir, 'Plots') if base_dir else 'Plots'
-        plots_dir = base_dir
+        plots_dir = os.path.join(_resolve_output_directory(self.output_path), 'per_condition_eval')
         os.makedirs(plots_dir, exist_ok=True)
         
         # Plot style

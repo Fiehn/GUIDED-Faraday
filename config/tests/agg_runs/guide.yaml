@@ -15,6 +15,7 @@ model:
     type: "dictionary"  # Options: "dictionary", "mlp", "gaussian_mlp", "art"
     hidden_dims: [128, 256, 512, 1024, 256]
     dropout: 0.2
+    mu_activation: "tanh"
   
   # Prior configuration
   prior:

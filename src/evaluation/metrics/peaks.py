@@ -113,7 +113,7 @@ class PeakMagnitude(_PeakBase):
 
     def plot_load_duration_curve(self) -> None:
         try:
-            output_dir = _resolve_output_directory(self.output_path)
+            output_dir = os.path.join(_resolve_output_directory(self.output_path), 'peak_magnitude')
             if not output_dir:
                 return
 

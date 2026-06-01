@@ -20,105 +20,21 @@ from src.model.hierarchical.aggregation import *
 from src.model.hierarchical.config import *
 from src.visualization.visualizer import Visualizer
 from src.visualization.writer import Writer
-from evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
 from src.visualization.plot_styling import PlotStyle
 from src.model.factory import _load_train_config, _save_training_config_snapshot, create_model_from_config
 from data.feeder_holdout import plot_feeder_holdout_analysis, run_coincidence_factor_analysis
 
-def _run_evaluation_and_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, phased_mode: bool, secondary_model = None,
-                                      train_loader = None):
-    """Route evaluation by mode and run shared visualizations."""
+def _run_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, secondary_model=None):
+    """Run post-training visualizations. Metric evaluation is exclusively in compare_models (ADR-0011)."""
     if test_loader is None:
-        print("Warning: test_loader is None; skipping evaluation and visualization.")
+        print("Warning: test_loader is None; skipping visualization.")
         return
     try:
         if len(test_loader) == 0:
-            print("Warning: test_loader has no batches; skipping evaluation and visualization.")
+            print("Warning: test_loader has no batches; skipping visualization.")
             return
     except TypeError:
-        # Some iterable loaders may not implement __len__; continue and rely on iteration.
         pass
-
-    eval_cfg = getattr(config, "evaluation", SimpleNamespace())
-    eval_device = str(getattr(eval_cfg, "device", device))
-    default_synth_samples = 300 if model.__class__.__name__ == "AutoRegressiveTransformerVAE" else 1000
-    n_synth_samples = int(getattr(eval_cfg, "n_synthetic_samples", default_synth_samples))
-
-    eval_normalizer = copy.deepcopy(normalizer) if normalizer is not None else None
-    if eval_normalizer is not None and hasattr(eval_normalizer, "to"):
-        eval_normalizer = eval_normalizer.to(eval_device)
-
-    if phased_mode:
-        phased_evaluator = PhasedEvaluationSuite(
-            model,
-            test_loader,
-            normalizer=eval_normalizer,
-            conditioner=conditioner,
-            device=eval_device,
-            window_size=config.window.input_len,
-            n_synthetic_samples=n_synth_samples,
-            output_path=log_path,
-            secondary_model=secondary_model,
-        )
-        try:
-            phased_evaluator.evaluate()
-        except RuntimeError as e:
-            # Fall back to CPU for evaluation if GPU memory is insufficient.
-            if eval_device != "cpu" and "out of memory" in str(e).lower():
-                print("Warning: GPU OOM during evaluation. Retrying evaluation on CPU.")
-                cpu_normalizer = copy.deepcopy(normalizer) if normalizer is not None else None
-                if cpu_normalizer is not None and hasattr(cpu_normalizer, "to"):
-                    cpu_normalizer = cpu_normalizer.to("cpu")
-                phased_evaluator = PhasedEvaluationSuite(
-                    model,
-                    test_loader,
-                    normalizer=cpu_normalizer,
-                    conditioner=conditioner,
-                    device="cpu",
-                    window_size=config.window.input_len,
-                    n_synthetic_samples=n_synth_samples,
-                    output_path=log_path,
-                    train_dataloader=train_loader,
-                )
-                phased_evaluator.evaluate()
-            else:
-                raise
-    else:
-        evaluator = EvalFramework(
-            model,
-            test_loader,
-            eval_normalizer,
-            conditioner=conditioner,
-            device=eval_device,
-            n_synthetic_samples=n_synth_samples,
-            output_path=log_path,
-            train_dataloader=train_loader,
-        )
-        evaluator.register_all()
-        try:
-            evaluator.evaluate()
-        except RuntimeError as e:
-            if eval_device != "cpu" and "out of memory" in str(e).lower():
-                print("Warning: GPU OOM during evaluation. Retrying evaluation on CPU.")
-                cpu_normalizer = copy.deepcopy(normalizer) if normalizer is not None else None
-                if cpu_normalizer is not None and hasattr(cpu_normalizer, "to"):
-                    cpu_normalizer = cpu_normalizer.to("cpu")
-                evaluator = EvalFramework(
-                    model,
-                    test_loader,
-                    cpu_normalizer,
-                    conditioner=conditioner,
-                    device="cpu",
-                    n_synthetic_samples=n_synth_samples,
-                    output_path=log_path,
-                    secondary_model=secondary_model,
-                    train_dataloader=train_loader,
-                )
-                evaluator.register_all()
-                evaluator.evaluate()
-            else:
-                raise
-        evaluator.save_results(os.path.join(log_path, 'eval_results.json'))
 
     visualizer = Visualizer(model=model, writer=writer,
                             plot_style=PlotStyle(),
@@ -382,10 +298,8 @@ def train(config, train_only_user_profile: bool = False):
         data_loader.refresh_test_cache(eval_batches)
         combined_test_loader = data_loader.get_test_loader()
 
-    train_loader = data_loader.get_train_epoch_loader(steps_per_epoch=eval_batches) if eval_batches > 0 else None
-
     if combined_test_loader is not None and model_type != "phase_splitter":
-        _run_evaluation_and_visualization(
+        _run_visualization(
             model=model,
             test_loader=combined_test_loader,
             normalizer=normalizer,
@@ -393,10 +307,7 @@ def train(config, train_only_user_profile: bool = False):
             device=device,
             log_path=log_path,
             config=config,
-            phased_mode=phased_mode,
             conditioner=conditioner,
-            secondary_model=None,
-            train_loader=train_loader,
         )
     elif model_type == "phase_splitter":
         if combined_test_loader is None:
@@ -430,124 +341,7 @@ def train(config, train_only_user_profile: bool = False):
             except Exception as e:
                 print(f"Warning: phase_splitter quality evaluation failed: {e}")
 
-    # Holdout feeder eval pass — uses EvalFramework regardless of phased_mode.
-    # Skipped silently when holdout_feeder_id is not configured or the loader is empty.
-    _holdout_loader = None
-    if holdout_feeder_id is not None and model_type != "phase_splitter":
-        _get_ho = getattr(data_loader, "get_holdout_loader", None)
-        if _get_ho is not None:
-            _holdout_loader = _get_ho()
-    if _holdout_loader is not None:
-        _eval_cfg = getattr(config, "evaluation", SimpleNamespace())
-        _eval_device = str(getattr(_eval_cfg, "device", device))
-        _holdout_n_draws = int(getattr(_eval_cfg, "holdout_n_draws", 1))
-        # Use the full holdout dataset so every calendar date and meter is
-        # represented in the feeder-level aggregated profile plot.
-        _n_holdout = len(_holdout_loader.dataset)
-        print(f"Holdout eval: {_n_holdout} real windows from feeder {holdout_feeder_id}, {_holdout_n_draws} synthetic draw(s).")
-        _eval_norm = copy.deepcopy(normalizer) if normalizer is not None else None
-        if _eval_norm is not None and hasattr(_eval_norm, "to"):
-            _eval_norm = _eval_norm.to(_eval_device)
-        holdout_evaluator = EvalFramework(
-            model,
-            _holdout_loader,
-            _eval_norm,
-            conditioner=conditioner,
-            device=_eval_device,
-            n_synthetic_samples=_n_holdout,
-            output_path=log_path,
-            train_dataloader=train_loader,
-            preserve_condition_order=True,
-        )
-        holdout_evaluator.register_all()
-        try:
-            holdout_evaluator.evaluate_averaged(n_draws=_holdout_n_draws)
-        except RuntimeError as e:
-            if _eval_device != "cpu" and "out of memory" in str(e).lower():
-                print("Warning: GPU OOM during holdout evaluation. Retrying on CPU.")
-                _cpu_norm = copy.deepcopy(normalizer) if normalizer is not None else None
-                if _cpu_norm is not None and hasattr(_cpu_norm, "to"):
-                    _cpu_norm = _cpu_norm.to("cpu")
-                holdout_evaluator = EvalFramework(
-                    model,
-                    _holdout_loader,
-                    _cpu_norm,
-                    conditioner=conditioner,
-                    device="cpu",
-                    n_synthetic_samples=_n_holdout,
-                    output_path=log_path,
-                    train_dataloader=train_loader,
-                    preserve_condition_order=True,
-                )
-                holdout_evaluator.register_all()
-                holdout_evaluator.evaluate_averaged(n_draws=_holdout_n_draws)
-            else:
-                raise
-        holdout_evaluator.save_results(os.path.join(log_path, "eval_results_feeder_holdout.json"))
-        _real_w = getattr(holdout_evaluator, '_real_data', None)
-        _synth_w = getattr(holdout_evaluator, '_synthetic_data', None)
-        _real_ts = getattr(holdout_evaluator, '_timestamps', None)
-        _real_mids = getattr(holdout_evaluator, '_meter_ids', None)
-        _missing = [n for n, v in [("_real_data", _real_w), ("_synthetic_data", _synth_w), ("_timestamps", _real_ts), ("_meter_ids", _real_mids)] if v is None]
-        if _missing:
-            print(f"Warning: feeder holdout profile plot skipped — EvalFramework did not populate: {_missing}")
-        if all(x is not None for x in [_real_w, _synth_w, _real_ts, _real_mids]):
-            import numpy as _np
-            _rw = _np.asarray(_real_w)
-            _sw = _np.asarray(_synth_w)
-            _rt = _np.asarray(_real_ts)
-            _rm = _np.asarray(_real_mids)
-            # For non-CVAE models EvalFramework does not track per-synthetic timestamps;
-            # tile real timestamps/meter_ids to cover the synthetic count so the
-            # feeder-level aggregation can still group windows by calendar date.
-            _raw_st = getattr(holdout_evaluator, '_synthetic_timestamps', None)
-            _raw_sm = getattr(holdout_evaluator, '_synthetic_meter_ids', None)
-            if _raw_st is not None:
-                _st = _np.asarray(_raw_st)
-                _sm = _np.asarray(_raw_sm) if _raw_sm is not None else _np.tile(_rm, (_sw.shape[0] // _rm.shape[0]) + 1)[:_sw.shape[0]]
-            else:
-                _n = _sw.shape[0]
-                _reps = (_n // _rt.shape[0]) + 1
-                _st = _np.tile(_rt, _reps)[:_n]
-                _sm = _np.tile(_rm, _reps)[:_n]
-            # For the profile plot, pool daily aggregates across K independent draws
-            # (not pixel-wise averaged), so bands reflect inter-draw AND inter-day variance.
-            _plot_extra_draws = None
-            if _holdout_n_draws > 1:
-                import torch as _torch_ho
-                with _torch_ho.no_grad():
-                    _fresh = [
-                        _np.asarray(holdout_evaluator._generate_synthetic(_n_holdout))
-                        for _ in range(_holdout_n_draws)
-                    ]
-                _sw = _fresh[0]
-                _plot_extra_draws = _fresh[1:]
-
-            _holdout_analysis_dir = os.path.join(log_path, "holdout_analysis")
-            plot_feeder_holdout_analysis(
-                real_windows=_rw, real_timestamps=_rt, real_meter_ids=_rm,
-                synth_windows=_sw, synth_timestamps=_st, synth_meter_ids=_sm,
-                output_dir=_holdout_analysis_dir,
-                conditioner=conditioner,
-                synth_extra_draws=_plot_extra_draws,
-            )
-            print(f"Feeder holdout analysis plots saved to: {_holdout_analysis_dir}")
-            _cf_scalars = run_coincidence_factor_analysis(
-                real_windows=_rw, real_meter_ids=_rm, real_timestamps=_rt,
-                synth_windows=_sw, synth_meter_ids=_sm, synth_timestamps=_st,
-                output_dir=_holdout_analysis_dir,
-            )
-            if _cf_scalars:
-                _holdout_json = os.path.join(log_path, "eval_results_feeder_holdout.json")
-                try:
-                    with open(_holdout_json) as _f:
-                        _holdout_results = json.load(_f)
-                    _holdout_results.update(_cf_scalars)
-                    with open(_holdout_json, "w") as _f:
-                        json.dump(_holdout_results, _f, indent=2)
-                except Exception as _e:
-                    print(f"Warning: could not merge CF scalars into holdout JSON: {_e}")
-                    import traceback as _tb; _tb.print_exc()
+    # Holdout eval pass removed — evaluation is exclusively in compare_models (ADR-0011).
 
     if writer is not None:
         writer.close()

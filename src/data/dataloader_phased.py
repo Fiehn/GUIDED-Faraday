@@ -1354,7 +1354,7 @@ class InMemoryCSVDataset(Dataset):
         value_cols: list[str],
         window_len: int = 24,
         stride: int = 24,
-        holdout_feeder_id: int | None = None,
+        holdout_feeder_id: int | list[int] | None = None,
         topology_path: str | None = None,
     ):
         split = str(split).lower()
@@ -1708,7 +1708,7 @@ class InMemoryPhasedDataset(Dataset):
         nan_as_zero: bool = False,
         normalizer: Optional[Normalizer] = None,
         output_aggregate_stream: bool = False,
-        holdout_feeder_id: int | None = None,
+        holdout_feeder_id: int | list[int] | None = None,
         topology_path: str | None = None,
     ):
         split = str(split).lower()
