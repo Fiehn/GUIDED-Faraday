@@ -232,10 +232,10 @@ class HourlyProfilesByMonth(SyntheticMetric):
             global_min: If provided, use this as the sample count for all months (for consistency)
         """
         try:
-            output_dir = _resolve_output_directory(self.output_path)
+            output_dir = os.path.join(_resolve_output_directory(self.output_path), 'hourly_profiles_by_month')
             if not output_dir:
                 return
-            
+
             unique_months = sorted(flexibility_distances_by_month.keys())
             num_months = len(unique_months)
             
@@ -531,10 +531,10 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
             global_min: If provided, use this as the sample count for all days (for consistency)
         """
         try:
-            output_dir = _resolve_output_directory(self.output_path)
+            output_dir = os.path.join(_resolve_output_directory(self.output_path), 'hourly_profiles_by_dayofweek')
             if not output_dir:
                 return
-            
+
             unique_days = sorted(flexibility_distances_by_day.keys())
             num_days = len(unique_days)
             

@@ -31,7 +31,7 @@ from src.evaluation.metrics.peaks import PeakMagnitude, PeakTiming
 from src.evaluation.metrics.condition_acc import EVConditionAccuracy
 from src.evaluation.metrics.basic_reconstructions import ReconstructionRMSE, ReconstructionLogLikelihood
 
-from src.evaluation.metrics.base.base import _sanitize_numeric_array, _align_phases_by_mse, _align_phases_to_reference_mean, _to_json_serializable, _save_standalone_metric_result, _flatten_windows, _resolve_output_directory
+from src.evaluation.metrics.base.base import _sanitize_numeric_array, _align_phases_by_mse, _align_phases_to_reference_mean, _rank_phases_by_total_consumption, _to_json_serializable, _save_standalone_metric_result, _flatten_windows, _resolve_output_directory
 
 from src.evaluation.metrics.mia import MembershipInferenceAttack
 from tabulate import tabulate
@@ -157,6 +157,7 @@ class EvalFramework:
         self.synthetic_metrics: Dict[str, SyntheticMetric] = {}
         self.privacy_metrics: Dict[str, PrivacyMetric] = {}
         self.results: Dict[str, float] = {}
+        self._results_std: Dict[str, float] = {}
         self.baseline_results: Dict[str, float] = {}
 
         self._real_data: np.ndarray = None
@@ -833,6 +834,87 @@ class EvalFramework:
         self._print_results_table()
         return self.results
 
+    def evaluate_repeated(self, k: int = 5) -> Dict[str, Any]:
+        """Generate k independent synthetic draws and compute synthetic metrics on each.
+
+        Real windows and reconstructions are collected once. Reconstruction and
+        privacy metrics run exactly once (before the draw loop) and are returned
+        as flat scalars. Only synthetic metrics repeat k times and are returned
+        as {mean, std, values} dicts (Intra-eval variance).
+
+        Returns:
+            {
+              metric_name: float,                          # reconstruction / privacy
+              metric_name: {"mean", "std", "values"},      # synthetic
+            }
+        """
+        if k < 1:
+            raise ValueError(f"k must be >= 1, got {k}")
+
+        t_total = time.time()
+        print(f"\n{'='*60}")
+        print(f"  {self.evaluation_title}  [repeated k={k}]")
+        print(f"{'='*60}")
+
+        self._prepare_data()
+        self._inject_data_into_metrics()
+
+        results: Dict[str, Any] = {}
+
+        # --- Reconstruction and privacy metrics: run exactly once ---
+        once_metrics = (
+            list(self.reconstruction_metrics.items())
+            + list(self.privacy_metrics.items())
+        )
+        for name, metric in once_metrics:
+            try:
+                results[name] = float(metric.compute())
+            except Exception as e:
+                print(f"\n  WARNING: {name} failed: {e}")
+                import traceback; traceback.print_exc()
+                results[name] = float("nan")
+
+        # --- Synthetic metrics: repeat k times ---
+        synth_metrics = list(self.synthetic_metrics.items())
+        per_synth_values: Dict[str, list] = {name: [] for name, _ in synth_metrics}
+
+        self._all_synthetic_draws: list = []
+        for draw_idx in range(k):
+            print(f"  Draw {draw_idx + 1}/{k}...", end="", flush=True)
+            t_draw = time.time()
+            with torch.no_grad():
+                self._synthetic_data = _sanitize_numeric_array(
+                    self._generate_synthetic(self.n_synthetic_samples)
+                )
+            self._all_synthetic_draws.append(self._synthetic_data)
+            self._inject_data_into_metrics()
+            for name, metric in synth_metrics:
+                try:
+                    per_synth_values[name].append(float(metric.compute()))
+                except Exception as e:
+                    print(f"\n  WARNING: {name} failed on draw {draw_idx + 1}: {e}")
+                    per_synth_values[name].append(float("nan"))
+            print(f" done ({time.time() - t_draw:.1f}s)")
+
+        self._results_std = {}
+        for name, values in per_synth_values.items():
+            arr = np.array(values)
+            std = float(np.nanstd(arr))
+            results[name] = {
+                "mean": float(np.nanmean(arr)),
+                "std": std,
+                "values": values,
+            }
+            self._results_std[name] = std
+
+        self.results = {
+            name: v["mean"] if isinstance(v, dict) else v
+            for name, v in results.items()
+        }
+        print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
+        self._print_results_table()
+        return results
+
     def evaluate_reconstruction_only(self) -> Dict[str, float]:
         """Run only reconstruction metrics.
         Returns:
@@ -919,10 +1001,14 @@ class EvalFramework:
 
         table_data = []
         for name, value in self.results.items():
-            model_str = "ERROR" if value is None else (
-                "N/A (no train data)" if value is None and name in self.privacy_metrics
-                else (f"{float(value):.6f}" if isinstance(value, (float, int, np.floating, np.integer)) else str(value))
-            )
+            if value is None:
+                model_str = "ERROR"
+            elif isinstance(value, (float, int, np.floating, np.integer)):
+                mean_str = f"{float(value):.6f}"
+                std = self._results_std.get(name)
+                model_str = f"{mean_str} ± {std:.6f}" if std is not None else mean_str
+            else:
+                model_str = str(value)
             goal = self._metric_direction(name)
             if goal == "target_1":
                 goal_label = "target=1"
@@ -976,6 +1062,7 @@ class PhasedEvaluationSuite:
         train_dataloader: Optional[torch.utils.data.DataLoader] = None,
         n_member_samples: int = 1000,
         mia_reconstruction_samples: int = 1,
+        n_draws: int = 1,
     ):
         self.model = model
         self.secondary_model = secondary_model if secondary_model is not None else None
@@ -989,6 +1076,7 @@ class PhasedEvaluationSuite:
         self.train_dataloader = train_dataloader
         self.n_member_samples = int(n_member_samples)
         self.mia_reconstruction_samples = int(mia_reconstruction_samples)
+        self.n_draws = max(1, int(n_draws))
 
     def _prepare_base_framework(self) -> EvalFramework:
         framework = EvalFramework(
@@ -1042,7 +1130,21 @@ class PhasedEvaluationSuite:
         n_features = arr.shape[1] // self.window_size
         return arr.reshape(arr.shape[0], n_features, self.window_size)  # SHAPER: [n_samples, n_features * window_size] -> [n_samples, n_features, window_size]
 
-    def _run_prepared_eval(self, prepared_data: Dict[str, Any], output_path: str, title: str) -> Dict[str, float]:
+    def _run_prepared_eval(
+        self,
+        prepared_data: Dict[str, Any],
+        output_path: str,
+        title: str,
+        synthetic_only: bool = False,
+    ) -> tuple[Dict[str, Any], set[str]]:
+        """Run one evaluation pass on pre-split prepared data.
+
+        Returns (results, once_keys) where once_keys names all reconstruction and
+        privacy metrics — callers use this to separate flat-scalar metrics from the
+        synthetic metrics that should be averaged across K draws.
+        When synthetic_only=True, skips reconstruction/privacy and returns an empty
+        once_keys set; used for draws 2..K to avoid recomputing expensive metrics.
+        """
         evaluator = EvalFramework(
             self.model,
             self.dataloader,
@@ -1057,9 +1159,16 @@ class PhasedEvaluationSuite:
             verbose=False,
         )
         evaluator.register_all(phased=True)
-        results = evaluator.evaluate()
-        evaluator.save_results(output_path)
-        return results
+        if synthetic_only:
+            evaluator._prepare_data()
+            evaluator._inject_data_into_metrics()
+            results = evaluator.evaluate_synthetic_only()
+            once_keys: set[str] = set()
+        else:
+            results = evaluator.evaluate()
+            once_keys = set(evaluator.reconstruction_metrics) | set(evaluator.privacy_metrics)
+            evaluator.save_results(output_path)
+        return results, once_keys
 
     def evaluate(self) -> Dict[str, Any]:
         output_dir = _resolve_output_directory(self.output_path)
@@ -1068,53 +1177,117 @@ class PhasedEvaluationSuite:
 
         real_phase = self._extract_phase_first(base._real_data, 'real data')
         recon_phase = self._extract_phase_first(base._reconstructed_data, 'reconstructed data')
-        synthetic_phase = self._extract_phase_first(base._synthetic_data, 'synthetic data')
 
+        # Generate all K synthetic draws at suite level so every phase view sees the
+        # same K populations (Option A).  Draw 0 comes from _prepare_base_framework();
+        # draws 1..K-1 are generated here via the same generator.
+        print(f"\n[PhasedEvaluationSuite] Generating {self.n_draws} synthetic draw(s)...")
+        synth_phases = [
+            self._extract_phase_first(base._synthetic_data, 'synthetic draw 0')
+        ]
+        for draw_idx in range(1, self.n_draws):
+            print(f"  Generating synthetic draw {draw_idx + 1}/{self.n_draws}...", flush=True)
+            with torch.no_grad():
+                raw = _sanitize_numeric_array(base._generate_synthetic(self.n_synthetic_samples))
+            synth_phases.append(self._extract_phase_first(raw, f'synthetic draw {draw_idx}'))
+
+        # Real and reconstructed phase rankings are fixed across draws.
+        ranked_real = _rank_phases_by_total_consumption(real_phase)
+        ranked_recon = _align_phases_by_mse(ranked_real, recon_phase)
+
+        def _aggregate(
+            draw_results: list[Dict[str, Any]],
+            once_keys: set[str],
+        ) -> Dict[str, Any]:
+            """Merge K draw results: flat scalar for reconstruction/privacy, {mean,std,values} for synthetic."""
+            if len(draw_results) == 1:
+                return draw_results[0]
+            final: Dict[str, Any] = {}
+            all_keys = set().union(*[dr.keys() for dr in draw_results])
+            for metric in all_keys:
+                if metric in once_keys:
+                    final[metric] = draw_results[0].get(metric, float('nan'))
+                else:
+                    vals = [float(dr.get(metric, float('nan'))) for dr in draw_results]
+                    arr = np.array(vals, dtype=float)
+                    final[metric] = {
+                        "mean": float(np.nanmean(arr)),
+                        "std": float(np.nanstd(arr)),
+                        "values": vals,
+                    }
+            return final
+
+        # --- Aggregated phase ---
         aggregated_dir = os.path.join(output_dir, 'aggregated_phase_eval')
         os.makedirs(aggregated_dir, exist_ok=True)
-        aggregated_prepared = {
-            'real_data': _flatten_windows(real_phase.sum(axis=1)),
-            'reconstructed_data': _flatten_windows(recon_phase.sum(axis=1)),
-            'synthetic_data': _flatten_windows(synthetic_phase.sum(axis=1)),
-            'timestamps': base._timestamps,
-            'meter_ids': base._meter_ids,
-            'train_data': base._train_data,
-            'train_reconstructed_data': base._train_reconstructed_data,
-        }
-        aggregate_results = self._run_prepared_eval(
-            prepared_data=aggregated_prepared,
-            title='AGGREGATED 3-PHASE EVALUATION',
-            output_path=os.path.join(aggregated_dir, 'eval_results.json'),
-        )
+        agg_json_path = os.path.join(aggregated_dir, 'eval_results.json')
 
-        ranked_real = real_phase
-        ranked_recon = _align_phases_by_mse(real_phase, recon_phase)
-        ranked_synth = _align_phases_to_reference_mean(real_phase, synthetic_phase)
+        agg_draw_results: list[Dict[str, Any]] = []
+        agg_once_keys: set[str] = set()
+        for draw_idx, synth_phase in enumerate(synth_phases):
+            prepared = {
+                'real_data': _flatten_windows(real_phase.sum(axis=1)),
+                'reconstructed_data': _flatten_windows(recon_phase.sum(axis=1)),
+                'synthetic_data': _flatten_windows(synth_phase.sum(axis=1)),
+                'timestamps': base._timestamps,
+                'meter_ids': base._meter_ids,
+                # MIA train data only needed on draw 0 (privacy metrics run once).
+                'train_data': base._train_data if draw_idx == 0 else None,
+                'train_reconstructed_data': base._train_reconstructed_data if draw_idx == 0 else None,
+            }
+            result, once_keys = self._run_prepared_eval(
+                prepared_data=prepared,
+                title=f'AGGREGATED 3-PHASE EVALUATION (draw {draw_idx + 1}/{self.n_draws})',
+                output_path=agg_json_path,
+                synthetic_only=(draw_idx > 0),
+            )
+            agg_draw_results.append(result)
+            if draw_idx == 0:
+                agg_once_keys = once_keys
 
-        ranked_results = {}
+        aggregate_results = _aggregate(agg_draw_results, agg_once_keys)
+        with open(agg_json_path, 'w') as f:
+            json.dump(_to_json_serializable(aggregate_results), f, indent=2)
+
+        # --- Ranked phases ---
+        ranked_results: Dict[str, Any] = {}
         num_phases = ranked_real.shape[1]
         for phase_idx in range(num_phases):
             phase_number = phase_idx + 1
             phase_dir = os.path.join(output_dir, f'ranked_phase_{phase_number}_eval')
             os.makedirs(phase_dir, exist_ok=True)
-            prepared = {
-                'real_data': _flatten_windows(ranked_real[:, phase_idx, :]),
-                'reconstructed_data': _flatten_windows(ranked_recon[:, phase_idx, :]),
-                'synthetic_data': _flatten_windows(ranked_synth[:, phase_idx, :]),
-                'timestamps': base._timestamps,
-                'meter_ids': base._meter_ids,
-            }
-            ranked_results[f'phase_{phase_number}'] = self._run_prepared_eval(
-                prepared_data=prepared,
-                title=f'ALIGNED PHASE {phase_number} EVALUATION',
-                output_path=os.path.join(phase_dir, 'eval_results.json'),
-            )
+            phase_json_path = os.path.join(phase_dir, 'eval_results.json')
+
+            phase_draw_results: list[Dict[str, Any]] = []
+            phase_once_keys: set[str] = set()
+            for draw_idx, synth_phase in enumerate(synth_phases):
+                ranked_synth = _align_phases_to_reference_mean(ranked_real, synth_phase)
+                prepared = {
+                    'real_data': _flatten_windows(ranked_real[:, phase_idx, :]),
+                    'reconstructed_data': _flatten_windows(ranked_recon[:, phase_idx, :]),
+                    'synthetic_data': _flatten_windows(ranked_synth[:, phase_idx, :]),
+                    'timestamps': base._timestamps,
+                    'meter_ids': base._meter_ids,
+                }
+                result, once_keys = self._run_prepared_eval(
+                    prepared_data=prepared,
+                    title=f'ALIGNED PHASE {phase_number} EVALUATION (draw {draw_idx + 1}/{self.n_draws})',
+                    output_path=phase_json_path,
+                    synthetic_only=(draw_idx > 0),
+                )
+                phase_draw_results.append(result)
+                if draw_idx == 0:
+                    phase_once_keys = once_keys
+
+            phase_result = _aggregate(phase_draw_results, phase_once_keys)
+            ranked_results[f'phase_{phase_number}'] = phase_result
+            with open(phase_json_path, 'w') as f:
+                json.dump(_to_json_serializable(phase_result), f, indent=2)
 
         summary = {
             'aggregated_phase': aggregate_results,
             'ranked_phases': ranked_results,
         }
-
         summary_path = os.path.join(output_dir, 'phased_eval_summary.json')
         with open(summary_path, 'w') as f:
             json.dump(_to_json_serializable(summary), f, indent=2)
@@ -1188,7 +1361,9 @@ class VisualEvaluation(SyntheticMetric):
         ax2.set_ylabel('PC2')
         ax2.set_zlabel('PC3')
         plt.tight_layout()
-        plt.savefig(os.path.join(self.output_path, 'pca_comparison.pdf'), format='pdf')
+        plots_dir = os.path.join(self.output_path, 'visual_evaluation')
+        os.makedirs(plots_dir, exist_ok=True)
+        plt.savefig(os.path.join(plots_dir, 'pca_comparison.pdf'), format='pdf')
         plt.close()
     
     def tsne(self) -> None:
@@ -1242,7 +1417,9 @@ class VisualEvaluation(SyntheticMetric):
         ax.set_ylabel('t-SNE 2')
         ax.legend()
         plt.tight_layout()
-        plt.savefig(os.path.join(self.output_path, 'tsne_comparison.pdf'), format='pdf')
+        plots_dir = os.path.join(self.output_path, 'visual_evaluation')
+        os.makedirs(plots_dir, exist_ok=True)
+        plt.savefig(os.path.join(plots_dir, 'tsne_comparison.pdf'), format='pdf')
         plt.close()
     
     def compute(self) -> float:

@@ -133,6 +133,7 @@ def create_model_from_config(config, device ="cpu"):
     decoder_hidden_dims = getattr(decoder_cfg, "hidden_dims", None)
     encoder_dropout = getattr(encoder_cfg, "dropout", None)
     decoder_dropout = getattr(decoder_cfg, "dropout", None)
+    decoder_mu_activation = getattr(decoder_cfg, "mu_activation", None)
 
     if (model_type in ("phase_splitter", "set_guide_vae", "sequential_phase_vae")) and not phased_mode:
         print("You have indicated a phased only model type is currently supported only with data.mode='phased_parquet'. Forcing phased mode for this run.")
@@ -218,6 +219,7 @@ def create_model_from_config(config, device ="cpu"):
                     decoder_hidden_dims=decoder_hidden_dims,
                     encoder_dropout=encoder_dropout,
                     decoder_dropout=decoder_dropout,
+                    decoder_mu_activation=decoder_mu_activation,
                     encoder_average_max_std=getattr(encoder_cfg, "average_max_std", 1.0),
                     decoder_average_max_std=getattr(decoder_cfg, "average_max_std", 1.0),
                     phased_mode=phased_mode,
@@ -347,6 +349,7 @@ def create_model_from_config(config, device ="cpu"):
                     decoder_hidden_dims=decoder_hidden_dims,
                     encoder_dropout=encoder_dropout,
                     decoder_dropout=decoder_dropout,
+                    decoder_mu_activation=decoder_mu_activation,
                     phased_mode=phased_mode,
                     sequence_length=seq_len,
                     )
@@ -413,6 +416,7 @@ def create_model_from_config(config, device ="cpu"):
             gmm_reg_covar=float(getattr(gmm_cfg, "reg_covar", 1e-6)),
             stochastic_loss=bool(getattr(gf_cfg, "stochastic_loss", True)),
             encoder_exclude_tags=list(getattr(gf_cfg, "encoder_exclude_tags", [])) or None,
+            decoder_mu_activation=decoder_mu_activation,
         )
     elif model_type == "faraday":
         from src.model.faraday import FaradayModel

@@ -40,4 +40,4 @@ early_stopping:
     min_delta: 0.001
 
 conditioning:
-  tags: [day_of_week, month_of_year, heatpump_phase, ev, pv]
+  tags: [day_of_week, month_of_year, heatpump_phase, ev, pv,user_profiles]

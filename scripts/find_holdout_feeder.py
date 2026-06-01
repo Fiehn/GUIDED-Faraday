@@ -189,8 +189,8 @@ def _parquet_stats_from_file(meters: set[str], parquet_file: Path) -> tuple[floa
 
 def filter_and_sort(
     stats: list[FeederStats],
-    ev_thresh: float = 0.20,
-    hp_thresh: float = 0.10,
+    ev_thresh: float = 0.0,
+    hp_thresh: float = 0.0,
 ) -> list[FeederStats]:
     """Return feeders meeting both thresholds, sorted by EV% descending."""
     candidates = [s for s in stats if s.ev_pct > ev_thresh and s.hp_pct > hp_thresh]
@@ -221,8 +221,8 @@ def _parse_args(argv=None):
     p.add_argument("--hp", required=True, help="Path to HP prediction CSV")
     p.add_argument("--parquet", "--parquet-dir", dest="parquet", default=None,
                    help="Hourly data: a single multi-index parquet file OR a directory of sm_*.parquet files (optional)")
-    p.add_argument("--ev-thresh", type=float, default=0.20, help="Minimum EV%% (default 0.20)")
-    p.add_argument("--hp-thresh", type=float, default=0.10, help="Minimum HP%% (default 0.10)")
+    p.add_argument("--ev-thresh", type=float, default=0.00, help="Minimum EV%% (default 0.20)")
+    p.add_argument("--hp-thresh", type=float, default=0.00, help="Minimum HP%% (default 0.10)")
     return p.parse_args(argv)
 
 

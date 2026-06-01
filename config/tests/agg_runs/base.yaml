@@ -15,9 +15,9 @@ data:
   max_value: 200.0
   max_hour_value: 20.0
   splits:
-    train_ratio: 0.8
-    val_ratio: 0.1
-    test_ratio: 0.1
+    train_ratio: 0.9
+    val_ratio: 0.05
+    test_ratio: 0.05
     random_seed: 42
   window:
     aggregated: true
@@ -39,7 +39,7 @@ data:
   output_aggregate_stream: false
   in_memory: true
   max_passes: 20
-  holdout_feeder_id: 291556   # n=42   ev=28.6%   hp=31.0%    avg?=9.70    cover?=100.0%
+  holdout_feeder_id: [291556, 887337, 267697, 129571, 921498, 123538, 615734, 144397, 652352, 942339, 47021, 60068, 641430, 667455, 318813, 732417, 164883, 307389, 657188, 893397]   #291556:  n=42   ev=28.6%   hp=31.0%    avg?=9.70    cover?=100.0%
   topology_path: data/topology/cleaned/Cleaned_SM_Topology_mapping.json       # path to topology JSON; required when holdout_feeder_id is set
 
 normalization:
@@ -154,15 +154,15 @@ training:
     min_delta: 0.001
   checkpointing:
     save_freq: 20
-    save_dir: E:/models/new3/
+    save_dir: E:/models/new4/
     save_best_model: true
     save_best_after_fraction: 0.00
     save_final_model: true
 
 logging:
-  log_dir: E:/models/new3/
+  log_dir: E:/models/new4/
   save_config: true
-  config_save_dir: E:/models/new3/
+  config_save_dir: E:/models/new4/
 
 visualize:
   num_samples: 5

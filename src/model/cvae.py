@@ -19,12 +19,15 @@ class CVAE(VAE):
         include_faraday_like: bool = False,
         encoder_average_max_std: float = 1.0,
         decoder_average_max_std: float = 1.0,
+        decoder_mu_activation: str = "tanh",
         **kwargs,
     ):
         if distribution_dict is None:
             distribution_dict = {}
         distribution_dict = dict(distribution_dict)
         distribution_dict["latent_dim"] = latent_dim
+
+        self.mu_activation = decoder_mu_activation if decoder_mu_activation is not None else "tanh"
 
         self.conditioner = conditioner
         self.condition_dim = conditioner.get_condition_dim() + extra_condition_dim
@@ -95,6 +98,7 @@ class CVAE(VAE):
             output_dim=input_dim,
             type=kwargs.get("decoder_type", "dictionary"),
             average_max_std=decoder_average_max_std,
+            mu_activation=self.mu_activation,
             **decoder_model_kwargs,
             **base_kwargs,
         )

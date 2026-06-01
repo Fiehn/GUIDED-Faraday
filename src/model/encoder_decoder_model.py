@@ -245,9 +245,10 @@ class DictionaryCoder(torch.nn.Module):
         elif self.mu_activation == "tanh":
             # Symmetric [-10, 10] — use for z-score normalised data or latent encoder codes
             param_dict["mu"] = torch.tanh(param_dict["mu"]) * 10.0
+        elif self.mu_activation == "relu":
+            param_dict["mu"] = F.relu(param_dict["mu"])
         # else "none": unbounded, trust the optimizer
 
-        
         max_sigma_range = self.sigma_upper_lim - self.sigma_lower_lim
         param_dict["sigma"] = self.sigma_lower_lim + torch.sigmoid(param_dict["sigma"]) * max_sigma_range
 

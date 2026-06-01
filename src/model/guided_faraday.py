@@ -129,6 +129,7 @@ class GuidedFaradayModel(BaseModel):
         phased_mode: bool = False,
         stochastic_loss: bool = True,
         encoder_exclude_tags: list[str] | None = None,
+        decoder_mu_activation: str = "softplus",
         **kwargs,
     ):
         super().__init__(phased_mode=phased_mode, sequence_length=sequence_length)
@@ -175,7 +176,7 @@ class GuidedFaradayModel(BaseModel):
             hidden_dims=dec_dims,
             layer_type="MLP",
             average_max_std=pdcc_average_max_std,
-            mu_activation="softplus", #TODO : TEST THIS FIRST! afterwards RELU
+            mu_activation=decoder_mu_activation if decoder_mu_activation is not None else "softplus",
         )
 
         self.hierarchy = None
