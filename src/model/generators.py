@@ -306,7 +306,7 @@ class SyntheticGenerator:
             c = self.model._get_conditions(
                 input_data, meter_id=meter_id, timestamps=timestamp, device=self.device
             )
-            mu, _ = self.model.encoder(x_flat, c)
+            mu, _ = self.model.encoder(x_flat, self.model._enc_conditions(c))
             recon_params = self.model.decoder(torch.cat([mu, c], dim=-1))  # {"mu": [B,D], "sigma": [B,D]}
         # Conditions for the encoding are always based on the original meter_id and timestamp, to get the correct latent representation.
         elif self._is_cvae:

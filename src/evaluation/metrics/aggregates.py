@@ -190,7 +190,7 @@ class PerConditionEval(SyntheticMetric):
     output_path: str = None
 
     def __init__(self, window_size: int = 24, max_lag: int = 10, min_samples_per_group: int = 2,
-                 verbose: bool = False, predictor_type: str = 'linear', tstr_epochs: int = 50,
+                 verbose: bool = False, predictor_type: str = 'linear', tstr_epochs: int = 10,
                  feeder_mapping_path: str = 'data/topology/cleaned/Cleaned_SM_Topology_mapping.json',
                  min_samples_per_feeder: int = 5):
         self.window_size = window_size
@@ -202,6 +202,11 @@ class PerConditionEval(SyntheticMetric):
         self.feeder_mapping_path = feeder_mapping_path
         self.min_samples_per_feeder = min_samples_per_feeder
         self._meter_to_feeder = None
+        self._has_plotted = False
+        self._real_cache_id: int | None = None
+        self._cached_days_of_week: np.ndarray | None = None
+        self._cached_months_of_year: np.ndarray | None = None
+        self._cached_feeder_ids = None
 
         self.results_by_condition = {
             'mmd': {
@@ -282,7 +287,11 @@ class PerConditionEval(SyntheticMetric):
                 print(f"\n  [TSTR] {group_label} (real={len(real_subset)}, synthetic={len(synthetic_subset)})")
             self.tstr_calculator.real_data = real_subset
             self.tstr_calculator.synthetic_data = synthetic_subset
+            # Suppress per-group plot and JSON I/O — only the top-level TSTR saves output.
+            _saved_path = self.tstr_calculator.output_path
+            self.tstr_calculator.output_path = None
             tstr_ratio = self.tstr_calculator.compute()
+            self.tstr_calculator.output_path = _saved_path
             return float(tstr_ratio)
         except Exception as e:
             if self.verbose:
@@ -690,21 +699,29 @@ class PerConditionEval(SyntheticMetric):
         if self.verbose:
             self._print_input_debug(real_data, synthetic_data, timestamps)
 
-        import pandas as pd
-        _dts = pd.to_datetime(timestamps.astype(np.int64), unit='s', utc=True)
-        days_of_week = _dts.day_of_week.to_numpy(dtype=int)
-        months_of_year = _dts.month.to_numpy(dtype=int)
+        # Cache real-side grouping arrays — recompute only when real_data changes.
+        real_id = id(self.real_data)
+        if self._real_cache_id != real_id:
+            import pandas as pd
+            _dts = pd.to_datetime(timestamps.astype(np.int64), unit='s', utc=True)
+            self._cached_days_of_week = _dts.day_of_week.to_numpy(dtype=int)
+            self._cached_months_of_year = _dts.month.to_numpy(dtype=int)
+            self._cached_feeder_ids = self._resolve_feeder_ids(len(real_data))
+            self._real_cache_id = real_id
 
-        # Resolve feeder IDs if available
-        feeder_ids = self._resolve_feeder_ids(len(real_data))
+        days_of_week = self._cached_days_of_week
+        months_of_year = self._cached_months_of_year
+        feeder_ids = self._cached_feeder_ids
 
-        aggregated_profile_plot_paths = self._plot_aggregated_profiles_bars(
-            real_data=real_data,
-            synthetic_data=synthetic_data,
-            days_of_week=days_of_week,
-            months_of_year=months_of_year,
-            feeder_ids=feeder_ids,
-        )
+        if not self._has_plotted:
+            self._has_plotted = True
+            self._last_plot_paths = self._plot_aggregated_profiles_bars(
+                real_data=real_data,
+                synthetic_data=synthetic_data,
+                days_of_week=days_of_week,
+                months_of_year=months_of_year,
+                feeder_ids=feeder_ids,
+            )
 
         # -------------------------
         # MMD 
@@ -787,7 +804,6 @@ class PerConditionEval(SyntheticMetric):
                 )
 
         aggregated_profiles_per_feeder = {}
-        feeder_ids = self._resolve_feeder_ids(len(real_data))
         if feeder_ids is not None:
             aggregated_profiles_per_feeder = self._compute_aggregated_profiles_per_feeder(
                 real_data=real_data,
@@ -854,7 +870,7 @@ class PerConditionEval(SyntheticMetric):
             'classical_statistics': self.results_by_condition['classical_statistics'],
             'aggregated_profiles': self.results_by_condition['aggregated_profiles'],
             'tstr': self.results_by_condition['tstr'],
-            'aggregated_profile_plots': aggregated_profile_plot_paths,
+            'aggregated_profile_plots': getattr(self, '_last_plot_paths', None),
             'feeder_mapping_path': self.feeder_mapping_path,
             'min_samples_per_feeder': int(self.min_samples_per_feeder),
             'window_size': int(self.window_size),

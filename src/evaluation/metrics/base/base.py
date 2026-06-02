@@ -65,11 +65,16 @@ def _flatten_windows(data: np.ndarray) -> np.ndarray:
 
 
 def _resolve_output_directory(output_path: str | None) -> str:
-    """Resolve a writable directory from either a directory path or a JSON file path."""
+    """Resolve a writable directory from either a directory path or a JSON file path.
+
+    Returns '' (falsy) when output_path is None or empty so that callers can
+    use `if not output_dir: return` as a no-op guard without accidentally
+    writing to the current working directory.
+    """
     if not output_path:
-        return '.'
+        return ''
     if output_path.endswith('.json'):
-        return os.path.dirname(output_path) or '.'
+        return os.path.dirname(output_path) or ''
     return output_path
 
 

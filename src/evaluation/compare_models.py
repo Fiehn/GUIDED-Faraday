@@ -21,10 +21,16 @@ if str(SRC_DIR) not in sys.path:
 
 from src.evaluation.load_model import load_model
 from src.model.factory import _load_train_config
-from src.data.dataloader_phased import PhasedReplayDataloaders, WindowSpec, InMemoryCSVDataloaders
+from src.data.dataloader_phased import PhasedReplayDataloaders, WindowSpec
 from src.evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
 from src.visualization.plot_styling import PlotStyle
-from src.data.feeder_holdout import plot_feeder_aggregated_profile, plot_feeder_holdout_analysis, run_coincidence_factor_analysis
+from src.data.feeder_holdout import (
+    HoldoutWindows,
+    load_holdout_windows_raw,
+    plot_feeder_aggregated_profile,
+    plot_feeder_holdout_analysis,
+    run_coincidence_factor_analysis,
+)
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -1131,17 +1137,38 @@ def _restore_results_from_checkpoint(checkpoint_dir: str, model_output_dir: str)
     return True
 
 
+def _build_holdout_loader(
+    raw_holdout: HoldoutWindows,
+    normalizer,
+    window_size: int,
+) -> "torch.utils.data.DataLoader":
+    """Apply normalizer to cached raw windows and wrap in a DataLoader."""
+    from torch.utils.data import TensorDataset, DataLoader as _DL
+
+    x_np = raw_holdout.x
+    if normalizer is not None and getattr(normalizer, "fitted", False):
+        x_2d = torch.from_numpy(x_np.reshape(-1, 1)).float()
+        x_2d = normalizer.transform(x_2d)
+        x_t = x_2d.reshape(len(x_np), window_size).unsqueeze(1)
+    else:
+        x_t = torch.from_numpy(x_np).float().unsqueeze(1)
+
+    agg_t = torch.zeros((len(x_np), 0, window_size), dtype=torch.float32)
+    ds = TensorDataset(
+        x_t,
+        torch.from_numpy(raw_holdout.meter_ids),
+        torch.from_numpy(raw_holdout.timestamps),
+        agg_t,
+    )
+    return _DL(ds, batch_size=1024, shuffle=False, num_workers=0, pin_memory=False)
+
+
 def _run_holdout_eval(
     model,
     normalizer,
     conditioner,
-    data_files: list[str],
+    raw_holdout: HoldoutWindows,
     feeder_id: int,
-    topology_path: str,
-    split_seed: int,
-    split_ratios: dict,
-    max_value: float | None,
-    num_samples: int,
     device: str,
     window_size: int,
     model_output_dir: str,
@@ -1149,30 +1176,13 @@ def _run_holdout_eval(
 ) -> None:
     """Run EvalFramework on one holdout feeder and save per-feeder results.
 
+    raw_holdout: pre-loaded un-normalised windows from load_holdout_windows_raw().
     n_synthetic_draws: number of independent synthetic draws for evaluate_repeated().
     """
     import copy
-    loader = InMemoryCSVDataloaders(
-        sm_files=data_files,
-        window_len=window_size,
-        stride=window_size,
-        batch_size=1024,
-        split_ratios=split_ratios,
-        split_seed=split_seed,
-        max_value=max_value,
-        normalizer=normalizer,
-        holdout_feeder_id=feeder_id,
-        topology_path=topology_path,
-        pin_memory=False,
-    )
-    holdout_loader = loader.get_holdout_loader()
-    if holdout_loader is None:
-        print(f"  [holdout] No windows found for feeder {feeder_id}; skipping.")
-        return
 
-    # Use the full holdout dataset as the collection target so every calendar date
-    # and every meter is represented in the feeder-level aggregated profile plot.
-    n_holdout_windows = len(holdout_loader.dataset)
+    holdout_loader = _build_holdout_loader(raw_holdout, normalizer, window_size)
+    n_holdout_windows = len(raw_holdout.x)
     print(f"  [holdout] {n_holdout_windows} real windows from feeder {feeder_id}.")
 
     eval_norm = copy.deepcopy(normalizer)
@@ -1264,6 +1274,8 @@ def _run_holdout_eval(
                 import traceback as _tb; _tb.print_exc()
 
         # --- Power flow scalars (voltage_nadir, transformer_utilisation) ---
+        if True:
+            return # Temporarily disable power flow analysis to save time during development; re-enable when needed.
         try:
             from src.power_flow.network_builder import build_feeder_network
             from src.data.feeder_holdout import (
@@ -1580,6 +1592,35 @@ def compare_models(model_paths: list[str],
         if shared_train_loader is not None:
             print(f"Shared train loader ready: {len(shared_train_loader.dataset)} member windows for MIA.")
 
+    # 5a. Pre-build holdout window cache (one read per feeder, shared across all models).
+    #     Raw un-normalised windows are cached; each model applies its own normalizer.
+    holdout_cache: dict[int, HoldoutWindows] = {}
+    if needs_recompute_indices and data_files:
+        _first_cfg_path = _find_model_config_path(eval_plan[needs_recompute_indices[0]]["path"])
+        if _first_cfg_path is not None:
+            try:
+                _hcfg = _load_train_config(_first_cfg_path)
+                _hid_raw = getattr(getattr(_hcfg, "data", None), "holdout_feeder_id", None)
+                _htopo  = getattr(getattr(_hcfg, "data", None), "topology_path", None)
+                if _hid_raw is not None and _htopo is not None:
+                    _hfids = _dispatch_holdout_feeder_ids(_hid_raw)
+                    print(f"\nPre-loading holdout windows for {len(_hfids)} feeder(s)...")
+                    for _hfid in _hfids:
+                        print(f"  Loading feeder {_hfid}...", end=" ", flush=True)
+                        try:
+                            holdout_cache[_hfid] = load_holdout_windows_raw(
+                                feeder_id=_hfid,
+                                data_files=data_files,
+                                topology_path=str(_htopo),
+                                window_size=window.input_len,
+                                max_value=max_value,
+                            )
+                            print(f"{len(holdout_cache[_hfid].x)} windows.")
+                        except Exception as _he:
+                            print(f"FAILED: {_he}")
+            except Exception as _hce:
+                print(f"  [holdout] Could not pre-load holdout cache: {_hce}")
+
     # 5. Loop through models and evaluate, reusing the shared test loader.
     used_eval_dirs: list[str] = []
 
@@ -1691,18 +1732,26 @@ def compare_models(model_paths: list[str],
                     else:
                         _fids = _dispatch_holdout_feeder_ids(_hid)
                         for _fid in _fids:
+                            if _fid not in holdout_cache:
+                                print(f"  [holdout] Feeder {_fid} not in cache; loading now...")
+                                try:
+                                    holdout_cache[_fid] = load_holdout_windows_raw(
+                                        feeder_id=_fid,
+                                        data_files=data_files,
+                                        topology_path=str(_topo),
+                                        window_size=window.input_len,
+                                        max_value=max_value,
+                                    )
+                                except Exception as _lhe:
+                                    print(f"  [holdout] Load failed for feeder {_fid}: {_lhe}")
+                                    continue
                             print(f"  Running holdout eval (feeder {_fid})...")
                             _run_holdout_eval(
                                 model=model,
                                 normalizer=normalizer,
                                 conditioner=conditioner,
-                                data_files=data_files,
+                                raw_holdout=holdout_cache[_fid],
                                 feeder_id=_fid,
-                                topology_path=str(_topo),
-                                split_seed=split_seed,
-                                split_ratios=split_ratios,
-                                max_value=max_value,
-                                num_samples=num_samples,
                                 device=device,
                                 window_size=window.input_len,
                                 model_output_dir=model_output_dir,
@@ -1760,6 +1809,35 @@ if __name__ == "__main__":
     args = parser.parse_args()
     holdout_n_draws = int(args.holdout_n_draws)
     n_draws = int(args.n_draws)
+
+    args.models = [
+                   #"E:/models/new4/CVAE_20260601_034519_guide_cnn",
+                #    "E:/models/new4/DiffusionModel_20260601_002842",
+                #    "E:/models/new4/FaradayModel_20260531_124255",
+                #    "E:/models/new4/GuidedFaradayModel_20260531_115215",
+                #    "E:/models/new4/GuidedFaradayModel_20260531_131653_relu",
+                #    "E:/models/new4/GuidedFaradayModel_20260531_143252_peaks",
+                #    "E:/models/new4/GuidedFaradayModel_20260531_152154_cnn",
+                #    "E:/models/new4/GuidedFaradayModel_20260531_225823_userprofile",
+                   "E:/models/new4/QuantileBaselineModel_20260601_005326",
+                   "E:/models/new4/CVAE_20260531_185015_guide_cnn_h_broken",
+                   "E:/models/new4/AverageBaselineModel_20260531_173051",
+                   "E:/models/new4/CVAE_20260531_180003_cvae",
+                   ]
+    args.names = [
+                    #"Guide-CNN",
+                    # "Diffusion",
+                    # "Faraday",
+                    # "Guided-Faraday",
+                    # "Guided-Faraday-RELU",
+                    # "Guided-Faraday-PEAKS",
+                    # "Guided-Faraday-CNN",
+                    # "Guided-Faraday-UserProfile",
+                    "Baseline-Quantile",
+                    "Guide-CNN-H-Broken",
+                    "Baseline-Average",
+                    "CVAE",
+    ]
 
     #args.models = ["E:/models/new3/FaradayModel_20260529_021321", "E:/models/new3/GuidedFaradayModel_20260529_000300"]
     #args.names = ["Faraday-NEW", "Guided-Faraday-NEW"]
