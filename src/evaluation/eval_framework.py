@@ -184,7 +184,6 @@ class EvalFramework:
             HourlyProfilesByMonth(),
             HourlyProfilesByDayofWeek(),
             HourlyProfilesByMonthAndDayofWeek(),
-            PerConditionEval(),
             EVConditionAccuracy(),
         ])
         if phased:
@@ -985,6 +984,16 @@ class EvalFramework:
         self._print_results_table()
         return self.results
 
+    def _print_interpretation_guide(self) -> None:
+        pass
+
+    def _compute_mean_baseline_results(
+        self,
+        reconstruction_only: bool = False,
+        synthetic_only: bool = False,
+    ) -> Dict[str, float]:
+        return {}
+
     def _metric_direction(self, metric_name: str) -> str:
         """Return optimization direction for display/benchmarking."""
         if metric_name == "TSTR (Train on Synthetic, Test on Real)":
@@ -1153,10 +1162,13 @@ class PhasedEvaluationSuite:
             device=self.device,
             window_size=self.window_size,
             n_synthetic_samples=self.n_synthetic_samples,
-            output_path=output_path,
+            # Synthetic-only draws skip plot generation: output_path=None causes all
+            # _plot_* guards to return early (plots were already saved on draw 0).
+            output_path=output_path if not synthetic_only else None,
             prepared_data=prepared_data,
             evaluation_title=title,
             verbose=False,
+            include_mean_baseline=False,
         )
         evaluator.register_all(phased=True)
         if synthetic_only:

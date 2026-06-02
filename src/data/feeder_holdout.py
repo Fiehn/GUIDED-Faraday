@@ -4,12 +4,140 @@ from __future__ import annotations
 import json
 import os
 import traceback
+from typing import NamedTuple
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+
+class HoldoutWindows(NamedTuple):
+    """Raw (un-normalised) windows for one holdout feeder."""
+    x: np.ndarray          # [N, window_len] float32
+    timestamps: np.ndarray # [N] int64 unix seconds
+    meter_ids: np.ndarray  # [N] int64
+
+
+def load_holdout_windows_raw(
+    feeder_id: int,
+    data_files: list[str],
+    topology_path: str,
+    window_size: int,
+    max_hour_value: float | None = 20.0,
+    max_value: float | None = None,
+    nan_as_zero: bool = False,
+) -> HoldoutWindows:
+    """Read raw (un-normalised) windows for *feeder_id* directly from parquet files.
+
+    Uses pyarrow predicate pushdown to read only the holdout meters' rows, then
+    applies the same windowing and validity filters as InMemoryCSVDataset without
+    building train/val/test datasets.  SHA1 split assignment is bypassed — all
+    valid windows from holdout meters are returned.
+
+    Returns HoldoutWindows with arrays of shape [N, window_size], [N], [N].
+    Raises ValueError if feeder_id is not found in topology or yields zero windows.
+    """
+    meter_ids_set = resolve_holdout_meter_ids(topology_path, feeder_id)
+    meter_ids_list = sorted(meter_ids_set)
+
+    all_x:    list[np.ndarray] = []
+    all_ts:   list[np.ndarray] = []
+    all_mids: list[np.ndarray] = []
+
+    for fpath in data_files:
+        try:
+            df = pd.read_parquet(
+                fpath,
+                filters=[("meter_number", "in", meter_ids_list)],
+            )
+        except Exception:
+            df = pd.read_parquet(fpath)
+            if isinstance(df.index, pd.MultiIndex):
+                mask = df.index.get_level_values("meter_number").isin(meter_ids_set)
+                df = df[mask]
+            else:
+                df = df[df["meter_number"].isin(meter_ids_set)]
+
+        if df.empty:
+            continue
+
+        if isinstance(df.index, pd.MultiIndex):
+            df.index = df.index.remove_unused_levels()
+            meter_vals_flat = df.index.get_level_values("meter_number").to_numpy()
+            ts_idx = df.index.get_level_values("timestamp_dst")
+        else:
+            df = df.sort_values(["meter_number", "timestamp_dst"])
+            meter_vals_flat = df["meter_number"].to_numpy()
+            ts_idx = pd.to_datetime(df["timestamp_dst"], utc=True, errors="coerce")
+
+        ts_idx = pd.DatetimeIndex(ts_idx)
+        if ts_idx.tz is None:
+            ts_idx = ts_idx.tz_localize("UTC")
+        naive = ts_idx.tz_convert("UTC").tz_localize(None)
+        ts_unix_all = naive.to_numpy(dtype="datetime64[s]").view(np.int64)
+
+        vals_flat = df["hourly_energy_consumption"].to_numpy(dtype=np.float32)
+
+        unique_meters, meter_starts = np.unique(meter_vals_flat, return_index=True)
+        meter_ends = np.append(meter_starts[1:], len(vals_flat))
+
+        for meter_id_val, m_start, m_end in zip(unique_meters, meter_starts, meter_ends):
+            m_vals = vals_flat[m_start:m_end].copy()
+            m_ts   = ts_unix_all[m_start:m_end]
+            n_rows = len(m_vals)
+
+            if nan_as_zero:
+                m_vals = np.nan_to_num(m_vals, nan=0.0)
+
+            first_aligned_idx = 0
+            for tz_offset in (3600, 7200, 0):
+                hits = np.where((m_ts + tz_offset) % 86400 == 0)[0]
+                if len(hits) > 0:
+                    first_aligned_idx = int(hits[0])
+                    break
+
+            if first_aligned_idx + window_size > n_rows:
+                continue
+
+            all_starts_arr = np.arange(first_aligned_idx, n_rows - window_size + 1, window_size, dtype=np.intp)
+            if len(all_starts_arr) == 0:
+                continue
+
+            idx_mat = all_starts_arr[:, None] + np.arange(window_size, dtype=np.intp)
+            windows = m_vals[idx_mat].astype(np.float32)
+            ts_wins = m_ts[all_starts_arr]
+
+            abs_vals = np.abs(windows)
+            valid = abs_vals.sum(axis=1) > 0
+            if not nan_as_zero:
+                valid &= ~np.isnan(windows).any(axis=1)
+            if max_hour_value is not None:
+                valid &= abs_vals.max(axis=1) <= float(max_hour_value)
+            if max_value is not None:
+                valid &= abs_vals.sum(axis=1) <= float(max_value)
+
+            windows = windows[valid]
+            ts_wins = ts_wins[valid]
+            if len(windows) == 0:
+                continue
+
+            all_x.append(windows)
+            all_ts.append(ts_wins)
+            all_mids.append(np.full(len(windows), int(meter_id_val), dtype=np.int64))
+
+    if not all_x:
+        raise ValueError(
+            f"Feeder {feeder_id}: no valid windows found across {len(data_files)} data files. "
+            "Check that the feeder's meters appear in the parquet files."
+        )
+
+    return HoldoutWindows(
+        x=np.vstack(all_x),
+        timestamps=np.concatenate(all_ts),
+        meter_ids=np.concatenate(all_mids),
+    )
 
 
 def resolve_holdout_meter_ids(

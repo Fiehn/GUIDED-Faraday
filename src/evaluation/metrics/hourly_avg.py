@@ -30,6 +30,7 @@ class HourlyProfilesByMonth(SyntheticMetric):
     def __init__(self, window_size: int = 24, plot_filename: str = 'hourly_profiles_by_month.pdf'):
         self.window_size = window_size
         self.plot_filename = plot_filename
+        self._has_plotted = False
     
     @property
     def name(self) -> str:
@@ -232,9 +233,13 @@ class HourlyProfilesByMonth(SyntheticMetric):
             global_min: If provided, use this as the sample count for all months (for consistency)
         """
         try:
-            output_dir = os.path.join(_resolve_output_directory(self.output_path), 'hourly_profiles_by_month')
-            if not output_dir:
+            base_dir = _resolve_output_directory(self.output_path)
+            if not base_dir:
                 return
+            if self._has_plotted:
+                return
+            self._has_plotted = True
+            output_dir = os.path.join(base_dir, 'hourly_profiles_by_month')
 
             unique_months = sorted(flexibility_distances_by_month.keys())
             num_months = len(unique_months)
@@ -330,6 +335,7 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
     def __init__(self, window_size: int = 24, plot_filename: str = 'hourly_profiles_by_dayofweek.pdf'):
         self.window_size = window_size
         self.plot_filename = plot_filename
+        self._has_plotted = False
     
     @property
     def name(self) -> str:
@@ -531,9 +537,13 @@ class HourlyProfilesByDayofWeek(SyntheticMetric):
             global_min: If provided, use this as the sample count for all days (for consistency)
         """
         try:
-            output_dir = os.path.join(_resolve_output_directory(self.output_path), 'hourly_profiles_by_dayofweek')
-            if not output_dir:
+            base_dir = _resolve_output_directory(self.output_path)
+            if not base_dir:
                 return
+            if self._has_plotted:
+                return
+            self._has_plotted = True
+            output_dir = os.path.join(base_dir, 'hourly_profiles_by_dayofweek')
 
             unique_days = sorted(flexibility_distances_by_day.keys())
             num_days = len(unique_days)
@@ -768,9 +778,13 @@ class HourlyProfilesByMonthAndDayofWeek(HourlyProfilesByDayofWeek):
                                                unique_days, global_min=None):
         """Plot hourly profiles as one figure per month with 7 day-of-week subplots."""
         try:
-            output_dir = _resolve_output_directory(self.output_path)
-            if not output_dir:
+            base_dir = _resolve_output_directory(self.output_path)
+            if not base_dir:
                 return
+            if self._has_plotted:
+                return
+            self._has_plotted = True
+            output_dir = os.path.join(base_dir, 'hourly_profiles_by_month_and_dayofweek')
 
             month_names = {
                 1: 'January', 2: 'February', 3: 'March', 4: 'April',

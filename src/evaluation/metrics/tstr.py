@@ -53,9 +53,9 @@ class TSTR(SyntheticMetric):
         self.predictor_type = predictor_type
         self.epochs = epochs
         self.random_state = random_state
-        # Number of timesteps ahead to predict (multi-step). Default 24 hours.
         self.horizon = int(horizon)
-        
+        self._has_plotted = False
+
         np.random.seed(random_state)
         torch.manual_seed(random_state)
     
@@ -295,14 +295,16 @@ class TSTR(SyntheticMetric):
         # Compute ratio (ideal: 1.0, higher = synthetic is worse)
         tstr_ratio = tstr_mse / trtr_mse if trtr_mse > 0 else float('inf')
 
-        self._plot_prediction_comparison(
-            X_real_test=X_real_test,
-            y_real_test=y_real_test,
-            model_real=model_real,
-            model_synth=model_synth,
-            tstr_ratio=tstr_ratio,
-            split_idx=split_idx,
-        )
+        if not self._has_plotted:
+            self._has_plotted = True
+            self._plot_prediction_comparison(
+                X_real_test=X_real_test,
+                y_real_test=y_real_test,
+                model_real=model_real,
+                model_synth=model_synth,
+                tstr_ratio=tstr_ratio,
+                split_idx=split_idx,
+            )
         
         _save_standalone_metric_result(
             metric_key='TSTR',
