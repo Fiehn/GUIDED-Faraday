@@ -430,8 +430,11 @@ def run_pca_and_clustering(x_windows, metadata, k=None, conditions_in=False, con
     pca = PCA(n_components=5, random_state=42)
     features_pca = pca.fit_transform(scaled_features)
     
-    explained_variance = np.sum(pca.explained_variance_ratio_)
-    print(f"PCA top 5 components explain {explained_variance*100:.1f}% of variance.")
+    explained_variance = np.cumsum(pca.explained_variance_ratio_)
+    print(f"PCA top 2 components explain {explained_variance[1]*100:.1f}% of variance.")
+    print(f"PCA top 3 components explain {explained_variance[2]*100:.1f}% of variance.")
+    print(f"PCA top 4 components explain {explained_variance[3]*100:.1f}% of variance.")
+    print(f"PCA top 5 components explain {explained_variance[-1]*100:.1f}% of variance.")
     
     if k is None:
         k = determine_optimal_clusters(features_pca)
@@ -561,12 +564,13 @@ def plot_archetypes(x_windows, cluster_labels, k, output_dir, dominant_combos=No
     plt.close()
 
 def plot_pca_scatters(features_pca, df, output_dir):
-    """Plot the top 2 PCA components colored by various metadata labels."""
+    """Plot the top 3 PCA components colored by various metadata labels."""
     os.makedirs(output_dir, exist_ok=True)
     
-    # We will only use top 2 components
+    # We will use the top 3 components so the third dimension is visible too.
     pc1 = features_pca[:, 0]
     pc2 = features_pca[:, 1]
+    pc3 = features_pca[:, 2]
     
     # Subsample if too large to avoid massive overplotting
     max_pts = 10000
@@ -578,6 +582,7 @@ def plot_pca_scatters(features_pca, df, output_dir):
         
     pc1_sub = pc1[idx]
     pc2_sub = pc2[idx]
+    pc3_sub = pc3[idx]
     df_sub = df.iloc[idx].copy()
     
     df_sub['day_season'] = df_sub['day_type'].astype(str) + " - " + df_sub['season'].astype(str)
@@ -593,24 +598,33 @@ def plot_pca_scatters(features_pca, df, output_dir):
     for col, title in color_configs:
         if col not in df_sub.columns:
             continue
-            
-        plt.figure(figsize=(10, 8))
+
         unique_vals = sorted(df_sub[col].unique())
+        fig = plt.figure(figsize=(12, 9))
+        ax = fig.add_subplot(111, projection='3d')
         
         for val in unique_vals:
             mask = (df_sub[col] == val)
-            plt.scatter(pc1_sub[mask], pc2_sub[mask], label=str(val), alpha=0.5, s=15)
+            ax.scatter(pc1_sub[mask], pc2_sub[mask], pc3_sub[mask], label=str(val), alpha=0.5, s=15)
             
-        plt.title(f"PCA Top 2 Components - Colored by {title}")
-        plt.xlabel("Principal Component 1")
-        plt.ylabel("Principal Component 2")
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        plt.tight_layout()
-        plt.grid(alpha=0.3)
+        # Place the 3D axes explicitly so the cube sits in the figure instead of hugging a corner.
+        ax.set_position([0.06, 0.08, 0.72, 0.80])
+        ax.set_box_aspect((1, 1, 0.85))
+
+        # Use a figure-level suptitle with a small top margin.
+        fig.suptitle(f"PCA Top 3 Components - Colored by {title}", y=0.96)
+        ax.set_xlabel("Principal Component 1")
+        ax.set_ylabel("Principal Component 2")
+        ax.set_zlabel("Principal Component 3")
+        ax.view_init(elev=20, azim=35)
+        ax.legend(loc='upper right', frameon=True)
+        # Leave a little room around the whole plot, but do not shove the axes away.
+        fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.92)
+        ax.grid(alpha=0.3)
         
         filename = f"pca_scatter_{col}.png"
-        plt.savefig(os.path.join(output_dir, filename), bbox_inches="tight")
-        plt.close()
+        fig.savefig(os.path.join(output_dir, filename), bbox_inches="tight")
+        plt.close(fig)
 
 def plot_pca_loadings(pca, feature_names, output_path):
     """Bar chart of the top 3 PC loadings per input feature."""
@@ -745,6 +759,7 @@ def main():
     parser.add_argument("--no_scatter", action="store_true", help="Skip PCA scatter plots (saves time and disk).")
     parser.add_argument("--profiler_path", type=str, default=None, help="Path to a fitted UserProfiler pickle. Skipped if not provided.")
     parser.add_argument("--profiler_k", type=int, default=0, help="Meter cluster count for UserProfiler analysis. 0 = auto via silhouette K=3..12.")
+    parser.add_argument("--mode", type=str, choices=["conditions_out", "conditions_in", "both"], default="both", help="Which mode(s) to run: conditions_out, conditions_in, or both")
     args = parser.parse_args()
 
     cfg = _load_train_config(args.config)
@@ -772,6 +787,10 @@ def main():
     shape_feature_names = [f"h{i:02d}" for i in range(24)] + ["total_energy", "peak", "peak_minus_valley"]
 
     for mode_label, do_conditions_in in [("conditions_out", False), ("conditions_in", True)]:
+        # Respect --mode selection to run only one of the modes if requested
+        if args.mode != "both" and args.mode != mode_label:
+            print(f"Skipping mode {mode_label} (not selected).")
+            continue
         print(f"\n{'='*60}")
         print(f"MODE: {mode_label}")
         print(f"{'='*60}")
