@@ -20,7 +20,7 @@ data:
   #data_dir: "/media/fiehn/LaCie/Data/processed_data/second_batch/individual_sm_datasets/raw_profiles/"
   # data_dir: "/Users/clarareginekold/Desktop/dtu/THESIS/rasmus-clara-synthetic-data/data/raw_profiles"
   # data_dir: "data/_parquet_cache"
-  data_dir: "E:/Data/processed_data/hourly_data/_parquet_cache"
+  data_dir: "/Volumes/USB/parq_hourly"
 
   # CSV filename to load
   data_files: []
