@@ -263,10 +263,15 @@ class AverageBaselineModel(BaseModel):
         result = global_mean.unsqueeze(0).expand(len(bucket_indices), -1, -1).clone()
         if self.force_global_mean:
             return result
-        for i, b_idx in enumerate(bucket_indices.tolist()):
-            if self.bucket_count[b_idx, 0, 0].item() >= self.min_bucket_samples:
-                safe_count = self.bucket_count[b_idx].clamp(min=1).float()
-                result[i] = (self.bucket_sum[b_idx] / safe_count).float()
+        # Vectorised: gather bucket stats for all requested indices at once
+        _bc: torch.Tensor = self.bucket_count  # type: ignore[assignment]
+        _bs: torch.Tensor = self.bucket_sum    # type: ignore[assignment]
+        bucket_counts = _bc[bucket_indices]                        # [B, L, F]
+        bucket_sums   = _bs[bucket_indices]                        # [B, L, F]
+        has_enough    = bucket_counts[:, 0, 0] >= self.min_bucket_samples  # [B]
+        safe_counts   = bucket_counts.clamp(min=1).float()
+        bucket_means  = (bucket_sums / safe_counts).float()        # [B, L, F]
+        result[has_enough] = bucket_means[has_enough]
         return result
 
     def get_optimizer(self, lr, weight_decay, *args, **kwargs):

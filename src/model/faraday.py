@@ -7,7 +7,17 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import glob as _glob
+
+if __name__ == "__main__":
+    _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    if _src not in sys.path:
+        sys.path.insert(0, _src)
+    while _script_dir in sys.path:
+        sys.path.remove(_script_dir)
+
 import torch
 import torch.nn as nn
 

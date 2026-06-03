@@ -21,13 +21,15 @@ outlier-injected arrays (as in 2407.11785) before calling ``compute()`` to
 run the improved attack without any code changes to this class.
 """
 
+import json
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
 from sklearn.metrics import roc_auc_score, roc_curve
 
-from src.evaluation.metrics.base.base import PrivacyMetric, _save_standalone_metric_result, _sanitize_numeric_array
+from src.evaluation.metrics.base.base import PrivacyMetric, _resolve_output_directory, _save_standalone_metric_result, _sanitize_numeric_array
 
 
 class MembershipInferenceAttack(PrivacyMetric):
@@ -113,6 +115,26 @@ class MembershipInferenceAttack(PrivacyMetric):
 
         fpr_arr, tpr_arr, _ = roc_curve(labels, scores)
         tpr_at_01 = self._tpr_at_fpr(fpr_arr, tpr_arr, target_fpr=0.1)
+
+        # Save ROC curve arrays for compare_models plotting.
+        _output_dir = _resolve_output_directory(self.output_path or "models/eval_results.json")
+        if _output_dir:
+            try:
+                _sidecar = os.path.join(_output_dir, "eval_mia_curve.json")
+                _curve_data = {
+                    "fpr": fpr_arr.tolist(),
+                    "tpr": tpr_arr.tolist(),
+                    "auc_roc": auc,
+                    "precision_balanced": precision,
+                    "tpr_at_fpr_0.1": tpr_at_01,
+                    "n_members": n,
+                    "n_non_members": n,
+                    "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                }
+                with open(_sidecar, "w") as _f:
+                    json.dump(_curve_data, _f, indent=2)
+            except Exception as _e:
+                print(f"  [MIA] Warning: could not save curve sidecar: {_e}")
 
         _save_standalone_metric_result(
             metric_key="MembershipInferenceAttack",

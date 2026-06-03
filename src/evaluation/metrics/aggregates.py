@@ -176,8 +176,6 @@ class PerConditionEval(SyntheticMetric):
     max_lag (int): Maximum lag for ACFDistribution (default: 10)
     min_samples_per_group (int): Minimum samples required in each group to compute metrics (default: 2)
     verbose (bool): Whether to print detailed debug information during computation (default: False)
-    predictor_type (str): Predictor type for TSTR ('linear', 'mlp', etc.) (default: 'linear')
-    tstr_epochs (int): Training epochs for TSTR predictor (default: 50)
     feeder_mapping_path (str): Path to JSON file mapping meter IDs to feeder IDs (default: 'topology/cleaned/Cleaned_SM_Topology_mapping.json')
     min_samples_per_feeder (int): Minimum samples required per feeder to compute AggregatedProfiles (default: 5)
     """
@@ -190,15 +188,13 @@ class PerConditionEval(SyntheticMetric):
     output_path: str = None
 
     def __init__(self, window_size: int = 24, max_lag: int = 10, min_samples_per_group: int = 2,
-                 verbose: bool = False, predictor_type: str = 'linear', tstr_epochs: int = 10,
+                 verbose: bool = False,
                  feeder_mapping_path: str = 'data/topology/cleaned/Cleaned_SM_Topology_mapping.json',
                  min_samples_per_feeder: int = 5):
         self.window_size = window_size
         self.max_lag = max_lag
         self.min_samples_per_group = min_samples_per_group
         self.verbose = verbose
-        self.predictor_type = predictor_type
-        self.tstr_epochs = tstr_epochs
         self.feeder_mapping_path = feeder_mapping_path
         self.min_samples_per_feeder = min_samples_per_feeder
         self._meter_to_feeder = None
@@ -234,15 +230,9 @@ class PerConditionEval(SyntheticMetric):
 
         self.mmd_calculator = MaximumMeanDiscrepancy(sigma=None, seed=42, max_samples=2000)
         self.acf_calculator = ACFDistribution(window_size=window_size, max_lag=max_lag)
-        tstr_horizon = 24 if window_size > 24 else max(1, window_size - 1)
         self.tstr_calculator = TSTR(
             task='next_step',
             window_size=window_size,
-            n_features=1,
-            predictor_type=predictor_type,
-            epochs=tstr_epochs,
-            random_state=42,
-            horizon=tstr_horizon,
         )
         self.aggregated_profiles_calculator = AggregatedProfiles(
             n_samples=100,
@@ -876,7 +866,7 @@ class PerConditionEval(SyntheticMetric):
             'window_size': int(self.window_size),
             'max_lag': int(self.max_lag),
             'min_samples_per_group': int(self.min_samples_per_group),
-            'predictor_type': self.predictor_type,
+            'tstr_predictor': 'OLS',
         }
 
         # Preserve standalone metric entries written by individual metric classes

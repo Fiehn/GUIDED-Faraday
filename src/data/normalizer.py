@@ -321,7 +321,8 @@ class Normalizer:
     @classmethod
     def load(cls, path: str, device: str | torch.device = 'cpu') -> 'Normalizer':
         """Load a previously saved Normalizer from disk."""
-        state = torch.load(path, map_location='cpu', weights_only=False)
+        with open(path, 'rb') as f:
+            state = torch.load(f, map_location='cpu', weights_only=False)
         norm = cls(method=state['method'])
         norm.fitted        = state['fitted']
         norm.epsilon       = state['epsilon']

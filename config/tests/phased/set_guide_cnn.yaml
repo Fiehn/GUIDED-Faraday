@@ -6,18 +6,18 @@ data:
 
 model:
   type: set_guide_vae
-  latent_dim: 128
+  latent_dim: 256
   encoder:
     type: dictionary_cnn
-    hidden_dims: [128, 256, 128]
+    hidden_dims: [24, 48, 24]
     dropout: 0.2
   decoder:
-    type: dictionary_cnn
+    type: dictionary
     hidden_dims: [128, 256, 128]
     dropout: 0.2
   prior:
     type: learnable_dictionary
-    dictionary_size: 256
+    dictionary_size: 512
     vamp_num_components: 20
     init_from_data: true
     init_noise_scale: 0.01

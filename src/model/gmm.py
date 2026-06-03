@@ -30,16 +30,19 @@ def _compute_precision_cholesky(
     eye = torch.eye(n_features, device=covariances.device, dtype=covariances.dtype)
 
     for k, cov in enumerate(covariances):
-        try:
-            L = torch.linalg.cholesky(cov, upper=False)
-        except torch.linalg.LinAlgError:
+        r = reg
+        L = None
+        while r <= 1.0:
             try:
-                L = torch.linalg.cholesky(cov + eye * reg, upper=False)
+                L = torch.linalg.cholesky(cov + eye * r, upper=False)
+                break
             except torch.linalg.LinAlgError:
-                raise ValueError(
-                    f"Component {k}: ill-defined covariance. "
-                    "Reduce n_components or increase reg_covar."
-                )
+                r *= 10.0
+        if L is None:
+            raise ValueError(
+                f"Component {k}: ill-defined covariance even after reg={r:.0e}. "
+                "Reduce n_components or increase reg_covar."
+            )
         precisions_chol[k] = torch.linalg.solve_triangular(L, eye, upper=False).T
 
     return precisions_chol
@@ -190,12 +193,23 @@ class GaussianMixtureModel(nn.Module):
             self.weights, n_samples, replacement=True
         ).bincount(minlength=self.n_components)
 
+        eye = torch.eye(self.n_features, device=self.means.device, dtype=self.means.dtype)
         chunks: list[torch.Tensor] = []
         for k, (mean, cov, count) in enumerate(
             zip(self.means, self.covariances, counts)
         ):
             if count > 0:
-                dist = torch.distributions.MultivariateNormal(mean, covariance_matrix=cov)
+                r = self.reg_covar
+                L = None
+                while r <= 1.0:
+                    try:
+                        L = torch.linalg.cholesky(cov + eye * r)
+                        break
+                    except torch.linalg.LinAlgError:
+                        r *= 10.0
+                if L is None:
+                    raise ValueError(f"Component {k}: covariance not PD even after jitter.")
+                dist = torch.distributions.MultivariateNormal(mean, scale_tril=L)
                 chunks.append(dist.sample((int(count),)))
 
         return torch.cat(chunks, dim=0)  # [n_samples, n_features]

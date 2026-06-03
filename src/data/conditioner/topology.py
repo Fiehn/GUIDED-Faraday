@@ -489,7 +489,10 @@ class HeatpumpPhaseConditioner(BaseConditioner):
             meter_col = topology_df.iloc[:, 0]
 
         meter_key = meter_col.astype(str).str.lower()
-        phase = meter_key.str.extract(r'^(l\d)_', expand=False)
+        # Force object dtype: pandas str.extract can return Arrow-backed StringDtype
+        # whose isna() path triggers an access violation on Windows when called after
+        # large tensor allocations have fragmented the heap.
+        phase = meter_key.str.extract(r'^(l\d)_', expand=False).astype(object)
         base_meter_id = pd.to_numeric(meter_key.str.extract(r'^l\d_(\d+)$', expand=False), errors='coerce')
 
         predicted_series = topology_df.get('predicted_hp', pd.Series(np.zeros(len(topology_df), dtype=np.int64)))

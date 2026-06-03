@@ -18,7 +18,7 @@ model:
     dropout: 0.2
   prior:
     type: learnable_dictionary
-    dictionary_size: 128
+    dictionary_size: 256
     vamp_num_components: 20
     init_from_data: true
     init_noise_scale: 0.01

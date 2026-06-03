@@ -97,6 +97,7 @@ class EvalFramework:
         n_member_samples: int = 1000,
         mia_reconstruction_samples: int = 1,
         preserve_condition_order: bool = False,
+        real_data_preprocessed: bool = False,
     ):
         """Initialize evaluation framework.
 
@@ -151,6 +152,7 @@ class EvalFramework:
         self.n_member_samples = int(n_member_samples)
         self.mia_reconstruction_samples = int(mia_reconstruction_samples)
         self.preserve_condition_order = bool(preserve_condition_order)
+        self._real_data_preprocessed = bool(real_data_preprocessed)
 
         # Metrics storage
         self.reconstruction_metrics: Dict[str, ReconstructionMetric] = {}
@@ -170,14 +172,13 @@ class EvalFramework:
 
     def register_all(self, phased: bool = False) -> None:
         """Convenience method to register all default metrics."""
-        tstr_horizon = 24 if self.window_size > 24 else max(1, self.window_size - 1)
         self.register_metrics([
             ReconstructionRMSE(),
             ReconstructionLogLikelihood(),
             FlexibilityDistance(),
             ACFDistribution(),
             ClassicalStatistics(),
-            TSTR(window_size=self.window_size, horizon=tstr_horizon),
+            TSTR(window_size=self.window_size),
             AggregatedProfiles(),
             PeakMagnitude(),
             PeakTiming(),
@@ -276,6 +277,11 @@ class EvalFramework:
                | [batch_size, seq_len * n_features]  (flattened 2D)
           ->  : same shape as x (denormalized)
         """
+        # When the dataloader already yields raw (pre-denormalized) data, skip the
+        # inverse transform entirely to avoid applying it twice.
+        if self._real_data_preprocessed:
+            return x
+
         # Prefer a normalizer whose feature-dimension matches the tensor shape.
         # Try secondary model normalizer first (if available), then fall back to
         # the primary normalizer provided to the evaluator.
@@ -342,7 +348,7 @@ class EvalFramework:
         # Fallback: let the normalizer handle it or assume last axis
         return inv(x)
     
-    def _prepare_data(self) -> None:
+    def _prepare_data(self, generate_synthetic: bool = True) -> None:
         """Extract real data, reconstructed data, and synthetic data for metrics that need it."""
         if self.prepared_data is not None:
             self._real_data = _sanitize_numeric_array(np.asarray(self.prepared_data.get('real_data')))
@@ -358,7 +364,9 @@ class EvalFramework:
                 self._train_reconstructed_data = _sanitize_numeric_array(np.asarray(train_recon))
             return
 
-        print("  [1/3] Collecting reconstructions from dataloader...", end='', flush=True)
+        needs_reconstruction = bool(self.reconstruction_metrics or self.privacy_metrics)
+        label = "[1/3] Collecting real data from dataloader..." if not needs_reconstruction else "[1/3] Collecting reconstructions from dataloader..."
+        print(f"  {label}", end='', flush=True)
         t_recon = time.time()
         real_batches = []
         recon_batches = []
@@ -406,13 +414,17 @@ class EvalFramework:
                     else:
                         meter_id_batches.append(np.asarray(meter_ids).reshape(-1))
 
-                recon = self._reconstruct(data, meter_id=meter_ids, timestamps=timestamps)
-                recon_batches.append(recon.cpu().numpy())
+                if needs_reconstruction:
+                    recon = self._reconstruct(data, meter_id=meter_ids, timestamps=timestamps)
+                    recon_batches.append(recon.cpu().numpy())
                 n_collected += len(data)
 
         # Trim to exactly n_to_collect (last batch may overshoot by up to batch_size - 1)
         self._real_data = _sanitize_numeric_array(np.concatenate(real_batches, axis=0)[:n_to_collect])  # SHAPER: [n_to_collect, n_features * seq_len]
-        self._reconstructed_data = _sanitize_numeric_array(np.concatenate(recon_batches, axis=0)[:n_to_collect])  # SHAPER: [n_to_collect, n_features * seq_len]
+        self._reconstructed_data = (
+            _sanitize_numeric_array(np.concatenate(recon_batches, axis=0)[:n_to_collect])
+            if recon_batches else np.empty((0,), dtype=np.float32)
+        )  # SHAPER: [n_to_collect, n_features * seq_len]
         self._meter_ids = np.concatenate(meter_id_batches, axis=0)[:n_to_collect] if meter_id_batches else None  # SHAPER: [n_to_collect]
         self._timestamps = np.concatenate(timestamp_batches, axis=0)[:n_to_collect] if timestamp_batches else None  # SHAPER: [n_to_collect]
         print(f" done — {len(self._real_data)} windows ({time.time() - t_recon:.1f}s)")
@@ -452,10 +464,11 @@ class EvalFramework:
             self._synthetic_meter_ids  = None
             self._synthetic_timestamps = None
 
-        print(f"  [2/3] Generating {self.n_synthetic_samples} synthetic samples...", end='', flush=True)
-        t_synth = time.time()
-        self._synthetic_data = _sanitize_numeric_array(self._generate_synthetic(self.n_synthetic_samples))
-        print(f" done ({time.time() - t_synth:.1f}s)")
+        if generate_synthetic:
+            print(f"  [2/3] Generating {self.n_synthetic_samples} synthetic samples...", end='', flush=True)
+            t_synth = time.time()
+            self._synthetic_data = _sanitize_numeric_array(self._generate_synthetic(self.n_synthetic_samples))
+            print(f" done ({time.time() - t_synth:.1f}s)")
 
         # Collect member windows (training data) for MIA privacy metrics.
         if self.train_dataloader is not None and self.privacy_metrics:
@@ -855,7 +868,7 @@ class EvalFramework:
         print(f"  {self.evaluation_title}  [repeated k={k}]")
         print(f"{'='*60}")
 
-        self._prepare_data()
+        self._prepare_data(generate_synthetic=False)
         self._inject_data_into_metrics()
 
         results: Dict[str, Any] = {}
@@ -894,6 +907,9 @@ class EvalFramework:
                     print(f"\n  WARNING: {name} failed on draw {draw_idx + 1}: {e}")
                     per_synth_values[name].append(float("nan"))
             print(f" done ({time.time() - t_draw:.1f}s)")
+            import gc as _gc; _gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         self._results_std = {}
         for name, values in per_synth_values.items():
@@ -1339,15 +1355,19 @@ class VisualEvaluation(SyntheticMetric):
           pca_real       : [min(n_real, 500), n_components]  n_components <= 3
           pca_synthetic  : [min(n_synth, 500), n_components]
         """
-        real_data = self.real_data[:500] if len(self.real_data) > 500 else self.real_data  # SHAPER: [min(n_real, 500), feature_dim]
-        synthetic_data = self.synthetic_data[:500] if len(self.synthetic_data) > 500 else self.synthetic_data  # SHAPER: [min(n_synth, 500), feature_dim]
-        
+        _cap = 5000
+        _rng = np.random.default_rng(42)
+        real_data = (self.real_data[_rng.choice(len(self.real_data), _cap, replace=False)]
+                     if len(self.real_data) > _cap else self.real_data)  # SHAPER: [min(n_real, 5000), feature_dim]
+        synthetic_data = (self.synthetic_data[_rng.choice(len(self.synthetic_data), _cap, replace=False)]
+                          if len(self.synthetic_data) > _cap else self.synthetic_data)  # SHAPER: [min(n_synth, 5000), feature_dim]
+
         # Verify same number of features
         if real_data.shape[1] != synthetic_data.shape[1]:
             min_features = min(real_data.shape[1], synthetic_data.shape[1])
             real_data = real_data[:, :min_features]
             synthetic_data = synthetic_data[:, :min_features]
-        
+
         # Apply PCA
         pca = PCA(n_components=min(3, real_data.shape[1], synthetic_data.shape[1]))
         pca_real = pca.fit_transform(real_data)  # SHAPER: [min(n_real, 500), feature_dim] -> [min(n_real, 500), n_components]
@@ -1389,9 +1409,13 @@ class VisualEvaluation(SyntheticMetric):
           tsne_result    : [min(n_real, 500) + min(n_synth, 500), 2]
         """
         # Use smaller subset for t-SNE
-        real_data = self.real_data[:500] if len(self.real_data) > 500 else self.real_data  # SHAPER: [min(n_real, 500), feature_dim]
-        synthetic_data = self.synthetic_data[:500] if len(self.synthetic_data) > 500 else self.synthetic_data  # SHAPER: [min(n_synth, 500), feature_dim]
-        
+        _cap = 5000
+        _rng = np.random.default_rng(42)
+        real_data = (self.real_data[_rng.choice(len(self.real_data), _cap, replace=False)]
+                     if len(self.real_data) > _cap else self.real_data)  # SHAPER: [min(n_real, 5000), feature_dim]
+        synthetic_data = (self.synthetic_data[_rng.choice(len(self.synthetic_data), _cap, replace=False)]
+                          if len(self.synthetic_data) > _cap else self.synthetic_data)  # SHAPER: [min(n_synth, 5000), feature_dim]
+
         # Verify same number of features
         if real_data.shape[1] != synthetic_data.shape[1]:
             min_features = min(real_data.shape[1], synthetic_data.shape[1])

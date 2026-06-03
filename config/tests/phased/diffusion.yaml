@@ -13,13 +13,13 @@ model:
     max_beta: 0.999
     beta_start: 1.0e-4
     beta_end: 0.02
-    time_dim: 64
-    base_channels: 64
-    num_blocks: 8
-    self_attention_heads: 8
+    time_dim: 128
+    base_channels: 128
+    num_blocks: 18
+    self_attention_heads: 16
     use_condition_cross_attention: true
-    condition_cross_attention_heads: 8
-    condition_tokens: 8
+    condition_cross_attention_heads: 16
+    condition_tokens: 16
     condition_dropout_prob: 0.10
     reconstruction_noise_fraction: 0.30
     deterministic_reconstruction: true

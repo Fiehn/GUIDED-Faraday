@@ -367,30 +367,39 @@ class DiffusionModel(BaseModel):
                 
         return x
 
-    def _sample_from_conditions(self, conditions, num_prior_samples=1, temperature=1.0):
+    def _sample_from_conditions(self, conditions, num_prior_samples=1, temperature=1.0,
+                                gen_batch_size=1024):
         c = conditions
         if c.dim() == 1:
             c = c.unsqueeze(0)
 
         b_size = c.shape[0]
-        c_rep = c.unsqueeze(0).expand(num_prior_samples, b_size, -1).reshape(num_prior_samples * b_size, -1)
-        self._validate_condition_dim(c_rep)
 
-        x = torch.randn(
-            (num_prior_samples * b_size, self.num_features, self.sequence_length),
-            device=c.device,
-        )
-        if temperature != 1.0:
-            x = x * float(temperature)
+        # Process in batches so VRAM peak is gen_batch_size samples, not all b_size at once.
+        if b_size <= gen_batch_size:
+            c_rep = c.unsqueeze(0).expand(num_prior_samples, b_size, -1).reshape(num_prior_samples * b_size, -1)
+            self._validate_condition_dim(c_rep)
+            x = torch.randn((num_prior_samples * b_size, self.num_features, self.sequence_length), device=c.device)
+            if temperature != 1.0:
+                x = x * float(temperature)
+            x = self._p_denoise(x, c_rep, start_t=self.noise_scheduler.num_timesteps - 1,
+                                temperature=temperature, stochastic=True)
+            return x.reshape(num_prior_samples, b_size, -1)
 
-        x = self._p_denoise(
-            x,
-            c_rep,
-            start_t=self.noise_scheduler.num_timesteps - 1,
-            temperature=temperature,
-            stochastic=True,
-        )
-        return x.reshape(num_prior_samples, b_size, -1)
+        chunks = []
+        for start in range(0, b_size, gen_batch_size):
+            end = min(start + gen_batch_size, b_size)
+            c_chunk = c[start:end]
+            n = end - start
+            c_rep = c_chunk.unsqueeze(0).expand(num_prior_samples, n, -1).reshape(num_prior_samples * n, -1)
+            self._validate_condition_dim(c_rep)
+            x = torch.randn((num_prior_samples * n, self.num_features, self.sequence_length), device=c.device)
+            if temperature != 1.0:
+                x = x * float(temperature)
+            x = self._p_denoise(x, c_rep, start_t=self.noise_scheduler.num_timesteps - 1,
+                                temperature=temperature, stochastic=True)
+            chunks.append(x.reshape(num_prior_samples, n, -1))
+        return torch.cat(chunks, dim=1)
 
     def train_core(
         self,

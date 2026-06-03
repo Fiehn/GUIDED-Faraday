@@ -1382,7 +1382,12 @@ class InMemoryCSVDataset(Dataset):
 
             # ---- Detect index layout ----------------------------------------
             if isinstance(df.index, pd.MultiIndex):
-                df.index = df.index.remove_unused_levels()  # fix stale level codes in parquet subsets
+                try:
+                    df.index = df.index.remove_unused_levels()
+                except (IndexError, ValueError, MemoryError):
+                    # Stale level codes that pandas cannot clean — rebuild from raw values.
+                    _arrays = [df.index.get_level_values(i) for i in range(df.index.nlevels)]
+                    df.index = pd.MultiIndex.from_arrays(_arrays, names=df.index.names)
                 idx_names = list(df.index.names)
                 meter_level = idx_names.index(meter_col) if meter_col in idx_names else 0
                 meter_vals_flat = df.index.get_level_values(meter_level).to_numpy()

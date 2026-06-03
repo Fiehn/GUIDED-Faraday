@@ -22,7 +22,7 @@ if str(SRC_DIR) not in sys.path:
 from src.evaluation.load_model import load_model
 from src.model.factory import _load_train_config
 from src.data.dataloader_phased import PhasedReplayDataloaders, WindowSpec
-from src.evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite
+from src.evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite, VisualEvaluation
 from src.visualization.plot_styling import PlotStyle
 from src.data.feeder_holdout import (
     HoldoutWindows,
@@ -50,6 +50,8 @@ class PhasedModelComparator:
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         self.models_data = {}
+        self._model_eval_dirs: dict[str, str] = {}
+        self._param_counts: dict[str, int | None] = {}
         # We define a superset of possible phases.
         self.phases = ['full_eval', 'aggregated_phase', 'ranked_phase_1', 'ranked_phase_2', 'ranked_phase_3']
 
@@ -157,6 +159,7 @@ class PhasedModelComparator:
             "mmd": "target_0",
             "hourlyconsumptionbymonth": "lower",
             "hourlyconsumptionbyday": "lower",
+            "hourlyprofilesbymonthanddayofweek": "lower",
             "peakmagnitude": "lower",
             "peaktiming": "lower",
 
@@ -211,8 +214,9 @@ class PhasedModelComparator:
             "setmmdpermutationinvariant",
             "mmd",
             "acfdistributionmatchks",
-            "hourlyconsumptionbymonth",
-            "hourlyconsumptionbyday",
+            # "hourlyconsumptionbymonth",
+            # "hourlyconsumptionbyday",
+            "hourlyprofilesbymonthanddayofweek",
             "peakmagnitude",
             "peaktiming",
             "cferrornmaxindependent",
@@ -269,9 +273,11 @@ class PhasedModelComparator:
     def _display_metric_title(self, metric: str) -> str:
         return f"{self._display_metric_name(metric)} ({self._metric_target_label(metric)})"
 
-    def add_model(self, model_name: str, model_dir: str):
+    def add_model(self, model_name: str, model_dir: str, trainable_params: int | None = None):
         """Add a model's evaluation results to the comparator, handling both phased and unphased output."""
         self.models_data[model_name] = {}
+        self._model_eval_dirs[model_name] = model_dir
+        self._param_counts[model_name] = trainable_params
         
         # 1. Check for phased results in subdirectories.
         #    Entries may be flat scalars (n_draws=1) or {mean,std,values} dicts (n_draws>1,
@@ -373,13 +379,6 @@ class PhasedModelComparator:
             except Exception as e:
                 print(f"Error loading {flat_path}: {e}")
 
-        # Inject holdout means into full_eval with [holdout] suffix (existing behaviour).
-        holdout_scalars = _load_holdout_scalars(model_dir)
-        if holdout_scalars:
-            full_eval = self.models_data[model_name].setdefault("full_eval", {})
-            for k, v in holdout_scalars.items():
-                full_eval[f"{k} [holdout]"] = v
-
         if not self.models_data[model_name]:
             print(f"No valid evaluation results found in {model_dir} for model {model_name}")
 
@@ -393,12 +392,137 @@ class PhasedModelComparator:
 
         return sorted(self.models_data.keys(), key=_score)
 
-    def compare(self):
-        """Generate comparison tables and plots for each phase."""
+    def _generate_mia_plots(self, models: list[str]) -> None:
+        """Generate MIA ROC curve and bar chart for all models that have eval_mia_curve.json."""
+        curves: dict[str, dict] = {}
+        for name in models:
+            eval_dir = self._model_eval_dirs.get(name)
+            if not eval_dir:
+                continue
+            sidecar = os.path.join(eval_dir, "eval_mia_curve.json")
+            if os.path.exists(sidecar):
+                try:
+                    with open(sidecar) as f:
+                        curves[name] = json.load(f)
+                except Exception as e:
+                    print(f"  [MIA] Could not load sidecar for {name}: {e}")
+                    import traceback; traceback.print_exc()
+
+        if not curves:
+            print("  [MIA] No curve sidecar (eval_mia_curve.json) found for any model; skipping MIA plots.")
+            print(f"  [MIA] Searched in: { {n: self._model_eval_dirs.get(n) for n in models} }")
+            return
+
+        mia_dir = os.path.join(self.output_dir, "mia")
+        os.makedirs(mia_dir, exist_ok=True)
+        print(f"  [MIA] Plotting {len(curves)} model(s) → {mia_dir}")
+        plot_style = PlotStyle()
+
+        # --- ROC curve ---
+        try:
+            fig, ax = plt.subplots(figsize=(7, 6))
+            ax.plot([0, 1], [0, 1], color="0.6", linestyle="--", lw=1, label="Random (AUC = 0.50)")
+            for i, name in enumerate(models):
+                if name not in curves:
+                    continue
+                c = curves[name]
+                fpr = c.get("fpr", [])
+                tpr = c.get("tpr", [])
+                auc = c.get("auc_roc", float("nan"))
+                color = self._model_color(name, i, plot_style)
+                ax.plot(fpr, tpr, color=color, lw=1.5, label=f"{name} (AUC={auc:.3f})")
+            ax.set_xlabel("False Positive Rate")
+            ax.set_ylabel("True Positive Rate")
+            ax.set_title("Membership Inference Attack — ROC Curves")
+            ax.legend(loc="lower right", fontsize=8)
+            ax.grid(True, linestyle="--", alpha=0.5)
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1.02)
+            fig.tight_layout()
+            roc_path = os.path.join(mia_dir, "mia_roc.pdf")
+            fig.savefig(roc_path, dpi=300, bbox_inches="tight")
+            print(f"  [MIA] ROC curve saved to {roc_path}")
+        except Exception as e:
+            print(f"  [MIA] Warning: could not save ROC curve: {e}")
+            import traceback; traceback.print_exc()
+        finally:
+            plt.close("all")
+
+        # --- Bar chart: AUC-ROC / Precision / TPR@FPR=0.1 ---
+        try:
+            scalar_specs = [
+                ("auc_roc",            "AUC-ROC"),
+                ("precision_balanced", "Precision (balanced)"),
+                ("tpr_at_fpr_0.1",     "TPR @ FPR=0.1"),
+            ]
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            fig.suptitle(
+                "Membership Inference Attack — Privacy Metrics  (↑ = more leakage, 0.5 = random guess)",
+                fontsize=13, fontweight="bold",
+            )
+            for ax, (key, title) in zip(axes, scalar_specs):
+                vals, labels, colors = [], [], []
+                for i, name in enumerate(models):
+                    if name not in curves:
+                        continue
+                    val = curves[name].get(key)
+                    if val is None:
+                        continue
+                    vals.append(float(val))
+                    labels.append(name)
+                    colors.append(self._model_color(name, i, plot_style))
+                if not vals:
+                    ax.set_visible(False)
+                    continue
+                x = np.arange(len(vals))
+                ax.bar(x, vals, color=colors)
+                ax.axhline(0.5, color="black", linestyle="--", lw=1, label="Random (0.5)")
+                ax.set_title(title, fontsize=11, fontweight="bold")
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+                ax.set_ylim(0, 1.05)
+                ax.grid(axis="y", linestyle="--", alpha=0.6)
+                ax.legend(fontsize=8)
+            fig.tight_layout()
+            bar_path = os.path.join(mia_dir, "mia_bar.pdf")
+            fig.savefig(bar_path, dpi=300, bbox_inches="tight")
+            print(f"  [MIA] Bar chart saved to {bar_path}")
+        except Exception as e:
+            print(f"  [MIA] Warning: could not save bar chart: {e}")
+            import traceback; traceback.print_exc()
+        finally:
+            plt.close("all")
+
+    def _print_param_table(self) -> None:
+        """Print and save a one-row-per-model trainable parameter count table."""
+        rows = [
+            [name, f"{self._param_counts[name]:,}" if self._param_counts.get(name) is not None else "N/A"]
+            for name in self.models_data
+        ]
+        table_str = tabulate(rows, headers=["Model", "Trainable Params"], tablefmt="grid")
+        print("\n=== Parameter Budget ===")
+        print(table_str)
+
+        table_path = os.path.join(self.output_dir, "parameter_count.txt")
+        with open(table_path, "w", encoding="utf-8") as f:
+            f.write(table_str)
+        print(f"Parameter count table saved to {table_path}")
+
+    def compare(self, mia_models: list[str] | None = None, sort_models: bool = True):
+        """Generate comparison tables and plots for each phase.
+
+        mia_models: if given, only these model names appear in MIA plots.
+                    Defaults to all models.
+        sort_models: if True (default), models are sorted by Avg Rank Synthetic Score.
+                     If False, models appear in the order they were added via add_model().
+        """
         if not self.models_data:
             print("No models added. Exiting.")
             return
 
+        self._print_param_table()
+
+        last_sorted_models: list[str] | None = None
         for phase in self.phases:
             # Only show a phase in the comparison if ALL loaded models have data for it.
             # This prevents partial 'N/A' columns from appearing when one model ran in
@@ -407,55 +531,166 @@ class PhasedModelComparator:
             if models_with_phase and len(models_with_phase) == len(self.models_data):
                 print(f"\n--- Comparing models for phase: {phase} ---")
                 self._compute_averages(phase)
-                sorted_models = self._sort_models_by_synthetic_score(phase)
+                sorted_models = self._sort_models_by_synthetic_score(phase) if sort_models else list(self.models_data.keys())
+                last_sorted_models = sorted_models
                 self._generate_table(phase, sorted_models)
                 self._generate_plots(phase, sorted_models)
             elif models_with_phase:
                 missing = [m for m in self.models_data if phase not in self.models_data[m]]
                 print(f"\n[Skipping phase '{phase}': missing for models {missing}]")
 
-        self._compare_holdout()
+        try:
+            self._compare_holdout(sorted_models=last_sorted_models)
+        except Exception as _hoe:
+            print(f"\n[compare] WARNING: _compare_holdout raised an exception; holdout plots may be incomplete.")
+            import traceback as _ho_tb; _ho_tb.print_exc()
+        mia_candidates = list(self.models_data.keys()) if mia_models is None else [
+            m for m in mia_models if m in self.models_data
+        ]
+        self._generate_mia_plots(mia_candidates)
 
-    def _compare_holdout(self):
+    def _compute_holdout_averages(self, models_with_holdout: list[str]) -> None:
+        """Compute MinMax/Rank/WinCount aggregate scores for holdout_eval metrics.
+
+        Mirrors _compute_averages but operates on holdout_eval instead of a phase dict,
+        and only considers models that actually have holdout data.
+        """
+        phase = 'holdout_eval'
+        all_metrics: set[str] = set()
+        for m in models_with_holdout:
+            for metric, val in self.models_data[m][phase].items():
+                if isinstance(val, (int, float)) and self._include_metric(metric):
+                    all_metrics.add(metric)
+
+        scalar_metrics = list(all_metrics)
+
+        def _comparable(v: float, goal: str) -> float:
+            if goal == "higher":   return -v
+            if goal == "target_1": return abs(v - 1.0)
+            if goal == "target_0": return abs(v)
+            return v
+
+        minmax_scores: dict[str, dict] = {m: {} for m in models_with_holdout}
+        rank_scores:   dict[str, dict] = {m: {} for m in models_with_holdout}
+        win_counts:    dict[str, dict] = {m: {} for m in models_with_holdout}
+
+        for metric in scalar_metrics:
+            goal = self._metric_goal(metric)
+            valid = {
+                m: float(self.models_data[m][phase][metric])
+                for m in models_with_holdout
+                if metric in self.models_data[m][phase]
+                and isinstance(self.models_data[m][phase][metric], (int, float))
+            }
+            if not valid:
+                continue
+
+            mapped = {m: _comparable(v, goal) for m, v in valid.items()}
+
+            vmin, vmax = min(mapped.values()), max(mapped.values())
+            for m, c in mapped.items():
+                minmax_scores[m][metric] = 1.0 if vmax == vmin else 1.0 - (c - vmin) / (vmax - vmin)
+
+            sorted_ms = sorted(mapped, key=mapped.__getitem__)
+            n = len(sorted_ms)
+            i = 0
+            while i < n:
+                j = i + 1
+                while j < n and mapped[sorted_ms[j]] == mapped[sorted_ms[i]]:
+                    j += 1
+                avg_rank = (i + j - 1) / 2
+                for k in range(i, j):
+                    rank_scores[sorted_ms[k]][metric] = avg_rank + 1.0
+                i = j
+
+            best = min(mapped.values())
+            winners = [m for m, c in mapped.items() if c == best]
+            share = 1.0 / len(winners)
+            for m in valid:
+                win_counts[m][metric] = share if m in winners else 0.0
+
+        recon_metrics = [m for m in scalar_metrics if self._metric_group(m) == "reconstruction"]
+        synth_metrics = [m for m in scalar_metrics if self._metric_group(m) == "synthetic"]
+
+        for m in models_with_holdout:
+            r_mm   = [minmax_scores[m][met] for met in recon_metrics if met in minmax_scores[m]]
+            s_mm   = [minmax_scores[m][met] for met in synth_metrics  if met in minmax_scores[m]]
+            r_rank = [rank_scores[m][met]   for met in recon_metrics  if met in rank_scores[m]]
+            s_rank = [rank_scores[m][met]   for met in synth_metrics  if met in rank_scores[m]]
+            r_wins = [win_counts[m][met]    for met in recon_metrics  if met in win_counts[m]]
+            s_wins = [win_counts[m][met]    for met in synth_metrics  if met in win_counts[m]]
+
+            if r_mm:   self.models_data[m][phase]['Avg MinMax Reconstruction Score'] = float(np.mean(r_mm))
+            if s_mm:   self.models_data[m][phase]['Avg MinMax Synthetic Score']      = float(np.mean(s_mm))
+            if r_rank: self.models_data[m][phase]['Avg Rank Reconstruction Score']   = float(np.mean(r_rank))
+            if s_rank: self.models_data[m][phase]['Avg Rank Synthetic Score']        = float(np.mean(s_rank))
+            if r_wins: self.models_data[m][phase]['Win Count Reconstruction']        = float(sum(r_wins))
+            if s_wins: self.models_data[m][phase]['Win Count Synthetic']             = float(sum(s_wins))
+
+    def _compare_holdout(self, sorted_models: list[str] | None = None):
         """Generate a separate comparison table and plots for feeder holdout results.
 
         Models without holdout results are shown as N/A — they are not excluded.
-        No aggregate scores (MinMax/Rank/WinCount) are computed because not all
-        models are guaranteed to have holdout data.
+        Aggregate scores (MinMax/Rank/WinCount) are computed over models that have holdout data.
+        If sorted_models is provided (the order from the main comparison), that order is
+        preserved; otherwise models are sorted by Avg Rank Synthetic Score.
         """
         models_with_holdout = [m for m in self.models_data if 'holdout_eval' in self.models_data[m]]
         if not models_with_holdout:
             print("\n[No holdout eval results found for any model; skipping holdout comparison.]")
             return
 
-        missing = [m for m in self.models_data if 'holdout_eval' not in self.models_data[m]]
+        self._compute_holdout_averages(models_with_holdout)
+
+        holdout_set = set(models_with_holdout)
+        if sorted_models is not None:
+            sorted_holdout = [m for m in sorted_models if m in holdout_set]
+            # models with holdout data not in sorted_models (edge case)
+            sorted_holdout += [m for m in models_with_holdout if m not in sorted_models]
+            missing = [m for m in sorted_models if m not in holdout_set]
+            missing += [m for m in self.models_data if m not in sorted_models and m not in holdout_set]
+        else:
+            sorted_holdout = sorted(
+                models_with_holdout,
+                key=lambda m: float(self.models_data[m].get('holdout_eval', {}).get('Avg Rank Synthetic Score', float('inf')))
+            )
+            missing = [m for m in self.models_data if 'holdout_eval' not in self.models_data[m]]
+        all_models = sorted_holdout + missing
+
         if missing:
             print(f"\n--- Holdout comparison (N/A for: {missing}) ---")
         else:
             print(f"\n--- Holdout comparison ({len(models_with_holdout)} models) ---")
 
-        # Collect all scalar metrics present in any model's holdout results.
         all_metrics: set[str] = set()
         for m in models_with_holdout:
-            all_metrics.update(self.models_data[m]['holdout_eval'].keys())
+            for metric, val in self.models_data[m]['holdout_eval'].items():
+                if isinstance(val, (int, float)) and self._include_metric(metric):
+                    all_metrics.add(metric)
 
         if not all_metrics:
             print("  [holdout] No scalar metrics to compare.")
             return
 
-        all_models = list(self.models_data.keys())
         scalar_metrics = sorted(all_metrics, key=lambda x: (0 if "Reconstruction" in x or "Flexibility" in x else 1, x))
+
+        _SUMMARY = {'Avg MinMax Reconstruction Score', 'Avg MinMax Synthetic Score',
+                    'Avg Rank Reconstruction Score',   'Avg Rank Synthetic Score',
+                    'Win Count Reconstruction',        'Win Count Synthetic'}
+        non_summary = [m for m in scalar_metrics if m not in _SUMMARY]
+        summaries   = [m for m in scalar_metrics if m in _SUMMARY]
+        scalar_metrics = non_summary + summaries
 
         # --- Table ---
         headers = ["Metric"] + all_models
         table_data = []
         for metric in scalar_metrics:
             goal = self._metric_goal(metric)
-            # ★ is always based on mean (the scalar stored in holdout_eval).
             model_vals = {
                 m: float(self.models_data[m]['holdout_eval'][metric])
                 for m in models_with_holdout
                 if metric in self.models_data[m]['holdout_eval']
+                and isinstance(self.models_data[m]['holdout_eval'][metric], (int, float))
             }
             best_models: set = set()
             if model_vals:
@@ -476,11 +711,14 @@ class PhasedModelComparator:
             for m in all_models:
                 if 'holdout_eval' in self.models_data[m] and metric in self.models_data[m]['holdout_eval']:
                     val = self.models_data[m]['holdout_eval'][metric]
-                    meta = self.models_data[m].get('holdout_summary_meta', {}).get(metric, {})
-                    std = meta.get('std') if meta else None
-                    mean_str = f"{val:.4f}"
-                    fmt = f"{mean_str} ± {std:.4f}" if std is not None else mean_str
-                    row.append(f"★ {fmt}" if m in best_models else fmt)
+                    if isinstance(val, (int, float)):
+                        meta = self.models_data[m].get('holdout_summary_meta', {}).get(metric, {})
+                        std = meta.get('std') if meta else None
+                        mean_str = f"{val:.4f}"
+                        fmt = f"{mean_str} ± {std:.4f}" if std is not None else mean_str
+                        row.append(f"★ {fmt}" if m in best_models else fmt)
+                    else:
+                        row.append("N/A")
                 else:
                     row.append("N/A")
             table_data.append(row)
@@ -594,7 +832,7 @@ class PhasedModelComparator:
 
         plt.tight_layout()
         os.makedirs(holdout_dir, exist_ok=True)
-        out_path = os.path.join(holdout_dir, f"distribution_{group_name}.png")
+        out_path = os.path.join(holdout_dir, f"distribution_{group_name}.pdf")
         plt.savefig(out_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Distribution plot saved to {out_path}")
@@ -809,8 +1047,9 @@ class PhasedModelComparator:
         for metric_group, group_name in [(reconstruction_metrics, "Reconstruction"), (synthetic_metrics, "Synthetic")]:
             if not metric_group:
                 continue
-            
+
             self._generate_metric_group_plot(phase, metric_group, group_name, models, plot_style)
+            self._generate_metric_group_boxplot(phase, metric_group, group_name, models, plot_style)
     
     def _generate_metric_group_plot(self, phase: str, metric_group: list, group_name: str, models: list, plot_style):
         """Generate a single bar chart figure for a metric group."""
@@ -923,13 +1162,245 @@ class PhasedModelComparator:
             fig.delaxes(axes[i])
             
         plt.tight_layout()
-        
+
         phase_output_dir = os.path.join(self.output_dir, phase)
         os.makedirs(phase_output_dir, exist_ok=True)
-        plot_path = os.path.join(phase_output_dir, f"metric_comparison_{group_name}.png")
+        plot_path = os.path.join(phase_output_dir, f"metric_comparison_{group_name}.pdf")
         plt.savefig(plot_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
         print(f"Plots saved to {plot_path}")
+
+    def _generate_metric_group_boxplot(self, phase: str, metric_group: list, group_name: str, models: list, plot_style):
+        """Save metric_comparison_{group_name}_boxplot.pdf — one subplot per metric.
+
+        Models that ran evaluate_repeated(k>1) show a full box plot of their K draw
+        values. Models with only a mean scalar (k=1) show a single diamond marker.
+        Skipped entirely when no (metric, model) pair has a values list with ≥ 2 entries.
+        """
+        has_any_values = any(
+            len(((self.models_data[m].get(f"{phase}_meta") or {}).get(metric) or {}).get("values") or []) >= 2
+            for metric in metric_group
+            for m in models
+        )
+        if not has_any_values:
+            return
+
+        n_metrics = len(metric_group)
+        n_cols = 3
+        n_rows = int(np.ceil(n_metrics / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows), squeeze=False)
+        axes_flat = axes.flatten()
+
+        title_map = {
+            "Reconstruction": "Reconstruction Evaluation — Draw Distribution",
+            "Synthetic": "Synthetic Data Evaluation — Draw Distribution",
+        }
+        fig.suptitle(title_map.get(group_name, f"{group_name} — Draw Distribution"),
+                     fontsize=16, fontweight='bold', y=0.995)
+
+        for idx, metric in enumerate(metric_group):
+            ax = axes_flat[idx]
+
+            bp_positions, bp_data, bp_colors = [], [], []
+            dot_positions, dot_values, dot_colors = [], [], []
+            tick_positions, tick_labels = [], []
+
+            model_pos = 0
+            for i, model in enumerate(models):
+                phase_data = self.models_data[model].get(phase)
+                if phase_data is None or metric not in phase_data:
+                    continue
+                val = phase_data[metric]
+                if not isinstance(val, (int, float)):
+                    continue
+
+                model_pos += 1
+                color = self._model_color(model, i, plot_style)
+                tick_positions.append(model_pos)
+                tick_labels.append(model)
+
+                meta = ((self.models_data[model].get(f"{phase}_meta") or {}).get(metric)) or {}
+                values = meta.get("values")
+                if values and len(values) >= 2:
+                    bp_positions.append(model_pos)
+                    bp_data.append([float(v) for v in values])
+                    bp_colors.append(color)
+                else:
+                    dot_positions.append(model_pos)
+                    dot_values.append(float(val))
+                    dot_colors.append(color)
+
+            if bp_data:
+                bp = ax.boxplot(bp_data, positions=bp_positions, patch_artist=True, widths=0.5)
+                for patch, color in zip(bp["boxes"], bp_colors):
+                    patch.set_facecolor(color)
+                    patch.set_alpha(0.7)
+
+            for pos, val, color in zip(dot_positions, dot_values, dot_colors):
+                ax.scatter([pos], [val], color=color, zorder=5, s=80, marker='D')
+
+            ax.set_title(self._display_metric_title(metric), fontsize=11, fontweight='bold')
+            if tick_positions:
+                ax.set_xticks(tick_positions)
+                ax.set_xticklabels(tick_labels, rotation=20, ha='right', fontsize=8)
+            ax.grid(axis='y', linestyle='--', alpha=0.7)
+
+        for i in range(n_metrics, len(axes_flat)):
+            fig.delaxes(axes_flat[i])
+
+        legend_handles = [
+            mpatches.Patch(color=self._model_color(m, i, plot_style), label=m)
+            for i, m in enumerate(models)
+        ]
+        fig.legend(handles=legend_handles, loc='lower center',
+                   bbox_to_anchor=(0.5, 1.02), ncol=min(3, len(models) + 1))
+
+        plt.tight_layout()
+
+        phase_output_dir = os.path.join(self.output_dir, phase)
+        os.makedirs(phase_output_dir, exist_ok=True)
+        plot_path = os.path.join(phase_output_dir, f"metric_comparison_{group_name}_boxplot.pdf")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Boxplot saved to {plot_path}")
+
+def _build_eval_test_loader(
+    data_files: list[str],
+    split_seed: int,
+    split_ratios: dict,
+    max_value: float | None,
+    window_len: int,
+    normalizer,
+    num_samples: int,
+    output_dir: str,
+    phased: bool,
+    agg_divisor: float = 1.0,
+) -> "torch.utils.data.DataLoader | None":
+    """Build a month-diverse test DataLoader with a persistent disk cache.
+
+    The cache stores the FULL test split (all months, raw values before normalization)
+    so that num_samples can be changed freely without rescanning parquet files.
+    Parquet files are processed one at a time to keep peak RAM bounded.
+    Normalization and the num_samples draw happen at load time from the cache.
+    """
+    import gc
+    import hashlib
+    import pickle
+    from torch.utils.data import DataLoader as _DL, TensorDataset as _TDS, Subset as _Sub
+
+    # Cache key covers everything that affects WHICH windows are in the test split
+    # and how they are valued — but NOT num_samples (that's applied at load time).
+    h = hashlib.md5()
+    for f in sorted(data_files):
+        h.update(f.encode())
+        try:
+            h.update(str(os.path.getmtime(f)).encode())
+        except OSError:
+            pass
+    h.update(str(split_seed).encode())
+    h.update(str(sorted(split_ratios.items())).encode())
+    h.update(str(max_value).encode())
+    h.update(str(window_len).encode())
+    h.update(str(phased).encode())
+    # Normalizer is intentionally excluded from the cache key: the cache stores
+    # raw unnormalized windows and normalization is applied at load time, so the
+    # same cache file is valid for any normalizer (or none).
+    cache_path = os.path.join(output_dir, f"_eval_test_cache_{h.hexdigest()[:16]}.pt")
+
+    def _sample_and_wrap(x_raw, meter_ids, timestamps):
+        """Apply normalizer + draw num_samples, return DataLoader."""
+        _n_total = len(x_raw)
+        _n_cap = min(num_samples, _n_total)
+        _g = torch.Generator()
+        _g.manual_seed(split_seed)
+        _idx = torch.randperm(_n_total, generator=_g)[:_n_cap]
+        _x = x_raw[_idx]; _m = meter_ids[_idx]; _t = timestamps[_idx]
+        if normalizer is not None and getattr(normalizer, "fitted", False):
+            _x2 = _x.reshape(-1, 1).float()
+            _x2 = normalizer.transform(_x2)
+            _x = _x2.reshape(len(_x), window_len).unsqueeze(1)
+        else:
+            _x = _x.float().unsqueeze(1)
+        _agg = torch.zeros((len(_x), 0, window_len), dtype=_x.dtype)
+        print(f"[eval cache] Using {_n_cap}/{_n_total} test windows (seed={split_seed}).")
+        return _DL(_TDS(_x, _m, _t, _agg), batch_size=1024, shuffle=False, num_workers=0, pin_memory=False)
+
+    # --- Try loading from cache ----------------------------------------------
+    if os.path.exists(cache_path):
+        try:
+            cached = torch.load(cache_path, weights_only=True)
+            print(f"[eval cache] Cache hit: {len(cached['x'])} total test windows.")
+            return _sample_and_wrap(cached["x"], cached["meter_ids"], cached["timestamps"])
+        except Exception as _ce:
+            print(f"[eval cache] Cache load failed ({_ce}); rebuilding.")
+            import traceback; traceback.print_exc()
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
+
+    # --- Build file-by-file (no num_samples limit — cache the full test split) ---
+    print(f"[eval cache] Scanning {len(data_files)} file(s) for test windows (runs once, then cached)...")
+    if phased:
+        from src.data.dataloader_phased import InMemoryPhasedDataset as _FileDS
+        def _load_file(fpath):
+            return _FileDS(
+                sm_files=[fpath], split="test",
+                feature_cols=["hourly_energy_consumption"],
+                split_ratios=split_ratios, split_seed=split_seed,
+                window_len=window_len, stride=window_len,
+                aggregation=agg_divisor > 1.0, aggregation_divisor=agg_divisor,
+                max_value=max_value, max_hour_value=20.0, normalizer=None,
+            )
+    else:
+        from src.data.dataloader_phased import InMemoryCSVDataset as _FileDS
+        def _load_file(fpath):
+            return _FileDS(
+                sm_files=[fpath], split="test",
+                split_ratios=split_ratios, split_seed=split_seed,
+                max_hour_value=20.0, max_value=max_value,
+                nan_as_zero=False, normalizer=None,
+                output_aggregate_stream=False,
+                meter_col="meter_number",
+                value_cols=["hourly_energy_consumption"],
+                window_len=window_len, stride=window_len,
+            )
+
+    xs: list[torch.Tensor] = []
+    ms: list[torch.Tensor] = []
+    ts: list[torch.Tensor] = []
+
+    for fpath in data_files:
+        try:
+            file_ds = _load_file(fpath)
+            if len(file_ds) == 0:
+                del file_ds; gc.collect()
+                continue
+            xs.append(file_ds.x.squeeze(1))  # raw, unnormalized [n, W]
+            ms.append(file_ds.meter_ids)
+            ts.append(file_ds.timestamps)
+            del file_ds; gc.collect()
+        except Exception as _fe:
+            print(f"[eval cache] Warning: skipping {fpath}: {_fe}")
+            import traceback; traceback.print_exc()
+
+    if not xs:
+        print("[eval cache] ERROR: no test windows found — check data_dir and split ratios.")
+        return None
+
+    _xc = torch.cat(xs); _mc = torch.cat(ms); _tc = torch.cat(ts)
+    del xs, ms, ts; gc.collect()
+
+    # Persist the full test split (raw, pre-normalization) to cache
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        torch.save({"x": _xc, "meter_ids": _mc, "timestamps": _tc}, cache_path)
+        print(f"[eval cache] Saved {len(_xc)} test windows → {cache_path}")
+    except Exception as _se:
+        print(f"[eval cache] Warning: could not save cache: {_se}")
+
+    return _sample_and_wrap(_xc, _mc, _tc)
+
 
 def get_eval_files(data_dir: str, data_files: list[str] | None = None):
     """
@@ -1052,6 +1523,11 @@ def _write_holdout_summary(model_output_dir: str, feeder_ids: list[int]) -> None
         with open(path) as f:
             data = json.load(f)
         for metric, entry in data.items():
+            if isinstance(entry, dict) and "mean" not in entry:
+                print(f"[holdout summary] WARNING: skipping '{metric}' in feeder {fid}: "
+                      f"dict has no 'mean' key (keys={list(entry.keys())[:5]}). "
+                      f"This is a diagnostic sidecar that should not be in a holdout JSON.")
+                continue
             mean_val = entry["mean"] if isinstance(entry, dict) else float(entry)
             per_feeder_data.setdefault(metric, {})[str(fid)] = mean_val
 
@@ -1185,6 +1661,11 @@ def _run_holdout_eval(
     n_holdout_windows = len(raw_holdout.x)
     print(f"  [holdout] {n_holdout_windows} real windows from feeder {feeder_id}.")
 
+    # All metric plots go into a feeder-specific subdirectory so each feeder's output is
+    # isolated and never clobbers the global eval or another feeder's plots.
+    # The per-feeder result JSON is written explicitly to model_output_dir (not affected).
+    _feeder_plot_dir = os.path.join(model_output_dir, f"feeder_{feeder_id}")
+    os.makedirs(_feeder_plot_dir, exist_ok=True)
     eval_norm = copy.deepcopy(normalizer)
     evaluator = EvalFramework(
         model=model,
@@ -1193,7 +1674,7 @@ def _run_holdout_eval(
         conditioner=conditioner,
         device=device,
         window_size=window_size,
-        output_path=model_output_dir,
+        output_path=_feeder_plot_dir,
         n_synthetic_samples=n_holdout_windows,
         preserve_condition_order=True,
     )
@@ -1207,7 +1688,7 @@ def _run_holdout_eval(
             evaluator = EvalFramework(
                 model=model, dataloader=holdout_loader, normalizer=cpu_norm,
                 conditioner=conditioner, device="cpu", window_size=window_size,
-                output_path=model_output_dir, n_synthetic_samples=n_holdout_windows,
+                output_path=_feeder_plot_dir, n_synthetic_samples=n_holdout_windows,
                 preserve_condition_order=True,
             )
             evaluator.register_all(phased=False)
@@ -1412,6 +1893,234 @@ def _build_mia_train_loader(
     )
 
 
+def _run_tstr_only(
+    model,
+    normalizer,
+    conditioner,
+    dataloader,
+    output_json: str,
+    n_draws: int,
+    device: str,
+    window_size: int,
+    n_synthetic_samples: int,
+    preserve_condition_order: bool = False,
+    framework_output_path: str | None = None,
+) -> None:
+    """Build a minimal EvalFramework with only TSTR registered, run it, and patch output_json.
+
+    Reads the existing JSON, updates only 'TSTR (Train on Synthetic, Test on Real)',
+    and writes back — all other metric keys are preserved.  Skips with a warning if
+    output_json does not already exist (full eval must be run first).
+
+    framework_output_path: where EvalFramework writes its diagnostic sidecar
+        (e.g. the TSTR {value, trtr_mse, ...} entry via _save_standalone_metric_result).
+        Defaults to output_json.  For holdout feeder calls pass the feeder plot dir so
+        the diagnostic does not land in the per-feeder holdout JSON — matching the
+        behaviour of _run_holdout_eval which uses output_path=_feeder_plot_dir.
+
+    Always uses evaluate_repeated(k=max(1, n_draws)) so the result is always stored
+    as {mean, std, values}, matching the holdout format and accepted by add_model().
+    """
+    if not os.path.exists(output_json):
+        print(f"  [recompute-tstr] SKIP: {output_json} does not exist; run full eval first.")
+        return
+
+    import copy
+    from src.evaluation.metrics.tstr import TSTR
+
+    tstr_key = "TSTR (Train on Synthetic, Test on Real)"
+    k = max(1, n_draws)
+    fw_path = framework_output_path if framework_output_path is not None else output_json
+
+    def _do_run(dev: str):
+        ev = EvalFramework(
+            model=model,
+            dataloader=dataloader,
+            normalizer=copy.deepcopy(normalizer),
+            conditioner=conditioner,
+            device=dev,
+            window_size=window_size,
+            output_path=fw_path,
+            n_synthetic_samples=n_synthetic_samples,
+            preserve_condition_order=preserve_condition_order,
+        )
+        ev.register_metric(TSTR(window_size=window_size))
+        results = ev.evaluate_repeated(k=k)
+        return results.get(tstr_key)
+
+    try:
+        tstr_val = _do_run(device)
+    except RuntimeError as e:
+        if device != "cpu" and "out of memory" in str(e).lower():
+            print("  [recompute-tstr] GPU OOM — retrying on CPU.")
+            tstr_val = _do_run("cpu")
+        else:
+            raise
+
+    if tstr_val is None:
+        print(f"  [recompute-tstr] WARNING: TSTR result is None; {output_json} not updated.")
+        return
+
+    try:
+        with open(output_json) as f:
+            existing = json.load(f)
+    except Exception as e:
+        print(f"  [recompute-tstr] WARNING: could not read {output_json} for patching: {e}")
+        import traceback; traceback.print_exc()
+        return
+
+    if framework_output_path is not None:
+        # Diagnostic sidecar is redirected away from output_json; remove any copy
+        # that landed here during a prior run before this redirect was in place.
+        # "TSTR" is the top-level sidecar key; "standalone_metrics" is a legacy nested
+        # variant from older code versions.
+        existing.pop("TSTR", None)
+        existing.pop("standalone_metrics", None)
+    existing[tstr_key] = tstr_val
+    with open(output_json, "w") as f:
+        json.dump(existing, f, indent=2)
+
+    if isinstance(tstr_val, dict):
+        print(f"  [recompute-tstr] Patched: TSTR mean={tstr_val['mean']:.4f} → {output_json}")
+    else:
+        print(f"  [recompute-tstr] Patched: TSTR={float(tstr_val):.4f} → {output_json}")
+
+
+def _run_mia_only(
+    model,
+    normalizer,
+    train_loader,
+    test_loader,
+    output_dir: str,
+    device: str,
+    window_size: int,
+    loader_normalizer=None,
+    n_member_samples: int = 1000,
+) -> None:
+    """Run MIA and save eval_mia_curve.json without triggering synthetic generation.
+
+    Drives reconstruction directly via EvalFramework helper methods so that
+    _generate_synthetic() is never called — avoiding failures specific to
+    certain model types (diffusion stochasticity, Faraday PDCC decoder, etc.).
+    """
+    import copy
+    import numpy as np
+    from src.evaluation.metrics.mia import MembershipInferenceAttack as _MIA
+
+    _test = (
+        _DenormalizingLoader(test_loader, loader_normalizer)
+        if normalizer is None and loader_normalizer is not None
+        else test_loader
+    )
+    _train = (
+        _DenormalizingLoader(train_loader, loader_normalizer)
+        if normalizer is None and loader_normalizer is not None
+        else train_loader
+    )
+    eval_norm = copy.deepcopy(normalizer)
+
+    # Build EvalFramework only for its helper methods (_unpack_batch,
+    # _inverse_transform_for_metrics, _flatten_for_metrics, _reconstruct_mean).
+    # We never call evaluate() so _generate_synthetic() never runs.
+    ev = EvalFramework(
+        model=model,
+        dataloader=_test,
+        normalizer=eval_norm,
+        device=device,
+        window_size=window_size,
+        output_path=os.path.join(output_dir, "eval_results.json"),
+        n_synthetic_samples=0,
+    )
+    k = 5 if ev.generator._is_diffusion else 1
+
+    def _collect(loader, cap=None):
+        real_list, recon_list = [], []
+        n = 0
+        model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                if cap is not None and n >= cap:
+                    break
+                x, meter_ids, timestamps, _agg = ev._unpack_batch(batch)
+                x = x.to(device)
+                x_inv = ev._inverse_transform_for_metrics(x)
+                x_flat = ev._flatten_for_metrics(x_inv)
+                recon = ev._reconstruct_mean(x, n_samples=k, meter_id=meter_ids, timestamps=timestamps)
+                real_list.append(x_flat.cpu().numpy())
+                recon_list.append(recon.cpu().numpy())
+                n += x.shape[0]
+        if not real_list:
+            return None, None
+        return np.concatenate(real_list), np.concatenate(recon_list)
+
+    non_member_data, non_member_recon = _collect(_test, cap=n_member_samples)
+    member_data, member_recon = _collect(_train, cap=n_member_samples)
+
+    if non_member_data is None or member_data is None:
+        print(f"  [MIA] No data collected for {output_dir}; skipping.")
+        return
+
+    mia = _MIA(n_reconstruction_samples=k)
+    mia.non_member_data = non_member_data
+    mia.non_member_reconstructed_data = non_member_recon
+    mia.member_data = member_data
+    mia.member_reconstructed_data = member_recon
+    mia.output_path = os.path.join(output_dir, "eval_results.json")
+    mia.compute()
+
+
+def _run_visual_only(
+    model,
+    normalizer,
+    conditioner,
+    dataloader,
+    output_dir: str,
+    device: str,
+    window_size: int,
+    n_synthetic_samples: int,
+    loader_normalizer=None,
+) -> None:
+    """Build a minimal EvalFramework with only VisualEvaluation registered and run it.
+
+    Saves pca_comparison.pdf and tsne_comparison.pdf to output_dir/visual_evaluation/.
+    Does not read or write eval_results.json.
+
+    loader_normalizer: the normalizer that was applied to dataloader's data (i.e. the
+        shared loader's normalizer, _first_norm).  When provided, the dataloader is
+        wrapped with _DenormalizingLoader so that real data reaching EvalFramework is
+        already in raw-kWh units — ensuring all models see the same real distribution
+        in t-SNE/PCA plots.  real_data_preprocessed=True tells EvalFramework not to
+        apply a second inverse transform.
+    """
+    import copy
+
+    # Pre-denormalize real data with the loader's normalizer so every model sees raw
+    # kWh.  Without this, each model would inverse-transform the shared normalised
+    # loader data with its *own* normalizer, causing the real cluster to look
+    # different across models when their normalizers differ.
+    raw_loader = (
+        _DenormalizingLoader(dataloader, loader_normalizer)
+        if loader_normalizer is not None
+        else dataloader
+    )
+
+    ev = EvalFramework(
+        model=model,
+        dataloader=raw_loader,
+        normalizer=copy.deepcopy(normalizer),
+        conditioner=conditioner,
+        device=device,
+        window_size=window_size,
+        output_path=output_dir,
+        n_synthetic_samples=n_synthetic_samples,
+        real_data_preprocessed=True,
+    )
+    ev.register_metric(VisualEvaluation(output_path=output_dir))
+    ev._prepare_data()
+    ev._inject_data_into_metrics()
+    ev.evaluate_synthetic_only()
+
+
 def compare_models(model_paths: list[str],
                    model_names: list[str],
                    secondary_model_paths: list[str] | None = None,
@@ -1428,6 +2137,11 @@ def compare_models(model_paths: list[str],
                    max_value: float | None = 200.0,
                    holdout_n_draws: int = 1,
                    n_draws: int = 1,
+                   recompute_tstr: bool = False,
+                   recompute_visual: bool = False,
+                   mia_model_names: list[str] | None = None,
+                   sort_models: bool = True,
+                   only_holdout: bool = False,
                    ):
     """
     Run evaluation for multiple models and compare results.
@@ -1492,14 +2206,18 @@ def compare_models(model_paths: list[str],
         requested_eval_dir = eval_result_dirs[i] if eval_result_dirs is not None else None
         eval_source_dir = requested_eval_dir if requested_eval_dir else path
         skip = (
-            (not recompute)
+            (not recompute and not recompute_tstr and not recompute_visual)
             and _has_existing_eval_outputs(eval_source_dir, phased=phased)
-            and secondary is None
+            and secondary is None and only_holdout is False
         )
         # Checkpoint-dir fallback (ADR-0011): when output_dir/<name>/ is empty and
         # recompute=False, restore cached results from the model checkpoint dir.
+        # When recompute_tstr=True or recompute_visual=True we still restore (so any
+        # existing JSON is present) but do NOT set skip=True — we need to fall through
+        # to the patch-only branch.
         if not skip and not recompute and secondary is None and path != model_output_dir:
-            if _restore_results_from_checkpoint(path, model_output_dir):
+            restored = _restore_results_from_checkpoint(path, model_output_dir)
+            if restored and not recompute_tstr and not recompute_visual and only_holdout is True:
                 skip = True
         eval_plan.append({
             "path": path,
@@ -1516,7 +2234,7 @@ def compare_models(model_paths: list[str],
     #    have been trained on the same dataset with a compatible normalizer.
     shared_test_loader = None
     shared_train_loader = None
-    loader_obj = None
+    _first_norm = None
     # Cache (model, normalizer, conditioner) for the first recomputing model so we
     # don't load its weights twice (once here for the normalizer, once in the loop).
     _first_model_cache: dict[int, tuple] = {}
@@ -1529,68 +2247,38 @@ def compare_models(model_paths: list[str],
         )
         _first_model_cache[first_idx] = (_first_model, _first_norm, _first_cond)
 
-        # replay_buffer_capacity sized to num_samples: the circular buffer can hold
-        # all requested unique test windows without evicting earlier ones.
-        # This loader is evaluation-only, so a large buffer is safe.
-        loader_obj = PhasedReplayDataloaders(
-            sm_files=data_files,
-            window_spec=window,
-            batch_size=1024,
-            replay_buffer_capacity=num_samples,
-            min_buffer_size=0,
-            normalizer=_first_norm,
-            num_workers=0,
-            phased_mode=phased,
-            sample_random=False,          # deterministic test selection + ordering
-            feature_cols=["hourly_energy_consumption"],
-            meter_col="meter_number",
-            aggregation_divisor=agg_divisor,
-            hourly_aggregation=agg_divisor > 1.0,
-            split_seed=split_seed,
-            split_ratios=split_ratios,
-            max_value=max_value,
-            pin_memory=False,
-        )
-
-        n_batches = max(1, num_samples // 32)
-        loader_obj.refresh_test_cache(n_batches)
-        shared_test_loader = loader_obj.get_test_loader()
-
-        if shared_test_loader is None and hasattr(loader_obj, "test_dataset"):
-            print("[WARN] get_test_loader() returned None; constructing DataLoader from test_dataset directly.")
-            from torch.utils.data import DataLoader as _DL
-            shared_test_loader = _DL(
-                loader_obj.test_dataset,
-                batch_size=1024,
-                shuffle=False,
-                num_workers=0,
-                pin_memory=False,
-            )
-
-        if shared_test_loader is None:
-            print("[ERROR] Could not build a test loader. No evaluation will be run.")
-        else:
-            try:
-                n_test = len(shared_test_loader.dataset)  # type: ignore[arg-type]
-                size_str = f"{n_test} windows"
-            except TypeError:
-                n_test = num_samples
-                size_str = f"~{n_test} samples (streaming, no len)"
-            print(f"\nShared test loader ready: {size_str}, batch_size=1024.")
-
-        shared_train_loader = _build_mia_train_loader(
+        shared_test_loader = _build_eval_test_loader(
             data_files=data_files,
-            normalizer=_first_norm,
             split_seed=split_seed,
             split_ratios=split_ratios,
             max_value=max_value,
-            window_size=window.input_len,
+            window_len=window.input_len,
+            normalizer=_first_norm,
             num_samples=num_samples,
+            output_dir=output_dir,
             phased=phased,
             agg_divisor=agg_divisor,
         )
-        if shared_train_loader is not None:
-            print(f"Shared train loader ready: {len(shared_train_loader.dataset)} member windows for MIA.")
+        import gc as _gc; _gc.collect()  # release 1M-tensor heap before model loading
+
+        if not recompute_tstr and not recompute_visual and only_holdout is False:
+            # MIA only needs a few thousand member windows — cap independently of
+            # num_samples so that large num_samples values don't trigger loading
+            # the entire training split.
+            _mia_n = min(num_samples, 5000)
+            shared_train_loader = _build_mia_train_loader(
+                data_files=data_files,
+                normalizer=_first_norm,
+                split_seed=split_seed,
+                split_ratios=split_ratios,
+                max_value=max_value,
+                window_size=window.input_len,
+                num_samples=_mia_n,
+                phased=phased,
+                agg_divisor=agg_divisor,
+            )
+            if shared_train_loader is not None:
+                print(f"Shared train loader ready: {len(shared_train_loader.dataset)} member windows for MIA.")
 
     # 5a. Pre-build holdout window cache (one read per feeder, shared across all models).
     #     Raw un-normalised windows are cached; each model applies its own normalizer.
@@ -1636,7 +2324,95 @@ def compare_models(model_paths: list[str],
 
         if plan["skip"]:
             print(f"  Found existing evaluation outputs in {eval_source_dir}; skipping recompute.")
-            used_eval_dirs.append(eval_source_dir)
+            # Ensure model_output_dir has the main eval JSON so the comparator can read
+            # from one canonical location alongside the holdout JSONs that live there.
+            if eval_source_dir != model_output_dir:
+                _restore_results_from_checkpoint(eval_source_dir, model_output_dir)
+            used_eval_dirs.append(model_output_dir)
+            # Feeder holdout JSONs and summary always live in model_output_dir.
+            # If the summary is missing, either build it from existing per-feeder JSONs
+            # (when >5 are found) or run the missing Feeder holdout eval passes first.
+            _summary_path = os.path.join(model_output_dir, "eval_results_feeder_holdout_summary.json")
+            if not os.path.exists(_summary_path) and data_files:
+                import glob as _glob
+                import traceback as _tb
+                _existing_feeder_jsons = sorted(
+                    _glob.glob(os.path.join(model_output_dir, "eval_results_feeder_holdout_*.json"))
+                )
+                _found_ids: list[int] = []
+                for _fp in _existing_feeder_jsons:
+                    try:
+                        _fid_str = os.path.basename(_fp).replace("eval_results_feeder_holdout_", "").replace(".json", "")
+                        _found_ids.append(int(_fid_str))
+                    except ValueError:
+                        continue  # skip summary file and any non-numeric names
+                if len(_found_ids) > 5:
+                    print(f"  [holdout] {len(_found_ids)} feeder JSONs found; creating holdout summary.")
+                    _write_holdout_summary(model_output_dir, _found_ids)
+                else:
+                    print(
+                        f"  [holdout] Only {len(_found_ids)} feeder JSONs found (threshold 5); "
+                        f"running missing Feeder holdout eval passes."
+                    )
+                    _cfg_path = _find_model_config_path(path)
+                    if _cfg_path is None:
+                        print(f"  [holdout] No training config found in {path}; cannot run holdout eval.")
+                    else:
+                        try:
+                            _mcfg = _load_train_config(_cfg_path)
+                            _hid = getattr(getattr(_mcfg, "data", None), "holdout_feeder_id", None)
+                            _topo = getattr(getattr(_mcfg, "data", None), "topology_path", None)
+                            if _hid is None:
+                                print(f"  [holdout] holdout_feeder_id not set in {_cfg_path}; skipping holdout eval.")
+                            elif _topo is None:
+                                print(f"  [holdout] holdout_feeder_id={_hid} set but topology_path missing in {_cfg_path}; skipping.")
+                            else:
+                                _fids = _dispatch_holdout_feeder_ids(_hid)
+                                _missing_fids = [fid for fid in _fids if fid not in _found_ids]
+                                if recompute_tstr:
+                                    _missing_fids = _fids # when recomputing TSTR, we want to re-run all holdout feeders to patch their JSONs with updated TSTR values — no skipping
+                                print(f"  [holdout] Running {len(_missing_fids)} missing feeder holdout(s) out of {len(_fids)} configured.")
+                                _skip_model, _skip_norm, _skip_cond = load_model(path, device=device)
+                                for _fid in _missing_fids:
+                                    if _fid not in holdout_cache:
+                                        try:
+                                            holdout_cache[_fid] = load_holdout_windows_raw(
+                                                feeder_id=_fid,
+                                                data_files=data_files,
+                                                topology_path=str(_topo),
+                                                window_size=window.input_len,
+                                                max_value=max_value,
+                                            )
+                                        except Exception as _lhe:
+                                            print(f"  [holdout] Load failed for feeder {_fid}: {_lhe}")
+                                            continue
+                                    print(f"  Running holdout eval (feeder {_fid})...")
+                                    _run_holdout_eval(
+                                        model=_skip_model,
+                                        normalizer=_skip_norm,
+                                        conditioner=_skip_cond,
+                                        raw_holdout=holdout_cache[_fid],
+                                        feeder_id=_fid,
+                                        device=device,
+                                        window_size=window.input_len,
+                                        model_output_dir=model_output_dir,
+                                        n_synthetic_draws=holdout_n_draws,
+                                    )
+                                # Re-scan model_output_dir to include both pre-existing and newly computed.
+                                _all_jsons = sorted(
+                                    _glob.glob(os.path.join(model_output_dir, "eval_results_feeder_holdout_*.json"))
+                                )
+                                _all_ids: list[int] = []
+                                for _fp in _all_jsons:
+                                    try:
+                                        _fid_str = os.path.basename(_fp).replace("eval_results_feeder_holdout_", "").replace(".json", "")
+                                        _all_ids.append(int(_fid_str))
+                                    except ValueError:
+                                        continue
+                                _write_holdout_summary(model_output_dir, _all_ids)
+                        except Exception as _e:
+                            print(f"  [holdout] FAILED with exception: {_e}")
+                            _tb.print_exc()
             continue
 
         if shared_test_loader is None:
@@ -1660,13 +2436,124 @@ def compare_models(model_paths: list[str],
             sec_model, *_ = load_model(secondary, device=device)
 
         # Faraday-family models have no normalizer and were trained on raw kWh.
-        # The shared loader yields normalized data, so wrap it to denormalize on the fly.
-        _loader_norm = getattr(loader_obj, 'normalizer', None)
+        # The in-memory loader yields data normalized with _first_norm, so wrap it
+        # to denormalize on the fly for models that have no normalizer of their own.
+        _loader_norm = _first_norm
         dataloader = (
             _DenormalizingLoader(shared_test_loader, _loader_norm)
             if normalizer is None and _loader_norm is not None
             else shared_test_loader
         )
+
+        if recompute_tstr:
+            # TSTR-only recompute: patch TSTR in all existing result files without
+            # running any other metric (no reconstruction, no MIA, no other synthetic metrics).
+            import glob as _tstr_glob, traceback as _tstr_tb
+
+            # Ensure eval results exist in model_output_dir (restore from checkpoint if needed).
+            _main_json = os.path.join(model_output_dir, "eval_results.json")
+            if not os.path.exists(_main_json) and path != model_output_dir:
+                _restore_results_from_checkpoint(path, model_output_dir)
+
+            # 1. Main test-split eval_results.json.
+            if not phased:
+                print(f"  [recompute-tstr] Patching main eval for '{name}'...")
+                if only_holdout:
+                    print(f"  [recompute-tstr] only_holdout=True: skipping main test-split TSTR recompute and patch; only holdout feeders will be updated.")
+                else:
+                    _run_tstr_only(
+                        model=model, normalizer=normalizer, conditioner=conditioner,
+                        dataloader=dataloader,
+                        output_json=_main_json,
+                        n_draws=n_draws, device=device,
+                        window_size=window.input_len, n_synthetic_samples=num_samples,
+                    )
+            else:
+                print(f"  [recompute-tstr] WARNING: phased TSTR recompute not implemented; "
+                      f"skipping phase-specific eval dirs for '{name}'.")
+
+            # 2. Warn about any phased eval dirs that may exist even in non-phased runs.
+            for _phase_dir in ['aggregated_phase_eval', 'ranked_phase_1_eval',
+                               'ranked_phase_2_eval', 'ranked_phase_3_eval']:
+                _pjson = os.path.join(model_output_dir, _phase_dir, "eval_results.json")
+                if os.path.exists(_pjson):
+                    print(f"  [recompute-tstr] WARNING: {_phase_dir}/eval_results.json exists "
+                          f"but phased TSTR recompute is not implemented; that file is NOT updated.")
+
+            # 3. Holdout per-feeder JSONs.
+            _cfg_path = _find_model_config_path(path)
+            if _cfg_path is None:
+                print(f"  [recompute-tstr] No config found in {path}; skipping holdout TSTR recompute.")
+            else:
+                try:
+                    _mcfg = _load_train_config(_cfg_path)
+                    _hid = getattr(getattr(_mcfg, "data", None), "holdout_feeder_id", None)
+                    if _hid is None:
+                        print(f"  [recompute-tstr] holdout_feeder_id not set; skipping holdout TSTR recompute.")
+                    else:
+                        _fids = _dispatch_holdout_feeder_ids(_hid)
+                        for _fid in _fids:
+                            _holdout_json = os.path.join(
+                                model_output_dir, f"eval_results_feeder_holdout_{_fid}.json"
+                            )
+                            if _fid not in holdout_cache:
+                                print(f"  [recompute-tstr] WARNING: feeder {_fid} not in holdout cache; skipping.")
+                                continue
+                            _hl = _build_holdout_loader(holdout_cache[_fid], normalizer, window.input_len)
+                            _n_hw = len(holdout_cache[_fid].x)
+                            _feeder_plot_dir = os.path.join(model_output_dir, f"feeder_{_fid}")
+                            os.makedirs(_feeder_plot_dir, exist_ok=True)
+                            print(f"  [recompute-tstr] Patching holdout feeder {_fid} ({_n_hw} windows, {holdout_n_draws} draw(s))...")
+                            _run_tstr_only(
+                                model=model, normalizer=normalizer, conditioner=conditioner,
+                                dataloader=_hl,
+                                output_json=_holdout_json,
+                                n_draws=holdout_n_draws, device=device,
+                                window_size=window.input_len, n_synthetic_samples=_n_hw,
+                                preserve_condition_order=True,
+                                framework_output_path=_feeder_plot_dir,
+                            )
+                        _write_holdout_summary(model_output_dir, _fids)
+                except Exception as _tstr_e:
+                    print(f"  [recompute-tstr] Holdout TSTR failed for '{name}': {_tstr_e}")
+                    _tstr_tb.print_exc()
+
+            _copy_results_to_checkpoint_dir(model_output_dir, path)
+            used_eval_dirs.append(model_output_dir)
+            continue
+
+        if recompute_visual:
+            if phased:
+                print(f"  [recompute-visual] Skipping '{name}': visual patch not supported for phased models.")
+            else:
+                print(f"  [recompute-visual] Generating visual evaluation for '{name}'...")
+                _n_vis = num_samples  # collect full eval budget so windows span all meters; VisualEvaluation subsamples to 5000
+                try:
+                    _run_visual_only(
+                        model=model,
+                        normalizer=normalizer,
+                        conditioner=conditioner,
+                        dataloader=shared_test_loader,
+                        output_dir=model_output_dir,
+                        device=device,
+                        window_size=window.input_len,
+                        n_synthetic_samples=_n_vis,
+                        loader_normalizer=_first_norm,
+                    )
+                except RuntimeError as _ve:
+                    if device != "cpu" and "out of memory" in str(_ve).lower():
+                        print("  [recompute-visual] GPU OOM — retrying on CPU.")
+                        _run_visual_only(
+                            model=model, normalizer=normalizer, conditioner=conditioner,
+                            dataloader=shared_test_loader, output_dir=model_output_dir,
+                            device="cpu", window_size=window.input_len,
+                            n_synthetic_samples=_n_vis,
+                            loader_normalizer=_first_norm,
+                        )
+                    else:
+                        raise
+            used_eval_dirs.append(model_output_dir)
+            continue
 
         if phased:
             # Phased models use PhasedEvaluationSuite which creates sub-phase directories
@@ -1763,26 +2650,125 @@ def compare_models(model_paths: list[str],
                     _tb.print_exc()
 
         used_eval_dirs.append(model_output_dir)
+        # Release GPU memory between models so each starts with a clean VRAM state.
+        import gc as _gc2
+        _gc2.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # 5b. MIA fallback: for each model missing eval_mia_curve.json, run MIA-only.
+    #     Builds loaders on demand when the main loop skipped them (recompute=False).
+    #     When mia_model_names is set, only those models get sidecar computation.
+    _mia_missing = [
+        (i, plan) for i, plan in enumerate(eval_plan)
+        if not os.path.exists(os.path.join(plan["model_output_dir"], "eval_mia_curve.json"))
+        and (mia_model_names is None or plan["name"] in mia_model_names)
+    ]
+    if _mia_missing and data_files:
+        _mia_test_loader = shared_test_loader
+        _mia_train_loader = shared_train_loader
+        _mia_loader_norm = _first_norm
+        _mia_model_cache: dict[int, tuple] = dict(_first_model_cache)
+
+        if _mia_test_loader is None or _mia_train_loader is None:
+            print("\n[MIA fallback] Building data loaders (main loop was skipped)...")
+            try:
+                _mia_first_i, _mia_first_plan = _mia_missing[0]
+                _mia_fm, _mia_fn, _mia_fc = load_model(_mia_first_plan["path"], device=device)
+                _mia_model_cache[_mia_first_i] = (_mia_fm, _mia_fn, _mia_fc)
+                _mia_lo = PhasedReplayDataloaders(
+                    sm_files=data_files, window_spec=window, batch_size=1024,
+                    replay_buffer_capacity=num_samples, min_buffer_size=0,
+                    normalizer=_mia_fn, num_workers=0, phased_mode=phased,
+                    sample_random=False, feature_cols=["hourly_energy_consumption"],
+                    meter_col="meter_number", aggregation_divisor=agg_divisor,
+                    hourly_aggregation=agg_divisor > 1.0,
+                    split_seed=split_seed, split_ratios=split_ratios,
+                    max_value=max_value, pin_memory=False,
+                )
+                _mia_lo.refresh_test_cache(max(1, num_samples // 32))
+                _mia_test_loader = _mia_lo.get_test_loader()
+                _mia_loader_norm = getattr(_mia_lo, "normalizer", None)
+                _mia_train_loader = _build_mia_train_loader(
+                    data_files=data_files, normalizer=_mia_fn,
+                    split_seed=split_seed, split_ratios=split_ratios,
+                    max_value=max_value, window_size=window.input_len,
+                    num_samples=num_samples, phased=phased, agg_divisor=agg_divisor,
+                )
+            except Exception as _mia_build_e:
+                print(f"  [MIA fallback] Could not build loaders: {_mia_build_e}")
+                import traceback as _mia_build_tb; _mia_build_tb.print_exc()
+                _mia_test_loader = None
+                _mia_train_loader = None
+
+        for _mia_i, _mia_plan in _mia_missing:
+            if _mia_test_loader is None or _mia_train_loader is None:
+                print(f"  [MIA fallback] No loaders available; skipping '{_mia_plan['name']}'.")
+                continue
+            print(f"\n[MIA fallback] Running MIA-only for '{_mia_plan['name']}'...")
+            try:
+                if _mia_i in _mia_model_cache:
+                    _fm, _fn, _fc = _mia_model_cache[_mia_i]
+                else:
+                    _fm, _fn, _fc = load_model(_mia_plan["path"], device=device)
+                _run_mia_only(
+                    model=_fm, normalizer=_fn,
+                    train_loader=_mia_train_loader,
+                    test_loader=_mia_test_loader,
+                    output_dir=_mia_plan["model_output_dir"],
+                    device=device, window_size=window.input_len,
+                    loader_normalizer=_mia_loader_norm,
+                )
+            except Exception as _mia_e:
+                print(f"  [MIA fallback] Failed for '{_mia_plan['name']}': {_mia_e}")
+                import traceback as _mia_tb; _mia_tb.print_exc()
 
     # 6. Use PhasedModelComparator to generate comparison tables and plots
     print("\n" + "="*50)
     print("GENERATING COMPARISON")
     print("="*50)
-    
+
+    # Count trainable parameters for each model from its config (best-effort; N/A on failure).
+    _param_counts: dict[str, int | None] = {}
+    for plan in eval_plan:
+        _name = plan["name"]
+        _cfg_path = _find_model_config_path(plan["path"])
+        if _cfg_path is None:
+            print(f"  [params] No config found for '{_name}'; parameter count unavailable.")
+            _param_counts[_name] = None
+            continue
+        try:
+            from src.model.usable.count_learnable_params import (  # noqa: PLC0415
+                _load_config as _clp_load_config,
+                count_from_config as _clp_count,
+            )
+            _cfg = _clp_load_config(_cfg_path)
+            _, _trainable, _ = _clp_count(_cfg)
+            _param_counts[_name] = _trainable
+        except Exception as _pe:
+            print(f"  [params] Could not count params for '{_name}': {_pe}")
+            import traceback as _params_tb; _params_tb.print_exc()
+            _param_counts[_name] = None
+
     comparator = PhasedModelComparator(output_dir=output_dir)
     if len(used_eval_dirs) != len(model_names):
         raise ValueError(
             f"Internal mismatch: have {len(used_eval_dirs)} eval dirs for {len(model_names)} model names."
         )
     for name, eval_dir in zip(model_names, used_eval_dirs):
-        comparator.add_model(name, eval_dir)
+        comparator.add_model(name, eval_dir, trainable_params=_param_counts.get(name))
     
-    comparator.compare()
-    
+    comparator.compare(mia_models=mia_model_names, sort_models=sort_models)
+
     print("\nComparison complete. Results saved to:", output_dir)
     return comparator.models_data
 
 if __name__ == "__main__":
+    import faulthandler as _fh, sys as _sys
+    # Write C-level crash dumps (segfaults, OOM kills) to a file alongside the log.
+    _crash_log = open("compare_models_crash.log", "w")
+    _fh.enable(file=_crash_log, all_threads=True)
+
     parser = argparse.ArgumentParser(description="Compare model evaluation results (reuse outputs or recompute).")
     parser.add_argument("--models", nargs="+", required=False, help="List of model directories (each contains config + checkpoint).")
     parser.add_argument("--names", nargs="+", required=False, help="Display names for models (same length as --models).")
@@ -1799,6 +2785,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default="evaluation_comparison", help="Where to write/read evaluation outputs.")
     parser.add_argument("--phased", action="store_true", help="Use phased evaluation suite.")
     parser.add_argument("--recompute", action="store_true", help="Recompute evaluation even if outputs already exist.")
+    parser.add_argument("--recompute-tstr", action="store_true", help="Recompute only TSTR in all existing eval result files (main eval + all holdout feeders). Skips reconstruction, MIA, and all other synthetic metrics.")
     parser.add_argument("--split-seed", type=int, default=None, help="Seed used for deterministic window-level train/val/test split. Defaults to first model's training config.")
     parser.add_argument("--train-ratio", type=float, default=None, help="Train ratio for split (defaults to first model's training config).")
     parser.add_argument("--val-ratio", type=float, default=None, help="Val ratio for split (defaults to first model's training config).")
@@ -1806,38 +2793,82 @@ if __name__ == "__main__":
     parser.add_argument("--max-value", type=float, default=200.0, help="Maximum value for filtering windows.")
     parser.add_argument("--holdout-n-draws", type=int, default=1, help="Number of synthetic draws to average for holdout feeder profile plot.")
     parser.add_argument("--n-draws", type=int, default=1, help="Number of independent synthetic draws for main test-split eval (Intra-eval variance). 1=single pass (default).")
+    parser.add_argument("--mia-models", nargs="*", default=None, help="Subset of model names to include in MIA plots. Defaults to all models with a sidecar.")
+    parser.add_argument("--recompute-visual", action="store_true", help="Recompute only visual evaluation (reconstruction plots) for all models, skipping all other metrics. Not compatible with phased evaluation.")
+    parser.add_argument("--no-sort", action="store_true", help="Disable automatic model sorting; models appear in the order listed in --names.")
+    parser.add_argument("--only-holdout", action="store_true", help="Only run holdout evaluation (and summary) for models with holdout_feeder_id set in their training config. Skips main test-split evaluation and all metrics except TSTR on the holdout.")
     args = parser.parse_args()
     holdout_n_draws = int(args.holdout_n_draws)
     n_draws = int(args.n_draws)
 
     args.models = [
-                   #"E:/models/new4/CVAE_20260601_034519_guide_cnn",
-                #    "E:/models/new4/DiffusionModel_20260601_002842",
+                #    "E:/models/new4/CVAE_20260601_034519_guide_cnn",
                 #    "E:/models/new4/FaradayModel_20260531_124255",
+                #    "E:/models/new4/FaradayModel_20260601_060319",
                 #    "E:/models/new4/GuidedFaradayModel_20260531_115215",
                 #    "E:/models/new4/GuidedFaradayModel_20260531_131653_relu",
                 #    "E:/models/new4/GuidedFaradayModel_20260531_143252_peaks",
-                #    "E:/models/new4/GuidedFaradayModel_20260531_152154_cnn",
-                #    "E:/models/new4/GuidedFaradayModel_20260531_225823_userprofile",
-                   "E:/models/new4/QuantileBaselineModel_20260601_005326",
-                   "E:/models/new4/CVAE_20260531_185015_guide_cnn_h_broken",
-                   "E:/models/new4/AverageBaselineModel_20260531_173051",
-                   "E:/models/new4/CVAE_20260531_180003_cvae",
+                #    "E:/models/new4/GuidedFaradayModel_20260531_204015",
+                #    "E:/models/new4/GuidedFaradayModel_20260531_211801_cnn",
+                # "E:/models/new4/GuidedFaradayModel_20260531_225823_userprofile",
+                # "E:/models/new3/FaradayModel_20260529_021321", # NOT for holdout
+                # "E:/models/new3/GuidedFaradayModel_20260528_223126", # NOt for holdout
+                # "E:/models/new3/GuidedFaradayModel_20260529_000300_cnn", # NOT for holdout
+                # "E:/models/new3/GuidedFaradayModel_20260529_012840_cnn_mmd" # NOT for holdout
+                # "E:/models/new4/GuidedFaradayModel_20260603_123450", # use
+                # "E:/models/new4/GuidedFaradayModel_20260603_120241", # use
+                # "E:/models/new4/GuidedFaradayModel_20260603_102551", # use
+                "E:/models/new4/CVAE_20260531_185015_guide_cnn_h_broken",
+                "E:/models/new4/DiffusionModel_20260601_002842", # use
+                # "E:/models/new4/FaradayModel_20260601_060319", # USe
+                "E:/models/new4/CVAE_20260601_022452_guide", # USE
+                "E:/models/new4/CVAE_20260531_180003_cvae",
+                "E:/models/new4/QuantileBaselineModel_20260601_005326",
+                "E:/models/new4/AverageBaselineModel_20260531_173051",
                    ]
     args.names = [
-                    #"Guide-CNN",
-                    # "Diffusion",
+                    # "Guide-CNN",
                     # "Faraday",
+                    # "Faraday-new-fix",
                     # "Guided-Faraday",
                     # "Guided-Faraday-RELU",
                     # "Guided-Faraday-PEAKS",
-                    # "Guided-Faraday-CNN",
+                    # "Guided-Faraday-Deterministic",
+                    # "Guided-Faraday-CNN-2",
                     # "Guided-Faraday-UserProfile",
-                    "Baseline-Quantile",
-                    "Guide-CNN-H-Broken",
-                    "Baseline-Average",
-                    "CVAE",
+                    # "Faraday-OLD",
+                    # "Guided-Faraday-OLD",
+                    # "Guided-Faraday-CNN-OLD",
+                    # "Guided-Faraday-CNN-MMD-OLD",
+                    # "Guided-Faraday-CNN", # Use # make holdout
+                    # "Guided-Faraday-UserProfiles", # use # make holdout
+                    # "Guided-Faraday", # USe # make holdout
+                    "H-Guide-CNN", # use
+                    "Diffusion", # use
+                    # "Faraday", # USE # make holdout
+                    "Guide", # USE
+                    "CVAE", # use
+                    "Baseline-Quantile", # use
+                    "Baseline-Average", # use
     ]
+    args.mia_models = [
+        "Guided-Faraday-CNN",
+        "Diffusion",
+        "H-Guide-CNN",
+    ]
+
+    # args.models = ["E:/models/new4/FaradayModel_20260603_133808"]
+    # args.names = ["Faraday-NEW-FIX2"]
+
+    # args.models = ["E:/models/new4/GuidedFaradayModel_20260603_102551",
+    #                "E:/models/new4/GuidedFaradayModel_20260603_120241",
+    #                "E:/models/new4/GuidedFaradayModel_20260603_123450" ]
+    # args.names = ["Guided-Faraday-UserProfiles", 
+    #               "Guided-Faraday", 
+    #               "Guided-Faraday-CNN"]
+
+    # args.models = ["E:/models/new4/FaradayModel_20260601_060319",]
+    # args.names = ["Faraday-new-fix",]
 
     #args.models = ["E:/models/new3/FaradayModel_20260529_021321", "E:/models/new3/GuidedFaradayModel_20260529_000300"]
     #args.names = ["Faraday-NEW", "Guided-Faraday-NEW"]
@@ -1979,24 +3010,39 @@ if __name__ == "__main__":
 
     
 
-    compare_models(
-        model_paths=args.models,
-        model_names=args.names,
-        secondary_model_paths=secondary_model_paths,
-        eval_result_dirs=eval_result_dirs,
-        data_dir=args.data_dir,
-        data_files=args.data_files,
-        num_samples=int(args.num_samples),
-        output_dir=args.output_dir,
-        phased=bool(args.phased),
-        recompute=bool(args.recompute),
-        split_seed=args.split_seed,
-        split_ratios=split_ratios,
-        max_value=args.max_value,
-        agg_divisor=1000.0 if args.phased else 1.0,
-        holdout_n_draws=holdout_n_draws,
-        n_draws=n_draws,
-    )
+    try:
+        compare_models(
+            model_paths=args.models,
+            model_names=args.names,
+            secondary_model_paths=secondary_model_paths,
+            eval_result_dirs=eval_result_dirs,
+            data_dir=args.data_dir,
+            data_files=args.data_files,
+            num_samples=int(args.num_samples),
+            output_dir=args.output_dir,
+            phased=bool(args.phased),
+            recompute=bool(args.recompute),
+            split_seed=args.split_seed,
+            split_ratios=split_ratios,
+            max_value=args.max_value,
+            agg_divisor=1000.0 if args.phased else 1.0,
+            holdout_n_draws=holdout_n_draws,
+            n_draws=n_draws,
+            recompute_tstr=bool(args.recompute_tstr),
+            mia_model_names=args.mia_models if args.mia_models else None,
+            recompute_visual=bool(args.recompute_visual) if hasattr(args, "recompute_visual") else False,
+            sort_models=not bool(args.no_sort),
+            only_holdout=bool(args.only_holdout) if hasattr(args, "only_holdout") else False,
+        )
+    except BaseException as _e:
+        import traceback as _tb
+        print(f"\n{'='*60}", flush=True)
+        print(f"FATAL: {type(_e).__name__}: {_e}", flush=True)
+        print("="*60, flush=True)
+        _tb.print_exc()
+        _tb.print_exc(file=_crash_log)
+        _crash_log.flush()
+        raise
 
 # Example run in CLI: 
 # python src/evaluation/compare_models.py \

@@ -67,12 +67,15 @@ class DispersionCalibrator:
     @staticmethod
     def save_to_checkpoint(checkpoint_path: str, temperature: float) -> None:
         """Write calibrated_temperature into an existing .pt checkpoint file."""
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        with open(checkpoint_path, "rb") as f:
+            ckpt = torch.load(f, map_location="cpu", weights_only=False)
         ckpt["calibrated_temperature"] = float(temperature)
-        torch.save(ckpt, checkpoint_path)
+        with open(checkpoint_path, "wb") as f:
+            torch.save(ckpt, f)
 
     @staticmethod
     def load_from_checkpoint(checkpoint_path: str) -> float | None:
         """Read calibrated_temperature from a .pt checkpoint, or None if absent."""
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        with open(checkpoint_path, "rb") as f:
+            ckpt = torch.load(f, map_location="cpu", weights_only=False)
         return ckpt.get("calibrated_temperature", None)
