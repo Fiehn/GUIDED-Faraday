@@ -2141,6 +2141,7 @@ def _run_holdout_eval_phased(
     window_size: int,
     model_output_dir: str,
     n_synthetic_draws: int = 5,
+    secondary_model=None,
 ) -> None:
     """Run EvalFramework on a phased holdout set and save results.
 
@@ -2153,7 +2154,7 @@ def _run_holdout_eval_phased(
             model=model, normalizer=normalizer, conditioner=conditioner,
             raw_holdout=raw_holdout, holdout_id=holdout_id, device=device,
             window_size=window_size, model_output_dir=model_output_dir,
-            n_synthetic_draws=n_synthetic_draws,
+            n_synthetic_draws=n_synthetic_draws, secondary_model=secondary_model,
         )
     finally:
         _remove_injected_holdout_profiles(conditioner, _injected)
@@ -2169,6 +2170,7 @@ def _run_holdout_eval_phased_inner(
     window_size: int,
     model_output_dir: str,
     n_synthetic_draws: int = 5,
+    secondary_model=None,
 ) -> None:
     import copy
 
@@ -2190,6 +2192,7 @@ def _run_holdout_eval_phased_inner(
         output_path=_plot_dir,
         n_synthetic_samples=n_windows,
         preserve_condition_order=True,
+        secondary_model=secondary_model,
     )
     evaluator.register_all(phased=True)
     try:
@@ -2202,7 +2205,7 @@ def _run_holdout_eval_phased_inner(
                 model=model, dataloader=holdout_loader, normalizer=cpu_norm,
                 conditioner=conditioner, device="cpu", window_size=window_size,
                 output_path=_plot_dir, n_synthetic_samples=n_windows,
-                preserve_condition_order=True,
+                preserve_condition_order=True, secondary_model=secondary_model,
             )
             evaluator.register_all(phased=True)
             repeated_results = evaluator.evaluate_repeated(k=n_synthetic_draws)
@@ -3141,6 +3144,9 @@ def compare_models(model_paths: list[str],
                                     else:
                                         print(f"  [holdout phased] topology_path not in config; cannot load holdout windows.")
                                 _skip_model, _skip_norm, _skip_cond = load_model(path, device=device)
+                                _skip_sec_model = None
+                                if secondary is not None:
+                                    _skip_sec_model, *_ = load_model(secondary, device=device)
                                 for _phoid, _phraw in phased_holdout_cache.items():
                                     _run_holdout_eval_phased(
                                         model=_skip_model,
@@ -3152,6 +3158,7 @@ def compare_models(model_paths: list[str],
                                         window_size=window.input_len,
                                         model_output_dir=model_output_dir,
                                         n_synthetic_draws=holdout_n_draws,
+                                        secondary_model=_skip_sec_model,
                                     )
                                 if phased_holdout_cache:
                                     _write_holdout_summary(model_output_dir, list(phased_holdout_cache.keys()))
@@ -3457,6 +3464,7 @@ def compare_models(model_paths: list[str],
                                     window_size=window.input_len,
                                     model_output_dir=model_output_dir,
                                     n_synthetic_draws=holdout_n_draws,
+                                    secondary_model=sec_model,
                                 )
                         if _fids and any(f in phased_holdout_cache for f in _fids):
                             _write_holdout_summary(model_output_dir, _fids)
@@ -3809,7 +3817,8 @@ if __name__ == "__main__":
     # ]
 
     # PHASED:
-    args.models = ["E:/models/phased2/SetGuideVAE_20260607_124614",
+    args.models = [
+        "E:/models/phased2/SetGuideVAE_20260607_124614",
                    "E:/models/phased2/SetGuideVAE_20260607_132508_CNN",
                   "E:/models/phased2/DiffusionModel_20260607_080656",
                   "E:/models/phased2/SequentialPhaseVAE_20260607_082110",
@@ -3817,7 +3826,8 @@ if __name__ == "__main__":
                     "E:/models/phased2/QuantileBaselineModel_20260607_112946",
                     "E:/models/phased2/AverageBaselineModel_20260607_113136"
                    ]
-    args.secondary_models = [None, 
+    args.secondary_models = [
+        None, 
                              None, 
                              None,
                              None, 
@@ -3825,7 +3835,8 @@ if __name__ == "__main__":
                              None,
                              None
                              ]
-    args.names = ["Set-Guide-VAE",
+    args.names = [
+        "Set-Guide-VAE",
                     "Set-Guide-VAE-CNN",
                     "Diffusion_phased", 
                     "Sequential",
@@ -3833,6 +3844,7 @@ if __name__ == "__main__":
                     "Quantile Baseline",
                     "Average Baseline"
                   ]
+    # uv run .\src\evaluation\compare_models.py --models "s" --names "s" --holdout-n-draws 5 --num-samples 50000 --data-dir "E:\Data\processed_data\second_batch\individual_sm_datasets\raw_profiles" --n-draws 10 --phased --cache-dir "E:/Data/processed_data/cached_data" --no-sort
 
 
     # args.names = ["Diffusion"]
