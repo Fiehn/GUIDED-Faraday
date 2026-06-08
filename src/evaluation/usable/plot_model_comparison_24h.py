@@ -119,14 +119,16 @@ def _get_aggregation_divisor(model_path: str) -> float:
 # Data loading
 # ---------------------------------------------------------------------------
 
-def _load_real_window(
+def _load_real_windows(
     data_path: str,
     seq_len: int,
     aggregation_divisor: float,
-) -> tuple[np.ndarray, int, int]:
-    """Load a random 24h window from a phased parquet file using InMemoryPhasedDataloaders.
+    n: int,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Load n random 24h windows from a phased parquet file.
 
-    Returns (values [seq_len, num_phases], meter_id, unix_timestamp).
+    Returns (windows [n, seq_len, num_phases], mean_window [seq_len, num_phases],
+             meter_id, unix_timestamp of the first sampled window).
     """
     from src.data.dataloader_phased import InMemoryPhasedDataloaders
 
@@ -149,12 +151,16 @@ def _load_real_window(
     if len(ds) == 0:
         raise ValueError(f"No windows loaded from {data_path} — check the file and feature columns.")
 
-    idx = int(torch.randint(len(ds), (1,)).item())
-    # ds.x shape: [N, num_phases, seq_len] — take one window and transpose to [seq_len, num_phases]
-    values = ds.x[idx].cpu().numpy().T
-    meter_id = int(ds.meter_ids[idx].item())
-    timestamp = int(ds.timestamps[idx].item())
-    return values, meter_id, timestamp
+    n_available = len(ds)
+    # Sample with replacement if the file has fewer windows than requested
+    indices = torch.randint(n_available, (n,)).tolist()
+
+    # ds.x shape: [N, num_phases, seq_len] → transpose to [n, seq_len, num_phases]
+    windows = ds.x[indices].cpu().numpy().transpose(0, 2, 1)
+    mean_window = windows.mean(axis=0)
+    meter_id = int(ds.meter_ids[indices[0]].item())
+    timestamp = int(ds.timestamps[indices[0]].item())
+    return windows, mean_window, meter_id, timestamp
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +236,8 @@ def _make_side_by_side(
 
     fig, (ax_real, ax_syn) = plt.subplots(1, 2, figsize=(16, 5), constrained_layout=True)
 
-    _draw_panel(ax_real, real, f"Real — {date_str}", style)
+    real_title = f"Real — {date_str}" if draw_key == "single" else f"Real (mean of {N_MEAN_DRAWS} windows)"
+    _draw_panel(ax_real, real, real_title, style)
     ax_real.set_ylim(y_min, y_max)
     ax_real.set_facecolor("#f5f5f5")
 
@@ -267,7 +274,8 @@ def _save_grid(
     fig, axes = plt.subplots(2, 4, figsize=(24, 9), constrained_layout=True)
     axes_flat = axes.flatten()
 
-    _draw_panel(axes_flat[0], real, f"Real — {date_str}", style)
+    real_title = f"Real — {date_str}" if draw_key == "single" else f"Real (mean of {N_MEAN_DRAWS} windows)"
+    _draw_panel(axes_flat[0], real, real_title, style)
     axes_flat[0].set_ylim(y_min, y_max)
     axes_flat[0].set_facecolor("#f5f5f5")
 
@@ -285,7 +293,7 @@ def _save_grid(
 
     draw_label = f"Mean of {N_MEAN_DRAWS} Draws" if draw_key == "mean" else "Single Draw"
     fig.suptitle(
-        f"3-Phase Synthetic Comparison — {draw_label} — {date_str}",
+        f"3-Phase Synthetic Comparison — {draw_label}" + (f" — {date_str}" if draw_key == "single" else ""),
         fontsize=13,
     )
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
@@ -363,15 +371,16 @@ def main() -> None:
 
     print(f"device={device}\n")
 
-    # Load a random real window
-    print(f"Loading random real window from: {args.data_path}")
-    real_raw, meter_id, timestamp_unix = _load_real_window(
-        args.data_path, args.seq_len, aggregation_divisor
+    # Load real windows — N for the mean figure, 1 (first of the batch) for the single figure
+    print(f"Loading {N_MEAN_DRAWS} random real windows from: {args.data_path}")
+    real_windows, real_mean_raw, meter_id, timestamp_unix = _load_real_windows(
+        args.data_path, args.seq_len, aggregation_divisor, n=N_MEAN_DRAWS
     )
-    real_sorted = _sort_phases(real_raw)
+    real_mean   = _sort_phases(real_mean_raw)
+    real_single = _sort_phases(real_windows[0])
     timestamp_dt = datetime.fromtimestamp(timestamp_unix, tz=timezone.utc)
     date_str = str(pd.to_datetime(timestamp_unix, unit="s").date())
-    print(f"  date={date_str}  shape={real_sorted.shape}\n")
+    print(f"  date={date_str}  loaded {len(real_windows)} windows  shape={real_mean.shape}\n")
 
     # Generate for all models
     model_results: list[dict] = []
@@ -461,11 +470,13 @@ def main() -> None:
                     f"{sum(valid_single)/len(valid_single)*1000:>9.1f}ms\n")
     print(f"  Saved {timing_path}")
 
+    real_by_key = {"mean": real_mean, "single": real_single}
+
     # Save all figures
     print("Saving grid figures...")
     for draw_key in ("mean", "single"):
         _save_grid(
-            real=real_sorted, model_results=model_results, draw_key=draw_key,
+            real=real_by_key[draw_key], model_results=model_results, draw_key=draw_key,
             style=style, meter_id=meter_id, date_str=date_str,
             output_path=os.path.join(OUTPUT_DIR, f"grid_{draw_key}.pdf"),
         )
@@ -473,7 +484,7 @@ def main() -> None:
     print("\nSaving appendix PDFs...")
     for draw_key in ("mean", "single"):
         _save_appendix(
-            real=real_sorted, model_results=model_results, draw_key=draw_key,
+            real=real_by_key[draw_key], model_results=model_results, draw_key=draw_key,
             style=style, meter_id=meter_id, date_str=date_str,
             output_path=os.path.join(OUTPUT_DIR, f"appendix_{draw_key}.pdf"),
         )
@@ -481,7 +492,7 @@ def main() -> None:
     print("\nSaving standalone PDFs...")
     for draw_key in ("mean", "single"):
         _save_standalones(
-            real=real_sorted, model_results=model_results, draw_key=draw_key,
+            real=real_by_key[draw_key], model_results=model_results, draw_key=draw_key,
             style=style, meter_id=meter_id, date_str=date_str,
         )
 
