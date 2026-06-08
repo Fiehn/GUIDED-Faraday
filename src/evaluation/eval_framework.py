@@ -98,6 +98,7 @@ class EvalFramework:
         mia_reconstruction_samples: int = 1,
         preserve_condition_order: bool = False,
         real_data_preprocessed: bool = False,
+        silent: bool = False,
     ):
         """Initialize evaluation framework.
 
@@ -153,6 +154,7 @@ class EvalFramework:
         self.mia_reconstruction_samples = int(mia_reconstruction_samples)
         self.preserve_condition_order = bool(preserve_condition_order)
         self._real_data_preprocessed = bool(real_data_preprocessed)
+        self.silent = bool(silent)
 
         # Metrics storage
         self.reconstruction_metrics: Dict[str, ReconstructionMetric] = {}
@@ -186,11 +188,12 @@ class EvalFramework:
             HourlyProfilesByDayofWeek(),
             HourlyProfilesByMonthAndDayofWeek(),
             EVConditionAccuracy(),
+            VisualEvaluation(),
         ])
         if phased:
             self.register_metric(SetMaximumMeanDiscrepancy())
         else:
-            self.register_metric(MaximumMeanDiscrepancy())
+            self.register_metric(MaximumMeanDiscrepancy(max_samples=5000))
 
         has_train = (
             self.train_dataloader is not None
@@ -737,9 +740,10 @@ class EvalFramework:
             Dict[str, float]: Dictionary mapping metric names to their computed values
         """
         t_total = time.time()
-        print(f"\n{'='*60}")
-        print(f"  {self.evaluation_title}")
-        print(f"{'='*60}")
+        if not self.silent:
+            print(f"\n{'='*60}")
+            print(f"  {self.evaluation_title}")
+            print(f"{'='*60}")
 
         # Prepare data for metrics that need it (reconstructions, synthetic samples)
         self._prepare_data()
@@ -747,7 +751,8 @@ class EvalFramework:
 
         n_real  = 0 if self._real_data  is None else int(len(self._real_data))
         n_synth = 0 if self._synthetic_data is None else int(len(self._synthetic_data))
-        print(f"  Data ready: {n_real} real windows, {n_synth} synthetic samples\n")
+        if not self.silent:
+            print(f"  Data ready: {n_real} real windows, {n_synth} synthetic samples\n")
 
         self.results = {}
 
@@ -759,23 +764,28 @@ class EvalFramework:
         n_total = len(all_metrics)
 
         for i, (name, metric) in enumerate(all_metrics, 1):
-            print(f"  [{i:>{len(str(n_total))}}/{n_total}] {name}...", end='', flush=True)
+            if not self.silent:
+                print(f"  [{i:>{len(str(n_total))}}/{n_total}] {name}...", end='', flush=True)
             t_metric = time.time()
             try:
                 value = metric.compute()
                 self.results[name] = value
                 elapsed = time.time() - t_metric
                 value_str = f"{float(value):.4f}" if isinstance(value, (float, int, np.floating, np.integer)) else str(value)
-                print(f" {value_str}  ({elapsed:.1f}s)")
+                if not self.silent:
+                    print(f" {value_str}  ({elapsed:.1f}s)")
             except Exception as e:
                 elapsed = time.time() - t_metric
-                print(f" ERROR ({elapsed:.1f}s): {e}")
+                if not self.silent:
+                    print(f" ERROR ({elapsed:.1f}s): {e}")
                 if self.verbose:
                     import traceback; traceback.print_exc()
                 self.results[name] = None
+                plt.close('all')
 
-        print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
-        self._print_results_table()
+        if not self.silent:
+            print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
+            self._print_results_table()
 
         return self.results
 
@@ -841,6 +851,7 @@ class EvalFramework:
                 if self.verbose:
                     import traceback; traceback.print_exc()
                 self.results[name] = None
+                plt.close('all')
 
         print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
         self._print_results_table()
@@ -906,6 +917,8 @@ class EvalFramework:
                 except Exception as e:
                     print(f"\n  WARNING: {name} failed on draw {draw_idx + 1}: {e}")
                     per_synth_values[name].append(float("nan"))
+                    plt.close('all')
+            plt.close('all')
             print(f" done ({time.time() - t_draw:.1f}s)")
             import gc as _gc; _gc.collect()
             if torch.cuda.is_available():
@@ -957,6 +970,7 @@ class EvalFramework:
                 if self.verbose:
                     import traceback; traceback.print_exc()
                 self.results[name] = None
+                plt.close('all')
 
         self.baseline_results = self._compute_mean_baseline_results(reconstruction_only=True) if self.include_mean_baseline else {}
 
@@ -971,33 +985,38 @@ class EvalFramework:
             Dict[str, float]: Dictionary mapping synthetic metric names to their computed values
         """
         t_total = time.time()
-        print(f"\n{'='*60}")
-        print(f"  {self.evaluation_title}  [synthetic only]")
-        print(f"{'='*60}")
+        if not self.silent:
+            print(f"\n{'='*60}")
+            print(f"  {self.evaluation_title}  [synthetic only]")
+            print(f"{'='*60}")
 
         self.results = {}
         n_total = len(self.synthetic_metrics)
         for i, (name, metric) in enumerate(self.synthetic_metrics.items(), 1):
-            print(f"  [{i:>{len(str(n_total))}}/{n_total}] {name}...", end='', flush=True)
+            if not self.silent:
+                print(f"  [{i:>{len(str(n_total))}}/{n_total}] {name}...", end='', flush=True)
             t_metric = time.time()
             try:
                 value = metric.compute()
                 self.results[name] = value
                 elapsed = time.time() - t_metric
                 value_str = f"{float(value):.4f}" if isinstance(value, (float, int, np.floating, np.integer)) else str(value)
-                print(f" {value_str}  ({elapsed:.1f}s)")
+                if not self.silent:
+                    print(f" {value_str}  ({elapsed:.1f}s)")
             except Exception as e:
                 elapsed = time.time() - t_metric
-                print(f" ERROR ({elapsed:.1f}s): {e}")
+                if not self.silent:
+                    print(f" ERROR ({elapsed:.1f}s): {e}")
                 if self.verbose:
                     import traceback; traceback.print_exc()
                 self.results[name] = None
 
         self.baseline_results = self._compute_mean_baseline_results(synthetic_only=True) if self.include_mean_baseline else {}
 
-        print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
-        self._print_interpretation_guide()
-        self._print_results_table()
+        if not self.silent:
+            print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
+            self._print_interpretation_guide()
+            self._print_results_table()
         return self.results
 
     def _print_interpretation_guide(self) -> None:
@@ -1119,7 +1138,13 @@ class PhasedEvaluationSuite:
             train_dataloader=self.train_dataloader,
             n_member_samples=self.n_member_samples,
             mia_reconstruction_samples=self.mia_reconstruction_samples,
+            # When a secondary model is present the loader provides raw un-normalized
+            # phased data; the generator handles normalisation internally. Skip the
+            # inverse transform on the real-data side to avoid double-denormalisation.
+            real_data_preprocessed=self.secondary_model is not None,
         )
+        # Force reconstruction collection — needed for phase alignment in evaluate().
+        framework.register_metric(ReconstructionRMSE())
         # Register privacy metrics so _prepare_data collects member windows.
         if self.train_dataloader is not None:
             k = self.mia_reconstruction_samples if self.mia_reconstruction_samples > 1 else (
@@ -1161,6 +1186,7 @@ class PhasedEvaluationSuite:
         output_path: str,
         title: str,
         synthetic_only: bool = False,
+        silent: bool = False,
     ) -> tuple[Dict[str, Any], set[str]]:
         """Run one evaluation pass on pre-split prepared data.
 
@@ -1185,6 +1211,7 @@ class PhasedEvaluationSuite:
             evaluation_title=title,
             verbose=False,
             include_mean_baseline=False,
+            silent=silent,
         )
         evaluator.register_all(phased=True)
         if synthetic_only:
@@ -1263,12 +1290,19 @@ class PhasedEvaluationSuite:
                 'train_data': base._train_data if draw_idx == 0 else None,
                 'train_reconstructed_data': base._train_reconstructed_data if draw_idx == 0 else None,
             }
+            _silent = draw_idx > 0
+            if _silent:
+                print(f"  Draw {draw_idx + 1}/{self.n_draws} (aggregated)...", end="", flush=True)
+                _t = time.time()
             result, once_keys = self._run_prepared_eval(
                 prepared_data=prepared,
                 title=f'AGGREGATED 3-PHASE EVALUATION (draw {draw_idx + 1}/{self.n_draws})',
                 output_path=agg_json_path,
                 synthetic_only=(draw_idx > 0),
+                silent=_silent,
             )
+            if _silent:
+                print(f" done ({time.time() - _t:.1f}s)")
             agg_draw_results.append(result)
             if draw_idx == 0:
                 agg_once_keys = once_keys
@@ -1297,12 +1331,19 @@ class PhasedEvaluationSuite:
                     'timestamps': base._timestamps,
                     'meter_ids': base._meter_ids,
                 }
+                _silent = draw_idx > 0
+                if _silent:
+                    print(f"  Draw {draw_idx + 1}/{self.n_draws} (phase {phase_number})...", end="", flush=True)
+                    _t = time.time()
                 result, once_keys = self._run_prepared_eval(
                     prepared_data=prepared,
                     title=f'ALIGNED PHASE {phase_number} EVALUATION (draw {draw_idx + 1}/{self.n_draws})',
                     output_path=phase_json_path,
                     synthetic_only=(draw_idx > 0),
+                    silent=_silent,
                 )
+                if _silent:
+                    print(f" done ({time.time() - _t:.1f}s)")
                 phase_draw_results.append(result)
                 if draw_idx == 0:
                     phase_once_keys = once_keys

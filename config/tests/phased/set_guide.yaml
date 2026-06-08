@@ -1,9 +1,5 @@
 base: base.yaml
 
-data:
-  batch_size: 256
-  eval_cache_on_gpu: false
-
 model:
   type: set_guide_vae
   latent_dim: 256

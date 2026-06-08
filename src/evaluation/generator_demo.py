@@ -52,10 +52,19 @@ def _format_condition_slice(tag: str, values: np.ndarray) -> str:
     if "user" in tag.lower() or "lda" in tag.lower():
         return f"Dom. Topic {int(np.argmax(values))}"
     if values.size == 1:
-        return f"{float(values[0]):.2f}"
+        v = float(values[0])
+        if np.isclose(v, 1.0, atol=0.1):
+            return "Yes"
+        if np.isclose(v, 0.0, atol=0.1):
+            return "No"
+        return f"{v:.2f}"
     if np.all(values >= 0) and np.isclose(values.sum(), 1.0):
         return f"Class {int(np.argmax(values))}"
     return ", ".join(f"{float(value):.2f}" for value in values)
+
+
+def _prettify_tag(tag: str) -> str:
+    return tag.replace("_", " ").title()
 
 
 def _summarize_used_conditions(used_conditions: torch.Tensor | None, conditioner) -> dict[str, str]:
@@ -135,8 +144,9 @@ def _plot_week(series: np.ndarray, seq_len: int, output_path: str, title: str, c
         handles.append(mpatches.Patch(color='none', label=' '))
         labels.append('--- Conditions ---')
         for k, v in conditions.items():
-            handles.append(mpatches.Patch(color='none', label=f'{k}: {v}'))
-            labels.append(f'{k}: {v}')
+            label = f'{_prettify_tag(k)}: {v}'
+            handles.append(mpatches.Patch(color='none', label=label))
+            labels.append(label)
             
     ax.legend(handles, labels, loc="upper right")
     plt.tight_layout()
@@ -190,12 +200,15 @@ def main():
     parser.add_argument("--days", type=int, default=7, help="Number of days to generate.")
     parser.add_argument("--input-path", default=None, help="CSV or parquet path for reconstruction input.")
     parser.add_argument("--input-date", default=None, help="Date (YYYY-MM-DD) for reconstruction window.")
-    parser.add_argument("--decode-ev-class", type=int, default=3, help="EV class for decoding (1, 2, or 3).")
+    parser.add_argument("--decode-ev-class", type=int, default=1, help="EV class for decoding (1, 2, or 3).")
     parser.add_argument("--num-recon-samples", type=int, default=6, help="Number of decoder samples for reconstruction.")
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature.")
     parser.add_argument("--ev-path", default=None, help="Override path to EV CSV used by conditioner.")
+    parser.add_argument("--model-name", default=None, help="Optional custom name for the model to use in plot titles (overrides auto-extraction).")
 
     args = parser.parse_args()
+
+    #uv run src/evaluation/generator_demo.py --model-path "E:/models/new4/GuidedFaradayModel_20260605_105946" --ev-path "data\EV\EV_detection_reduced_60000_SM.csv"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.output_dir, exist_ok=True)
@@ -252,8 +265,8 @@ def main():
     if not conditions_dict:
         conditions_dict["Model"] = "Unconditioned"
 
-    week_path = os.path.join(args.output_dir, "week_generation.png")
-    model_name = os.path.basename(os.path.normpath(args.model_path))
+    week_path = os.path.join(args.output_dir, "week_generation.pdf")
+    model_name = os.path.basename(os.path.normpath(args.model_path)) if args.model_name is None else args.model_name
     _plot_week(
         week_series,
         seq_len=seq_len,

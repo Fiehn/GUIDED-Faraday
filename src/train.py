@@ -5,7 +5,10 @@ import shutil
 import yaml
 import copy
 import json
+import faulthandler
 from types import SimpleNamespace
+
+faulthandler.enable()  # dumps C-level traceback on SIGSEGV / fatal errors
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
@@ -93,27 +96,39 @@ def train(config, train_only_user_profile: bool = False):
     writer = Writer(log_dir=os.path.join(log_path, 'logs'))
 
     # === Data loader ===
-    data_paths = []
     configured_files = list(config.data_files) if len(config.data_files) > 0 else []
     if len(configured_files) > 0:
+        data_paths = []
         for f in configured_files:
-            if os.path.isabs(f):
-                data_paths.append(f)
-            else:
-                data_paths.append(os.path.join(data_dir, f))
+            p = f if os.path.isabs(f) else os.path.join(data_dir, f)
+            data_paths.append(p)
+        # configured paths may not exist yet — filter with os.path.exists
+        parquet_paths = sorted([p for p in data_paths if os.path.exists(p)])
     else:
-        for root, _, files in os.walk(data_dir):
-            for f in files:
-                if f.endswith(".parquet") and not f.startswith("test"):
-                    data_paths.append(os.path.join(root, f))
-    
-    parquet_paths = sorted([p for p in data_paths if os.path.exists(p)])
+        # os.scandir yields DirEntry objects whose .is_file() costs no extra syscall
+        # on Windows (the file type is included in the directory listing result).
+        # This avoids both the overhead of os.walk's recursive bookkeeping and the
+        # redundant os.path.exists() calls that would follow — critical when data_dir
+        # contains tens of thousands of files on a slow drive.
+        data_paths = []
+        def _scan_parquet(directory):
+            with os.scandir(directory) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        _scan_parquet(entry.path)
+                    elif entry.is_file() and entry.name.endswith(".parquet") and not entry.name.startswith("test"):
+                        data_paths.append(entry.path)
+        _scan_parquet(data_dir)
+        # Files discovered by scandir already exist — no os.path.exists needed.
+        parquet_paths = sorted(data_paths)
     if len(parquet_paths) == 0:
         raise ValueError(f"No data files (.parquet) found in: {data_dir}")
     
     data_cfg = getattr(config, "data", SimpleNamespace())
     holdout_feeder_id = getattr(data_cfg, "holdout_feeder_id", None)
     topology_path = getattr(data_cfg, "topology_path", None)
+    _hm = getattr(data_cfg, "holdout_meter_ids", None)
+    holdout_meter_ids: list[int] | None = [int(m) for m in _hm] if _hm else None
 
     if phased_mode:
         print(f"Data is Phased.")
@@ -182,33 +197,58 @@ def train(config, train_only_user_profile: bool = False):
     in_memory = bool(getattr(data_cfg, "in_memory", False))
 
     if in_memory and phased_mode:
-        print("Using InMemoryPhasedDataloaders.")
         _phased_feature_cols = ["active_power_p14_l1", "active_power_p14_l2", "active_power_p14_l3"]
-        data_loader = InMemoryPhasedDataloaders(
-            sm_files=parquet_paths,
-            feature_cols=_phased_feature_cols,
-            window_len=int(config.window.input_len),
-            stride=int(config.window.stride),
-            batch_size=int(data_cfg.batch_size),
-            aggregation=bool(data_cfg.window.aggregated),
-            base_frequency="1h" if data_cfg.window.aggregated else "15min",
-            aggregation_divisor=aggregation_divisor,
-            split_ratios={
-                "train_ratio": float(getattr(data_cfg.splits, "train_ratio", 1.0)),
-                "val_ratio":   float(getattr(data_cfg.splits, "val_ratio",   0.0)),
-                "test_ratio":  float(getattr(data_cfg.splits, "test_ratio",  0.0)),
-            },
-            split_seed=int(getattr(data_cfg.splits, "random_seed", 0)),
-            max_hour_value=float(v) if (v := getattr(data_cfg, "max_hour_value", None)) is not None else None,
-            max_value=float(v) if (v := getattr(data_cfg, "max_value", None)) is not None else None,
-            nan_as_zero=nan_as_zero,
-            normalizer=normalizer,
-            output_aggregate_stream=output_aggregate_stream,
-            pin_memory=(str(device) != "cpu"),
-            eval_cache_device=eval_cache_device,
-            holdout_feeder_id=holdout_feeder_id,
-            topology_path=topology_path,
+        print(
+            f"Using InMemoryPhasedDataloaders — loading {len(parquet_paths):,} files into RAM. "
+            f"If the process is killed silently here, the system ran out of memory.",
+            flush=True,
         )
+        try:
+            data_loader = InMemoryPhasedDataloaders(
+                sm_files=parquet_paths,
+                feature_cols=_phased_feature_cols,
+                window_len=int(config.window.input_len),
+                stride=int(config.window.stride),
+                batch_size=int(data_cfg.batch_size),
+                aggregation=bool(data_cfg.window.aggregated),
+                base_frequency="1h" if data_cfg.window.aggregated else "15min",
+                aggregation_divisor=aggregation_divisor,
+                split_ratios={
+                    "train_ratio": float(getattr(data_cfg.splits, "train_ratio", 1.0)),
+                    "val_ratio":   float(getattr(data_cfg.splits, "val_ratio",   0.0)),
+                    "test_ratio":  float(getattr(data_cfg.splits, "test_ratio",  0.0)),
+                },
+                split_seed=int(getattr(data_cfg.splits, "random_seed", 0)),
+                max_hour_value=float(v) if (v := getattr(data_cfg, "max_hour_value", None)) is not None else None,
+                max_value=float(v) if (v := getattr(data_cfg, "max_value", None)) is not None else None,
+                nan_as_zero=nan_as_zero,
+                normalizer=normalizer,
+                output_aggregate_stream=output_aggregate_stream,
+                pin_memory=(str(device) != "cpu"),
+                eval_cache_device=eval_cache_device,
+                holdout_feeder_id=holdout_feeder_id,
+                topology_path=topology_path,
+                holdout_meter_ids=holdout_meter_ids,
+                num_workers=workers,
+                preprocessed_cache_dir=getattr(data_cfg, "preprocessed_cache_dir", None) or None,
+            )
+        except MemoryError as _e:
+            print(
+                f"\n[train] FATAL: ran out of memory while building InMemoryPhasedDataloaders.\n"
+                f"  Reduce num_workers, use in_memory: false, or add more RAM.\n"
+                f"  Details: {_e}",
+                flush=True,
+            )
+            raise SystemExit(1) from _e
+        except Exception as _e:
+            import traceback
+            print(
+                f"\n[train] FATAL: InMemoryPhasedDataloaders construction failed:\n"
+                f"  {type(_e).__name__}: {_e}\n",
+                flush=True,
+            )
+            traceback.print_exc()
+            raise SystemExit(1) from _e
     elif in_memory:
         print("Using InMemoryCSVDataloaders. Note: this may lead to high memory usage.")
         data_loader = InMemoryCSVDataloaders(
@@ -267,6 +307,7 @@ def train(config, train_only_user_profile: bool = False):
             max_hour_value=float(v) if (v := getattr(data_cfg, "max_hour_value", None)) is not None else None,
             holdout_feeder_id=holdout_feeder_id,
             topology_path=topology_path,
+            holdout_meter_ids=holdout_meter_ids,
         )
 
     if conditioner is not None:

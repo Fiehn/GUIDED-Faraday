@@ -55,3 +55,19 @@ class BaseConditioner(ABC):
                     if isinstance(v, torch.Tensor):
                         attr_value[i] = v.to(device)
         return self
+
+    def __getstate__(self):
+        """Prevents pickling of dynamically generated device caches."""
+        state = self.__dict__.copy()
+        state.pop('_lookup_by_device', None)
+        state.pop('_profile_lookup_tensors', None)
+        return state
+
+    def __setstate__(self, state):
+        """Restores empty caches when unpickled so they rebuild on-the-fly."""
+        self.__dict__.update(state)
+        # Re-initialize so downstream checks don't fail
+        if not hasattr(self, '_lookup_by_device'):
+            self._lookup_by_device = {}
+        if not hasattr(self, '_profile_lookup_tensors'):
+            self._profile_lookup_tensors = {}

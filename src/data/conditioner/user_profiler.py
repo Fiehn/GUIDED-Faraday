@@ -737,3 +737,24 @@ class UserProfiler(LatentDirichletAllocation, BaseConditioner):
         self._invalidate_profile_lookup()
         if self.verbose:
             print(f"Loaded model with {len(self.user_profiles_cache)} cached profiles")
+    
+    def __getstate__(self):
+        # Cooperate with sklearn's BaseEstimator.__getstate__ 
+        if hasattr(super(), '__getstate__'):
+            state = super().__getstate__().copy()
+        else:
+            state = self.__dict__.copy()
+            
+        # Strip out device tensors
+        state.pop('_profile_lookup_tensors', None)
+        return state
+
+    def __setstate__(self, state):
+        if hasattr(super(), '__setstate__'):
+            super().__setstate__(state)
+        else:
+            self.__dict__.update(state)
+            
+        # Ensure dict exists to be repopulated dynamically
+        if not hasattr(self, '_profile_lookup_tensors'):
+            self._profile_lookup_tensors = {}

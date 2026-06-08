@@ -665,7 +665,7 @@ def reconstruct_topic_curves(profiler) -> np.ndarray:
 
 def plot_topic_curves(topic_curves: np.ndarray, save_path: str) -> None:
     """Saves an 8×5 grid of 24h topic curve subplots."""
-    nrows, ncols = 8, 5
+    nrows, ncols = 4, 10
     n_topics = topic_curves.shape[0]
     hours = np.arange(24)
     fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3, nrows * 2))
@@ -795,49 +795,49 @@ def main():
         print(f"MODE: {mode_label}")
         print(f"{'='*60}")
 
-        cluster_labels, features_pca, pca_model, _ = run_pca_and_clustering(
-            x_windows, metadata, k=k_target,
-            conditions_in=do_conditions_in,
-            conditioners_dict=conditioners_dict,
-        )
+        # cluster_labels, features_pca, pca_model, _ = run_pca_and_clustering(
+        #     x_windows, metadata, k=k_target,
+        #     conditions_in=do_conditions_in,
+        #     conditioners_dict=conditioners_dict,
+        # )
 
         # Cross tabulation
-        xtab_dir = os.path.join(base_dir, "cross_tabulation", mode_label)
-        df, dominant_combos = find_dominant_combinations(
-            metadata, cluster_labels, save_dir=xtab_dir
-        )
+        # xtab_dir = os.path.join(base_dir, "cross_tabulation", mode_label)
+        # df, dominant_combos = find_dominant_combinations(
+        #     metadata, cluster_labels, save_dir=xtab_dir
+        # )
 
         # Archetypes
-        archetype_dir = os.path.join(base_dir, "archetypes", mode_label)
-        plot_archetypes(
-            x_windows, cluster_labels, df["cluster"].nunique(), archetype_dir,
-            dominant_combos=dominant_combos,
-        )
+        # archetype_dir = os.path.join(base_dir, "archetypes", mode_label)
+        # plot_archetypes(
+        #     x_windows, cluster_labels, df["cluster"].nunique(), archetype_dir,
+        #     dominant_combos=dominant_combos,
+        # )
 
-        # PCA scatters (skip with --no_scatter to save time)
-        if not args.no_scatter:
-            scatter_dir = os.path.join(base_dir, "pca_scatters", mode_label)
-            plot_pca_scatters(features_pca, df, scatter_dir)
-            print(f"PCA scatters→ {scatter_dir}")
+        # # PCA scatters (skip with --no_scatter to save time)
+        # if not args.no_scatter:
+        #     scatter_dir = os.path.join(base_dir, "pca_scatters", mode_label)
+        #     plot_pca_scatters(features_pca, df, scatter_dir)
+        #     print(f"PCA scatters→ {scatter_dir}")
 
-        # PCA loadings
-        if do_conditions_in:
-            cond_names = []
-            for key, cond_obj in conditioners_dict.items():
-                if key in metadata:
-                    cond_names += [f"{key}_{j}" for j in range(cond_obj.condition_dim)]
-            feature_names = shape_feature_names + cond_names
-        else:
-            feature_names = shape_feature_names
+        # # PCA loadings
+        # if do_conditions_in:
+        #     cond_names = []
+        #     for key, cond_obj in conditioners_dict.items():
+        #         if key in metadata:
+        #             cond_names += [f"{key}_{j}" for j in range(cond_obj.condition_dim)]
+        #     feature_names = shape_feature_names + cond_names
+        # else:
+        #     feature_names = shape_feature_names
 
-        loadings_path = os.path.join(base_dir, "pca_loadings", f"loadings_{mode_label}.png")
-        plot_pca_loadings(pca_model, feature_names, loadings_path)
+        # loadings_path = os.path.join(base_dir, "pca_loadings", f"loadings_{mode_label}.png")
+        # plot_pca_loadings(pca_model, feature_names, loadings_path)
 
-        print(f"Archetypes  → {archetype_dir}")
-        print(f"Loadings    → {loadings_path}")
+        # print(f"Archetypes  → {archetype_dir}")
+        # print(f"Loadings    → {loadings_path}")
 
-        expl = np.sum(pca_model.explained_variance_ratio_) * 100
-        print(f"Explained variance (top {pca_model.n_components_} PCs): {expl:.1f}%")
+        # expl = np.sum(pca_model.explained_variance_ratio_) * 100
+        # print(f"Explained variance (top {pca_model.n_components_} PCs): {expl:.1f}%")
     
     # 4. UserProfiler-specific analysis (if we have a profiler checkpoint)
     if args.profiler_path is not None:
@@ -853,7 +853,7 @@ def main():
 
         # 4a. Topic curve grid
         topic_curves = reconstruct_topic_curves(profiler)
-        topic_curves_path = os.path.join(profiler_dir, "topic_curves.png")
+        topic_curves_path = os.path.join(profiler_dir, "topic_curves.pdf")
         plot_topic_curves(topic_curves, topic_curves_path)
         print(f"Topic curves → {topic_curves_path}")
 

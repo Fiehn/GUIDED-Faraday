@@ -8,23 +8,24 @@ model:
   latent_dim: 128
   encoder:
     type: cnn
-    hidden_dims: [64, 128, 256, 192]   # 4 conv layers, downsample every 2nd
+    hidden_dims: [64, 128, 128, 128]
   decoder:
     type: mlp
-    hidden_dims: [128, 256, 256, 512]
+    hidden_dims: [128, 256, 512, 512, 512, 512]
+    mu_activation: "softplus"
 
   faraday:
     mse_weight: 10.0
-    mmd_weight: 2000.0
+    mmd_weight: 100.0
     upper_quantile_weight: 100.0
     lower_quantile_weight: 100.0
     median_quantile_weight: 100.0
 
   guided_faraday:
     dictionary_size: 256
-    pdcc_average_max_std: 1.0 # scales PDCC noise; ~0.5 * sqrt(24/100) * 10 is ca 4.9 std in output space'
+    pdcc_average_max_std: 2.0 # scales PDCC noise; ~0.5 * sqrt(24/100) * 10 is ca 4.9 std in output
+    encoder_exclude_tags: []
     stochastic_loss: false
-    encoder_exclude_tags: [user_profiles]
 
   gmm:
     n_components: 300      # 300 causes degenerate components when MMD regularization is strong
@@ -40,4 +41,4 @@ early_stopping:
     min_delta: 0.001
 
 conditioning:
-  tags: [day_of_week, month_of_year, heatpump_phase, ev, pv, user_profiles]
+  tags: [day_of_week, month_of_year, heatpump_phase, ev, pv]

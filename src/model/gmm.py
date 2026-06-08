@@ -86,11 +86,12 @@ class GaussianMixtureModel(nn.Module):
     on the same device without any CPU round-trips.
     """
 
-    def __init__(self, n_components: int, n_features: int, reg_covar: float = 1e-6):
+    def __init__(self, n_components: int, n_features: int, reg_covar: float = 1e-6, latent_dim: int = 0):
         super().__init__()
         self.n_components = n_components
         self.n_features = n_features
         self.reg_covar = reg_covar
+        self.latent_dim = latent_dim
 
         self.register_buffer("weights", torch.empty(n_components))
         self.register_buffer("means", torch.empty(n_components, n_features))
@@ -213,3 +214,76 @@ class GaussianMixtureModel(nn.Module):
                 chunks.append(dist.sample((int(count),)))
 
         return torch.cat(chunks, dim=0)  # [n_samples, n_features]
+
+    @torch.no_grad()
+    def sample_conditional(self, c: torch.Tensor) -> torch.Tensor:
+        """Draw one z per row from p(z | c) using Gaussian conditioning.
+
+        Requires latent_dim > 0.  c: [N, cond_dim] → returns [N, latent_dim].
+        """
+        if self.latent_dim <= 0:
+            raise ValueError("sample_conditional requires latent_dim > 0")
+
+        N = c.shape[0]
+        d_z = self.latent_dim                              # z dimensionality
+        device = self.means.device
+        dtype = self.means.dtype
+        c = c.to(device=device, dtype=dtype)
+
+        # --- reweight component log-probs by p(c | mu_k_c, Sigma_k_cc) ---
+        mu_c = self.means[:, d_z:]                        # [K, d_c]
+        cov_cc = self.covariances[:, d_z:, d_z:]          # [K, d_c, d_c]
+
+        # log N(c[n] | mu_k_c, Sigma_k_cc) for all (n, k)  →  [N, K]
+        log_w = self.weights.log()                        # [K]
+        d_c = mu_c.shape[1]
+        pi_const = torch.tensor(torch.pi, device=device, dtype=dtype)
+        log_p_c = torch.empty(N, self.n_components, device=device, dtype=dtype)
+        eye_c = torch.eye(d_c, device=device, dtype=dtype)
+        for k in range(self.n_components):
+            diff = c - mu_c[k]                            # [N, d_c]
+            cov_k = cov_cc[k] + eye_c * self.reg_covar
+            L = torch.linalg.cholesky(cov_k)
+            # mahalanobis^2 = sum((L^{-1} diff)^2, dim=-1)
+            v = torch.linalg.solve_triangular(L, diff.T, upper=False).T  # [N, d_c]
+            maha2 = v.square().sum(dim=-1)                # [N]
+            log_det = L.diagonal().log().sum()
+            log_p_c[:, k] = -0.5 * (d_c * torch.log(2 * pi_const) + maha2) - log_det
+
+        log_weights_c = log_w + log_p_c                  # [N, K]
+        log_norm = torch.logsumexp(log_weights_c, dim=1, keepdim=True)
+        log_resp = log_weights_c - log_norm               # [N, K]
+
+        # --- sample a component index per row ---
+        probs = log_resp.exp()                            # [N, K]
+        k_idx = torch.multinomial(probs, num_samples=1).squeeze(1)  # [N]
+
+        # --- Gaussian conditioning per sample ---
+        mu_z = self.means[:, :d_z]                       # [K, d_z]
+        cov_zz = self.covariances[:, :d_z, :d_z]         # [K, d_z, d_z]
+        cov_zc = self.covariances[:, :d_z, d_z:]          # [K, d_z, d_c]
+
+        eye_z = torch.eye(d_z, device=device, dtype=dtype)
+        samples = torch.empty(N, d_z, device=device, dtype=dtype)
+        for k in range(self.n_components):
+            mask = (k_idx == k).nonzero(as_tuple=True)[0]
+            if mask.numel() == 0:
+                continue
+            c_k = c[mask]                                 # [M, d_c]
+            diff_c = c_k - mu_c[k]                       # [M, d_c]
+            cov_k = cov_cc[k] + eye_c * self.reg_covar
+
+            # mu_z|c = mu_z_k + Sigma_zc @ Sigma_cc^{-1} @ diff_c^T  →  [d_z, M]
+            gain = torch.linalg.solve(cov_k, cov_zc[k].T)  # [d_c, d_z]
+            mu_cond = mu_z[k] + (diff_c @ gain)           # [M, d_z]
+
+            # Sigma_z|c = Sigma_zz - Sigma_zc @ Sigma_cc^{-1} @ Sigma_cz
+            sigma_cond = cov_zz[k] - cov_zc[k] @ gain + eye_z * self.reg_covar
+            L_z = torch.linalg.cholesky(sigma_cond)
+
+            dist = torch.distributions.MultivariateNormal(
+                loc=mu_cond, scale_tril=L_z
+            )
+            samples[mask] = dist.sample()
+
+        return samples  # [N, latent_dim]

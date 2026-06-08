@@ -19,7 +19,7 @@ from src.data.conditioner import (
     HolidayConditioner, MonthOfYearConditioner, 
     ActivePhaseCountConditioner, HeatpumpPhaseConditioner, ElectricVehicleConditioner, SolarPanelConditioner, ElectricVehicleConditionerBool
 )
-from src.model.baseline import AverageBaselineModel, QuantileBaselineModel, FlatMeanBaselineModel
+from src.model.baseline import AverageBaselineModel, QuantileBaselineModel, FlatMeanBaselineModel, RealDataBaselineModel
 def _to_namespace(obj):
     if isinstance(obj, dict):
         return SimpleNamespace(**{k: _to_namespace(v) for k, v in obj.items()})
@@ -372,6 +372,15 @@ def create_model_from_config(config, device ="cpu"):
                                         sequence_length=seq_len,
                                         device=device,
                                      )
+    elif model_type == "baseline_real_data":
+        model = RealDataBaselineModel(
+            phased_mode=phased_mode,
+            sequence_length=seq_len,
+            device=device,
+            conditioner=conditioner,
+            reservoir_size=getattr(model_cfg, "reservoir_size", 500_000),
+            min_bucket_samples=getattr(model_cfg, "min_bucket_samples", 30),
+        )
     elif model_type == "sequential_vae":
         model = SequentialPhaseVAE(
             input_dim=input_dim,
@@ -417,6 +426,7 @@ def create_model_from_config(config, device ="cpu"):
             stochastic_loss=bool(getattr(gf_cfg, "stochastic_loss", True)),
             encoder_exclude_tags=list(getattr(gf_cfg, "encoder_exclude_tags", [])) or None,
             decoder_mu_activation=decoder_mu_activation,
+            gmm_include_tags=list(getattr(gf_cfg, "gmm_include_tags", [])) or None,
         )
     elif model_type == "faraday":
         from src.model.faraday import FaradayModel

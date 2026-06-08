@@ -123,8 +123,9 @@ class HierarchicalSplitter(BaseModel):
         device = next(self.parameters()).device
         for batch in valloader:
             batch = self.move_to_device(batch, device)
-            x_raw, meter_id, timestamps, x_agg = self._unpack_batch(batch)
+            x_raw, meter_id, timestamps, _ = self._unpack_batch(batch)
             x_true_phases = self._to_phase_first(x_raw).float()
+            x_agg = x_true_phases.sum(dim=1, keepdim=True)  # [B, 1, 24]
 
             x_for_cond = self._build_condition_input(x_true_phases)
             c = self.conditioner.get_conditions(x_for_cond, meter_id=meter_id, timestamps=timestamps)

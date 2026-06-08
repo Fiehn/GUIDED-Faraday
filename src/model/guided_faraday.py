@@ -130,6 +130,7 @@ class GuidedFaradayModel(BaseModel):
         stochastic_loss: bool = True,
         encoder_exclude_tags: list[str] | None = None,
         decoder_mu_activation: str = "softplus",
+        gmm_include_tags: list[str] | None = None,
         **kwargs,
     ):
         super().__init__(phased_mode=phased_mode, sequence_length=sequence_length)
@@ -181,10 +182,29 @@ class GuidedFaradayModel(BaseModel):
 
         self.hierarchy = None
 
+        # Resolve household condition indices for conditional GMM prior.
+        gmm_hh_indices: list[int] = []
+        if conditioner is not None and gmm_include_tags:
+            for tag in gmm_include_tags:
+                try:
+                    start, end = conditioner.get_condition_indexes(tag)
+                    gmm_hh_indices.extend(range(start, end))
+                except ValueError:
+                    pass
+        _gmm_hh_idx_tensor = (
+            torch.tensor(gmm_hh_indices, dtype=torch.long)
+            if gmm_hh_indices
+            else torch.tensor([], dtype=torch.long)
+        )
+        self.register_buffer("_gmm_hh_indices", _gmm_hh_idx_tensor)
+        self._gmm_hh_indices: torch.Tensor = _gmm_hh_idx_tensor  # typed alias for static analysis
+
+        gmm_n_features = latent_dim + len(gmm_hh_indices)
         self.gmm = GaussianMixtureModel(
             n_components=gmm_n_components,
-            n_features=latent_dim,
+            n_features=gmm_n_features,
             reg_covar=gmm_reg_covar,
+            latent_dim=latent_dim if gmm_hh_indices else 0,
         )
 
         self.mse_weight = mse_weight
@@ -338,7 +358,12 @@ class GuidedFaradayModel(BaseModel):
         B = c.shape[0]
 
         if self.gmm.fitted:
-            z_flat = self.gmm.sample(num_prior_samples * B)[:, : self.latent_dim]
+            if self.gmm.latent_dim > 0 and self._gmm_hh_indices.numel() > 0:
+                c_hh = c[:, self._gmm_hh_indices]  # [B, hh_cond_dim]
+                c_hh_exp = c_hh.unsqueeze(0).expand(num_prior_samples, -1, -1).reshape(num_prior_samples * B, -1)
+                z_flat = self.gmm.sample_conditional(c_hh_exp)  # [num_prior_samples*B, latent_dim]
+            else:
+                z_flat = self.gmm.sample(num_prior_samples * B)[:, : self.latent_dim]
         else:
             z_flat = torch.randn(num_prior_samples * B, self.latent_dim, device=device)
 
@@ -400,7 +425,11 @@ class GuidedFaradayModel(BaseModel):
                 x_flat = self._prep_inputs(x)
                 c = self._get_conditions(x, meter_id=meter_id, timestamps=timestamps, device=device)
                 mu, _ = self.encoder(x_flat, self._enc_conditions(c))
-                z_list.append(mu)
+                if self._gmm_hh_indices.numel() > 0:
+                    c_hh = c[:, self._gmm_hh_indices]
+                    z_list.append(torch.cat([mu, c_hh], dim=-1))
+                else:
+                    z_list.append(mu)
 
         if not z_list:
             return

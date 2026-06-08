@@ -7,6 +7,19 @@ from model.model_utils import *
 
 from model.model import BaseModel
 
+
+def _sort_phases(x: torch.Tensor) -> torch.Tensor:
+    """Sort the phase channels of x ascending by per-sample mean energy.
+
+    Input/output shape: [B, num_phases, L].
+    Gives each sample a canonical ordering (channel 0 = smallest load phase,
+    channel num_phases-1 = largest) so the model sees consistent structure
+    across meters regardless of physical L1/L2/L3 wiring convention.
+    """
+    sort_idx = x.mean(dim=-1).argsort(dim=-1, stable=True)  # [B, num_phases]
+    return torch.gather(x, 1, sort_idx.unsqueeze(-1).expand_as(x))
+
+
 class NoiseScheduler(nn.Module):
     """Noise schedule for diffusion models. Supports linear and cosine schedules. 
     Precomputes and buffers all necessary noise parameters for efficient sampling and training.
@@ -414,10 +427,7 @@ class DiffusionModel(BaseModel):
 
         x_raw, meter_id, timestamps, agg = self._unpack_batch(batch)
         x_phase_first = self._to_phase_first(x_raw).float()
-
-        if self.training:
-            perm = torch.randperm(x_phase_first.size(1), device=x_phase_first.device)
-            x_phase_first = x_phase_first[:, perm, :]
+        x_phase_first = _sort_phases(x_phase_first)
 
         b_size = x_phase_first.size(0)
         c = self._prepare_provided_conditions(
@@ -467,7 +477,7 @@ class DiffusionModel(BaseModel):
         for batch in valloader:
             x_raw, meter_id, timestamps, x_agg = self._unpack_batch(batch)
             x_raw = self.move_to_device(x_raw, device=device).float()
-            x_phase_first = self._to_phase_first(x_raw)
+            x_phase_first = _sort_phases(self._to_phase_first(x_raw))
 
             b_size = x_phase_first.size(0)
 
@@ -572,7 +582,7 @@ class DiffusionModel(BaseModel):
         self.to(device)
 
         x_in = self.move_to_device(x, device=device).float()
-        x_phase_first = self._to_phase_first(x_in)
+        x_phase_first = _sort_phases(self._to_phase_first(x_in))
 
         if c is None:
             c = self._build_conditions(

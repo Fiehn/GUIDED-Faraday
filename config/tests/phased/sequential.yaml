@@ -1,15 +1,5 @@
 base: base.yaml
 
-data:
-  batch_size: 256
-  eval_cache_on_gpu: false
-  columns:
-    value_cols: [phase_1, phase_2, phase_3]
-
-conditioning:
-  heatpump_phase:
-    path: data/HP/label_propagation_predictions.csv
-
 training:
   lr_scheduler:
     scheduler_type: exponential
@@ -17,10 +7,6 @@ training:
   beta_annealing:
     enabled: false
   weighted_loss: 0.0
-
-logging:
-  log_dir: models/sequential_phase_vae
-  config_save_dir: models/sequential_phase_vae
 
 model:
   type: sequential_vae

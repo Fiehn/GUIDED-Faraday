@@ -1,6 +1,188 @@
 from model.model import BaseModel
 import torch
 
+
+class RealDataBaselineModel(BaseModel):
+    """Stores 500k real training windows (reservoir sampling, bucketed by conditions).
+    sample() draws randomly from the matching condition bucket — no generation involved.
+    reconstruct() is identity, giving RMSE=0 by construction.
+    Use this as an evaluation oracle: its metric scores represent what a perfect
+    generative model would achieve if it reproduced the training distribution exactly.
+    """
+
+    def __init__(
+        self,
+        phased_mode: bool = False,
+        sequence_length: int = 24,
+        device: str = "cpu",
+        conditioner=None,
+        reservoir_size: int = 500_000,
+        min_bucket_samples: int = 30,
+        **kwargs,
+    ):
+        super().__init__(phased_mode=phased_mode, sequence_length=sequence_length, **kwargs)
+        self.device = device
+        self.conditioner = conditioner
+        self.reservoir_size = reservoir_size
+        self.min_bucket_samples = min_bucket_samples
+        self.normalizer = None  # injected at inference time by SyntheticGenerator
+        self.tag = "baseline_real_data" + ("_phased" if phased_mode else "")
+
+        if conditioner is not None:
+            self._bucket_tags, self._bucket_slices, self._bucket_cardinalities = \
+                AverageBaselineModel._compute_bucket_metadata(conditioner)
+            self._num_buckets = 1
+            for c in self._bucket_cardinalities:
+                self._num_buckets *= c
+            self._num_buckets = max(self._num_buckets, 1)
+        else:
+            self._bucket_tags = []
+            self._bucket_slices = []
+            self._bucket_cardinalities = []
+            self._num_buckets = 0
+
+        self.register_buffer("n_seen", torch.tensor(0, dtype=torch.long))
+        self.register_buffer(
+            "reservoir",
+            torch.empty((reservoir_size, sequence_length, self.num_features), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "reservoir_bucket_ids",
+            torch.zeros(reservoir_size, dtype=torch.long),
+        )
+
+    def _conditions_to_bucket_indices(self, conditions: torch.Tensor) -> torch.Tensor:
+        """Convert [B, D] condition vector to [B] mixed-radix bucket index."""
+        B = conditions.shape[0]
+        device = conditions.device
+        indices = torch.zeros(B, dtype=torch.long, device=device)
+        n = len(self._bucket_slices)
+        for i, ((start, end), cardinality) in enumerate(zip(self._bucket_slices, self._bucket_cardinalities)):
+            sliced = conditions[:, start:end]
+            disc = sliced.argmax(dim=-1) if (end - start) > 1 else (sliced[:, 0] >= 0.5).long()
+            stride = 1
+            for j in range(i + 1, n):
+                stride *= self._bucket_cardinalities[j]
+            indices = indices + disc * stride
+        return indices.clamp(0, max(self._num_buckets - 1, 0))
+
+    def get_optimizer(self, lr, weight_decay, *args, **kwargs):
+        dummy_param = torch.nn.Parameter(torch.zeros(1))
+        return torch.optim.Adam([dummy_param], lr=lr)
+
+    @torch.no_grad()
+    def update(self, batch: torch.Tensor):
+        x, meter_id, timestamp, agg = self._unpack_batch(batch)
+        x = x.transpose(1, 2).to(device=self.reservoir.device, dtype=self.reservoir.dtype)  # [B, F, L] -> [B, L, F]
+
+        if self.conditioner is not None and self._num_buckets > 0:
+            conditions = self.conditioner.get_conditions(x, meter_id=meter_id, timestamps=timestamp)
+            conditions = self.move_to_device(conditions, device=self.reservoir.device).float()
+            bucket_ids = self._conditions_to_bucket_indices(conditions)
+        else:
+            bucket_ids = torch.zeros(x.shape[0], dtype=torch.long, device=self.reservoir.device)
+
+        batch_size = x.shape[0]
+        seen_so_far = int(self.n_seen.item())
+
+        if seen_so_far < self.reservoir_size:
+            fill_amount = min(batch_size, self.reservoir_size - seen_so_far)
+            self.reservoir[seen_so_far: seen_so_far + fill_amount] = x[:fill_amount]
+            self.reservoir_bucket_ids[seen_so_far: seen_so_far + fill_amount] = bucket_ids[:fill_amount]
+            self.n_seen += fill_amount
+            remaining = batch_size - fill_amount
+            if remaining > 0:
+                self._stream_update(x[fill_amount:], bucket_ids[fill_amount:])
+        else:
+            self._stream_update(x, bucket_ids)
+
+    @torch.no_grad()
+    def _stream_update(self, batch: torch.Tensor, bucket_ids: torch.Tensor):
+        batch = batch.to(device=self.reservoir.device, dtype=self.reservoir.dtype)
+        batch_size = batch.shape[0]
+        stream_start = int(self.n_seen.item()) + 1
+        stream_end = stream_start + batch_size
+
+        stream_indices = torch.arange(stream_start, stream_end, device=self.reservoir.device)
+        random_rolls = torch.rand(batch_size, device=self.reservoir.device) * stream_indices
+        keep_mask = random_rolls < self.reservoir_size
+        if keep_mask.any():
+            kept_items = batch[keep_mask]
+            kept_bucket_ids = bucket_ids[keep_mask]
+            num_kept = kept_items.shape[0]
+            replace_indices = torch.randint(0, self.reservoir_size, (num_kept,), device=self.reservoir.device)
+            self.reservoir[replace_indices] = kept_items
+            self.reservoir_bucket_ids[replace_indices] = kept_bucket_ids
+        self.n_seen += batch_size
+
+    @torch.no_grad()
+    def _sample_by_bucket(self, bucket_indices: torch.Tensor) -> torch.Tensor:
+        """Sample one window per entry in bucket_indices from the reservoir."""
+        n_filled = min(int(self.n_seen.item()), self.reservoir_size)
+        n_filled = max(n_filled, 1)
+        filled_bucket_ids = self.reservoir_bucket_ids[:n_filled]
+        B = bucket_indices.shape[0]
+        result = torch.zeros(
+            B, self.sequence_length, self.num_features,
+            device=self.reservoir.device, dtype=torch.float32,
+        )
+        for b in bucket_indices.unique():
+            req_mask = bucket_indices == b
+            n_req = int(req_mask.sum().item())
+            avail_mask = filled_bucket_ids == b
+            n_avail = int(avail_mask.sum().item())
+            if n_avail >= self.min_bucket_samples:
+                avail_idx = avail_mask.nonzero(as_tuple=True)[0]
+                chosen = avail_idx[torch.randint(0, n_avail, (n_req,), device=self.reservoir.device)]
+            else:
+                chosen = torch.randint(0, n_filled, (n_req,), device=self.reservoir.device)
+            result[req_mask] = self.reservoir[chosen]
+        return result
+
+    def train_core(self, batch, optim=None, gradient_clip=0.0, gradient_clip_max_norm=0.0,
+                   beta=0.0, weighted_loss=0.0):
+        self.update(batch)
+        return {
+            "loss": torch.tensor(0.0, device=self.reservoir.device),
+            "recon_loglikelihood": torch.tensor(0.0, device=self.reservoir.device),
+            "kl_divergence": torch.tensor(0.0, device=self.reservoir.device),
+        }
+
+    def validate(self, valloader, num_samples=1, beta=1, device="cpu", **kwargs):
+        return {
+            "loss": torch.tensor(0.0, device=device),
+            "recon_loglikelihood": torch.tensor(0.0, device=device),
+            "kl_divergence": torch.tensor(0.0, device=device),
+        }
+
+    @torch.no_grad()
+    def sample(self, conditions=None, num_prior_samples=1, num_samples_prior=1,
+               num_x_samples=1, device="cpu", **kwargs):
+        n_filled = min(int(self.n_seen.item()), self.reservoir_size)
+        n_filled = max(n_filled, 1)
+
+        if self.conditioner is not None and conditions is not None:
+            conditions = self.move_to_device(conditions, device=self.reservoir.device).float()
+            bucket_indices = self._conditions_to_bucket_indices(conditions)
+            samples = self._sample_by_bucket(bucket_indices)  # [B, L, F]
+            if self.phased_mode:
+                samples = samples.transpose(1, 2)  # [B, F, L]
+            B, d1, d2 = samples.shape
+            return samples.reshape(1, 1, B, d1 * d2)
+
+        num_samples = kwargs.get("num_samples", max(num_prior_samples, num_samples_prior))
+        idx = torch.randint(0, n_filled, (num_samples,), device=self.reservoir.device)
+        samples = self.reservoir[idx]  # [N, L, F]
+        if self.phased_mode:
+            samples = samples.transpose(1, 2)  # [N, F, L]
+        return samples.reshape(num_samples, 1, 1, self.sequence_length * self.num_features)
+
+    @torch.no_grad()
+    def reconstruct(self, x, meter_ids=None, timestamps=None, num_samples=1, **kwargs):
+        """Identity reconstruction — returns the input unchanged (RMSE = 0 by construction)."""
+        flat = x.reshape(x.shape[0], -1)  # [B, F*L]
+        return flat.unsqueeze(0).expand(num_samples, -1, -1)  # [S, B, F*L]
+
 class QuantileBaselineModel(BaseModel):
     """A simple baseline model that maintains a global reservoir of observed sequences and computes quantiles from it.
     This model does not learn any parameters and serves as a non-parametric baseline for comparison.

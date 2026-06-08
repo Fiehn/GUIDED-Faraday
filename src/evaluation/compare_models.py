@@ -21,12 +21,14 @@ if str(SRC_DIR) not in sys.path:
 
 from src.evaluation.load_model import load_model
 from src.model.factory import _load_train_config
-from src.data.dataloader_phased import PhasedReplayDataloaders, WindowSpec
+from src.data.dataloader_phased import PhasedReplayDataloaders, WindowSpec, _extract_meter_id_from_filename
 from src.evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite, VisualEvaluation
 from src.visualization.plot_styling import PlotStyle
 from src.data.feeder_holdout import (
     HoldoutWindows,
+    HoldoutPhasedWindows,
     load_holdout_windows_raw,
+    load_holdout_windows_phased,
     plot_feeder_aggregated_profile,
     plot_feeder_holdout_analysis,
     run_coincidence_factor_analysis,
@@ -309,6 +311,45 @@ class PhasedModelComparator:
                 except Exception as e:
                     print(f"Error loading {eval_json_path}: {e}")
         
+        # 1b. Fallback: load from phased_eval_summary.json when per-phase eval_results.json files
+        #     were not found (e.g. only the consolidated summary was written).
+        def _extract_phase_dict(raw: dict) -> tuple[dict, dict]:
+            phase_eval: dict[str, float] = {}
+            phase_meta: dict[str, dict] = {}
+            for key, val in raw.items():
+                if isinstance(val, dict) and "mean" in val:
+                    phase_eval[key] = float(val["mean"])
+                    phase_meta[key] = {
+                        "std": float(val["std"]) if val.get("std") is not None else None,
+                        "values": val.get("values"),
+                    }
+                else:
+                    try:
+                        phase_eval[key] = float(val)
+                    except (TypeError, ValueError):
+                        phase_eval[key] = val
+            return phase_eval, phase_meta
+
+        phased_summary_path = os.path.join(model_dir, "phased_eval_summary.json")
+        if os.path.exists(phased_summary_path):
+            try:
+                with open(phased_summary_path, 'r') as f:
+                    summary = json.load(f)
+                _phase_map = {
+                    'aggregated_phase': summary.get('aggregated_phase', {}),
+                    'ranked_phase_1': summary.get('ranked_phases', {}).get('phase_1', {}),
+                    'ranked_phase_2': summary.get('ranked_phases', {}).get('phase_2', {}),
+                    'ranked_phase_3': summary.get('ranked_phases', {}).get('phase_3', {}),
+                }
+                for phase_key, raw in _phase_map.items():
+                    if raw and phase_key not in self.models_data[model_name]:
+                        pe, pm = _extract_phase_dict(raw)
+                        self.models_data[model_name][phase_key] = pe
+                        if pm:
+                            self.models_data[model_name][f"{phase_key}_meta"] = pm
+            except Exception as e:
+                print(f"Error loading {phased_summary_path}: {e}")
+
         # 2. Check for unphased results at root (either EvalFramework or PhasedEvaluationSuite summary)
         root_eval_path = os.path.join(model_dir, "eval_results.json")
         if os.path.exists(root_eval_path):
@@ -363,6 +404,7 @@ class PhasedModelComparator:
                     }
                 self.models_data[model_name]["holdout_eval"] = holdout_eval
                 self.models_data[model_name]["holdout_summary_meta"] = holdout_meta
+                self.models_data[model_name]["holdout_eval_meta"] = holdout_meta
             except Exception as e:
                 print(f"Error loading {summary_path}: {e}")
         elif os.path.exists(flat_path):
@@ -507,6 +549,127 @@ class PhasedModelComparator:
         with open(table_path, "w", encoding="utf-8") as f:
             f.write(table_str)
         print(f"Parameter count table saved to {table_path}")
+
+    def _generate_ev_hp_plots(self) -> None:
+        """Generate EV/HP breakdown comparison bar charts from ev_hp_breakdown.json sidecars.
+
+        Produces ev_hp_breakdown/ev_hp_ev_fd.pdf and ev_hp_breakdown/ev_hp_hp_fd.pdf.
+        When ev_hp_breakdown_random_profiles.json sidecars are also present, produces a
+        separate set of figures with a _random_profiles suffix.
+        Skipped entirely when no model has a non-empty sidecar or all FD values are null.
+        """
+        ev_hp_dir = os.path.join(self.output_dir, "ev_hp_breakdown")
+        os.makedirs(ev_hp_dir, exist_ok=True)
+
+        for sidecar_name, out_suffix in [
+            ("ev_hp_breakdown.json", ""),
+            ("ev_hp_breakdown_random_profiles.json", "_random_profiles"),
+        ]:
+            self._generate_ev_hp_plots_for_sidecar(sidecar_name, out_suffix, ev_hp_dir)
+
+    def _generate_ev_hp_plots_for_sidecar(
+        self,
+        sidecar_name: str,
+        out_suffix: str,
+        ev_hp_dir: str,
+    ) -> None:
+        """Render bar charts for one ev_hp_breakdown sidecar variant."""
+        breakdown: dict[str, dict] = {}
+        for name in self.models_data:
+            path = os.path.join(self._model_eval_dirs.get(name, ""), sidecar_name)
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        data = json.load(f)
+                    if data:
+                        breakdown[name] = data
+                except Exception as e:
+                    print(f"  [ev_hp] Could not load sidecar '{sidecar_name}' for {name}: {e}")
+
+        if not breakdown:
+            return
+
+        all_groups: set[str] = set()
+        for bd in breakdown.values():
+            for grp, info in bd.items():
+                if info.get("fd") is not None:
+                    all_groups.add(grp)
+        if not all_groups:
+            print(f"  [ev_hp] All FD values are null in '{sidecar_name}'; skipping plots.")
+            return
+
+        models_order = [n for n in self.models_data if n in breakdown]
+        plot_style = PlotStyle()
+
+        for pair_name, pair_groups in [("EV", ["EV", "No-EV"]), ("HP", ["HP", "No-HP"])]:
+            valid_groups = [g for g in pair_groups if g in all_groups]
+            if not valid_groups:
+                continue
+
+            n_groups = len(valid_groups)
+            fig, axes = plt.subplots(1, n_groups, figsize=(5 * n_groups, 5), squeeze=False)
+            axes_flat = axes.flatten()
+            title_suffix = " (Random User Profiles)" if out_suffix else ""
+            fig.suptitle(
+                f"Aggregated Profiles FD — {pair_name} Condition Breakdown{title_suffix}  (↓)",
+                fontsize=14, fontweight="bold", y=1.02,
+            )
+
+            for col, group_name in enumerate(valid_groups):
+                ax = axes_flat[col]
+                vals, labels, colors, n_reals = [], [], [], []
+                for i, name in enumerate(models_order):
+                    info = breakdown[name].get(group_name, {})
+                    fd = info.get("fd")
+                    if fd is None:
+                        continue
+                    vals.append(float(fd))
+                    labels.append(name)
+                    colors.append(self._model_color(name, i, plot_style))
+                    n_reals.append(info.get("n_real", "?"))
+
+                if not vals:
+                    ax.set_visible(False)
+                    continue
+
+                best_val = min(vals)
+                x = np.arange(len(vals))
+                for xi, (val, color) in enumerate(zip(vals, colors)):
+                    is_best = abs(val - best_val) < abs(best_val) * 1e-9 + 1e-12
+                    ec = "black" if is_best else "none"
+                    lw = 1.5 if is_best else 0
+                    hatch = "///" if is_best else ""
+                    ax.bar([xi], [val], color=color, edgecolor=ec, linewidth=lw, hatch=hatch)
+                    if is_best:
+                        ax.annotate("★", xy=(xi, val), xytext=(0, 3),
+                                    textcoords="offset points", ha="center", va="bottom",
+                                    fontsize=12, color="black", alpha=0.8)
+
+                ax.set_title(group_name, fontsize=11, fontweight="bold")
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+                ax.grid(axis="y", linestyle="--", alpha=0.6)
+
+                for xi, (n, val) in enumerate(zip(n_reals, vals)):
+                    ax.annotate(f"n={n}", xy=(xi, 0), xytext=(0, 2),
+                                textcoords="offset points", ha="center", va="bottom",
+                                fontsize=7, color="0.5")
+
+            legend_handles = [
+                mpatches.Patch(color=self._model_color(name, i, plot_style), label=name)
+                for i, name in enumerate(models_order)
+            ]
+            legend_handles.append(
+                mpatches.Patch(facecolor="white", edgecolor="black", hatch="///", label="★ Best Value")
+            )
+            fig.legend(handles=legend_handles, loc="lower center",
+                       bbox_to_anchor=(0.5, 1.04), ncol=min(3, len(models_order) + 1))
+
+            plt.tight_layout()
+            out_path = os.path.join(ev_hp_dir, f"ev_hp_{pair_name.lower()}_fd{out_suffix}.pdf")
+            plt.savefig(out_path, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  [ev_hp] Plot saved to {out_path}")
 
     def compare(self, mia_models: list[str] | None = None, sort_models: bool = True):
         """Generate comparison tables and plots for each phase.
@@ -736,11 +899,25 @@ class PhasedModelComparator:
 
         # --- Bar plots (only models with holdout data) ---
         plot_style = PlotStyle()
-        reconstruction_metrics = sorted(m for m in scalar_metrics if self._metric_group(m) == "reconstruction")
-        synthetic_metrics = sorted(m for m in scalar_metrics if self._metric_group(m) == "synthetic")
-        for metric_group, group_name in [(reconstruction_metrics, "Reconstruction"), (synthetic_metrics, "Synthetic")]:
+        _RECON_SUMMARY = [
+            "Avg MinMax Reconstruction Score",
+            "Avg Rank Reconstruction Score",
+        ]
+        _SYNTH_SUMMARY = [
+            "Avg MinMax Synthetic Score",
+            "Avg Rank Synthetic Score",
+        ]
+        reconstruction_metrics = sorted(m for m in scalar_metrics if self._metric_group(m) == "reconstruction") \
+            + [m for m in _RECON_SUMMARY if m in all_metrics]
+        synthetic_metrics = sorted(m for m in scalar_metrics if self._metric_group(m) == "synthetic") \
+            + [m for m in _SYNTH_SUMMARY if m in all_metrics]
+        # For the holdout plot keep only CF_error_N_max_shared_cond from CF metrics and rename it.
+        _CF_PLOT_EXCLUDED = {"CF_error_N_max_independent", "CF_area_independent", "CF_area_shared_cond"}
+        _HOLDOUT_NAME_OVERRIDES = {"CF_error_N_max_shared_cond": "CF Error"}
+        synthetic_metrics_plot = [m for m in synthetic_metrics if m not in _CF_PLOT_EXCLUDED]
+        for metric_group, group_name in [(reconstruction_metrics, "Reconstruction"), (synthetic_metrics_plot, "Synthetic")]:
             if metric_group:
-                self._generate_metric_group_plot("holdout_eval", metric_group, group_name, models_with_holdout, plot_style)
+                self._generate_metric_group_plot("holdout_eval", metric_group, group_name, models_with_holdout, plot_style, name_overrides=_HOLDOUT_NAME_OVERRIDES)
 
         # --- Distribution plots (box + violin) per metric group ---
         # Only when at least one model has ≥ 2 feeders in its summary meta.
@@ -1051,7 +1228,7 @@ class PhasedModelComparator:
             self._generate_metric_group_plot(phase, metric_group, group_name, models, plot_style)
             self._generate_metric_group_boxplot(phase, metric_group, group_name, models, plot_style)
     
-    def _generate_metric_group_plot(self, phase: str, metric_group: list, group_name: str, models: list, plot_style):
+    def _generate_metric_group_plot(self, phase: str, metric_group: list, group_name: str, models: list, plot_style, name_overrides: dict | None = None):
         """Generate a single bar chart figure for a metric group."""
         n_metrics = len(metric_group)
         n_cols = 3
@@ -1143,7 +1320,8 @@ class PhasedModelComparator:
                                     textcoords='offset points', ha='center', va=va, 
                                     fontsize=12, color='black', alpha=0.8)
             
-            ax.set_title(self._display_metric_title(metric), fontsize=11, fontweight='bold')
+            _display_name = name_overrides.get(metric, self._display_metric_name(metric)) if name_overrides else self._display_metric_name(metric)
+            ax.set_title(f"{_display_name} ({self._metric_target_label(metric)})", fontsize=11, fontweight='bold')
             ax.set_xticks([])
             ax.grid(axis='y', linestyle='--', alpha=0.7)
         
@@ -1256,7 +1434,6 @@ class PhasedModelComparator:
                    bbox_to_anchor=(0.5, 1.02), ncol=min(3, len(models) + 1))
 
         plt.tight_layout()
-
         phase_output_dir = os.path.join(self.output_dir, phase)
         os.makedirs(phase_output_dir, exist_ok=True)
         plot_path = os.path.join(phase_output_dir, f"metric_comparison_{group_name}_boxplot.pdf")
@@ -1275,37 +1452,35 @@ def _build_eval_test_loader(
     output_dir: str,
     phased: bool,
     agg_divisor: float = 1.0,
+    output_aggregate: bool = False,
+    preprocessed_cache_dir: str | None = None,
 ) -> "torch.utils.data.DataLoader | None":
-    """Build a month-diverse test DataLoader with a persistent disk cache.
-
-    The cache stores the FULL test split (all months, raw values before normalization)
-    so that num_samples can be changed freely without rescanning parquet files.
-    Parquet files are processed one at a time to keep peak RAM bounded.
-    Normalization and the num_samples draw happen at load time from the cache.
-    """
     import gc
     import hashlib
-    import pickle
-    from torch.utils.data import DataLoader as _DL, TensorDataset as _TDS, Subset as _Sub
+    import os
+    import torch
+    from torch.utils.data import DataLoader as _DL, TensorDataset as _TDS
 
-    # Cache key covers everything that affects WHICH windows are in the test split
-    # and how they are valued — but NOT num_samples (that's applied at load time).
-    h = hashlib.md5()
-    for f in sorted(data_files):
-        h.update(f.encode())
-        try:
-            h.update(str(os.path.getmtime(f)).encode())
-        except OSError:
-            pass
-    h.update(str(split_seed).encode())
-    h.update(str(sorted(split_ratios.items())).encode())
-    h.update(str(max_value).encode())
-    h.update(str(window_len).encode())
-    h.update(str(phased).encode())
-    # Normalizer is intentionally excluded from the cache key: the cache stores
-    # raw unnormalized windows and normalization is applied at load time, so the
-    # same cache file is valid for any normalizer (or none).
-    cache_path = os.path.join(output_dir, f"_eval_test_cache_{h.hexdigest()[:16]}.pt")
+    # Cache key covers everything that affects WHICH windows land in the test split
+    # and their raw values — NOT num_samples (applied at load time from the cache).
+    if not phased:
+        h = hashlib.md5()
+        for f in sorted(data_files):
+            h.update(f.encode())
+            try:
+                h.update(str(os.path.getmtime(f)).encode())
+            except OSError:
+                pass
+        h.update(str(split_seed).encode())
+        h.update(str(sorted(split_ratios.items())).encode())
+        h.update(str(max_value).encode())
+        h.update(str(window_len).encode())
+        h.update(str(phased).encode())
+        h.update(str(agg_divisor).encode())
+        # Normalizer excluded: cache stores raw windows, normalization is at load time.
+        cache_path = os.path.join(output_dir, f"_eval_test_cache_{h.hexdigest()[:16]}.pt")
+    else:
+        cache_path = preprocessed_cache_dir
 
     def _sample_and_wrap(x_raw, meter_ids, timestamps):
         """Apply normalizer + draw num_samples, return DataLoader."""
@@ -1315,43 +1490,81 @@ def _build_eval_test_loader(
         _g.manual_seed(split_seed)
         _idx = torch.randperm(_n_total, generator=_g)[:_n_cap]
         _x = x_raw[_idx]; _m = meter_ids[_idx]; _t = timestamps[_idx]
-        if normalizer is not None and getattr(normalizer, "fitted", False):
-            _x2 = _x.reshape(-1, 1).float()
-            _x2 = normalizer.transform(_x2)
-            _x = _x2.reshape(len(_x), window_len).unsqueeze(1)
+        if output_aggregate:
+            _x = _x.float()
+            if _x.dim() == 3:
+                _x = _x.sum(dim=1, keepdim=True)
+            if normalizer is not None and getattr(normalizer, "fitted", False):
+                _x = normalizer.transform(_x.reshape(-1, 1)).reshape(len(_x), 1, window_len)
+        elif normalizer is not None and getattr(normalizer, "fitted", False):
+            if phased:
+                _x = normalizer.transform(_x.float())
+            else:
+                _x2 = _x.reshape(-1, 1).float()
+                _x2 = normalizer.transform(_x2)
+                _x = _x2.reshape(len(_x), window_len).unsqueeze(1)
         else:
-            _x = _x.float().unsqueeze(1)
+            _x = _x.float() if phased else _x.float().unsqueeze(1)
         _agg = torch.zeros((len(_x), 0, window_len), dtype=_x.dtype)
         print(f"[eval cache] Using {_n_cap}/{_n_total} test windows (seed={split_seed}).")
         return _DL(_TDS(_x, _m, _t, _agg), batch_size=1024, shuffle=False, num_workers=0, pin_memory=False)
 
     # --- Try loading from cache ----------------------------------------------
-    if os.path.exists(cache_path):
+    if os.path.exists(cache_path) and not phased:
         try:
             cached = torch.load(cache_path, weights_only=True)
             print(f"[eval cache] Cache hit: {len(cached['x'])} total test windows.")
             return _sample_and_wrap(cached["x"], cached["meter_ids"], cached["timestamps"])
         except Exception as _ce:
             print(f"[eval cache] Cache load failed ({_ce}); rebuilding.")
-            import traceback; traceback.print_exc()
             try:
                 os.remove(cache_path)
             except OSError:
                 pass
 
-    # --- Build file-by-file (no num_samples limit — cache the full test split) ---
+    # --- Build (phased: via InMemoryPhasedDataloaders with disk cache support) ---
     print(f"[eval cache] Scanning {len(data_files)} file(s) for test windows (runs once, then cached)...")
+
     if phased:
-        from src.data.dataloader_phased import InMemoryPhasedDataset as _FileDS
-        def _load_file(fpath):
-            return _FileDS(
-                sm_files=[fpath], split="test",
-                feature_cols=["hourly_energy_consumption"],
-                split_ratios=split_ratios, split_seed=split_seed,
-                window_len=window_len, stride=window_len,
-                aggregation=agg_divisor > 1.0, aggregation_divisor=agg_divisor,
-                max_value=max_value, max_hour_value=20.0, normalizer=None,
-            )
+        print(f"[eval cache] Phased data, using InMemoryPhasedDataloaders with disk cache support. Cache path: {cache_path}")
+        from src.data.dataloader_phased import InMemoryPhasedDataloaders as _PhasedDL
+        _PHASED_FEATURE_COLS = ['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3']
+        _dl = _PhasedDL(
+            sm_files=data_files,
+            feature_cols=_PHASED_FEATURE_COLS,
+            window_len=window_len,
+            stride=window_len,
+            batch_size=1024,
+            aggregation=agg_divisor > 1.0,
+            aggregation_divisor=agg_divisor,
+            split_ratios=split_ratios,
+            split_seed=split_seed,
+            max_hour_value=20.0,
+            max_value=max_value,
+            nan_as_zero=False,
+            normalizer=None,
+            output_aggregate_stream=False,
+            num_workers=1,
+            preprocessed_cache_dir=preprocessed_cache_dir,
+        )
+        test_ds = _dl.test_dataset
+        if len(test_ds) == 0:
+            print("[eval cache] ERROR: no test windows found — check data_dir and split ratios.")
+            return None
+        _xc = test_ds.x
+        _mc = test_ds.meter_ids
+        _tc = test_ds.timestamps
+        del _dl, test_ds; gc.collect()
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            torch.save({"x": _xc, "meter_ids": _mc, "timestamps": _tc}, cache_path)
+            print(f"[eval cache] Saved {len(_xc)} test windows → {cache_path}")
+        except Exception as _se:
+            print(f"[eval cache] Warning: could not save cache: {_se}")
+
+        return _sample_and_wrap(_xc, _mc, _tc)
+
     else:
         from src.data.dataloader_phased import InMemoryCSVDataset as _FileDS
         def _load_file(fpath):
@@ -1366,51 +1579,49 @@ def _build_eval_test_loader(
                 window_len=window_len, stride=window_len,
             )
 
-    xs: list[torch.Tensor] = []
-    ms: list[torch.Tensor] = []
-    ts: list[torch.Tensor] = []
+        xs: list[torch.Tensor] = []
+        ms: list[torch.Tensor] = []
+        ts: list[torch.Tensor] = []
 
-    for fpath in data_files:
-        try:
-            file_ds = _load_file(fpath)
-            if len(file_ds) == 0:
+        for fpath in data_files:
+            try:
+                file_ds = _load_file(fpath)
+                if len(file_ds) == 0:
+                    del file_ds; gc.collect()
+                    continue
+                xs.append(file_ds.x.squeeze(1))
+                ms.append(file_ds.meter_ids)
+                ts.append(file_ds.timestamps)
                 del file_ds; gc.collect()
-                continue
-            xs.append(file_ds.x.squeeze(1))  # raw, unnormalized [n, W]
-            ms.append(file_ds.meter_ids)
-            ts.append(file_ds.timestamps)
-            del file_ds; gc.collect()
-        except Exception as _fe:
-            print(f"[eval cache] Warning: skipping {fpath}: {_fe}")
-            import traceback; traceback.print_exc()
+            except Exception as _fe:
+                print(f"[eval cache] Warning: skipping {fpath}: {_fe}")
 
-    if not xs:
-        print("[eval cache] ERROR: no test windows found — check data_dir and split ratios.")
-        return None
+        if not xs:
+            print("[eval cache] ERROR: no test windows found — check data_dir and split ratios.")
+            return None
 
-    _xc = torch.cat(xs); _mc = torch.cat(ms); _tc = torch.cat(ts)
-    del xs, ms, ts; gc.collect()
+        _xc = torch.cat(xs); _mc = torch.cat(ms); _tc = torch.cat(ts)
+        del xs, ms, ts; gc.collect()
 
-    # Persist the full test split (raw, pre-normalization) to cache
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        torch.save({"x": _xc, "meter_ids": _mc, "timestamps": _tc}, cache_path)
-        print(f"[eval cache] Saved {len(_xc)} test windows → {cache_path}")
-    except Exception as _se:
-        print(f"[eval cache] Warning: could not save cache: {_se}")
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            torch.save({"x": _xc, "meter_ids": _mc, "timestamps": _tc}, cache_path)
+            print(f"[eval cache] Saved {len(_xc)} test windows → {cache_path}")
+        except Exception as _se:
+            print(f"[eval cache] Warning: could not save cache: {_se}")
 
-    return _sample_and_wrap(_xc, _mc, _tc)
+        return _sample_and_wrap(_xc, _mc, _tc)
 
 
 def get_eval_files(data_dir: str, data_files: list[str] | None = None):
     """
-    Simplified file discovery: if data_files is None, 
+    Simplified file discovery: if data_files is None,
     grab all .parquet files in data_dir that don't start with 'test_'.
     """
     if data_files is not None and len(data_files) > 0:
         # Ensure absolute paths
         return [os.path.join(data_dir, f) if not os.path.isabs(f) else f for f in data_files]
-    
+
     if not os.path.exists(data_dir):
         raise FileNotFoundError(f"Data directory {data_dir} does not exist.")
 
@@ -1419,10 +1630,10 @@ def get_eval_files(data_dir: str, data_files: list[str] | None = None):
         for f in files:
             if f.endswith(".parquet") and not f.startswith("test_"):
                 discovered.append(os.path.join(root, f))
-    
+
     if not discovered:
         raise FileNotFoundError(f"No .parquet files (not starting with 'test_') found in {data_dir}")
-        
+
     # Deterministic ordering by default to avoid data variance across runs/models.
     return sorted(discovered)
 
@@ -1463,6 +1674,11 @@ def _has_existing_eval_outputs(model_output_dir: str, phased: bool) -> bool:
         p = os.path.join(model_output_dir, f"{phase}_eval", "eval_results.json")
         if os.path.exists(p):
             return True
+    if os.path.exists(os.path.join(model_output_dir, "phased_eval_summary.json")):
+        return True
+    if phased:
+        # A flat eval_results.json is from a non-phased run and must not satisfy a phased check.
+        return False
     return os.path.exists(os.path.join(model_output_dir, "eval_results.json"))
 
 class _DenormalizingLoader:
@@ -1613,6 +1829,52 @@ def _restore_results_from_checkpoint(checkpoint_dir: str, model_output_dir: str)
     return True
 
 
+def _inject_random_holdout_profiles(conditioner, meter_ids: np.ndarray, seed: int = 42) -> set:
+    """Overwrite UserProfiler cache entries for holdout meters with random Dirichlet profiles.
+
+    User profiles are computed from all meters before training, so holdout meters already
+    have real profiles in the cache derived from their own consumption data. This leaks
+    holdout behavior into the condition. We must unconditionally overwrite their entries
+    with random profiles before the eval pass. See ADR-0015.
+
+    Returns the set of meter IDs that were overwritten so the caller can clean them up.
+    """
+    if conditioner is None:
+        return set()
+    user_profiler = getattr(conditioner, "condition_items", {}).get("user_profile")
+    if user_profiler is None:
+        return set()
+
+    unique_ids = np.unique(meter_ids).tolist()
+    rng = np.random.default_rng(seed)
+    profiles = rng.dirichlet(np.ones(user_profiler.n_topics), size=len(unique_ids)).astype(np.float32)
+
+    injected: set = set()
+    for i, mid in enumerate(unique_ids):
+        mid_int = int(mid)
+        user_profiler.user_profiles_cache[mid_int] = profiles[i]
+        injected.add(mid_int)
+
+    user_profiler._invalidate_profile_lookup()
+    print(
+        f"  [holdout] Overwrote user profiles with random Dirichlet for {len(injected)} holdout meters "
+        f"(seed={seed}, n_topics={user_profiler.n_topics})."
+    )
+    return injected
+
+
+def _remove_injected_holdout_profiles(conditioner, injected_ids: set) -> None:
+    """Remove random profiles injected by _inject_random_holdout_profiles."""
+    if not injected_ids or conditioner is None:
+        return
+    user_profiler = getattr(conditioner, "condition_items", {}).get("user_profile")
+    if user_profiler is None:
+        return
+    for mid in injected_ids:
+        user_profiler.user_profiles_cache.pop(mid, None)
+    user_profiler._invalidate_profile_lookup()
+
+
 def _build_holdout_loader(
     raw_holdout: HoldoutWindows,
     normalizer,
@@ -1655,6 +1917,31 @@ def _run_holdout_eval(
     raw_holdout: pre-loaded un-normalised windows from load_holdout_windows_raw().
     n_synthetic_draws: number of independent synthetic draws for evaluate_repeated().
     """
+    import copy
+
+    _injected = _inject_random_holdout_profiles(conditioner, raw_holdout.meter_ids)
+    try:
+        _run_holdout_eval_inner(
+            model=model, normalizer=normalizer, conditioner=conditioner,
+            raw_holdout=raw_holdout, feeder_id=feeder_id, device=device,
+            window_size=window_size, model_output_dir=model_output_dir,
+            n_synthetic_draws=n_synthetic_draws,
+        )
+    finally:
+        _remove_injected_holdout_profiles(conditioner, _injected)
+
+
+def _run_holdout_eval_inner(
+    model,
+    normalizer,
+    conditioner,
+    raw_holdout: HoldoutWindows,
+    feeder_id: int,
+    device: str,
+    window_size: int,
+    model_output_dir: str,
+    n_synthetic_draws: int = 5,
+) -> None:
     import copy
 
     holdout_loader = _build_holdout_loader(raw_holdout, normalizer, window_size)
@@ -1818,6 +2105,162 @@ def _run_holdout_eval(
             import traceback as _tb_pf; _tb_pf.print_exc()
 
 
+def _build_holdout_loader_phased(
+    raw_holdout: HoldoutPhasedWindows,
+    normalizer,
+    window_size: int,
+) -> "torch.utils.data.DataLoader":
+    """Apply normalizer to raw phased windows and wrap in a DataLoader."""
+    from torch.utils.data import TensorDataset, DataLoader as _DL
+
+    x_np = raw_holdout.x  # [N, n_phases, window_len]
+    n, p, l = x_np.shape
+    if normalizer is not None and getattr(normalizer, "fitted", False):
+        x_t = torch.from_numpy(x_np).float()
+        x_t = normalizer.transform(x_t)
+    else:
+        x_t = torch.from_numpy(x_np).float()
+
+    agg_t = torch.zeros((n, 0, window_size), dtype=torch.float32)
+    ds = TensorDataset(
+        x_t,
+        torch.from_numpy(raw_holdout.meter_ids),
+        torch.from_numpy(raw_holdout.timestamps),
+        agg_t,
+    )
+    return _DL(ds, batch_size=1024, shuffle=False, num_workers=0, pin_memory=False)
+
+
+def _run_holdout_eval_phased(
+    model,
+    normalizer,
+    conditioner,
+    raw_holdout: HoldoutPhasedWindows,
+    holdout_id: int,
+    device: str,
+    window_size: int,
+    model_output_dir: str,
+    n_synthetic_draws: int = 5,
+) -> None:
+    """Run EvalFramework on a phased holdout set and save results.
+
+    Mirrors _run_holdout_eval but uses register_all(phased=True) and handles
+    3-phase windows [N, 3, window_len] instead of 1-channel [N, 1, window_len].
+    """
+    _injected = _inject_random_holdout_profiles(conditioner, raw_holdout.meter_ids)
+    try:
+        _run_holdout_eval_phased_inner(
+            model=model, normalizer=normalizer, conditioner=conditioner,
+            raw_holdout=raw_holdout, holdout_id=holdout_id, device=device,
+            window_size=window_size, model_output_dir=model_output_dir,
+            n_synthetic_draws=n_synthetic_draws,
+        )
+    finally:
+        _remove_injected_holdout_profiles(conditioner, _injected)
+
+
+def _run_holdout_eval_phased_inner(
+    model,
+    normalizer,
+    conditioner,
+    raw_holdout: HoldoutPhasedWindows,
+    holdout_id: int,
+    device: str,
+    window_size: int,
+    model_output_dir: str,
+    n_synthetic_draws: int = 5,
+) -> None:
+    import copy
+
+    holdout_loader = _build_holdout_loader_phased(raw_holdout, normalizer, window_size)
+    n_windows = len(raw_holdout.x)
+    n_meters = len(np.unique(raw_holdout.meter_ids))
+    print(f"  [holdout phased] {n_windows} windows from {n_meters} meters.")
+
+    _plot_dir = os.path.join(model_output_dir, f"phased_holdout_{holdout_id}")
+    os.makedirs(_plot_dir, exist_ok=True)
+    eval_norm = copy.deepcopy(normalizer)
+    evaluator = EvalFramework(
+        model=model,
+        dataloader=holdout_loader,
+        normalizer=eval_norm,
+        conditioner=conditioner,
+        device=device,
+        window_size=window_size,
+        output_path=_plot_dir,
+        n_synthetic_samples=n_windows,
+        preserve_condition_order=True,
+    )
+    evaluator.register_all(phased=True)
+    try:
+        repeated_results = evaluator.evaluate_repeated(k=n_synthetic_draws)
+    except RuntimeError as e:
+        if device != "cpu" and "out of memory" in str(e).lower():
+            print("  [holdout phased] GPU OOM — retrying on CPU.")
+            cpu_norm = copy.deepcopy(normalizer)
+            evaluator = EvalFramework(
+                model=model, dataloader=holdout_loader, normalizer=cpu_norm,
+                conditioner=conditioner, device="cpu", window_size=window_size,
+                output_path=_plot_dir, n_synthetic_samples=n_windows,
+                preserve_condition_order=True,
+            )
+            evaluator.register_all(phased=True)
+            repeated_results = evaluator.evaluate_repeated(k=n_synthetic_draws)
+        else:
+            raise
+
+    holdout_json = os.path.join(model_output_dir, f"eval_results_feeder_holdout_{holdout_id}.json")
+    with open(holdout_json, "w") as f:
+        json.dump(repeated_results, f, indent=2)
+    print(f"  [holdout phased] Metrics saved to {holdout_json}")
+
+    # Profile plots: sum the 3 phases to get the aggregated load profile.
+    _rw_raw = getattr(evaluator, '_real_data', None)
+    _sw_raw = getattr(evaluator, '_synthetic_data', None)
+    _rt = getattr(evaluator, '_timestamps', None)
+    _rm = getattr(evaluator, '_meter_ids', None)
+    if all(x is not None for x in [_rw_raw, _sw_raw, _rt, _rm]):
+        _rw = np.asarray(_rw_raw)
+        _sw = np.asarray(_sw_raw)
+        # Sum phases: [N, n_phases, window_len] -> [N, window_len]
+        if _rw.ndim == 3:
+            _rw = _rw.sum(axis=1)
+        if _sw.ndim == 3:
+            _sw = _sw.sum(axis=1)
+        _rt = np.asarray(_rt)
+        _rm = np.asarray(_rm)
+        _raw_st = getattr(evaluator, '_synthetic_timestamps', None)
+        _raw_sm = getattr(evaluator, '_synthetic_meter_ids', None)
+        if _raw_st is not None:
+            _st = np.asarray(_raw_st)
+            _sm = np.asarray(_raw_sm) if _raw_sm is not None else np.tile(_rm, (_sw.shape[0] // max(_rm.shape[0], 1)) + 1)[:_sw.shape[0]]
+        else:
+            _n = _sw.shape[0]
+            _st = np.tile(_rt, (_n // max(_rt.shape[0], 1)) + 1)[:_n]
+            _sm = np.tile(_rm, (_n // max(_rm.shape[0], 1)) + 1)[:_n]
+        _cached = getattr(evaluator, "_all_synthetic_draws", None) or []
+        if _cached:
+            _sw = np.asarray(_cached[0])
+            if _sw.ndim == 3:
+                _sw = _sw.sum(axis=1)
+            _plot_extra_draws = [
+                np.asarray(d).sum(axis=1) if np.asarray(d).ndim == 3 else np.asarray(d)
+                for d in _cached[1:]
+            ] or None
+        else:
+            _plot_extra_draws = None
+        try:
+            plot_feeder_holdout_analysis(
+                real_windows=_rw, real_timestamps=_rt, real_meter_ids=_rm,
+                synth_windows=_sw, synth_timestamps=_st, synth_meter_ids=_sm,
+                output_dir=_plot_dir,
+                conditioner=conditioner,
+                synth_extra_draws=_plot_extra_draws,
+            )
+        except Exception as _pe:
+            print(f"  [holdout phased] Profile plots failed: {_pe}")
+
+
 def _build_mia_train_loader(
     data_files: list[str],
     normalizer,
@@ -1828,6 +2271,7 @@ def _build_mia_train_loader(
     num_samples: int,
     phased: bool = False,
     agg_divisor: float = 1.0,
+    preprocessed_cache_dir: str | None = None,
 ):
     """Build a capped DataLoader over the training split for MIA.
 
@@ -1837,38 +2281,39 @@ def _build_mia_train_loader(
     """
     if not data_files:
         return None
-    import math as _math, random as _random
+    import torch
+    import os
     from torch.utils.data import DataLoader as _DL, Subset as _Sub
 
-    # Sub-sample files before loading: assume at least 20 train windows per file
-    # so we load only as many files as needed to cover num_samples.
-    n_files = max(1, min(len(data_files), _math.ceil(num_samples / 20)))
-    files = _random.Random(split_seed).sample(data_files, n_files)
-
-    # Build only the train split — avoids constructing val/test datasets.
     if phased:
-        from data.dataloader_phased import InMemoryPhasedDataset as _DS
-        train_ds = _DS(
-            sm_files=files,
-            split="train",
+        from src.data.dataloader_phased import InMemoryPhasedDataloaders
+        _PHASED_FEATURE_COLS = ['active_power_p14_l1', 'active_power_p14_l2', 'active_power_p14_l3']
+        dl = InMemoryPhasedDataloaders(
+            sm_files=data_files,
+            feature_cols=_PHASED_FEATURE_COLS,
+            window_len=window_size,
+            stride=window_size,
+            batch_size=1024,
+            aggregation=agg_divisor > 1.0,
+            aggregation_divisor=agg_divisor,
             split_ratios=split_ratios,
             split_seed=split_seed,
             max_hour_value=20.0,
             max_value=max_value,
             nan_as_zero=False,
-            normalizer=normalizer,
+            normalizer=None,
             output_aggregate_stream=False,
-            feature_cols=["hourly_energy_consumption"],
-            aggregation_divisor=agg_divisor,
-            aggregation=agg_divisor > 1.0,
+            num_workers=min(16, (os.cpu_count() or 4)),
+            preprocessed_cache_dir=preprocessed_cache_dir,
+        )
+        train_ds = dl.train_dataset
+    else:
+        from src.data.dataloader_phased import InMemoryCSVDataloaders
+        dl = InMemoryCSVDataloaders(
+            sm_files=data_files,
             window_len=window_size,
             stride=window_size,
-        )
-    else:
-        from data.dataloader_phased import InMemoryCSVDataset as _DS
-        train_ds = _DS(
-            sm_files=files,
-            split="train",
+            batch_size=1024,
             split_ratios=split_ratios,
             split_seed=split_seed,
             max_hour_value=20.0,
@@ -1878,9 +2323,10 @@ def _build_mia_train_loader(
             output_aggregate_stream=False,
             meter_col="meter_number",
             value_cols=["hourly_energy_consumption"],
-            window_len=window_size,
-            stride=window_size,
+            pin_memory=False,
         )
+        train_ds = dl.train_dataset
+
     n_cap = min(num_samples, len(train_ds))
     if n_cap == 0:
         return None
@@ -2121,6 +2567,198 @@ def _run_visual_only(
     ev.evaluate_synthetic_only()
 
 
+def _run_ev_hp_breakdown(
+    model,
+    normalizer,
+    conditioner,
+    dataloader,
+    model_output_dir: str,
+    device: str,
+    window_size: int,
+    n_synthetic_samples: int,
+    min_group_size: int = 30,
+    _shared_real: "dict | None" = None,
+    random_user_profiles: bool = False,
+) -> "dict | None":
+    """Compute aggregated-profile FD for EV/no-EV and HP/no-HP test-set groups.
+
+    Saves ev_hp_breakdown.json (or ev_hp_breakdown_random_profiles.json when
+    random_user_profiles=True):
+      { "EV": {"fd": float|null, "n_real": int}, "No-EV": ..., "HP": ..., "No-HP": ... }
+    Also saves three EV Variance Profile PDFs (ev_variance_profile_*.pdf, or
+    ev_variance_profile_*_random_profiles.pdf) when both EV and no-EV groups are
+    present and large enough.
+    Groups with < min_group_size real windows are recorded with fd=null.
+    When the conditioner has no EV or HP items, an empty dict is saved.
+
+    random_user_profiles: when True, inject one random Dirichlet user profile per
+    unique test-split meter into the conditioner cache before generation.  This
+    isolates the EV condition's effect from per-meter behavioural-type confounding.
+    Profiles are removed from the cache after the call (try/finally).
+
+    _shared_real: pre-computed real EV/no-EV denormalised windows from a previous
+    call, keyed as {"ev": np.ndarray, "noev": np.ndarray}.  When provided the real
+    data is reused so every model plot shows identical real curves.  On the first
+    call (None) it is computed here and returned so the caller can pass it forward.
+    Returns the shared_real dict (or None on early exit).
+    """
+    import copy
+    import traceback as _evhp_tb
+    from torch.utils.data import TensorDataset, DataLoader as _DL
+    from src.data.feeder_holdout import _get_ev_hp_flags_per_window, plot_ev_variance_profile
+    from src.evaluation.metrics.aggregates import AggregatedProfiles as _AFP
+
+    _AFP_KEY = "Aggregated Profiles (Flexibility Distance)"
+    print(f"  [ev_hp] Collecting test windows for EV/HP breakdown...")
+
+    all_x, all_m, all_t, all_agg = [], [], [], []
+    try:
+        for batch in dataloader:
+            x, m, t, agg = batch
+            all_x.append(x.cpu())
+            all_m.append(m.cpu())
+            all_t.append(t.cpu())
+            all_agg.append(agg.cpu())
+    except Exception as e:
+        print(f"  [ev_hp] Data collection failed: {e}")
+        return
+
+    if not all_x:
+        print("  [ev_hp] No data collected; skipping.")
+        return
+
+    x_all   = torch.cat(all_x,   dim=0)
+    m_all   = torch.cat(all_m,   dim=0)
+    t_all   = torch.cat(all_t,   dim=0)
+    agg_all = torch.cat(all_agg, dim=0)
+
+    ev_flags, hp_flags = _get_ev_hp_flags_per_window(m_all.numpy(), conditioner)
+
+    has_ev = bool(ev_flags.any())
+    has_hp = bool(hp_flags.any())
+    if not has_ev and not has_hp:
+        print("  [ev_hp] Conditioner has no EV or HP items; writing empty sidecar.")
+        os.makedirs(model_output_dir, exist_ok=True)
+        with open(os.path.join(model_output_dir, "ev_hp_breakdown.json"), "w") as f:
+            json.dump({}, f)
+        return _shared_real
+
+    # Compute real EV/no-EV denormalised windows directly from x_all.
+    # Done once on the first call (_shared_real is None) and passed back to the
+    # caller so all subsequent model plots use identical real curves — bypasses
+    # per-model EvalFramework denormalisation which would vary across models.
+    if _shared_real is None:
+        _inv = getattr(normalizer, 'inverse_transform', None)
+        with torch.no_grad():
+            _xd = _inv(x_all.float()) if _inv is not None else x_all.float()
+        if isinstance(_xd, torch.Tensor):
+            _xd = _xd.detach().cpu().numpy()
+        _xd = np.asarray(_xd, dtype=np.float32)
+        if _xd.ndim == 3:
+            _xd = _xd[:, :, 0] if _xd.shape[2] == 1 else _xd[:, 0, :]
+        elif _xd.ndim == 2 and _xd.shape[1] != window_size:
+            _xd = _xd[:, :window_size]
+        _shared_real = {"ev": _xd[ev_flags], "noev": _xd[~ev_flags]}
+        print(f"  [ev_hp] Real windows: EV={len(_shared_real['ev'])}, No-EV={len(_shared_real['noev'])}")
+
+    groups: list[tuple[str, np.ndarray]] = []
+    if has_ev:
+        groups += [("EV", ev_flags), ("No-EV", ~ev_flags)]
+    if has_hp:
+        groups += [("HP", hp_flags), ("No-HP", ~hp_flags)]
+
+    _sidecar_name = "ev_hp_breakdown_random_profiles.json" if random_user_profiles else "ev_hp_breakdown.json"
+    _vp_suffix = "_random_profiles" if random_user_profiles else ""
+
+    _injected_ev: set = set()
+    if random_user_profiles:
+        _injected_ev = _inject_random_holdout_profiles(conditioner, m_all.numpy(), seed=42)
+        if not _injected_ev:
+            print("  [ev_hp] random_user_profiles=True but conditioner has no user_profile item; proceeding without injection.")
+
+    try:
+        results: dict[str, dict] = {}
+        # Collect synthetic windows per EV/no-EV group for variance profile plots
+        _evvp_synth: dict[str, "np.ndarray | None"] = {"EV": None, "No-EV": None}
+
+        for group_name, mask in groups:
+            n_group = int(mask.sum())
+            results[group_name] = {"fd": None, "n_real": n_group}
+            if n_group < min_group_size:
+                print(f"  [ev_hp] '{group_name}': {n_group} windows < {min_group_size}; skipping.")
+                continue
+
+            mask_t = torch.from_numpy(mask)
+            x_g   = x_all[mask_t]
+            m_g   = m_all[mask_t]
+            t_g   = t_all[mask_t]
+            agg_g = agg_all[mask_t]
+            n_synth_g = min(n_synthetic_samples, n_group)
+
+            group_loader = _DL(
+                TensorDataset(x_g, m_g, t_g, agg_g),
+                batch_size=512, shuffle=False, num_workers=0,
+            )
+            out_subdir = os.path.join(
+                model_output_dir,
+                f"ev_hp_{group_name.lower().replace(' ', '_').replace('-', '_')}",
+            )
+            try:
+                ev = EvalFramework(
+                    model=model,
+                    dataloader=group_loader,
+                    normalizer=copy.deepcopy(normalizer),
+                    conditioner=conditioner,
+                    device=device,
+                    window_size=window_size,
+                    output_path=out_subdir,
+                    n_synthetic_samples=n_synth_g,
+                )
+                ev.register_metric(_AFP(n_samples=min(100, n_group), window_size=window_size))
+                ev._prepare_data()
+                ev._inject_data_into_metrics()
+                ev.evaluate_synthetic_only()
+                fd = ev.results.get(_AFP_KEY)
+                results[group_name]["fd"] = float(fd) if fd is not None else None
+                _fd_str = f"{fd:.4f}" if fd is not None else "None"
+                print(f"  [ev_hp] '{group_name}': n={n_group}, FD={_fd_str}")
+
+                # Capture synthetic windows for EV variance profile
+                if group_name in _evvp_synth:
+                    _evvp_synth[group_name] = ev._synthetic_data  # [N_synth, window_size]
+            except Exception as e:
+                print(f"  [ev_hp] '{group_name}' failed: {e}")
+                _evhp_tb.print_exc()
+
+        out_path = os.path.join(model_output_dir, _sidecar_name)
+        os.makedirs(model_output_dir, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"  [ev_hp] Breakdown saved to {out_path}")
+
+        # EV Variance Profile plots — use shared real data so curves are identical across models
+        if has_ev and _shared_real is not None:
+            if _evvp_synth["EV"] is not None or _evvp_synth["No-EV"] is not None:
+                try:
+                    plot_ev_variance_profile(
+                        real_ev=_shared_real["ev"],
+                        synth_ev=_evvp_synth["EV"],
+                        real_noev=_shared_real["noev"],
+                        synth_noev=_evvp_synth["No-EV"],
+                        output_dir=model_output_dir,
+                        suffix=_vp_suffix,
+                    )
+                except Exception as e:
+                    print(f"  [ev_hp] EV variance profile plot failed: {e}")
+                    _evhp_tb.print_exc()
+            else:
+                print("  [ev_hp] Skipping EV variance profile — EV groups had too few windows.")
+    finally:
+        _remove_injected_holdout_profiles(conditioner, _injected_ev)
+
+    return _shared_real
+
+
 def compare_models(model_paths: list[str],
                    model_names: list[str],
                    secondary_model_paths: list[str] | None = None,
@@ -2142,6 +2780,9 @@ def compare_models(model_paths: list[str],
                    mia_model_names: list[str] | None = None,
                    sort_models: bool = True,
                    only_holdout: bool = False,
+                   ev_hp_breakdown: bool = False,
+                   ev_random_user_profiles: bool = False,
+                   preprocessed_cache_dir: str | None = None,
                    ):
     """
     Run evaluation for multiple models and compare results.
@@ -2182,6 +2823,8 @@ def compare_models(model_paths: list[str],
     elif data_files is None:
         data_files = []
 
+    # Removed sequential file validation loop, datasets gracefully handle skipping bad files.
+
     # 2. Pick a single global test split definition so all models see identical windows.
     if split_seed is None or split_ratios is None:
         inferred_seed, inferred_ratios = _infer_split_from_first_model(model_paths)
@@ -2207,8 +2850,13 @@ def compare_models(model_paths: list[str],
         eval_source_dir = requested_eval_dir if requested_eval_dir else path
         skip = (
             (not recompute and not recompute_tstr and not recompute_visual)
-            and _has_existing_eval_outputs(eval_source_dir, phased=phased)
-            and secondary is None and only_holdout is False
+            and (
+                # Checkpoint dir results only count for standalone models — a secondary
+                # combo produces different outputs than the primary alone.
+                (secondary is None and _has_existing_eval_outputs(eval_source_dir, phased=phased))
+                or _has_existing_eval_outputs(model_output_dir, phased=phased)
+            )
+            and only_holdout is False
         )
         # Checkpoint-dir fallback (ADR-0011): when output_dir/<name>/ is empty and
         # recompute=False, restore cached results from the model checkpoint dir.
@@ -2247,6 +2895,28 @@ def compare_models(model_paths: list[str],
         )
         _first_model_cache[first_idx] = (_first_model, _first_norm, _first_cond)
 
+        _cache_dir = os.path.join(output_dir, "_parquet_cache")
+        if preprocessed_cache_dir:
+            _cache_dir = preprocessed_cache_dir
+        else:
+            _first_cfg_path = _find_model_config_path(eval_plan[first_idx]["path"])
+            if _first_cfg_path is not None:
+                try:
+                    _hcfg = _load_train_config(_first_cfg_path)
+                    if hasattr(_hcfg, "data") and getattr(_hcfg.data, "preprocessed_cache_dir", None):
+                        _cache_dir = _hcfg.data.preprocessed_cache_dir
+                except Exception:
+                    pass
+        print(f"[eval cache] Using preprocessed cache dir: {_cache_dir}")
+
+        # When phased, a single-phase normalizer (feature dim 1) cannot transform [n,3,24]
+        # data.  Clear _first_norm so the shared loader is built raw and all downstream
+        # _loader_norm / _DenormalizingLoader logic remains consistent.
+        if phased and _first_norm is not None and getattr(_first_norm, "fitted", False):
+            _feat_dim = _first_norm._feature_dim_hint()
+            if _feat_dim is not None and _feat_dim != 3:
+                _first_norm = None
+
         shared_test_loader = _build_eval_test_loader(
             data_files=data_files,
             split_seed=split_seed,
@@ -2258,8 +2928,10 @@ def compare_models(model_paths: list[str],
             output_dir=output_dir,
             phased=phased,
             agg_divisor=agg_divisor,
+            preprocessed_cache_dir=_cache_dir,
         )
         import gc as _gc; _gc.collect()  # release 1M-tensor heap before model loading
+        print(f"Shared test loader ready: {len(shared_test_loader.dataset)} windows for evaluation.")
 
         if not recompute_tstr and not recompute_visual and only_holdout is False:
             # MIA only needs a few thousand member windows — cap independently of
@@ -2276,6 +2948,7 @@ def compare_models(model_paths: list[str],
                 num_samples=_mia_n,
                 phased=phased,
                 agg_divisor=agg_divisor,
+                preprocessed_cache_dir=_cache_dir,
             )
             if shared_train_loader is not None:
                 print(f"Shared train loader ready: {len(shared_train_loader.dataset)} member windows for MIA.")
@@ -2296,12 +2969,18 @@ def compare_models(model_paths: list[str],
                     for _hfid in _hfids:
                         print(f"  Loading feeder {_hfid}...", end=" ", flush=True)
                         try:
+                            _h_max_hr = getattr(_hcfg.data, "max_hour_value", None)
+                            if _h_max_hr is not None: _h_max_hr = float(_h_max_hr)
+                            _h_nan = bool(getattr(_hcfg.data, "nan_as_zero", False))
+
                             holdout_cache[_hfid] = load_holdout_windows_raw(
                                 feeder_id=_hfid,
                                 data_files=data_files,
                                 topology_path=str(_htopo),
                                 window_size=window.input_len,
                                 max_value=max_value,
+                                max_hour_value=_h_max_hr,
+                                nan_as_zero=_h_nan,
                             )
                             print(f"{len(holdout_cache[_hfid].x)} windows.")
                         except Exception as _he:
@@ -2309,8 +2988,59 @@ def compare_models(model_paths: list[str],
             except Exception as _hce:
                 print(f"  [holdout] Could not pre-load holdout cache: {_hce}")
 
+    # 5b. Pre-build phased holdout window cache (phased mode, holdout_feeder_id).
+    phased_holdout_cache: dict[int, HoldoutPhasedWindows] = {}
+    if needs_recompute_indices and data_files and phased:
+        _first_cfg_path = _find_model_config_path(eval_plan[needs_recompute_indices[0]]["path"])
+        if _first_cfg_path is not None:
+            try:
+                _hcfg = _load_train_config(_first_cfg_path)
+                _hid_raw = getattr(getattr(_hcfg, "data", None), "holdout_feeder_id", None)
+                if _hid_raw is None:
+                    _hid_raw = getattr(getattr(_hcfg, "data", None), "holdout_meter_ids", None)
+                _htopo  = getattr(getattr(_hcfg, "data", None), "topology_path", None)
+                if _hid_raw is not None and _htopo is not None:
+                    _phased_feature_cols = ["active_power_p14_l1", "active_power_p14_l2", "active_power_p14_l3"]
+                    _hfids = _dispatch_holdout_feeder_ids(_hid_raw)
+                    from src.data.feeder_holdout import resolve_holdout_meter_ids
+                    print(f"\nPre-loading phased holdout windows for {len(_hfids)} feeder(s)...")
+                    for _hfid in _hfids:
+                        print(f"  Loading feeder {_hfid}...", end=" ", flush=True)
+                        try:
+                            _hm_ids = resolve_holdout_meter_ids(str(_htopo), _hfid)
+                            _holdout_files = [
+                                f for f in data_files
+                                if _extract_meter_id_from_filename(os.path.basename(f)) in _hm_ids
+                            ]
+                            if not _holdout_files:
+                                print(f"FAILED: No valid files found for feeder {_hfid}.")
+                                continue
+                            _h_agg = bool(getattr(getattr(_hcfg.data, "window", None), "aggregated", True))
+                            _h_agg_unit = str(getattr(_hcfg.data, "aggregation_energy_unit", "wh")).lower()
+                            _h_agg_div = 1000.0 if _h_agg and _h_agg_unit == "kwh" else 1.0
+                            _h_max_hr = getattr(_hcfg.data, "max_hour_value", None)
+                            if _h_max_hr is not None: _h_max_hr = float(_h_max_hr)
+                            _h_nan = bool(getattr(_hcfg.data, "nan_as_zero", False))
+
+                            phased_holdout_cache[_hfid] = load_holdout_windows_phased(
+                                files=_holdout_files,
+                                feature_cols=_phased_feature_cols,
+                                window_size=window.input_len,
+                                max_value=max_value,
+                                max_hour_value=_h_max_hr,
+                                aggregation=_h_agg,
+                                aggregation_divisor=_h_agg_div,
+                                nan_as_zero=_h_nan,
+                            )
+                            print(f"{len(phased_holdout_cache[_hfid].x)} windows loaded.")
+                        except Exception as _phe:
+                            print(f"FAILED: {_phe}")
+            except Exception as _phce:
+                print(f"  [holdout phased] Could not pre-load phased holdout cache: {_phce}")
+
     # 5. Loop through models and evaluate, reusing the shared test loader.
     used_eval_dirs: list[str] = []
+    _ev_shared_real: "dict | None" = None  # real EV/no-EV arrays, computed once and reused
 
     for i, plan in enumerate(eval_plan):
         path             = plan["path"]
@@ -2323,10 +3053,13 @@ def compare_models(model_paths: list[str],
         os.makedirs(model_output_dir, exist_ok=True)
 
         if plan["skip"]:
-            print(f"  Found existing evaluation outputs in {eval_source_dir}; skipping recompute.")
+            _skip_src = model_output_dir if _has_existing_eval_outputs(model_output_dir, phased=phased) else eval_source_dir
+            print(f"  Found existing evaluation outputs in {_skip_src}; skipping recompute.")
             # Ensure model_output_dir has the main eval JSON so the comparator can read
             # from one canonical location alongside the holdout JSONs that live there.
-            if eval_source_dir != model_output_dir:
+            # Only restore from checkpoint dir when model_output_dir itself has no results
+            # — avoids overwriting correct phased results with stale single-phase JSONs.
+            if eval_source_dir != model_output_dir and not _has_existing_eval_outputs(model_output_dir, phased=phased):
                 _restore_results_from_checkpoint(eval_source_dir, model_output_dir)
             used_eval_dirs.append(model_output_dir)
             # Feeder holdout JSONs and summary always live in model_output_dir.
@@ -2360,13 +3093,77 @@ def compare_models(model_paths: list[str],
                     else:
                         try:
                             _mcfg = _load_train_config(_cfg_path)
+
+                            # --- Phased holdout (holdout_meter_ids) ---
+                            _phm_raw = getattr(getattr(_mcfg, "data", None), "holdout_meter_ids", None)
+                            if _phm_raw is None:
+                                _phm_raw = getattr(getattr(_mcfg, "data", None), "holdout_feeder_id", None)
+                            if phased and _phm_raw and 0 not in _found_ids:
+                                print(f"  [holdout phased] Running missing phased holdout eval...")
+                                # phased_holdout_cache is only pre-loaded when needs_recompute_indices
+                                # is non-empty. When all models were skipped it stays empty, so we
+                                # populate it lazily here.
+                                if not phased_holdout_cache:
+                                    _htopo_lazy = getattr(getattr(_mcfg, "data", None), "topology_path", None)
+                                    if _htopo_lazy is not None:
+                                        _phased_feature_cols = ["active_power_p14_l1", "active_power_p14_l2", "active_power_p14_l3"]
+                                        _hfids_lazy = _dispatch_holdout_feeder_ids(_phm_raw)
+                                        from src.data.feeder_holdout import resolve_holdout_meter_ids
+                                        for _hfid_lazy in _hfids_lazy:
+                                            try:
+                                                _hm_ids_lazy = resolve_holdout_meter_ids(str(_htopo_lazy), _hfid_lazy)
+                                                _holdout_files_lazy = [
+                                                    f for f in data_files
+                                                    if _extract_meter_id_from_filename(os.path.basename(f)) in _hm_ids_lazy
+                                                ]
+                                                if not _holdout_files_lazy:
+                                                    print(f"  [holdout phased] No files for feeder {_hfid_lazy}; skipping.")
+                                                    continue
+                                                _h_agg_lazy = bool(getattr(getattr(_mcfg.data, "window", None), "aggregated", True))
+                                                _h_agg_unit_lazy = str(getattr(_mcfg.data, "aggregation_energy_unit", "wh")).lower()
+                                                _h_agg_div_lazy = 1000.0 if _h_agg_lazy and _h_agg_unit_lazy == "kwh" else 1.0
+                                                _h_max_hr_lazy = getattr(_mcfg.data, "max_hour_value", None)
+                                                if _h_max_hr_lazy is not None: _h_max_hr_lazy = float(_h_max_hr_lazy)
+                                                _h_nan_lazy = bool(getattr(_mcfg.data, "nan_as_zero", False))
+                                                phased_holdout_cache[_hfid_lazy] = load_holdout_windows_phased(
+                                                    files=_holdout_files_lazy,
+                                                    feature_cols=_phased_feature_cols,
+                                                    window_size=window.input_len,
+                                                    max_value=max_value,
+                                                    max_hour_value=_h_max_hr_lazy,
+                                                    aggregation=_h_agg_lazy,
+                                                    aggregation_divisor=_h_agg_div_lazy,
+                                                    nan_as_zero=_h_nan_lazy,
+                                                )
+                                                print(f"  [holdout phased] Loaded {len(phased_holdout_cache[_hfid_lazy].x)} windows for feeder {_hfid_lazy}.")
+                                            except Exception as _lphe:
+                                                print(f"  [holdout phased] Load failed for feeder {_hfid_lazy}: {_lphe}")
+                                    else:
+                                        print(f"  [holdout phased] topology_path not in config; cannot load holdout windows.")
+                                _skip_model, _skip_norm, _skip_cond = load_model(path, device=device)
+                                for _phoid, _phraw in phased_holdout_cache.items():
+                                    _run_holdout_eval_phased(
+                                        model=_skip_model,
+                                        normalizer=_skip_norm,
+                                        conditioner=_skip_cond,
+                                        raw_holdout=_phraw,
+                                        holdout_id=_phoid,
+                                        device=device,
+                                        window_size=window.input_len,
+                                        model_output_dir=model_output_dir,
+                                        n_synthetic_draws=holdout_n_draws,
+                                    )
+                                if phased_holdout_cache:
+                                    _write_holdout_summary(model_output_dir, list(phased_holdout_cache.keys()))
+
+                            # --- Topology-based feeder holdout (unphased) ---
                             _hid = getattr(getattr(_mcfg, "data", None), "holdout_feeder_id", None)
                             _topo = getattr(getattr(_mcfg, "data", None), "topology_path", None)
-                            if _hid is None:
+                            if not phased and _hid is None:
                                 print(f"  [holdout] holdout_feeder_id not set in {_cfg_path}; skipping holdout eval.")
-                            elif _topo is None:
+                            elif not phased and _topo is None:
                                 print(f"  [holdout] holdout_feeder_id={_hid} set but topology_path missing in {_cfg_path}; skipping.")
-                            else:
+                            elif not phased:
                                 _fids = _dispatch_holdout_feeder_ids(_hid)
                                 _missing_fids = [fid for fid in _fids if fid not in _found_ids]
                                 if recompute_tstr:
@@ -2444,6 +3241,35 @@ def compare_models(model_paths: list[str],
             if normalizer is None and _loader_norm is not None
             else shared_test_loader
         )
+
+        # Guard: when a secondary model is present the primary model is single-phase
+        # (e.g. CVAE + HierarchicalSplitter). The shared_test_loader was built with
+        # phased=True and provides [n, 3, 24] tensors, but the primary's normalizer
+        # expects 1-feature data. Build a per-model unphased loader so PhasedEvaluationSuite
+        # can create its inner EvalFramework without a shape mismatch.
+        if secondary is not None and phased:
+            # CVAE+Splitter composite: provide raw un-normalized 3-phase data so that
+            # PhasedEvaluationSuite gets real_phase=[n,3,W]. The generator normalizes
+            # the aggregate internally after phase summation (is_denormalized=False path).
+            # Reuse the already-loaded shared_test_loader tensors — no disk I/O needed.
+            print(f"  '{name}': secondary model present — using pre-loaded data for PhasedEvaluationSuite.")
+            try:
+                from torch.utils.data import DataLoader as _DL2, TensorDataset as _TDS2
+                _ds = shared_test_loader.dataset
+                _x_norm = _ds.tensors[0].float()
+                if _first_norm is not None and getattr(_first_norm, "fitted", False):
+                    _x_raw = _first_norm.inverse_transform(_x_norm)
+                else:
+                    _x_raw = _x_norm
+                dataloader = _DL2(
+                    _TDS2(_x_raw, _ds.tensors[1], _ds.tensors[2], _ds.tensors[3]),
+                    batch_size=1024, shuffle=False, num_workers=0, pin_memory=False,
+                )
+                _loader_norm = None
+            except Exception as _sgl_e:
+                print(f"  [ERROR] Could not build raw phased loader for '{name}': {_sgl_e}; skipping.")
+                used_eval_dirs.append(model_output_dir)
+                continue
 
         if recompute_tstr:
             # TSTR-only recompute: patch TSTR in all existing result files without
@@ -2610,13 +3436,39 @@ def compare_models(model_paths: list[str],
                 import traceback as _tb
                 try:
                     _mcfg = _load_train_config(_cfg_path)
+
+                    # --- Phased file-based holdout (holdout_feeder_id) ---
+                    _hid = getattr(getattr(_mcfg, "data", None), "holdout_feeder_id", None)
+                    if _hid is None:
+                        _hid = getattr(getattr(_mcfg, "data", None), "holdout_meter_ids", None)
+                    if phased and _hid is not None:
+                        _fids = _dispatch_holdout_feeder_ids(_hid)
+                        for _fid in _fids:
+                            if _fid in phased_holdout_cache:
+                                _phraw = phased_holdout_cache[_fid]
+                                print(f"  Running phased holdout eval for feeder {_fid} ({len(_phraw.x)} windows)...")
+                                _run_holdout_eval_phased(
+                                    model=model,
+                                    normalizer=normalizer,
+                                    conditioner=conditioner,
+                                    raw_holdout=_phraw,
+                                    holdout_id=_fid,
+                                    device=device,
+                                    window_size=window.input_len,
+                                    model_output_dir=model_output_dir,
+                                    n_synthetic_draws=holdout_n_draws,
+                                )
+                        if _fids and any(f in phased_holdout_cache for f in _fids):
+                            _write_holdout_summary(model_output_dir, _fids)
+
+                    # --- Topology-based feeder holdout (unphased) ---
                     _hid = getattr(getattr(_mcfg, "data", None), "holdout_feeder_id", None)
                     _topo = getattr(getattr(_mcfg, "data", None), "topology_path", None)
-                    if _hid is None:
+                    if not phased and _hid is None:
                         print(f"  [holdout] holdout_feeder_id not set in {_cfg_path}; skipping holdout eval.")
-                    elif _topo is None:
+                    elif not phased and _topo is None:
                         print(f"  [holdout] holdout_feeder_id={_hid} is set but topology_path is missing in {_cfg_path}; skipping holdout eval.")
-                    else:
+                    elif not phased:
                         _fids = _dispatch_holdout_feeder_ids(_hid)
                         for _fid in _fids:
                             if _fid not in holdout_cache:
@@ -2650,6 +3502,27 @@ def compare_models(model_paths: list[str],
                     _tb.print_exc()
 
         used_eval_dirs.append(model_output_dir)
+
+        # EV/HP breakdown (optional, unphased only — phased uses a different evaluator structure)
+        # Always recomputes when the flag is set — no sidecar caching.
+        if ev_hp_breakdown and not phased:
+            try:
+                _ev_shared_real = _run_ev_hp_breakdown(
+                    model=model,
+                    normalizer=normalizer,
+                    conditioner=conditioner,
+                    dataloader=dataloader,
+                    model_output_dir=model_output_dir,
+                    device=device,
+                    window_size=window.input_len,
+                    n_synthetic_samples=num_samples,
+                    _shared_real=_ev_shared_real,
+                    random_user_profiles=ev_random_user_profiles,
+                ) or _ev_shared_real
+            except Exception as _evhp_e:
+                print(f"  [ev_hp] EV/HP breakdown failed for '{name}': {_evhp_e}")
+                import traceback as _evhp_loop_tb; _evhp_loop_tb.print_exc()
+
         # Release GPU memory between models so each starts with a clean VRAM state.
         import gc as _gc2
         _gc2.collect()
@@ -2667,7 +3540,9 @@ def compare_models(model_paths: list[str],
     if _mia_missing and data_files:
         _mia_test_loader = shared_test_loader
         _mia_train_loader = shared_train_loader
-        _mia_loader_norm = _first_norm
+        # Phased loaders provide raw un-normalized data; applying a 1-feature normalizer
+        # to 3-phase tensors would fail. MIA still runs, just on raw data.
+        _mia_loader_norm = None if phased else _first_norm
         _mia_model_cache: dict[int, tuple] = dict(_first_model_cache)
 
         if _mia_test_loader is None or _mia_train_loader is None:
@@ -2676,24 +3551,27 @@ def compare_models(model_paths: list[str],
                 _mia_first_i, _mia_first_plan = _mia_missing[0]
                 _mia_fm, _mia_fn, _mia_fc = load_model(_mia_first_plan["path"], device=device)
                 _mia_model_cache[_mia_first_i] = (_mia_fm, _mia_fn, _mia_fc)
-                _mia_lo = PhasedReplayDataloaders(
-                    sm_files=data_files, window_spec=window, batch_size=1024,
-                    replay_buffer_capacity=num_samples, min_buffer_size=0,
-                    normalizer=_mia_fn, num_workers=0, phased_mode=phased,
-                    sample_random=False, feature_cols=["hourly_energy_consumption"],
-                    meter_col="meter_number", aggregation_divisor=agg_divisor,
-                    hourly_aggregation=agg_divisor > 1.0,
-                    split_seed=split_seed, split_ratios=split_ratios,
-                    max_value=max_value, pin_memory=False,
+                _mia_cache_dir = preprocessed_cache_dir or os.path.join(output_dir, "_parquet_cache")
+                _mia_norm = _mia_fn
+                if phased and _mia_norm is not None and getattr(_mia_norm, "fitted", False):
+                    _feat_dim = _mia_norm._feature_dim_hint()
+                    if _feat_dim is not None and _feat_dim != 3:
+                        _mia_norm = None
+                _mia_test_loader = _build_eval_test_loader(
+                    data_files=data_files, split_seed=split_seed,
+                    split_ratios=split_ratios, max_value=max_value,
+                    window_len=window.input_len, normalizer=_mia_norm,
+                    num_samples=num_samples, output_dir=output_dir,
+                    phased=phased, agg_divisor=agg_divisor,
+                    preprocessed_cache_dir=_mia_cache_dir,
                 )
-                _mia_lo.refresh_test_cache(max(1, num_samples // 32))
-                _mia_test_loader = _mia_lo.get_test_loader()
-                _mia_loader_norm = getattr(_mia_lo, "normalizer", None)
+                _mia_loader_norm = _mia_norm
                 _mia_train_loader = _build_mia_train_loader(
-                    data_files=data_files, normalizer=_mia_fn,
+                    data_files=data_files, normalizer=_mia_norm,
                     split_seed=split_seed, split_ratios=split_ratios,
                     max_value=max_value, window_size=window.input_len,
                     num_samples=num_samples, phased=phased, agg_divisor=agg_divisor,
+                    preprocessed_cache_dir=_mia_cache_dir,
                 )
             except Exception as _mia_build_e:
                 print(f"  [MIA fallback] Could not build loaders: {_mia_build_e}")
@@ -2722,6 +3600,61 @@ def compare_models(model_paths: list[str],
             except Exception as _mia_e:
                 print(f"  [MIA fallback] Failed for '{_mia_plan['name']}': {_mia_e}")
                 import traceback as _mia_tb; _mia_tb.print_exc()
+
+    # 5c. EV/HP breakdown fallback: compute for any model skipped in the main loop.
+    # Always recomputes when the flag is set — no sidecar caching.
+    if ev_hp_breakdown and not phased and data_files:
+        _evhp_missing = list(enumerate(eval_plan))
+        if _evhp_missing:
+            _evhp_loader = shared_test_loader
+            _evhp_loader_norm = _first_norm
+            _evhp_model_cache2: dict[int, tuple] = dict(_first_model_cache)
+
+            if _evhp_loader is None:
+                print("\n[ev_hp fallback] Building data loader (main loop was skipped)...")
+                try:
+                    _evhp_fi, _evhp_fp = _evhp_missing[0]
+                    _evhp_bfm, _evhp_bfn, _evhp_bfc = load_model(_evhp_fp["path"], device=device)
+                    _evhp_model_cache2[_evhp_fi] = (_evhp_bfm, _evhp_bfn, _evhp_bfc)
+                    _evhp_loader = _build_eval_test_loader(
+                        data_files=data_files, split_seed=split_seed,
+                        split_ratios=split_ratios, max_value=max_value,
+                        window_len=window.input_len, normalizer=_evhp_bfn,
+                        num_samples=num_samples, output_dir=output_dir,
+                        phased=phased, agg_divisor=agg_divisor,
+                    )
+                    _evhp_loader_norm = _evhp_bfn
+                except Exception as _evhp_bl:
+                    print(f"  [ev_hp fallback] Could not build loader: {_evhp_bl}")
+                    _evhp_loader = None
+
+            for _evhp_fi2, _evhp_fp2 in _evhp_missing:
+                if _evhp_loader is None:
+                    print(f"  [ev_hp fallback] No loader; skipping '{_evhp_fp2['name']}'.")
+                    continue
+                print(f"\n[ev_hp fallback] Computing breakdown for '{_evhp_fp2['name']}'...")
+                try:
+                    if _evhp_fi2 in _evhp_model_cache2:
+                        _efm, _efn, _efc = _evhp_model_cache2[_evhp_fi2]
+                    else:
+                        _efm, _efn, _efc = load_model(_evhp_fp2["path"], device=device)
+                    _evhp_dl = (
+                        _DenormalizingLoader(_evhp_loader, _evhp_loader_norm)
+                        if _efn is None and _evhp_loader_norm is not None
+                        else _evhp_loader
+                    )
+                    _ev_shared_real = _run_ev_hp_breakdown(
+                        model=_efm, normalizer=_efn, conditioner=_efc,
+                        dataloader=_evhp_dl,
+                        model_output_dir=_evhp_fp2["model_output_dir"],
+                        device=device, window_size=window.input_len,
+                        n_synthetic_samples=num_samples,
+                        _shared_real=_ev_shared_real,
+                        random_user_profiles=ev_random_user_profiles,
+                    ) or _ev_shared_real
+                except Exception as _evhp_re:
+                    print(f"  [ev_hp fallback] Failed for '{_evhp_fp2['name']}': {_evhp_re}")
+                    import traceback as _evhp_ftb; _evhp_ftb.print_exc()
 
     # 6. Use PhasedModelComparator to generate comparison tables and plots
     print("\n" + "="*50)
@@ -2757,7 +3690,12 @@ def compare_models(model_paths: list[str],
         )
     for name, eval_dir in zip(model_names, used_eval_dirs):
         comparator.add_model(name, eval_dir, trainable_params=_param_counts.get(name))
-    
+
+    if ev_hp_breakdown:
+        comparator._generate_ev_hp_plots()
+        print("\nEV/HP breakdown complete. Results saved to:", output_dir)
+        return comparator.models_data
+
     comparator.compare(mia_models=mia_model_names, sort_models=sort_models)
 
     print("\nComparison complete. Results saved to:", output_dir)
@@ -2781,6 +3719,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--data-dir", type=str, default="data/_parquet_cache", help="Directory with parquet files.")
     parser.add_argument("--data-files", nargs="*", default=None, help="Optional explicit parquet files (relative to --data-dir unless absolute).")
+    parser.add_argument("--cache-dir", type=str, default=None, help="Directory for preprocessed window cache (overrides preprocessed_cache_dir from model config).")
     parser.add_argument("--num-samples", type=int, default=10000, help="Approx number of windows to evaluate per model.")
     parser.add_argument("--output-dir", type=str, default="evaluation_comparison", help="Where to write/read evaluation outputs.")
     parser.add_argument("--phased", action="store_true", help="Use phased evaluation suite.")
@@ -2797,6 +3736,8 @@ if __name__ == "__main__":
     parser.add_argument("--recompute-visual", action="store_true", help="Recompute only visual evaluation (reconstruction plots) for all models, skipping all other metrics. Not compatible with phased evaluation.")
     parser.add_argument("--no-sort", action="store_true", help="Disable automatic model sorting; models appear in the order listed in --names.")
     parser.add_argument("--only-holdout", action="store_true", help="Only run holdout evaluation (and summary) for models with holdout_feeder_id set in their training config. Skips main test-split evaluation and all metrics except TSTR on the holdout.")
+    parser.add_argument("--ev-hp-breakdown", action="store_true", help="Compute and plot EV/no-EV and HP/no-HP aggregated-profile FD breakdown and EV variance profile plots on the full test set. Always recomputes and overwrites existing sidecars and PDFs.")
+    parser.add_argument("--ev-random-user-profiles", action="store_true", help="When --ev-hp-breakdown is active, inject random Dirichlet user profiles for all test-split meters before synthetic generation. Isolates the EV condition effect from per-meter behavioural-type confounding. Writes separate _random_profiles sidecar files and PDFs alongside the real-profile outputs.")
     args = parser.parse_args()
     holdout_n_draws = int(args.holdout_n_draws)
     n_draws = int(args.n_draws)
@@ -2815,16 +3756,21 @@ if __name__ == "__main__":
                 # "E:/models/new3/GuidedFaradayModel_20260528_223126", # NOt for holdout
                 # "E:/models/new3/GuidedFaradayModel_20260529_000300_cnn", # NOT for holdout
                 # "E:/models/new3/GuidedFaradayModel_20260529_012840_cnn_mmd" # NOT for holdout
-                # "E:/models/new4/GuidedFaradayModel_20260603_123450", # use
+                #"E:/models/new4/GuidedFaradayModel_20260604_102425_deterministic", # use
+                #"E:/models/new4/GuidedFaradayModel_20260603_123450", # use
+                #"E:/models/new4/GuidedFaradayModel_20260605_173422",
                 # "E:/models/new4/GuidedFaradayModel_20260603_120241", # use
                 # "E:/models/new4/GuidedFaradayModel_20260603_102551", # use
+                "E:/models/new4/GuidedFaradayModel_20260605_105946",# "E:/models/new4/GuidedFaradayModel_20260605_112623",
+                "E:/models/new4/GuidedFaradayModel_20260605_201145",
                 "E:/models/new4/CVAE_20260531_185015_guide_cnn_h_broken",
                 "E:/models/new4/DiffusionModel_20260601_002842", # use
-                # "E:/models/new4/FaradayModel_20260601_060319", # USe
+                "E:/models/new4/FaradayModel_20260601_060319", # USe
                 "E:/models/new4/CVAE_20260601_022452_guide", # USE
                 "E:/models/new4/CVAE_20260531_180003_cvae",
                 "E:/models/new4/QuantileBaselineModel_20260601_005326",
                 "E:/models/new4/AverageBaselineModel_20260531_173051",
+                "E:/models/new4/RealDataBaselineModel_20260608_143634",
                    ]
     args.names = [
                     # "Guide-CNN",
@@ -2840,22 +3786,78 @@ if __name__ == "__main__":
                     # "Guided-Faraday-OLD",
                     # "Guided-Faraday-CNN-OLD",
                     # "Guided-Faraday-CNN-MMD-OLD",
-                    # "Guided-Faraday-CNN", # Use # make holdout
-                    # "Guided-Faraday-UserProfiles", # use # make holdout
-                    # "Guided-Faraday", # USe # make holdout
+                    #"Guided-Faraday-CNN-Deterministic-big", # use
+                    #"Guided-Faraday-CNN-Stochastic-big", # Use
+                    #"Guided-Faraday-CNN-newGMM",
+                    #"Guided-Faraday-UserProfiles", # use
+                    #"Guided-Faraday", # USe
+                    "Guided-Faraday-CNN",# "Guided-Faraday-CNN-Stochastic",
+                    "Guided-Faraday-CNN-UserProfiles",
                     "H-Guide-CNN", # use
                     "Diffusion", # use
-                    # "Faraday", # USE # make holdout
+                    "Faraday", # USE
                     "Guide", # USE
                     "CVAE", # use
                     "Baseline-Quantile", # use
                     "Baseline-Average", # use
+                    "Baseline-RealData", # use
     ]
-    args.mia_models = [
-        "Guided-Faraday-CNN",
-        "Diffusion",
-        "H-Guide-CNN",
-    ]
+    # args.mia_models = [
+    #     "Guided-Faraday-CNN",
+    #     "Diffusion",
+    #     "H-Guide-CNN",
+    # ]
+
+    # PHASED:
+    args.models = ["E:/models/phased2/SetGuideVAE_20260607_124614",
+                   "E:/models/phased2/SetGuideVAE_20260607_132508_CNN",
+                  "E:/models/phased2/DiffusionModel_20260607_080656",
+                  "E:/models/phased2/SequentialPhaseVAE_20260607_082110",
+                    "E:/models/new4/GuidedFaradayModel_20260605_105946",
+                    "E:/models/phased2/QuantileBaselineModel_20260607_112946",
+                    "E:/models/phased2/AverageBaselineModel_20260607_113136"
+                   ]
+    args.secondary_models = [None, 
+                             None, 
+                             None,
+                             None, 
+                             "E:/models/phased/HierarchicalSplitter_20260604_171559", 
+                             None,
+                             None
+                             ]
+    args.names = ["Set-Guide-VAE",
+                    "Set-Guide-VAE-CNN",
+                    "Diffusion_phased", 
+                    "Sequential",
+                    "Guide-CNN (with Hierarchical Splitter)",
+                    "Quantile Baseline",
+                    "Average Baseline"
+                  ]
+
+
+    # args.names = ["Diffusion"]
+    # args.models = ["E:/models/new4/DiffusionModel_20260601_002842"]
+    # uv run src/evaluation/compare_models.py --models "s" --names "s" --num-samples 50000 --holdout-n-draws 5 --n-draws 10 --recompute --only-holdout
+
+    # args.models = ["E:/models/new4/CVAE_20260531_185015_guide_cnn_h_broken"]
+    # args.secondary_models = ["E:/models/phased/HierarchicalSplitter_20260604_171559"]
+    # args.names = ["Guide-CNN (with Hierarchical Splitter)"]
+
+    # args.models = ["E:/models/new4/GuidedFaradayModel_20260605_201145"]
+    # args.names = ["Guided-Faraday-CNN-UserProfiles-newMMD"]
+
+    # args.models = ["E:/models/new4/GuidedFaradayModel_20260605_173422"]
+    # args.names = ["Guided-Faraday-CNN-newGMM-userProfiles"]
+
+    # args.models = ["E:/models/new4/GuidedFaradayModel_20260603_120241"]
+    # args.names = ["Guided-Faraday-UserProfiles"]
+
+    # args.models = ["E:/models/new4/GuidedFaradayModel_20260604_102425_deterministic"]
+    # args.names = ["Guided-Faraday-CNN-Deterministic-big"]
+
+    # args.models = ["E:/models/new4/GuidedFaradayModel_20260605_105946"]
+    # args.names = ["Guided-Faraday-CNN"]
+
 
     # args.models = ["E:/models/new4/FaradayModel_20260603_133808"]
     # args.names = ["Faraday-NEW-FIX2"]
@@ -3033,6 +4035,9 @@ if __name__ == "__main__":
             recompute_visual=bool(args.recompute_visual) if hasattr(args, "recompute_visual") else False,
             sort_models=not bool(args.no_sort),
             only_holdout=bool(args.only_holdout) if hasattr(args, "only_holdout") else False,
+            ev_hp_breakdown=bool(args.ev_hp_breakdown) if hasattr(args, "ev_hp_breakdown") else False,
+            ev_random_user_profiles=bool(args.ev_random_user_profiles) if hasattr(args, "ev_random_user_profiles") else False,
+            preprocessed_cache_dir=args.cache_dir if hasattr(args, "cache_dir") and args.cache_dir else None,
         )
     except BaseException as _e:
         import traceback as _tb

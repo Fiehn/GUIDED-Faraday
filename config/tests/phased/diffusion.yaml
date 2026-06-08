@@ -1,13 +1,9 @@
 base: base.yaml
 
-data:
-  batch_size: 256
-  eval_cache_on_gpu: false
-
 model:
   type: diffusion
   diffusion:
-    num_timesteps: 200
+    num_timesteps: 150
     schedule_type: cosine
     cosine_s: 0.008
     max_beta: 0.999
