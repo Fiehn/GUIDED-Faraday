@@ -55,7 +55,7 @@ class PhasedModelComparator:
         self._model_eval_dirs: dict[str, str] = {}
         self._param_counts: dict[str, int | None] = {}
         # We define a superset of possible phases.
-        self.phases = ['full_eval', 'aggregated_phase', 'ranked_phase_1', 'ranked_phase_2', 'ranked_phase_3']
+        self.phases = ['full_eval', 'aggregated_phase', 'ranked_phase_1', 'ranked_phase_2', 'ranked_phase_3', 'cross_phase', 'c2st']
 
     def _metric_target_label(self, metric: str) -> str:
         """Return target direction/target value for plot titles."""
@@ -164,6 +164,19 @@ class PhasedModelComparator:
             "hourlyprofilesbymonthanddayofweek": "lower",
             "peakmagnitude": "lower",
             "peaktiming": "lower",
+
+            # Cross-phase metrics (ADR-0018)
+            "crossphasecorrelationerror": "lower",
+            "crosscorrelationdistributionks": "lower",
+            "slicedwassersteindistance": "lower",
+            "classifiertwosampletestauc": "lower",
+
+            # Single-channel C2ST analysis
+            "c2staucaggregate": "lower",
+            "c2staucphase1low": "lower",
+            "c2staucphase2mid": "lower",
+            "c2staucphase3high": "lower",
+            "c2staucsinglechannel": "lower",
 
             # Coincidence factor metrics
             "cferrornmaxindependent": "lower",
@@ -340,6 +353,8 @@ class PhasedModelComparator:
                     'ranked_phase_1': summary.get('ranked_phases', {}).get('phase_1', {}),
                     'ranked_phase_2': summary.get('ranked_phases', {}).get('phase_2', {}),
                     'ranked_phase_3': summary.get('ranked_phases', {}).get('phase_3', {}),
+                    'cross_phase': summary.get('cross_phase', {}),
+                    'c2st': summary.get('c2st', {}),
                 }
                 for phase_key, raw in _phase_map.items():
                     if raw and phase_key not in self.models_data[model_name]:
@@ -380,7 +395,22 @@ class PhasedModelComparator:
                         self.models_data[model_name]['full_eval_meta'] = full_eval_meta
             except Exception as e:
                 print(f"Error loading {root_eval_path}: {e}")
-        
+
+        # 2b. Standalone C2ST results (non-phased models, or as fallback for phased).
+        #     For phased models 'c2st' is already loaded from phased_eval_summary.json above.
+        c2st_path = os.path.join(model_dir, 'c2st_results.json')
+        if os.path.exists(c2st_path) and 'c2st' not in self.models_data.get(model_name, {}):
+            try:
+                with open(c2st_path, 'r') as f:
+                    c2st_raw = json.load(f)
+                pe, pm = _extract_phase_dict(c2st_raw)
+                if pe:
+                    self.models_data[model_name]['c2st'] = pe
+                if pm:
+                    self.models_data[model_name]['c2st_meta'] = pm
+            except Exception as e:
+                print(f"Error loading {c2st_path}: {e}")
+
         # 3. Feeder holdout results.
         #    3a. Summary JSON → holdout_eval (mean scalars) + holdout_summary_meta (std, per_feeder).
         #    3b. Legacy flat JSON → holdout_eval only (backward compat, no meta).
@@ -698,6 +728,11 @@ class PhasedModelComparator:
                 last_sorted_models = sorted_models
                 self._generate_table(phase, sorted_models)
                 self._generate_plots(phase, sorted_models)
+                if phase == 'cross_phase':
+                    try:
+                        self._generate_cross_phase_radar(sorted_models)
+                    except Exception as _rdr_e:
+                        print(f"  [compare] cross-phase radar failed: {_rdr_e}")
             elif models_with_phase:
                 missing = [m for m in self.models_data if phase not in self.models_data[m]]
                 print(f"\n[Skipping phase '{phase}': missing for models {missing}]")
@@ -1440,6 +1475,72 @@ class PhasedModelComparator:
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
         print(f"Boxplot saved to {plot_path}")
+
+    def _generate_cross_phase_radar(self, models: list[str]) -> None:
+        """Spider/radar chart normalising all 4 cross-phase metrics so higher = better."""
+        METRIC_KEYS = [
+            "Cross-Phase Correlation Error",
+            "Cross-Correlation Distribution (KS)",
+            "Sliced Wasserstein Distance",
+            "Classifier Two-Sample Test (AUC)",
+        ]
+        AXIS_LABELS = ["Corr.\nError", "CCF KS", "Sliced\nWasserstein", "C2ST\nAUC"]
+
+        raw: dict[str, np.ndarray] = {}
+        for model in models:
+            cp_data = self.models_data[model].get('cross_phase', {})
+            row = []
+            for key in METRIC_KEYS:
+                v = cp_data.get(key)
+                if isinstance(v, dict):
+                    v = v.get('mean')
+                try:
+                    row.append(float(v))
+                except (TypeError, ValueError):
+                    row.append(np.nan)
+            raw[model] = np.array(row, dtype=float)
+
+        all_vals = np.array([raw[m] for m in models], dtype=float)
+        v_min = np.nanmin(all_vals, axis=0)
+        v_max = np.nanmax(all_vals, axis=0)
+        denom = np.where(v_max > v_min, v_max - v_min, 1e-12)
+        # All metrics are lower-better → invert so 1.0 = best on the spider
+        normalized = {
+            m: np.where(np.isfinite(raw[m]), (v_max - raw[m]) / denom, 0.0)
+            for m in models
+        }
+
+        n_axes = len(METRIC_KEYS)
+        angles = np.linspace(0, 2 * np.pi, n_axes, endpoint=False).tolist()
+        angles += angles[:1]
+
+        fig, ax = plt.subplots(figsize=(9, 8), subplot_kw={'polar': True})
+        plot_style = PlotStyle()
+
+        for i, model in enumerate(models):
+            vals = normalized[model].tolist() + [normalized[model][0]]
+            color = self._model_color(model, i, plot_style)
+            ax.plot(angles, vals, color=color, lw=2, label=model)
+            ax.fill(angles, vals, color=color, alpha=0.08)
+
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(AXIS_LABELS, fontsize=10)
+        ax.set_ylim(0, 1)
+        ax.set_yticks([0.25, 0.5, 0.75, 1.0])
+        ax.set_yticklabels(["0.25", "0.50", "0.75", "1.00"], fontsize=7)
+        ax.set_title(
+            "Cross-Phase Metrics — Radar Chart\n(higher = better; relative to loaded models)",
+            fontsize=12, pad=22,
+        )
+        ax.legend(loc='upper right', bbox_to_anchor=(1.38, 1.18), fontsize=9)
+
+        out_dir = os.path.join(self.output_dir, 'cross_phase')
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, 'cross_phase_radar.pdf')
+        fig.savefig(path, bbox_inches='tight')
+        plt.close(fig)
+        print(f"  Cross-phase radar chart → {path}")
+
 
 def _build_eval_test_loader(
     data_files: list[str],
@@ -2783,6 +2884,10 @@ def compare_models(model_paths: list[str],
                    mia_model_names: list[str] | None = None,
                    sort_models: bool = True,
                    only_holdout: bool = False,
+                   only_cross_phase: bool = False,
+                   cross_phase_samples: int | None = None,
+                   only_c2st: bool = False,
+                   c2st_samples: int | None = None,
                    ev_hp_breakdown: bool = False,
                    ev_random_user_profiles: bool = False,
                    preprocessed_cache_dir: str | None = None,
@@ -2852,7 +2957,7 @@ def compare_models(model_paths: list[str],
         requested_eval_dir = eval_result_dirs[i] if eval_result_dirs is not None else None
         eval_source_dir = requested_eval_dir if requested_eval_dir else path
         skip = (
-            (not recompute and not recompute_tstr and not recompute_visual)
+            (not recompute and not recompute_tstr and not recompute_visual and not only_cross_phase and not only_c2st)
             and (
                 # Checkpoint dir results only count for standalone models — a secondary
                 # combo produces different outputs than the primary alone.
@@ -3388,6 +3493,84 @@ def compare_models(model_paths: list[str],
             used_eval_dirs.append(model_output_dir)
             continue
 
+        if only_cross_phase:
+            if not phased:
+                print(f"  [only-cross-phase] Skipping '{name}': --only-cross-phase requires --phased.")
+            else:
+                _cp_samples = cross_phase_samples if cross_phase_samples is not None else num_samples
+                print(f"  [only-cross-phase] Running cross-phase metrics only for '{name}' "
+                      f"({_cp_samples} samples, {n_draws} draw(s))...")
+                evaluator = PhasedEvaluationSuite(
+                    model=model,
+                    dataloader=dataloader,  # type: ignore[arg-type]
+                    normalizer=normalizer,
+                    conditioner=conditioner,
+                    device=device,
+                    window_size=window.input_len,
+                    output_path=model_output_dir,
+                    secondary_model=sec_model,
+                    n_synthetic_samples=_cp_samples,
+                    n_draws=n_draws,
+                )
+                evaluator.evaluate_cross_phase_only()
+                _copy_results_to_checkpoint_dir(model_output_dir, path)
+            used_eval_dirs.append(model_output_dir)
+            continue
+
+        if only_c2st:
+            _c2st_samples = c2st_samples if c2st_samples is not None else num_samples
+            print(f"  [only-c2st] Running C2ST analysis for '{name}' "
+                  f"({_c2st_samples} samples, {n_draws} draw(s), phased={phased})...")
+            if phased:
+                evaluator = PhasedEvaluationSuite(
+                    model=model,
+                    dataloader=dataloader,  # type: ignore[arg-type]
+                    normalizer=normalizer,
+                    conditioner=conditioner,
+                    device=device,
+                    window_size=window.input_len,
+                    output_path=model_output_dir,
+                    secondary_model=sec_model,
+                    n_synthetic_samples=_c2st_samples,
+                    n_draws=n_draws,
+                )
+                evaluator.evaluate_c2st_only()
+            else:
+                # Non-phased: lean single-channel C2ST — no reconstruction pass needed.
+                import time as _time
+                from src.evaluation.metrics.c2st import C2STSuite
+                from src.evaluation.metrics.base.base import _sanitize_numeric_array as _san
+
+                _fw = EvalFramework(
+                    model,
+                    dataloader,  # type: ignore[arg-type]
+                    normalizer=normalizer,
+                    conditioner=conditioner,
+                    device=device,
+                    window_size=window.input_len,
+                    n_synthetic_samples=_c2st_samples,
+                    output_path=model_output_dir,
+                    evaluation_title='C2ST DATA COLLECTION',
+                    verbose=False,
+                )
+                _fw._prepare_data()
+                _real   = _san(_fw._real_data)
+                _synths = [_san(_fw._synthetic_data)]
+                for _di in range(1, n_draws):
+                    print(f"    Generating draw {_di + 1}/{n_draws}...", end="", flush=True)
+                    _t0 = _time.time()
+                    with torch.no_grad():
+                        _synths.append(_san(_fw._generate_synthetic(_c2st_samples)))
+                    print(f" done ({_time.time() - _t0:.1f}s)")
+                C2STSuite(
+                    output_path=model_output_dir,
+                    n_draws=n_draws,
+                    device=device,
+                ).evaluate(_real, _synths)
+            _copy_results_to_checkpoint_dir(model_output_dir, path)
+            used_eval_dirs.append(model_output_dir)
+            continue
+
         if phased:
             # Phased models use PhasedEvaluationSuite which creates sub-phase directories
             evaluator = PhasedEvaluationSuite(
@@ -3746,70 +3929,75 @@ if __name__ == "__main__":
     parser.add_argument("--only-holdout", action="store_true", help="Only run holdout evaluation (and summary) for models with holdout_feeder_id set in their training config. Skips main test-split evaluation and all metrics except TSTR on the holdout.")
     parser.add_argument("--ev-hp-breakdown", action="store_true", help="Compute and plot EV/no-EV and HP/no-HP aggregated-profile FD breakdown and EV variance profile plots on the full test set. Always recomputes and overwrites existing sidecars and PDFs.")
     parser.add_argument("--ev-random-user-profiles", action="store_true", help="When --ev-hp-breakdown is active, inject random Dirichlet user profiles for all test-split meters before synthetic generation. Isolates the EV condition effect from per-meter behavioural-type confounding. Writes separate _random_profiles sidecar files and PDFs alongside the real-profile outputs.")
+    parser.add_argument("--only-cross-phase", action="store_true", help="Compute only the four cross-phase metrics (CrossPhaseCorrelationError, CrossCorrelationDistribution, SlicedWassersteinDistance, ClassifierTwoSampleTest) for phased models. Patches existing phased_eval_summary.json; skips all per-phase metric computation and reconstruction passes.")
+    parser.add_argument("--cross-phase-samples", type=int, default=None, help="Number of synthetic samples for --only-cross-phase (defaults to --num-samples). Reduce to speed up generation.")
+    parser.add_argument("--only-c2st", action="store_true", help="Run only the single-channel C2ST analysis (aggregate + 3 ranked phases) for phased models. Patches existing phased_eval_summary.json; skips all per-phase metric computation and reconstruction passes.")
+    parser.add_argument("--c2st-samples", type=int, default=None, help="Number of synthetic samples for --only-c2st (defaults to --num-samples).")
     args = parser.parse_args()
     holdout_n_draws = int(args.holdout_n_draws)
     n_draws = int(args.n_draws)
 
-    args.models = [
-                #    "E:/models/new4/CVAE_20260601_034519_guide_cnn",
-                #    "E:/models/new4/FaradayModel_20260531_124255",
-                #    "E:/models/new4/FaradayModel_20260601_060319",
-                #    "E:/models/new4/GuidedFaradayModel_20260531_115215",
-                #    "E:/models/new4/GuidedFaradayModel_20260531_131653_relu",
-                #    "E:/models/new4/GuidedFaradayModel_20260531_143252_peaks",
-                #    "E:/models/new4/GuidedFaradayModel_20260531_204015",
-                #    "E:/models/new4/GuidedFaradayModel_20260531_211801_cnn",
-                # "E:/models/new4/GuidedFaradayModel_20260531_225823_userprofile",
-                # "E:/models/new3/FaradayModel_20260529_021321", # NOT for holdout
-                # "E:/models/new3/GuidedFaradayModel_20260528_223126", # NOt for holdout
-                # "E:/models/new3/GuidedFaradayModel_20260529_000300_cnn", # NOT for holdout
-                # "E:/models/new3/GuidedFaradayModel_20260529_012840_cnn_mmd" # NOT for holdout
-                #"E:/models/new4/GuidedFaradayModel_20260604_102425_deterministic", # use
-                #"E:/models/new4/GuidedFaradayModel_20260603_123450", # use
-                #"E:/models/new4/GuidedFaradayModel_20260605_173422",
-                # "E:/models/new4/GuidedFaradayModel_20260603_120241", # use
-                # "E:/models/new4/GuidedFaradayModel_20260603_102551", # use
-                "E:/models/new4/GuidedFaradayModel_20260605_105946",# "E:/models/new4/GuidedFaradayModel_20260605_112623",
-                "E:/models/new4/GuidedFaradayModel_20260605_201145",
-                "E:/models/new4/CVAE_20260531_185015_guide_cnn_h_broken",
-                "E:/models/new4/DiffusionModel_20260601_002842", # use
-                "E:/models/new4/FaradayModel_20260601_060319", # USe
-                "E:/models/new4/CVAE_20260601_022452_guide", # USE
-                "E:/models/new4/CVAE_20260531_180003_cvae",
-                "E:/models/new4/QuantileBaselineModel_20260601_005326",
-                "E:/models/new4/AverageBaselineModel_20260531_173051",
-                "E:/models/new4/RealDataBaselineModel_20260608_143634",
-                   ]
-    args.names = [
-                    # "Guide-CNN",
-                    # "Faraday",
-                    # "Faraday-new-fix",
-                    # "Guided-Faraday",
-                    # "Guided-Faraday-RELU",
-                    # "Guided-Faraday-PEAKS",
-                    # "Guided-Faraday-Deterministic",
-                    # "Guided-Faraday-CNN-2",
-                    # "Guided-Faraday-UserProfile",
-                    # "Faraday-OLD",
-                    # "Guided-Faraday-OLD",
-                    # "Guided-Faraday-CNN-OLD",
-                    # "Guided-Faraday-CNN-MMD-OLD",
-                    #"Guided-Faraday-CNN-Deterministic-big", # use
-                    #"Guided-Faraday-CNN-Stochastic-big", # Use
-                    #"Guided-Faraday-CNN-newGMM",
-                    #"Guided-Faraday-UserProfiles", # use
-                    #"Guided-Faraday", # USe
-                    "Guided-Faraday-CNN",# "Guided-Faraday-CNN-Stochastic",
-                    "Guided-Faraday-CNN-UserProfiles",
-                    "H-Guide-CNN", # use
-                    "Diffusion", # use
-                    "Faraday", # USE
-                    "Guide", # USE
-                    "CVAE", # use
-                    "Baseline-Quantile", # use
-                    "Baseline-Average", # use
-                    "Baseline-RealData", # use
-    ]
+
+    # args.models = [
+    #             #    "E:/models/new4/CVAE_20260601_034519_guide_cnn",
+    #             #    "E:/models/new4/FaradayModel_20260531_124255",
+    #             #    "E:/models/new4/FaradayModel_20260601_060319",
+    #             #    "E:/models/new4/GuidedFaradayModel_20260531_115215",
+    #             #    "E:/models/new4/GuidedFaradayModel_20260531_131653_relu",
+    #             #    "E:/models/new4/GuidedFaradayModel_20260531_143252_peaks",
+    #             #    "E:/models/new4/GuidedFaradayModel_20260531_204015",
+    #             #    "E:/models/new4/GuidedFaradayModel_20260531_211801_cnn",
+    #             # "E:/models/new4/GuidedFaradayModel_20260531_225823_userprofile",
+    #             # "E:/models/new3/FaradayModel_20260529_021321", # NOT for holdout
+    #             # "E:/models/new3/GuidedFaradayModel_20260528_223126", # NOt for holdout
+    #             # "E:/models/new3/GuidedFaradayModel_20260529_000300_cnn", # NOT for holdout
+    #             # "E:/models/new3/GuidedFaradayModel_20260529_012840_cnn_mmd" # NOT for holdout
+    #             #"E:/models/new4/GuidedFaradayModel_20260604_102425_deterministic", # use
+    #             #"E:/models/new4/GuidedFaradayModel_20260603_123450", # use
+    #             #"E:/models/new4/GuidedFaradayModel_20260605_173422",
+    #             # "E:/models/new4/GuidedFaradayModel_20260603_120241", # use
+    #             # "E:/models/new4/GuidedFaradayModel_20260603_102551", # use
+    #             "E:/models/new4/GuidedFaradayModel_20260605_105946",# "E:/models/new4/GuidedFaradayModel_20260605_112623",
+    #             "E:/models/new4/GuidedFaradayModel_20260605_201145",
+    #             "E:/models/new4/CVAE_20260531_185015_guide_cnn_h_broken",
+    #             "E:/models/new4/DiffusionModel_20260601_002842", # use
+    #             "E:/models/new4/FaradayModel_20260601_060319", # USe
+    #             "E:/models/new4/CVAE_20260601_022452_guide", # USE
+    #             "E:/models/new4/CVAE_20260531_180003_cvae",
+    #             "E:/models/new4/QuantileBaselineModel_20260601_005326",
+    #             "E:/models/new4/AverageBaselineModel_20260531_173051",
+    #             "E:/models/new4/RealDataBaselineModel_20260608_143634",
+    #                ]
+    # args.names = [
+    #                 # "Guide-CNN",
+    #                 # "Faraday",
+    #                 # "Faraday-new-fix",
+    #                 # "Guided-Faraday",
+    #                 # "Guided-Faraday-RELU",
+    #                 # "Guided-Faraday-PEAKS",
+    #                 # "Guided-Faraday-Deterministic",
+    #                 # "Guided-Faraday-CNN-2",
+    #                 # "Guided-Faraday-UserProfile",
+    #                 # "Faraday-OLD",
+    #                 # "Guided-Faraday-OLD",
+    #                 # "Guided-Faraday-CNN-OLD",
+    #                 # "Guided-Faraday-CNN-MMD-OLD",
+    #                 #"Guided-Faraday-CNN-Deterministic-big", # use
+    #                 #"Guided-Faraday-CNN-Stochastic-big", # Use
+    #                 #"Guided-Faraday-CNN-newGMM",
+    #                 #"Guided-Faraday-UserProfiles", # use
+    #                 #"Guided-Faraday", # USe
+    #                 "Guided-Faraday-CNN",# "Guided-Faraday-CNN-Stochastic",
+    #                 "Guided-Faraday-CNN-UserProfiles",
+    #                 "H-Guide-CNN", # use
+    #                 "Diffusion", # use
+    #                 "Faraday", # USE
+    #                 "Guide", # USE
+    #                 "CVAE", # use
+    #                 "Baseline-Quantile", # use
+    #                 "Baseline-Average", # use
+    #                 "Baseline-RealData", # use
+    # ]
     # args.mia_models = [
     #     "Guided-Faraday-CNN",
     #     "Diffusion",
@@ -3817,33 +4005,30 @@ if __name__ == "__main__":
     # ]
 
     # PHASED:
-    args.models = [
-        "E:/models/phased2/SetGuideVAE_20260607_124614",
-                   "E:/models/phased2/SetGuideVAE_20260607_132508_CNN",
-                  "E:/models/phased2/DiffusionModel_20260607_080656",
-                  "E:/models/phased2/SequentialPhaseVAE_20260607_082110",
-                    "E:/models/new4/GuidedFaradayModel_20260605_105946",
-                    "E:/models/phased2/QuantileBaselineModel_20260607_112946",
-                    "E:/models/phased2/AverageBaselineModel_20260607_113136"
-                   ]
-    args.secondary_models = [
-        None, 
-                             None, 
-                             None,
-                             None, 
-                             "E:/models/phased/HierarchicalSplitter_20260604_171559", 
-                             None,
-                             None
-                             ]
-    args.names = [
-        "Set-Guide-VAE",
-                    "Set-Guide-VAE-CNN",
-                    "Diffusion_phased", 
-                    "Sequential",
-                    "Guide-CNN (with Hierarchical Splitter)",
-                    "Quantile Baseline",
-                    "Average Baseline"
-                  ]
+    # args.models = ["E:/models/phased2/SetGuideVAE_20260607_124614",
+    #                "E:/models/phased2/SetGuideVAE_20260607_132508_CNN",
+    #               "E:/models/phased2/DiffusionModel_20260607_080656",
+    #               "E:/models/phased2/SequentialPhaseVAE_20260607_082110",
+    #                 "E:/models/new4/GuidedFaradayModel_20260605_105946",
+    #                 "E:/models/phased2/QuantileBaselineModel_20260607_112946",
+    #                 "E:/models/phased2/AverageBaselineModel_20260607_113136"
+    #                ]
+    # args.secondary_models = [None, 
+    #                          None, 
+    #                          None,
+    #                          None, 
+    #                          "E:/models/phased/HierarchicalSplitter_20260604_171559", 
+    #                          None,
+    #                          None
+    #                          ]
+    # args.names = [ "Set-Guide-VAE",
+    #                 "Set-Guide-VAE-CNN",
+    #                 "Diffusion_phased", 
+    #                 "Sequential",
+    #                 "Guide-CNN (with Hierarchical Splitter)",
+    #                 "Quantile Baseline",
+    #                 "Average Baseline"
+    #               ]
     # uv run .\src\evaluation\compare_models.py --models "s" --names "s" --holdout-n-draws 5 --num-samples 50000 --data-dir "E:\Data\processed_data\second_batch\individual_sm_datasets\raw_profiles" --n-draws 10 --phased --cache-dir "E:/Data/processed_data/cached_data" --no-sort
 
 
@@ -4050,6 +4235,10 @@ if __name__ == "__main__":
             ev_hp_breakdown=bool(args.ev_hp_breakdown) if hasattr(args, "ev_hp_breakdown") else False,
             ev_random_user_profiles=bool(args.ev_random_user_profiles) if hasattr(args, "ev_random_user_profiles") else False,
             preprocessed_cache_dir=args.cache_dir if hasattr(args, "cache_dir") and args.cache_dir else None,
+            only_cross_phase=bool(args.only_cross_phase) if hasattr(args, "only_cross_phase") else False,
+            cross_phase_samples=int(args.cross_phase_samples) if hasattr(args, "cross_phase_samples") and args.cross_phase_samples else None,
+            only_c2st=bool(args.only_c2st) if hasattr(args, "only_c2st") else False,
+            c2st_samples=int(args.c2st_samples) if hasattr(args, "c2st_samples") and args.c2st_samples else None,
         )
     except BaseException as _e:
         import traceback as _tb
