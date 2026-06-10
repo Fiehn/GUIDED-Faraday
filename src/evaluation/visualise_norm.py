@@ -270,7 +270,7 @@ def main():
         ax_raw = axes[i][0]
         hours = np.arange(raw_vals.shape[0])
         ax_raw.plot(hours, raw_vals[:, i]*1000, label='raw', color='C0', linewidth=2.0, marker='o', markersize=4)
-        ax_raw.set_title(f'Raw: {col} — SM {args.meter_id} — {start.date()}')
+        ax_raw.set_title(f'Raw: {col} — Selected SM — {start.date()}')
         ax_raw.set_xlabel('Hour')
         ax_raw.set_ylabel(f'Consumption (Wh)')
         ax_raw.set_ylim(-1400, 2800)
@@ -279,7 +279,7 @@ def main():
         if norm_vals is not None:
             ax_norm = axes[i][1]
             ax_norm.plot(hours, norm_vals[:, i]*1000, label='normalized', color='C1', linewidth=2.0, marker='o', markersize=4)
-            ax_norm.set_title(f'Normalized: {col} — SM {args.meter_id} — {start.date()}')
+            ax_norm.set_title(f'Normalized: {col} — Selected SM — {start.date()}')
             ax_norm.set_xlabel('Hour')
             ax_norm.set_ylabel(f'Consumption (normalized)')
             ax_norm.set_ylim(-1400, 2800)
@@ -291,7 +291,9 @@ def main():
     out_file = args.out_file
     if out_file is None:
         safe_start = start.isoformat().replace(':', '')
-        out_file = f'visualise_norm_{safe_start}_meter{args.meter_id}.png'
+        out_file = f'visualise_norm_{safe_start}_meter{args.meter_id}.pdf'
+    elif not os.path.splitext(out_file)[1]:
+        out_file = f"{out_file}.pdf"
     try:
         fig.savefig(out_file, bbox_inches='tight')
         print('Saved figure to', out_file)
