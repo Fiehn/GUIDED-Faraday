@@ -805,6 +805,15 @@ class Visualizer:
         for view_name, real_view, synth_view, mean_real_view, mean_synth_view, view_label in view_specs:
             # Create single figure with 3 subplots
             fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharex=True)
+
+            # max y axis
+            # max y axis
+            y_max_real = real_view.max().item()
+            y_max_synth = synth_view.max().item()
+            y_max_mean_real = mean_real_view.max().item()
+            y_max_mean_synth = mean_synth_view.max().item()
+            
+            y_max = max(y_max_real, y_max_synth, y_max_mean_real, y_max_mean_synth) + 0.5
             
             # Subplot 1: All 5 real profiles overlaid
             ax1 = axes[0]
@@ -817,8 +826,9 @@ class Visualizer:
                     label=f"Real {i+1}",
                     marker=self.plot_style.marker,
                     markersize=4,
-                    alpha=0.7
+                    alpha=0.7,
                 )
+            ax1.set_ylim(0, y_max)
             ax1.set_title(f"5 Real Profiles ({view_label})", fontsize=12, fontweight='bold')
             ax1.set_xlabel("Hour", fontsize=10)
             ax1.set_ylabel("Energy (kWh)", fontsize=10)
@@ -845,6 +855,7 @@ class Visualizer:
             ax2.legend(loc='upper right', fontsize=8)
             ax2.grid(True, alpha=0.3)
             ax2.set_xlim(0, L - 1)
+            ax2.set_ylim(0, y_max)
             
             # Subplot 3: Mean comparison
             ax3 = axes[2]
@@ -881,10 +892,11 @@ class Visualizer:
             ax3.legend(loc='upper right', fontsize=9)
             ax3.grid(True, alpha=0.3)
             ax3.set_xlim(0, L - 1)
+            ax3.set_ylim(0, y_max)
             
             # Overall title and layout
             fig.suptitle(
-                f"5 Real vs 5 Synthetic Profiles ({view_label})",
+                f"5 Real vs 5 Synthetic Profiles",
                 fontsize=14,
                 fontweight='bold',
                 y=1.00

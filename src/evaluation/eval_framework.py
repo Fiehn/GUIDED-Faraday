@@ -34,6 +34,15 @@ from src.evaluation.metrics.basic_reconstructions import ReconstructionRMSE, Rec
 from src.evaluation.metrics.base.base import _sanitize_numeric_array, _align_phases_by_mse, _align_phases_to_reference_mean, _rank_phases_by_total_consumption, _to_json_serializable, _save_standalone_metric_result, _flatten_windows, _resolve_output_directory
 
 from src.evaluation.metrics.mia import MembershipInferenceAttack
+from src.evaluation.metrics.cross_phase import (
+    CrossPhaseCorrelationError,
+    CrossCorrelationDistribution,
+    SlicedWassersteinDistance,
+    ClassifierTwoSampleTest,
+    _COLOR_REAL as _CP_COLOR_REAL,
+    _COLOR_SYN  as _CP_COLOR_SYN,
+    _PHASE_LABELS as _CP_PHASE_LABELS,
+)
 from tabulate import tabulate
 
 class EvalFramework:
@@ -98,6 +107,7 @@ class EvalFramework:
         mia_reconstruction_samples: int = 1,
         preserve_condition_order: bool = False,
         real_data_preprocessed: bool = False,
+        silent: bool = False,
     ):
         """Initialize evaluation framework.
 
@@ -153,6 +163,7 @@ class EvalFramework:
         self.mia_reconstruction_samples = int(mia_reconstruction_samples)
         self.preserve_condition_order = bool(preserve_condition_order)
         self._real_data_preprocessed = bool(real_data_preprocessed)
+        self.silent = bool(silent)
 
         # Metrics storage
         self.reconstruction_metrics: Dict[str, ReconstructionMetric] = {}
@@ -186,11 +197,12 @@ class EvalFramework:
             HourlyProfilesByDayofWeek(),
             HourlyProfilesByMonthAndDayofWeek(),
             EVConditionAccuracy(),
+            VisualEvaluation(),
         ])
         if phased:
             self.register_metric(SetMaximumMeanDiscrepancy())
         else:
-            self.register_metric(MaximumMeanDiscrepancy())
+            self.register_metric(MaximumMeanDiscrepancy(max_samples=5000))
 
         has_train = (
             self.train_dataloader is not None
@@ -737,9 +749,10 @@ class EvalFramework:
             Dict[str, float]: Dictionary mapping metric names to their computed values
         """
         t_total = time.time()
-        print(f"\n{'='*60}")
-        print(f"  {self.evaluation_title}")
-        print(f"{'='*60}")
+        if not self.silent:
+            print(f"\n{'='*60}")
+            print(f"  {self.evaluation_title}")
+            print(f"{'='*60}")
 
         # Prepare data for metrics that need it (reconstructions, synthetic samples)
         self._prepare_data()
@@ -747,7 +760,8 @@ class EvalFramework:
 
         n_real  = 0 if self._real_data  is None else int(len(self._real_data))
         n_synth = 0 if self._synthetic_data is None else int(len(self._synthetic_data))
-        print(f"  Data ready: {n_real} real windows, {n_synth} synthetic samples\n")
+        if not self.silent:
+            print(f"  Data ready: {n_real} real windows, {n_synth} synthetic samples\n")
 
         self.results = {}
 
@@ -759,23 +773,28 @@ class EvalFramework:
         n_total = len(all_metrics)
 
         for i, (name, metric) in enumerate(all_metrics, 1):
-            print(f"  [{i:>{len(str(n_total))}}/{n_total}] {name}...", end='', flush=True)
+            if not self.silent:
+                print(f"  [{i:>{len(str(n_total))}}/{n_total}] {name}...", end='', flush=True)
             t_metric = time.time()
             try:
                 value = metric.compute()
                 self.results[name] = value
                 elapsed = time.time() - t_metric
                 value_str = f"{float(value):.4f}" if isinstance(value, (float, int, np.floating, np.integer)) else str(value)
-                print(f" {value_str}  ({elapsed:.1f}s)")
+                if not self.silent:
+                    print(f" {value_str}  ({elapsed:.1f}s)")
             except Exception as e:
                 elapsed = time.time() - t_metric
-                print(f" ERROR ({elapsed:.1f}s): {e}")
+                if not self.silent:
+                    print(f" ERROR ({elapsed:.1f}s): {e}")
                 if self.verbose:
                     import traceback; traceback.print_exc()
                 self.results[name] = None
+                plt.close('all')
 
-        print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
-        self._print_results_table()
+        if not self.silent:
+            print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
+            self._print_results_table()
 
         return self.results
 
@@ -841,6 +860,7 @@ class EvalFramework:
                 if self.verbose:
                     import traceback; traceback.print_exc()
                 self.results[name] = None
+                plt.close('all')
 
         print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
         self._print_results_table()
@@ -906,6 +926,8 @@ class EvalFramework:
                 except Exception as e:
                     print(f"\n  WARNING: {name} failed on draw {draw_idx + 1}: {e}")
                     per_synth_values[name].append(float("nan"))
+                    plt.close('all')
+            plt.close('all')
             print(f" done ({time.time() - t_draw:.1f}s)")
             import gc as _gc; _gc.collect()
             if torch.cuda.is_available():
@@ -957,6 +979,7 @@ class EvalFramework:
                 if self.verbose:
                     import traceback; traceback.print_exc()
                 self.results[name] = None
+                plt.close('all')
 
         self.baseline_results = self._compute_mean_baseline_results(reconstruction_only=True) if self.include_mean_baseline else {}
 
@@ -971,33 +994,38 @@ class EvalFramework:
             Dict[str, float]: Dictionary mapping synthetic metric names to their computed values
         """
         t_total = time.time()
-        print(f"\n{'='*60}")
-        print(f"  {self.evaluation_title}  [synthetic only]")
-        print(f"{'='*60}")
+        if not self.silent:
+            print(f"\n{'='*60}")
+            print(f"  {self.evaluation_title}  [synthetic only]")
+            print(f"{'='*60}")
 
         self.results = {}
         n_total = len(self.synthetic_metrics)
         for i, (name, metric) in enumerate(self.synthetic_metrics.items(), 1):
-            print(f"  [{i:>{len(str(n_total))}}/{n_total}] {name}...", end='', flush=True)
+            if not self.silent:
+                print(f"  [{i:>{len(str(n_total))}}/{n_total}] {name}...", end='', flush=True)
             t_metric = time.time()
             try:
                 value = metric.compute()
                 self.results[name] = value
                 elapsed = time.time() - t_metric
                 value_str = f"{float(value):.4f}" if isinstance(value, (float, int, np.floating, np.integer)) else str(value)
-                print(f" {value_str}  ({elapsed:.1f}s)")
+                if not self.silent:
+                    print(f" {value_str}  ({elapsed:.1f}s)")
             except Exception as e:
                 elapsed = time.time() - t_metric
-                print(f" ERROR ({elapsed:.1f}s): {e}")
+                if not self.silent:
+                    print(f" ERROR ({elapsed:.1f}s): {e}")
                 if self.verbose:
                     import traceback; traceback.print_exc()
                 self.results[name] = None
 
         self.baseline_results = self._compute_mean_baseline_results(synthetic_only=True) if self.include_mean_baseline else {}
 
-        print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
-        self._print_interpretation_guide()
-        self._print_results_table()
+        if not self.silent:
+            print(f"\n  Total evaluation time: {time.time() - t_total:.1f}s")
+            self._print_interpretation_guide()
+            self._print_results_table()
         return self.results
 
     def _print_interpretation_guide(self) -> None:
@@ -1088,6 +1116,8 @@ class PhasedEvaluationSuite:
         n_member_samples: int = 1000,
         mia_reconstruction_samples: int = 1,
         n_draws: int = 1,
+        run_cross_phase: bool = True,
+        run_c2st: bool = True,
     ):
         self.model = model
         self.secondary_model = secondary_model if secondary_model is not None else None
@@ -1102,6 +1132,8 @@ class PhasedEvaluationSuite:
         self.n_member_samples = int(n_member_samples)
         self.mia_reconstruction_samples = int(mia_reconstruction_samples)
         self.n_draws = max(1, int(n_draws))
+        self.run_cross_phase = run_cross_phase
+        self.run_c2st = run_c2st
 
     def _prepare_base_framework(self) -> EvalFramework:
         framework = EvalFramework(
@@ -1119,7 +1151,13 @@ class PhasedEvaluationSuite:
             train_dataloader=self.train_dataloader,
             n_member_samples=self.n_member_samples,
             mia_reconstruction_samples=self.mia_reconstruction_samples,
+            # When a secondary model is present the loader provides raw un-normalized
+            # phased data; the generator handles normalisation internally. Skip the
+            # inverse transform on the real-data side to avoid double-denormalisation.
+            real_data_preprocessed=self.secondary_model is not None,
         )
+        # Force reconstruction collection — needed for phase alignment in evaluate().
+        framework.register_metric(ReconstructionRMSE())
         # Register privacy metrics so _prepare_data collects member windows.
         if self.train_dataloader is not None:
             k = self.mia_reconstruction_samples if self.mia_reconstruction_samples > 1 else (
@@ -1161,6 +1199,7 @@ class PhasedEvaluationSuite:
         output_path: str,
         title: str,
         synthetic_only: bool = False,
+        silent: bool = False,
     ) -> tuple[Dict[str, Any], set[str]]:
         """Run one evaluation pass on pre-split prepared data.
 
@@ -1185,6 +1224,7 @@ class PhasedEvaluationSuite:
             evaluation_title=title,
             verbose=False,
             include_mean_baseline=False,
+            silent=silent,
         )
         evaluator.register_all(phased=True)
         if synthetic_only:
@@ -1263,12 +1303,19 @@ class PhasedEvaluationSuite:
                 'train_data': base._train_data if draw_idx == 0 else None,
                 'train_reconstructed_data': base._train_reconstructed_data if draw_idx == 0 else None,
             }
+            _silent = draw_idx > 0
+            if _silent:
+                print(f"  Draw {draw_idx + 1}/{self.n_draws} (aggregated)...", end="", flush=True)
+                _t = time.time()
             result, once_keys = self._run_prepared_eval(
                 prepared_data=prepared,
                 title=f'AGGREGATED 3-PHASE EVALUATION (draw {draw_idx + 1}/{self.n_draws})',
                 output_path=agg_json_path,
                 synthetic_only=(draw_idx > 0),
+                silent=_silent,
             )
+            if _silent:
+                print(f" done ({time.time() - _t:.1f}s)")
             agg_draw_results.append(result)
             if draw_idx == 0:
                 agg_once_keys = once_keys
@@ -1297,12 +1344,19 @@ class PhasedEvaluationSuite:
                     'timestamps': base._timestamps,
                     'meter_ids': base._meter_ids,
                 }
+                _silent = draw_idx > 0
+                if _silent:
+                    print(f"  Draw {draw_idx + 1}/{self.n_draws} (phase {phase_number})...", end="", flush=True)
+                    _t = time.time()
                 result, once_keys = self._run_prepared_eval(
                     prepared_data=prepared,
                     title=f'ALIGNED PHASE {phase_number} EVALUATION (draw {draw_idx + 1}/{self.n_draws})',
                     output_path=phase_json_path,
                     synthetic_only=(draw_idx > 0),
+                    silent=_silent,
                 )
+                if _silent:
+                    print(f" done ({time.time() - _t:.1f}s)")
                 phase_draw_results.append(result)
                 if draw_idx == 0:
                     phase_once_keys = once_keys
@@ -1312,14 +1366,353 @@ class PhasedEvaluationSuite:
             with open(phase_json_path, 'w') as f:
                 json.dump(_to_json_serializable(phase_result), f, indent=2)
 
-        summary = {
+        summary: Dict[str, Any] = {
             'aggregated_phase': aggregate_results,
             'ranked_phases': ranked_results,
         }
+
+        if self.run_cross_phase:
+            cross_phase_suite = CrossPhaseEvaluationSuite(
+                output_path=self.output_path,
+                n_draws=self.n_draws,
+                device=self.device,
+            )
+            summary['cross_phase'] = cross_phase_suite.evaluate(real_phase, synth_phases)
+        else:
+            print("[PhasedEvaluationSuite] Skipping cross-phase evaluation (run_cross_phase=False).")
+
+        if self.run_c2st:
+            from src.evaluation.metrics.c2st import C2STSuite
+            c2st_suite = C2STSuite(
+                output_path=self.output_path,
+                n_draws=self.n_draws,
+                device=self.device,
+            )
+            summary['c2st'] = c2st_suite.evaluate(real_phase, synth_phases)
+        else:
+            print("[PhasedEvaluationSuite] Skipping C2ST analysis (run_c2st=False).")
+
         summary_path = os.path.join(output_dir, 'phased_eval_summary.json')
         with open(summary_path, 'w') as f:
             json.dump(_to_json_serializable(summary), f, indent=2)
         return summary
+
+    def evaluate_cross_phase_only(self) -> Dict[str, Any]:
+        """Collect real data and generate synthetic draws, then run only CrossPhaseEvaluationSuite.
+
+        Skips all per-phase metric computation and reconstruction forward-passes.
+        Patches the existing phased_eval_summary.json with the 'cross_phase' key
+        (creates a minimal summary if the file doesn't exist yet).
+        """
+        output_dir = _resolve_output_directory(self.output_path)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Lean framework — no metrics registered, so _prepare_data skips reconstruction.
+        framework = EvalFramework(
+            self.model,
+            self.dataloader,
+            normalizer=self.normalizer,
+            conditioner=self.conditioner,
+            device=self.device,
+            window_size=self.window_size,
+            n_synthetic_samples=self.n_synthetic_samples,
+            output_path=self.output_path,
+            evaluation_title='CROSS-PHASE DATA COLLECTION',
+            verbose=False,
+            secondary_model=self.secondary_model,
+            real_data_preprocessed=self.secondary_model is not None,
+        )
+        framework._prepare_data()
+
+        real_phase = self._extract_phase_first(framework._real_data, 'real data')
+        print(f"\n[CrossPhaseOnly] Collected {len(real_phase)} real windows. "
+              f"Generating {self.n_draws} synthetic draw(s)...")
+        synth_phases = [
+            self._extract_phase_first(framework._synthetic_data, 'synthetic draw 0')
+        ]
+        for draw_idx in range(1, self.n_draws):
+            print(f"  Generating draw {draw_idx + 1}/{self.n_draws}...", end="", flush=True)
+            _t = time.time()
+            with torch.no_grad():
+                raw = _sanitize_numeric_array(framework._generate_synthetic(self.n_synthetic_samples))
+            synth_phases.append(self._extract_phase_first(raw, f'synthetic draw {draw_idx}'))
+            print(f" done ({time.time() - _t:.1f}s)")
+
+        cross_phase_suite = CrossPhaseEvaluationSuite(
+            output_path=self.output_path,
+            n_draws=self.n_draws,
+            device=self.device,
+        )
+        cross_phase_result = cross_phase_suite.evaluate(real_phase, synth_phases)
+
+        summary_path = os.path.join(output_dir, 'phased_eval_summary.json')
+        summary: Dict[str, Any] = {}
+        if os.path.exists(summary_path):
+            try:
+                with open(summary_path, 'r') as f:
+                    summary = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"  [CrossPhaseOnly] WARNING: could not read {summary_path}: {e}; will create fresh summary.")
+        else:
+            print(f"  [CrossPhaseOnly] {summary_path} not found; creating it now.")
+        summary['cross_phase'] = cross_phase_result
+        with open(summary_path, 'w') as f:
+            json.dump(_to_json_serializable(summary), f, indent=2)
+
+        return cross_phase_result
+
+    def evaluate_c2st_only(self) -> Dict[str, Any]:
+        """Collect real data and generate synthetic draws, then run only C2STSuite.
+
+        Skips all per-phase metric computation and reconstruction forward-passes.
+        Patches the existing phased_eval_summary.json with the 'c2st' key
+        (creates a minimal summary if the file doesn't exist yet).
+        """
+        from src.evaluation.metrics.c2st import C2STSuite
+
+        output_dir = _resolve_output_directory(self.output_path)
+        os.makedirs(output_dir, exist_ok=True)
+
+        framework = EvalFramework(
+            self.model,
+            self.dataloader,
+            normalizer=self.normalizer,
+            conditioner=self.conditioner,
+            device=self.device,
+            window_size=self.window_size,
+            n_synthetic_samples=self.n_synthetic_samples,
+            output_path=self.output_path,
+            evaluation_title='C2ST DATA COLLECTION',
+            verbose=False,
+            secondary_model=self.secondary_model,
+            real_data_preprocessed=self.secondary_model is not None,
+        )
+        framework._prepare_data()
+
+        real_phase = self._extract_phase_first(framework._real_data, 'real data')
+        print(f"\n[C2STOnly] Collected {len(real_phase)} real windows. "
+              f"Generating {self.n_draws} synthetic draw(s)...")
+        synth_phases = [
+            self._extract_phase_first(framework._synthetic_data, 'synthetic draw 0')
+        ]
+        for draw_idx in range(1, self.n_draws):
+            print(f"  Generating draw {draw_idx + 1}/{self.n_draws}...", end="", flush=True)
+            _t = time.time()
+            with torch.no_grad():
+                raw = _sanitize_numeric_array(framework._generate_synthetic(self.n_synthetic_samples))
+            synth_phases.append(self._extract_phase_first(raw, f'synthetic draw {draw_idx}'))
+            print(f" done ({time.time() - _t:.1f}s)")
+
+        c2st_suite = C2STSuite(
+            output_path=self.output_path,
+            n_draws=self.n_draws,
+            device=self.device,
+        )
+        c2st_result = c2st_suite.evaluate(real_phase, synth_phases)
+
+        summary_path = os.path.join(output_dir, 'phased_eval_summary.json')
+        summary: Dict[str, Any] = {}
+        if os.path.exists(summary_path):
+            try:
+                with open(summary_path, 'r') as f:
+                    summary = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"  [C2STOnly] WARNING: could not read {summary_path}: {e}; will create fresh summary.")
+        else:
+            print(f"  [C2STOnly] {summary_path} not found; creating it now.")
+        summary['c2st'] = c2st_result
+        with open(summary_path, 'w') as f:
+            json.dump(_to_json_serializable(summary), f, indent=2)
+
+        return c2st_result
+
+
+class CrossPhaseEvaluationSuite:
+    """Evaluate the joint 3-phase distribution of a model's output.
+
+    Accepts pre-collected [N, 3, 24] real and synthetic tensors from
+    PhasedEvaluationSuite (no extra generation pass) and computes four
+    cross-phase metrics defined in ADR-0018.  Results land under the
+    'cross_phase' key in phased_eval_summary.json.
+    """
+
+    def __init__(
+        self,
+        output_path: str,
+        n_draws: int = 1,
+        max_ccf_lag: int = 5,
+        swd_projections: int = 512,
+        c2st_epochs: int = 20,
+        c2st_batch_size: int = 256,
+        c2st_train_fraction: float = 0.25,
+        device: str = 'cpu',
+    ):
+        self.output_path         = output_path
+        self.n_draws             = max(1, int(n_draws))
+        self.max_ccf_lag         = max_ccf_lag
+        self.swd_projections     = swd_projections
+        self.c2st_epochs         = c2st_epochs
+        self.c2st_batch_size     = c2st_batch_size
+        self.c2st_train_fraction = c2st_train_fraction
+        self.device              = device
+
+    def evaluate(
+        self,
+        real_phase: np.ndarray,
+        synth_phases: list,
+    ) -> Dict[str, Any]:
+        """
+        Args:
+            real_phase:   [N, 3, 24] real windows (canonically phase-sorted, ADR-0017)
+            synth_phases: list of K [M, 3, 24] synthetic draws
+        Returns:
+            dict: metric name -> float (K=1) or {mean, std, values} (K>1)
+        """
+        print("\n[CrossPhaseEvaluationSuite] Computing cross-phase metrics...")
+
+        # Resolve output directories up-front so plots land in a tidy subdir.
+        output_dir = _resolve_output_directory(self.output_path)
+        cp_plot_dir: str | None = None
+        if output_dir:
+            cp_plot_dir = os.path.join(output_dir, 'cross_phase')
+            os.makedirs(cp_plot_dir, exist_ok=True)
+
+        other_metrics = [
+            CrossPhaseCorrelationError(),
+            CrossCorrelationDistribution(max_lag=self.max_ccf_lag),
+            SlicedWassersteinDistance(n_projections=self.swd_projections),
+        ]
+
+        draw_results: list = []
+        for draw_idx, synth in enumerate(synth_phases):
+            # Retrain C2ST fresh on this draw's synthetic batch.
+            c2st = ClassifierTwoSampleTest(
+                epochs=self.c2st_epochs,
+                batch_size=self.c2st_batch_size,
+                train_fraction=self.c2st_train_fraction,
+                device=self.device,
+            )
+            print(f"  Fitting C2ST on draw {draw_idx + 1}/{len(synth_phases)}...",
+                  end="", flush=True)
+            _t = time.time()
+            c2st.fit(real_phase, synth, draw_idx=draw_idx)
+            print(f" done ({time.time() - _t:.1f}s)")
+
+            all_metrics = other_metrics + [c2st]
+
+            draw_result: Dict[str, float] = {}
+            for metric in all_metrics:
+                metric.real_data = real_phase
+                metric.synthetic_data = synth
+                # Plots go into the cross_phase/ subdir; only generated on draw 0.
+                metric.output_path = cp_plot_dir if draw_idx == 0 else None
+                _t = time.time()
+                try:
+                    val = metric.compute()
+                    val = float(val) if np.isfinite(val) else float('nan')
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    print(f"  [CrossPhaseEvaluationSuite] {metric.name} failed on draw {draw_idx}: {e}")
+                    val = float('nan')
+                draw_result[metric.name] = val
+                if draw_idx == 0:
+                    print(f"  {metric.name}: {val:.4f} ({time.time() - _t:.1f}s)")
+            draw_results.append(draw_result)
+
+        if len(draw_results) == 1:
+            result: Dict[str, Any] = draw_results[0]
+        else:
+            result = {}
+            for metric_name in draw_results[0]:
+                vals = [float(dr.get(metric_name, float('nan'))) for dr in draw_results]
+                arr = np.array(vals, dtype=float)
+                result[metric_name] = {
+                    "mean": float(np.nanmean(arr)),
+                    "std": float(np.nanstd(arr)),
+                    "values": vals,
+                }
+
+        if output_dir:
+            output_file = os.path.join(output_dir, 'cross_phase_eval_results.json')
+            with open(output_file, 'w') as f:
+                json.dump(_to_json_serializable(result), f, indent=2)
+            print(f"  Saved to {output_file}")
+            try:
+                self._plot_joint_scatter(real_phase, synth_phases[0], cp_plot_dir)
+                self._plot_mean_profiles(real_phase, synth_phases[0], cp_plot_dir)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                print(f"  [CrossPhaseEvaluationSuite] joint diagnostic plots failed: {e}")
+        else:
+            print("  [CrossPhaseEvaluationSuite] WARNING: output_path not set; results not saved to disk.")
+
+        return result
+
+    def _plot_joint_scatter(self, real: np.ndarray, syn: np.ndarray, output_dir: str) -> None:
+        """Scatter of per-window total load per phase — 3 pairwise panels (P_i vs P_j)."""
+        path = os.path.join(output_dir, "cross_phase_joint_scatter.pdf")
+        if os.path.exists(path):
+            return
+
+        real_energy = real.sum(axis=2)  # [N, 3]
+        syn_energy  = syn.sum(axis=2)   # [M, 3]
+
+        pairs = [(0, 1, "P1 × P2"), (0, 2, "P1 × P3"), (1, 2, "P2 × P3")]
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+        n_plot = min(2000, len(real_energy), len(syn_energy))
+        rng = np.random.RandomState(42)
+        for ax, (i, j, lbl) in zip(axes, pairs):
+            r_idx = rng.choice(len(real_energy), n_plot, replace=False)
+            s_idx = rng.choice(len(syn_energy),  n_plot, replace=False)
+            ax.scatter(real_energy[r_idx, i], real_energy[r_idx, j],
+                       c=_CP_COLOR_REAL, alpha=0.22, s=6, label=f"Real (n={n_plot})")
+            ax.scatter(syn_energy[s_idx, i], syn_energy[s_idx, j],
+                       c=_CP_COLOR_SYN, alpha=0.22, s=6, label=f"Synthetic (n={n_plot})")
+            ax.set_xlabel(f"Phase {i+1} daily load (Σ hours)", fontsize=10)
+            ax.set_ylabel(f"Phase {j+1} daily load (Σ hours)", fontsize=10)
+            ax.set_title(lbl, fontsize=11)
+            ax.legend(markerscale=3, fontsize=9)
+
+        fig.suptitle("Cross-Phase Joint Load Distribution  (per-window daily totals)", fontsize=13)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+    def _plot_mean_profiles(self, real: np.ndarray, syn: np.ndarray, output_dir: str) -> None:
+        """Per-phase mean ± 1σ hourly load profiles (real vs synthetic)."""
+        path = os.path.join(output_dir, "cross_phase_mean_profiles.pdf")
+        if os.path.exists(path):
+            return
+
+        hours = np.arange(24)
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+
+        for idx, ax in enumerate(axes):
+            r_mean = real[:, idx, :].mean(0)
+            r_std  = real[:, idx, :].std(0)
+            s_mean = syn[:, idx, :].mean(0)
+            s_std  = syn[:, idx, :].std(0)
+
+            ax.plot(hours, r_mean, color=_CP_COLOR_REAL, lw=2, label="Real")
+            ax.fill_between(hours, r_mean - r_std, r_mean + r_std,
+                            color=_CP_COLOR_REAL, alpha=0.12)
+            ax.plot(hours, s_mean, color=_CP_COLOR_SYN, lw=2, label="Synthetic")
+            ax.fill_between(hours, s_mean - s_std, s_mean + s_std,
+                            color=_CP_COLOR_SYN, alpha=0.18)
+
+            ax.set_title(_CP_PHASE_LABELS[idx], fontsize=11)
+            ax.set_xlabel("Hour of Day", fontsize=10)
+            if idx == 0:
+                ax.set_ylabel("Load (normalised)", fontsize=10)
+            ax.set_xticks(np.arange(0, 24, 3))
+            ax.legend(fontsize=9)
+
+        fig.suptitle("Per-Phase Mean Hourly Profiles  (mean ± 1σ)", fontsize=13)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
 
 
 # ============================================================================

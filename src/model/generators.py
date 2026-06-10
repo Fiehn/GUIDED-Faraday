@@ -229,6 +229,11 @@ class SyntheticGenerator:
                     input_data = phased_input_data.sum(dim=-1, keepdim=True)  # SHAPER: [batch_size, seq_len, num_phases] -> [batch_size, seq_len, 1]
                 elif phased_input_data.shape[1] == 3:
                     input_data = phased_input_data.sum(dim=1, keepdim=True).transpose(1, 2)  # SHAPER: [batch_size, num_phases, seq_len] -> sum -> [batch_size, 1, seq_len] -> transpose -> [batch_size, seq_len, 1]
+                elif phased_input_data.shape[1] == 1:
+                    # Already aggregated to single phase [batch, 1, seq_len] → transpose to time-major
+                    input_data = phased_input_data.transpose(1, 2)  # SHAPER: [batch_size, 1, seq_len] -> [batch_size, seq_len, 1]
+                elif phased_input_data.shape[-1] == 1:
+                    input_data = phased_input_data  # SHAPER: already [batch_size, seq_len, 1]
                 else:
                     input_data = phased_input_data.sum(dim=-1, keepdim=True)  # SHAPER: [batch_size, seq_len, num_phases] -> [batch_size, seq_len, 1]
             else:
@@ -436,11 +441,19 @@ class SyntheticGenerator:
             # It builds its own conditions from x_phased_real + meter_id/timestamp.
             if self.normalizer is not None and not is_denormalized:
                 output = self._apply_normalizer(output, inverse=True)  # SHAPER: [num_reconstructions * batch_size, seq_len, num_features]
+            # Only pass x_phased_real if it contains actual multi-phase data (3 phases).
+            # When the loader already aggregated to 1 phase, the phase information is lost;
+            # fall back to metadata-only conditioning in the splitter.
+            _n_input_phases = (
+                phased_input_data.shape[1]
+                if phased_input_data is not None and phased_input_data.dim() == 3
+                else 0
+            )
             output = self.secondary_model.reconstruct(
                 x_agg_generated=output,
                 conditions=conditions,
                 normalizer=None,
-                x_phased_real=phased_input_data,
+                x_phased_real=phased_input_data if _n_input_phases == 3 else None,
                 meter_id=meter_id,
                 timestamp=timestamp,
             )

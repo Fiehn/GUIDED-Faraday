@@ -1,5 +1,6 @@
 import math
 import hashlib
+import json
 import torch
 import random
 import pyarrow as pa
@@ -11,6 +12,9 @@ import os
 import pandas as pd
 from dataclasses import dataclass
 import gc
+import multiprocessing as mp
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import threading
 import time
@@ -208,9 +212,9 @@ class StreamingParquetBuffer(IterableDataset):
                  num_workers: int = 0,
                  hourly_aggregation: bool = False,
                  aggregation_divisor: float = 1.0,
-                 file_seen_map=None,
-                 file_completed_map=None,
-                 file_skipped_map=None,
+                 file_seen_counter=None,
+                 file_completed_counter=None,
+                 file_skipped_counter=None,
                  skip_corrupt_files: bool = True,
                  max_skip_warnings: int = 20,
                  output_aggregate_stream: bool = False,
@@ -272,10 +276,19 @@ class StreamingParquetBuffer(IterableDataset):
         self.nan_as_zero = bool(nan_as_zero)
         self.phased_mode = bool(phased_mode)
 
-        # Shared (manager-backed) maps to track file coverage across worker processes.
-        self.file_seen_map = file_seen_map
-        self.file_completed_map = file_completed_map
-        self.file_skipped_map = file_skipped_map
+        # mp.Value counters shared across worker processes via shared memory.
+        # Regular dicts can't cross process boundaries (DataLoader workers get pickled copies).
+        # mp.Value uses mmap-backed shared memory — survives pickle/unpickle with sharing intact
+        # on Windows Python 3.13 (unlike Manager().dict() proxies which fail to reconnect).
+        self.file_seen_counter = file_seen_counter
+        self.file_completed_counter = file_completed_counter
+        self.file_skipped_counter = file_skipped_counter
+        # Per-instance sets tracking which files have been counted for the first time.
+        # Prevents double-counting when the background thread loops over files repeatedly.
+        # NOT reset on generation change — persist across epochs so the counter saturates
+        # at total_files after the first full pass and stays there.
+        self._file_seen_ever: set[str] = set()
+        self._file_completed_ever: set[str] = set()
         self.skip_corrupt_files = bool(skip_corrupt_files)
         self.max_skip_warnings = max(0, int(max_skip_warnings))
         self._skip_warning_count = 0
@@ -293,23 +306,28 @@ class StreamingParquetBuffer(IterableDataset):
         self._buffer_lock = threading.Lock()
 
     def _mark_file_seen(self, file_path: str):
-        if self.file_seen_map is not None:
+        if self.file_seen_counter is not None and file_path not in self._file_seen_ever:
+            self._file_seen_ever.add(file_path)
             try:
-                self.file_seen_map[file_path] = 1
+                with self.file_seen_counter.get_lock():
+                    self.file_seen_counter.value += 1
             except Exception:
                 pass
 
     def _mark_file_completed(self, file_path: str):
-        if self.file_completed_map is not None:
+        if self.file_completed_counter is not None and file_path not in self._file_completed_ever:
+            self._file_completed_ever.add(file_path)
             try:
-                self.file_completed_map[file_path] = 1
+                with self.file_completed_counter.get_lock():
+                    self.file_completed_counter.value += 1
             except Exception:
                 pass
 
     def _mark_file_skipped(self, file_path: str, reason: str):
-        if self.file_skipped_map is not None:
+        if self.file_skipped_counter is not None:
             try:
-                self.file_skipped_map[file_path] = reason[:300]
+                with self.file_skipped_counter.get_lock():
+                    self.file_skipped_counter.value += 1
             except Exception:
                 pass
 
@@ -795,6 +813,7 @@ class PhasedReplayDataloaders:
                 max_hour_value: float | None = 20.0,
                 holdout_feeder_id: int | None = None,
                 topology_path: str | None = None,
+                holdout_meter_ids: list[int] | None = None,
     ):
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
@@ -810,6 +829,9 @@ class PhasedReplayDataloaders:
         self.max_hour_value = float(max_hour_value) if max_hour_value is not None else None
         self._holdout_feeder_id = holdout_feeder_id
         self._topology_path = topology_path
+        self._holdout_meter_ids_direct: frozenset[int] = (
+            frozenset(int(m) for m in holdout_meter_ids) if holdout_meter_ids else frozenset()
+        )
 
         sm_files = list(sm_files)
         self.total_files = len(set(sm_files))
@@ -827,16 +849,24 @@ class PhasedReplayDataloaders:
                 f for f in sm_files
                 if _extract_meter_id_from_filename(os.path.basename(f)) not in _holdout_ids
             ]
+        elif self._holdout_meter_ids_direct:
+            # Phased-mode file-based holdout: exclude files whose meter IDs are in the set.
+            self._holdout_files = [
+                f for f in sm_files
+                if _extract_meter_id_from_filename(os.path.basename(f)) in self._holdout_meter_ids_direct
+            ]
+            sm_files = [
+                f for f in sm_files
+                if _extract_meter_id_from_filename(os.path.basename(f)) not in self._holdout_meter_ids_direct
+            ]
         else:
             self._holdout_files = []
 
-        # Regular dicts — per-process copies in DataLoader workers (logging only).
-        # mp.Manager().dict() proxies fail to reconnect on Windows+Python 3.13 when
-        # workers are spawned, causing silent worker crashes.
-        self._stats_manager = None
-        self._file_seen_map = {}
-        self._file_completed_map = {}
-        self._file_skipped_map = {}
+        # mp.Value counters — shared memory scalars that survive DataLoader worker
+        # pickling on Windows Python 3.13 (unlike Manager().dict() proxies).
+        self._files_seen_ctr     = mp.Value('i', 0)
+        self._files_completed_ctr = mp.Value('i', 0)
+        self._files_skipped_ctr  = mp.Value('i', 0)
 
         self.files_seen = 0
         self.files_completed = 0
@@ -850,9 +880,9 @@ class PhasedReplayDataloaders:
             num_workers=num_workers,
             hourly_aggregation=hourly_aggregation,
             aggregation_divisor=aggregation_divisor,
-            file_seen_map=self._file_seen_map,
-            file_completed_map=self._file_completed_map,
-            file_skipped_map=self._file_skipped_map,
+            file_seen_counter=self._files_seen_ctr,
+            file_completed_counter=self._files_completed_ctr,
+            file_skipped_counter=self._files_skipped_ctr,
             skip_corrupt_files=skip_corrupt_files,
             max_skip_warnings=max_skip_warnings,
             output_aggregate_stream=self.output_aggregate_stream,
@@ -889,9 +919,9 @@ class PhasedReplayDataloaders:
             num_workers=0,  # keep eval deterministic / simple
             hourly_aggregation=hourly_aggregation,
             aggregation_divisor=aggregation_divisor,
-            file_seen_map=None,
-            file_completed_map=None,
-            file_skipped_map=None,
+            file_seen_counter=None,
+            file_completed_counter=None,
+            file_skipped_counter=None,
             skip_corrupt_files=skip_corrupt_files,
             max_skip_warnings=max_skip_warnings,
             output_aggregate_stream=self.output_aggregate_stream,
@@ -918,9 +948,9 @@ class PhasedReplayDataloaders:
             num_workers=0,
             hourly_aggregation=hourly_aggregation,
             aggregation_divisor=aggregation_divisor,
-            file_seen_map=None,
-            file_completed_map=None,
-            file_skipped_map=None,
+            file_seen_counter=None,
+            file_completed_counter=None,
+            file_skipped_counter=None,
             skip_corrupt_files=skip_corrupt_files,
             max_skip_warnings=max_skip_warnings,
             output_aggregate_stream=self.output_aggregate_stream,
@@ -938,37 +968,59 @@ class PhasedReplayDataloaders:
         )
 
     def get_holdout_loader(self):
-        """Return a DataLoader over holdout-feeder windows, or None if not configured."""
+        """Return a DataLoader over holdout windows, or None if not configured."""
         if not self._holdout_files:
             return None
         ds = self.train_dataset
-        holdout_ds = InMemoryPhasedDataset(
-            sm_files=self._holdout_files,
-            split="holdout",
-            feature_cols=ds.feature_cols,
-            split_ratios=self.split_ratios,
-            split_seed=self.split_seed,
-            window_len=ds.window_spec.input_len,
-            stride=ds.window_spec.stride,
-            aggregation=ds.aggregation,
-            aggregation_divisor=ds.aggregation_divisor,
-            max_hour_value=self.max_hour_value,
-            max_value=ds.max_value,
-            nan_as_zero=ds.nan_as_zero,
-            normalizer=ds.normalizer,
-            output_aggregate_stream=self.output_aggregate_stream,
-            holdout_feeder_id=self._holdout_feeder_id,
-            topology_path=self._topology_path,
-        )
+        if self._holdout_meter_ids_direct:
+            # Phased file-based holdout: load all windows from the holdout files.
+            # split_ratios all-train ensures no SHA1 time-split filtering.
+            holdout_ds = InMemoryPhasedDataset(
+                sm_files=self._holdout_files,
+                split="train",
+                feature_cols=ds.feature_cols,
+                split_ratios={"train_ratio": 1.0, "val_ratio": 0.0, "test_ratio": 0.0},
+                split_seed=self.split_seed,
+                window_len=ds.window_spec.input_len,
+                stride=ds.window_spec.stride,
+                aggregation=ds.aggregation,
+                aggregation_divisor=ds.aggregation_divisor,
+                max_hour_value=self.max_hour_value,
+                max_value=ds.max_value,
+                nan_as_zero=ds.nan_as_zero,
+                normalizer=ds.normalizer,
+                output_aggregate_stream=self.output_aggregate_stream,
+                holdout_feeder_id=None,
+                topology_path=None,
+            )
+        else:
+            holdout_ds = InMemoryPhasedDataset(
+                sm_files=self._holdout_files,
+                split="holdout",
+                feature_cols=ds.feature_cols,
+                split_ratios=self.split_ratios,
+                split_seed=self.split_seed,
+                window_len=ds.window_spec.input_len,
+                stride=ds.window_spec.stride,
+                aggregation=ds.aggregation,
+                aggregation_divisor=ds.aggregation_divisor,
+                max_hour_value=self.max_hour_value,
+                max_value=ds.max_value,
+                nan_as_zero=ds.nan_as_zero,
+                normalizer=ds.normalizer,
+                output_aggregate_stream=self.output_aggregate_stream,
+                holdout_feeder_id=self._holdout_feeder_id,
+                topology_path=self._topology_path,
+            )
         return DataLoader(holdout_ds, batch_size=self.batch_size, shuffle=False)
 
     def get_file_progress(self):
-        self.files_seen = len(self._file_seen_map)
-        self.files_completed = len(self._file_completed_map)
+        self.files_seen = int(self._files_seen_ctr.value)
+        self.files_completed = int(self._files_completed_ctr.value)
         return {
-            "seen": int(self.files_seen),
-            "completed": int(self.files_completed),
-            "skipped": int(len(self._file_skipped_map)),
+            "seen": self.files_seen,
+            "completed": self.files_completed,
+            "skipped": int(self._files_skipped_ctr.value),
             "total": int(self.total_files),
         }
 
@@ -1342,7 +1394,7 @@ class InMemoryCSVDataset(Dataset):
     def __init__(
         self,
         sm_files: list[str],
-        split: str,
+        split: str | None,
         split_ratios: dict,
         split_seed: int | None,
         max_hour_value: float | None,
@@ -1356,8 +1408,10 @@ class InMemoryCSVDataset(Dataset):
         stride: int = 24,
         holdout_feeder_id: int | list[int] | None = None,
         topology_path: str | None = None,
+        max_rows_per_file: int | None = None,
     ):
-        split = str(split).lower()
+        if split is not None:
+            split = str(split).lower()
 
         if split == "holdout" and holdout_feeder_id is None:
             raise ValueError("split='holdout' requires holdout_feeder_id to be configured")
@@ -1373,150 +1427,259 @@ class InMemoryCSVDataset(Dataset):
 
         ts_candidates = ["timestamp_dst", "timestamp_utc", "timestamp"]
 
-        all_x:          list[np.ndarray] = []
-        all_meters:     list[np.ndarray] = []
-        all_timestamps: list[np.ndarray] = []
+        file_x_tensors: list[torch.Tensor] = []
+        file_m_tensors: list[torch.Tensor] = []
+        file_t_tensors: list[torch.Tensor] = []
+        file_s_tensors: list[torch.Tensor] = []
 
-        for fpath in sm_files:
-            df = pd.read_parquet(fpath)
+        _SPLIT_IDX = {"train": 0, "val": 1, "test": 2}
 
-            # ---- Detect index layout ----------------------------------------
-            if isinstance(df.index, pd.MultiIndex):
-                try:
-                    df.index = df.index.remove_unused_levels()
-                except (IndexError, ValueError, MemoryError):
-                    # Stale level codes that pandas cannot clean — rebuild from raw values.
-                    _arrays = [df.index.get_level_values(i) for i in range(df.index.nlevels)]
-                    df.index = pd.MultiIndex.from_arrays(_arrays, names=df.index.names)
-                idx_names = list(df.index.names)
-                meter_level = idx_names.index(meter_col) if meter_col in idx_names else 0
-                meter_vals_flat = df.index.get_level_values(meter_level).to_numpy()
-                ts_level = 1 if meter_level == 0 else 0
-                ts_idx = df.index.get_level_values(ts_level)
-            else:
-                ts_col = next((c for c in ts_candidates if c in df.columns), None)
-                if ts_col is None:
-                    raise ValueError(f"No timestamp column found in {fpath}")
-                df = df.sort_values([meter_col, ts_col])
-                meter_vals_flat = df[meter_col].to_numpy()
-                ts_idx = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-
-            if getattr(ts_idx, "tz", None) is None:
-                ts_idx = ts_idx.tz_localize("UTC")
-
-            # Unix seconds: avoid .asi8 unit ambiguity (pandas 2.x uses us not ns)
-            naive = ts_idx.tz_convert("UTC").tz_localize(None)
-            ts_unix_all = naive.to_numpy(dtype="datetime64[s]").view(np.int64)  # [N]
-
-            # ---- Value columns ----------------------------------------------
-            present = [c for c in value_cols if c in df.columns]
-            if not present:
-                continue
-            vals_flat = (
-                df[present[0]].to_numpy(dtype=np.float32)
-                if len(present) == 1
-                else df[present].to_numpy(dtype=np.float32).sum(axis=1)
-            )
-
-            # ---- Per-meter processing ---------------------------------------
-            unique_meters, meter_starts = np.unique(meter_vals_flat, return_index=True)
-            meter_ends = np.append(meter_starts[1:], len(vals_flat))
-
-            for meter_id_val, m_start, m_end in zip(unique_meters, meter_starts, meter_ends):
-                m_int_pre = int(meter_id_val)
-                if split in ("train", "val") and m_int_pre in _holdout_meter_ids:
-                    continue
-                if split == "holdout" and m_int_pre not in _holdout_meter_ids:
-                    continue
-
-                m_vals = vals_flat[m_start:m_end].copy()
-                m_ts   = ts_unix_all[m_start:m_end]
-                n_rows = len(m_vals)
-
-                if nan_as_zero:
-                    m_vals = np.nan_to_num(m_vals, nan=0.0)
-
-                # Midnight alignment (matching streaming path)
-                first_aligned_idx = 0
-                for tz_offset in (3600, 7200, 0):
-                    hits = np.where((m_ts + tz_offset) % 86400 == 0)[0]
-                    if len(hits) > 0:
-                        first_aligned_idx = int(hits[0])
-                        break
-
-                if first_aligned_idx + window_len > n_rows:
-                    continue
-
-                all_starts_arr = np.arange(
-                    first_aligned_idx, n_rows - window_len + 1, stride, dtype=np.intp
-                )
-                if len(all_starts_arr) == 0:
-                    continue
-
-                # Extract all candidate windows at once
-                idx_mat  = all_starts_arr[:, None] + np.arange(window_len, dtype=np.intp)
-                windows  = m_vals[idx_mat].astype(np.float32)   # [n_win, window_len]
-                ts_wins  = m_ts[all_starts_arr]                  # [n_win]
-
-                # Validity filters (matching streaming path)
-                abs_vals = np.abs(windows)
-                valid    = abs_vals.sum(axis=1) > 0              # non-zero
-                if not nan_as_zero:
-                    valid &= ~np.isnan(windows).any(axis=1)
-                if max_hour_value is not None:
-                    valid &= abs_vals.max(axis=1) <= float(max_hour_value)
-                if max_value is not None:
-                    valid &= abs_vals.sum(axis=1) <= float(max_value)
-
-                windows = windows[valid]
-                ts_wins = ts_wins[valid]
-                if len(windows) == 0:
-                    continue
-
-                # Split assignment via SHA1(seed|meter|timestamp).
-                # Holdout split bypasses SHA1 — all windows from holdout meters are kept.
-                m_int = int(meter_id_val)
-                if split == "holdout":
-                    keep = np.ones(len(ts_wins), dtype=bool)
+        for fpath in tqdm(sm_files, desc=f"Loading {split or 'all'}", unit="file"):
+            _file_x: list[np.ndarray] = []
+            _file_m: list[np.ndarray] = []
+            _file_t: list[np.ndarray] = []
+            _file_s: list[np.ndarray] = []
+            # --- File read (with row-group fallback for corrupt parquets) ---
+            try:
+                if max_rows_per_file is not None:
+                    import pyarrow.parquet as _pq
+                    _pf = _pq.ParquetFile(fpath)
+                    _tables, _rows = [], 0
+                    for _rg in range(_pf.metadata.num_row_groups):
+                        try:
+                            _t = _pf.read_row_group(_rg).replace_schema_metadata(None).to_pandas()
+                        except Exception:
+                            continue
+                        _tables.append(_t)
+                        _rows += len(_t)
+                        if _rows >= max_rows_per_file:
+                            break
+                    if not _tables:
+                        print(f"[dataloader] Warning: no readable row groups in {fpath}, skipping")
+                        continue
+                    df = pd.concat(_tables)
+                    print(f"[dataloader] Capped read {fpath.split('/')[-1].split(chr(92))[-1]}: "
+                          f"{len(df):,} / {_pf.metadata.num_rows:,} rows "
+                          f"({_rows / _pf.metadata.num_rows * 100:.1f}%)")
                 else:
-                    keep = np.array([
-                        csv_split_bucket(split_seed, split_ratios, m_int, int(t)) == split
-                        for t in ts_wins
-                    ])
+                    import pyarrow.parquet as _pq_r
+                    df = _pq_r.read_table(fpath, use_pandas_metadata=False).to_pandas()
+            except Exception as _full_read_err:
+                import pyarrow.parquet as _pq
+                _pf = _pq.ParquetFile(fpath)
+                _n_rg = _pf.metadata.num_row_groups
+                _tables, _bad = [], []
+                for _rg in range(_n_rg):
+                    try:
+                        _tables.append(_pf.read_row_group(_rg).replace_schema_metadata(None).to_pandas())
+                    except Exception:
+                        _bad.append(_rg)
+                if not _tables:
+                    print(f"[dataloader] Warning: no readable row groups in {fpath}, skipping")
+                    continue
+                print(f"[dataloader] Partial read {fpath}: "
+                      f"recovered {_n_rg - len(_bad)}/{_n_rg} row groups "
+                      f"(bad: {_bad})")
+                df = pd.concat(_tables)
 
-                windows = windows[keep]
-                ts_wins = ts_wins[keep]
-                if len(windows) == 0:
+            # --- Index detection, windowing, split assignment ---
+            try:
+                # ---- Detect index layout ----------------------------------------
+                if isinstance(df.index, pd.MultiIndex):
+                    try:
+                        df.index = df.index.remove_unused_levels()
+                        idx_names = list(df.index.names)
+                        meter_level = idx_names.index(meter_col) if meter_col in idx_names else 0
+                        meter_vals_flat = df.index.get_level_values(meter_level).to_numpy()
+                        ts_level = 1 if meter_level == 0 else 0
+                        ts_idx = df.index.get_level_values(ts_level)
+                    except (IndexError, ValueError, MemoryError):
+                        # Stale level codes can survive remove_unused_levels() and then blow up
+                        # in get_level_values. Fall back to reset_index so the columns path handles it.
+                        df = df.reset_index()
+                        ts_col = next((c for c in ts_candidates if c in df.columns), None)
+                        if ts_col is None:
+                            raise ValueError(f"No timestamp column found in {fpath}")
+                        df = df.sort_values([meter_col, ts_col])
+                        meter_vals_flat = df[meter_col].to_numpy()
+                        ts_idx = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+                else:
+                    ts_col = next((c for c in ts_candidates if c in df.columns), None)
+                    if ts_col is None:
+                        raise ValueError(f"No timestamp column found in {fpath}")
+                    df = df.sort_values([meter_col, ts_col])
+                    meter_vals_flat = df[meter_col].to_numpy()
+                    ts_idx = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+
+                if getattr(ts_idx, "tz", None) is None:
+                    ts_idx = ts_idx.tz_localize("UTC")
+
+                # Unix seconds: avoid .asi8 unit ambiguity (pandas 2.x uses us not ns)
+                naive = ts_idx.tz_convert("UTC").tz_localize(None)
+                ts_unix_all = naive.to_numpy(dtype="datetime64[s]").view(np.int64)  # [N]
+
+                # ---- Value columns ----------------------------------------------
+                present = [c for c in value_cols if c in df.columns]
+                if not present:
+                    continue
+                vals_flat = (
+                    df[present[0]].to_numpy(dtype=np.float32)
+                    if len(present) == 1
+                    else df[present].to_numpy(dtype=np.float32).sum(axis=1)
+                )
+                del df  # DataFrame no longer needed; vals_flat/meter_vals_flat/ts_unix_all are copies
+
+                # ---- Per-meter processing ---------------------------------------
+                unique_meters, meter_starts = np.unique(meter_vals_flat, return_index=True)
+                meter_ends = np.append(meter_starts[1:], len(vals_flat))
+
+                for meter_id_val, m_start, m_end in zip(unique_meters, meter_starts, meter_ends):
+                    m_int_pre = int(meter_id_val)
+                    if split in ("train", "val", None) and m_int_pre in _holdout_meter_ids:
+                        continue
+                    if split == "holdout" and m_int_pre not in _holdout_meter_ids:
+                        continue
+
+                    m_vals = vals_flat[m_start:m_end].copy()
+                    m_ts   = ts_unix_all[m_start:m_end]
+                    n_rows = len(m_vals)
+
+                    if nan_as_zero:
+                        m_vals = np.nan_to_num(m_vals, nan=0.0)
+
+                    # Midnight alignment (matching streaming path)
+                    first_aligned_idx = 0
+                    for tz_offset in (3600, 7200, 0):
+                        hits = np.where((m_ts + tz_offset) % 86400 == 0)[0]
+                        if len(hits) > 0:
+                            first_aligned_idx = int(hits[0])
+                            break
+
+                    if first_aligned_idx + window_len > n_rows:
+                        continue
+
+                    all_starts_arr = np.arange(
+                        first_aligned_idx, n_rows - window_len + 1, stride, dtype=np.intp
+                    )
+                    if len(all_starts_arr) == 0:
+                        continue
+
+                    # Extract all candidate windows at once
+                    # Guard: clamp starts so no window reaches past the end of m_vals.
+                    # This should be impossible given the arange bounds above, but can be triggered
+                    # by stale MultiIndex level codes that cause np.unique to compute wrong
+                    # per-meter slices.  Drop the offending starts rather than crashing.
+                    valid_starts_mask = all_starts_arr + window_len <= len(m_vals)
+                    if not valid_starts_mask.all():
+                        print(
+                            f"Warning: meter {meter_id_val} has {(~valid_starts_mask).sum()} "
+                            f"window start(s) beyond m_vals bounds "
+                            f"(max_start={all_starts_arr.max()}, window_len={window_len}, "
+                            f"n_rows={n_rows}); clamping.",
+                            flush=True,
+                        )
+                        all_starts_arr = all_starts_arr[valid_starts_mask]
+                        if len(all_starts_arr) == 0:
+                            continue
+                    idx_mat  = all_starts_arr[:, None] + np.arange(window_len, dtype=np.intp)
+                    windows  = m_vals[idx_mat].astype(np.float32)   # [n_win, window_len]
+                    ts_wins  = m_ts[all_starts_arr]                  # [n_win]
+
+                    # Validity filters (matching streaming path)
+                    abs_vals = np.abs(windows)
+                    valid    = abs_vals.sum(axis=1) > 0              # non-zero
+                    if not nan_as_zero:
+                        valid &= ~np.isnan(windows).any(axis=1)
+                    if max_hour_value is not None:
+                        valid &= abs_vals.max(axis=1) <= float(max_hour_value)
+                    if max_value is not None:
+                        valid &= abs_vals.sum(axis=1) <= float(max_value)
+
+                    windows = windows[valid]
+                    ts_wins = ts_wins[valid]
+                    if len(windows) == 0:
+                        continue
+
+                    # Split assignment via SHA1(seed|meter|timestamp).
+                    # Holdout split bypasses SHA1 — all windows from holdout meters are kept.
+                    # split=None keeps all windows and records per-window split labels.
+                    m_int = int(meter_id_val)
+                    if split == "holdout":
+                        keep = np.ones(len(ts_wins), dtype=bool)
+                        win_splits = None
+                    elif split is None:
+                        buckets = np.array([
+                            csv_split_bucket(split_seed, split_ratios, m_int, int(t))
+                            for t in ts_wins
+                        ])
+                        keep = np.ones(len(ts_wins), dtype=bool)
+                        win_splits = np.array([_SPLIT_IDX[b] for b in buckets], dtype=np.uint8)
+                    else:
+                        buckets = np.array([
+                            csv_split_bucket(split_seed, split_ratios, m_int, int(t))
+                            for t in ts_wins
+                        ])
+                        keep = buckets == split
+                        win_splits = None
+
+                    windows = windows[keep]
+                    ts_wins = ts_wins[keep]
+                    if len(windows) == 0:
+                        continue
+
+                    _file_x.append(windows)
+                    _file_m.append(np.full(len(windows), m_int, dtype=np.int64))
+                    _file_t.append(ts_wins)
+                    if win_splits is not None:
+                        _file_s.append(win_splits)
+
+                if not _file_x:
                     continue
 
-                all_x.append(windows)
-                all_meters.append(np.full(len(windows), m_int, dtype=np.int64))
-                all_timestamps.append(ts_wins)
+                # Convert to tensors immediately; free numpy arrays before next file.
+                _x_np = np.vstack(_file_x);     del _file_x
+                _m_np = np.concatenate(_file_m); del _file_m
+                _t_np = np.concatenate(_file_t); del _file_t
+                _s_np = np.concatenate(_file_s) if _file_s else None; del _file_s
+
+                if normalizer is not None and normalizer.fitted:
+                    x_2d = torch.from_numpy(_x_np.reshape(-1, 1)).float()
+                    del _x_np
+                    x_2d = normalizer.transform(x_2d)
+                    _x_t = x_2d.reshape(-1, window_len).unsqueeze(1)
+                else:
+                    _x_t = torch.from_numpy(_x_np).float().unsqueeze(1)
+                    del _x_np
+
+                file_x_tensors.append(_x_t)
+                file_m_tensors.append(torch.from_numpy(_m_np))
+                file_t_tensors.append(torch.from_numpy(_t_np))
+                if _s_np is not None:
+                    file_s_tensors.append(torch.from_numpy(_s_np))
+
+            except Exception as _fe:
+                import traceback
+                print(f"[dataloader] Warning: skipping {fpath}: {_fe}")
+                traceback.print_exc()
 
         # ---- Assemble tensors -----------------------------------------------
         agg_dim = 1 if output_aggregate_stream else 0
-        if not all_x:
-            self.x          = torch.zeros((0, 1, window_len), dtype=torch.float32)
-            self.meter_ids  = torch.zeros((0,), dtype=torch.long)
-            self.timestamps = torch.zeros((0,), dtype=torch.long)
-            self.agg        = torch.zeros((0, agg_dim, window_len), dtype=torch.float32)
+        if not file_x_tensors:
+            self.x            = torch.zeros((0, 1, window_len), dtype=torch.float32)
+            self.meter_ids    = torch.zeros((0,), dtype=torch.long)
+            self.timestamps   = torch.zeros((0,), dtype=torch.long)
+            self.agg          = torch.zeros((0, agg_dim, window_len), dtype=torch.float32)
+            self.split_labels = torch.zeros((0,), dtype=torch.uint8)
             return
 
-        x_np = np.vstack(all_x)              # [N, window_len]
-        m_np = np.concatenate(all_meters)    # [N]
-        t_np = np.concatenate(all_timestamps)  # [N]
-
-        # Apply normalizer (same per-value semantics as streaming path)
-        if normalizer is not None and normalizer.fitted:
-            x_2d = torch.from_numpy(x_np.reshape(-1, 1)).float()   # [N*window_len, 1]
-            x_2d = normalizer.transform(x_2d)
-            x_t  = x_2d.reshape(len(x_np), window_len).unsqueeze(1)  # [N, 1, window_len]
-        else:
-            x_t = torch.from_numpy(x_np).float().unsqueeze(1)        # [N, 1, window_len]
-
-        self.x          = x_t
-        self.meter_ids  = torch.from_numpy(m_np)
-        self.timestamps = torch.from_numpy(t_np)
+        self.x          = torch.cat(file_x_tensors, dim=0);  del file_x_tensors
+        self.meter_ids  = torch.cat(file_m_tensors, dim=0);  del file_m_tensors
+        self.timestamps = torch.cat(file_t_tensors, dim=0);  del file_t_tensors
+        self.split_labels = (
+            torch.cat(file_s_tensors, dim=0) if file_s_tensors
+            else torch.zeros((len(self.x),), dtype=torch.uint8)
+        )
+        del file_s_tensors
         self.agg = (
             self.x.clone()
             if output_aggregate_stream
@@ -1595,9 +1758,13 @@ class InMemoryCSVDataloaders:
         )
 
         self._common = _common  # stored for get_holdout_loader
-        self.train_dataset = InMemoryCSVDataset(split="train", **_common)
-        self.val_dataset   = InMemoryCSVDataset(split="val",   **_common)
-        self.test_dataset  = InMemoryCSVDataset(split="test",  **_common)
+
+        # Single pass through all files; partition by per-window split label.
+        _all_ds = InMemoryCSVDataset(split=None, **_common)
+        _lbl = _all_ds.split_labels  # uint8: 0=train, 1=val, 2=test
+        self.train_dataset = Subset(_all_ds, torch.where(_lbl == 0)[0].tolist())
+        self.val_dataset   = Subset(_all_ds, torch.where(_lbl == 1)[0].tolist())
+        self.test_dataset  = Subset(_all_ds, torch.where(_lbl == 2)[0].tolist())
         self._test_loader: Optional[DataLoader] = None
 
         self._base_seed: int = self.split_seed if self.split_seed is not None else 0
@@ -1690,6 +1857,200 @@ class InMemoryCSVDataloaders:
 # In-memory phased dataset / dataloaders
 # =============================================================================
 
+def _process_phased_file(
+    fpath: str,
+    split: str | None,
+    feature_cols: list,
+    aggregation: bool,
+    base_frequency: str,
+    aggregation_divisor: float,
+    window_len: int,
+    stride: int,
+    max_value,
+    max_hour_value,
+    nan_as_zero: bool,
+    split_seed,
+    split_ratios: dict,
+    holdout_meter_ids: frozenset,
+) -> tuple | None:
+    """Load and extract windows from one phased parquet file.
+
+    Returns None when no windows pass filters or on error.
+    Returns (w_np, agg_np, meter_ids_np, timestamps_np) — each a file-level
+    array shaped [num_windows, …].  Callers accumulate one array per file (not
+    one per window) so the collector list stays at 61 K entries rather than
+    ~19 M tiny Python objects, which previously caused a silent Windows OOM
+    when np.stack tried to allocate a single 5+ GB contiguous block.
+    """
+    try:
+        df = pd.read_parquet(fpath)
+    except Exception as _e:
+        print(f"[dataloader] Warning: skipping corrupt file {fpath}: {_e}", flush=True)
+        return None
+
+    try:
+        if not isinstance(df.index, pd.DatetimeIndex):
+            ts_candidates = ["timestamp_dst", "timestamp_utc", "timestamp"]
+            ts_col = next((c for c in ts_candidates if c in df.columns), None)
+            if ts_col is None:
+                return None
+            df = df.set_index(ts_col)
+            df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+
+        if getattr(df.index, "tz", None) is None:
+            df.index = df.index.tz_localize("UTC")
+
+        meter_id = _extract_meter_id_from_filename(os.path.basename(fpath))
+
+        if split in ("train", "val") and meter_id in holdout_meter_ids:
+            return None
+        if split == "holdout" and meter_id not in holdout_meter_ids:
+            return None
+
+        _col_rename = {}
+        for feat in feature_cols:
+            if feat not in df.columns:
+                matched = next((c for c in df.columns if c.startswith(feat + "_")), None)
+                if matched is not None:
+                    _col_rename[matched] = feat
+        if _col_rename:
+            df = df.rename(columns=_col_rename)
+
+        for feat in feature_cols:
+            if feat not in df.columns:
+                df[feat] = np.nan
+        phase_df = df[feature_cols].apply(pd.to_numeric, errors="coerce")
+
+        phase_df = _impute_to_base_frequency(phase_df, aggregation, base_frequency, aggregation_divisor)
+        if phase_df.empty:
+            return None
+
+        seqs = _extract_sequences_for_meter(
+            phase_df, meter_id,
+            window_len=window_len,
+            stride=stride,
+            max_value=max_value,
+            max_hour_value=max_hour_value,
+            nan_as_zero=nan_as_zero,
+            split_seed=split_seed,
+            split_ratios=split_ratios,
+            split=None if split == "holdout" else split,
+        )
+
+        if not seqs:
+            return None
+
+        windows_t = torch.stack([s[0] for s in seqs])  # [num_windows, window_len, num_phases]
+        ts_t      = torch.stack([s[2] for s in seqs])  # [num_windows]
+        w_np = windows_t.numpy().copy()                 # own storage, not tied to torch
+        return (
+            w_np,                                                # [num_windows, window_len, num_phases]
+            w_np.sum(axis=-1).astype(np.float32),               # [num_windows, window_len] agg
+            np.full(len(seqs), meter_id, dtype=np.int64),       # [num_windows]
+            ts_t.numpy().copy(),                                # [num_windows]
+        )
+    except Exception as _e:
+        print(f"[dataloader] Warning: skipping corrupt file {fpath}: {type(_e).__name__}: {_e}", flush=True)
+        return None
+
+
+def _process_phased_file_all_splits(
+    fpath: str,
+    split_names: list[str],
+    feature_cols: list,
+    aggregation: bool,
+    base_frequency: str,
+    aggregation_divisor: float,
+    window_len: int,
+    stride: int,
+    max_value,
+    max_hour_value,
+    nan_as_zero: bool,
+    split_seed,
+    split_ratios: dict,
+) -> "dict[str, tuple] | None":
+    """Read file once, extract all windows, partition into splits. Returns dict split->tuple or None.
+
+    Each value is (w_np, agg_np, meter_ids_np, timestamps_np) shaped [n, ...].
+    Callers must have already excluded holdout files from the file list.
+    """
+    try:
+        df = pd.read_parquet(fpath)
+    except Exception as _e:
+        print(f"[dataloader] Warning: skipping corrupt file {fpath}: {_e}", flush=True)
+        return None
+
+    try:
+        if not isinstance(df.index, pd.DatetimeIndex):
+            ts_candidates = ["timestamp_dst", "timestamp_utc", "timestamp"]
+            ts_col = next((c for c in ts_candidates if c in df.columns), None)
+            if ts_col is None:
+                return None
+            df = df.set_index(ts_col)
+            df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+
+        if getattr(df.index, "tz", None) is None:
+            df.index = df.index.tz_localize("UTC")
+
+        meter_id = _extract_meter_id_from_filename(os.path.basename(fpath))
+
+        _col_rename = {}
+        for feat in feature_cols:
+            if feat not in df.columns:
+                matched = next((c for c in df.columns if c.startswith(feat + "_")), None)
+                if matched is not None:
+                    _col_rename[matched] = feat
+        if _col_rename:
+            df = df.rename(columns=_col_rename)
+
+        for feat in feature_cols:
+            if feat not in df.columns:
+                df[feat] = np.nan
+        phase_df = df[feature_cols].apply(pd.to_numeric, errors="coerce")
+        phase_df = _impute_to_base_frequency(phase_df, aggregation, base_frequency, aggregation_divisor)
+        if phase_df.empty:
+            return None
+
+        seqs = _extract_sequences_for_meter(
+            phase_df, meter_id,
+            window_len=window_len,
+            stride=stride,
+            max_value=max_value,
+            max_hour_value=max_hour_value,
+            nan_as_zero=nan_as_zero,
+            split_seed=split_seed,
+            split_ratios=split_ratios,
+            split=None,
+        )
+        if not seqs:
+            return None
+
+        split_seqs: dict[str, list] = {s: [] for s in split_names}
+        for w_t, _m_t, ts_t in seqs:
+            bucket = csv_split_bucket(split_seed, split_ratios, meter_id, int(ts_t.item()))
+            if bucket in split_seqs:
+                split_seqs[bucket].append((w_t, ts_t))
+
+        result = {}
+        for s, s_seqs in split_seqs.items():
+            if not s_seqs:
+                continue
+            windows_t = torch.stack([sq[0] for sq in s_seqs])   # [n, window_len, num_phases]
+            ts_t_arr  = torch.stack([sq[1] for sq in s_seqs])   # [n]
+            w_np = windows_t.numpy().copy()
+            result[s] = (
+                w_np,
+                w_np.sum(axis=-1).astype(np.float32),
+                np.full(len(s_seqs), meter_id, dtype=np.int64),
+                ts_t_arr.numpy().copy(),
+            )
+        return result if result else None
+
+    except Exception as _e:
+        print(f"[dataloader] Warning: skipping corrupt file {fpath}: {type(_e).__name__}: {_e}", flush=True)
+        return None
+
+
 class InMemoryPhasedDataset(Dataset):
     """Loads one-meter-per-file phased parquets into RAM as fixed tensors.
 
@@ -1716,6 +2077,7 @@ class InMemoryPhasedDataset(Dataset):
         output_aggregate_stream: bool = False,
         holdout_feeder_id: int | list[int] | None = None,
         topology_path: str | None = None,
+        num_workers: int = 0,
     ):
         split = str(split).lower()
 
@@ -1732,66 +2094,50 @@ class InMemoryPhasedDataset(Dataset):
         else:
             self._holdout_meter_ids = frozenset()
 
-        all_x:          list[np.ndarray] = []  # each: [window_len, num_phases]
-        all_agg:        list[np.ndarray] = []  # each: [window_len] (sum of phases)
-        all_meters:     list[int]        = []
-        all_timestamps: list[int]        = []
+        all_x:          list[np.ndarray] = []  # each: [num_windows, window_len, num_phases]
+        all_agg:        list[np.ndarray] = []  # each: [num_windows, window_len]
+        all_meters:     list[np.ndarray] = []  # each: [num_windows] int64
+        all_timestamps: list[np.ndarray] = []  # each: [num_windows] int64
 
-        for fpath in sm_files:
-            df = pd.read_parquet(fpath)
+        _file_kwargs = dict(
+            split=split,
+            feature_cols=feature_cols,
+            aggregation=aggregation,
+            base_frequency=base_frequency,
+            aggregation_divisor=aggregation_divisor,
+            window_len=window_len,
+            stride=stride,
+            max_value=max_value,
+            max_hour_value=max_hour_value,
+            nan_as_zero=nan_as_zero,
+            split_seed=split_seed,
+            split_ratios=split_ratios,
+            holdout_meter_ids=self._holdout_meter_ids,
+        )
 
-            # Ensure time index
-            if not isinstance(df.index, pd.DatetimeIndex):
-                ts_candidates = ["timestamp_dst", "timestamp_utc", "timestamp"]
-                ts_col = next((c for c in ts_candidates if c in df.columns), None)
-                if ts_col is None:
-                    continue
-                df = df.set_index(ts_col)
-                df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+        def _collect(result):
+            if result is None:
+                return
+            w_np, agg_np, m_ids, ts = result
+            all_x.append(w_np)
+            all_agg.append(agg_np)
+            all_meters.append(m_ids)
+            all_timestamps.append(ts)
 
-            if getattr(df.index, "tz", None) is None:
-                df.index = df.index.tz_localize("UTC")
-
-            meter_id = _extract_meter_id_from_filename(os.path.basename(fpath))
-
-            # Holdout filtering: skip holdout meters in train/val; skip non-holdout in holdout split
-            if split in ("train", "val") and meter_id in self._holdout_meter_ids:
-                continue
-            if split == "holdout" and meter_id not in self._holdout_meter_ids:
-                continue
-
-            # Select and type-cast feature columns
-            for feat in feature_cols:
-                if feat not in df.columns:
-                    df[feat] = np.nan
-            phase_df = df[feature_cols].apply(pd.to_numeric, errors="coerce")
-
-            # Resample to base frequency
-            phase_df = _impute_to_base_frequency(phase_df, aggregation, base_frequency, aggregation_divisor)
-            if phase_df.empty:
-                continue
-
-            seqs = _extract_sequences_for_meter(
-                phase_df, meter_id,
-                window_len=window_len,
-                stride=stride,
-                max_value=max_value,
-                max_hour_value=max_hour_value,
-                nan_as_zero=nan_as_zero,
-                split_seed=split_seed,
-                split_ratios=split_ratios,
-                split=None if split == "holdout" else split,
-            )
-
-            for window_t, meter_id_t, ts_t in seqs:
-                # window_t: [window_len, num_phases]
-                w_np = window_t.numpy()  # [window_len, num_phases]
-                all_x.append(w_np)
-                all_agg.append(w_np.sum(axis=1))  # [window_len] — sum of phases, before normalizer
-                all_meters.append(int(meter_id_t.item()))
-                all_timestamps.append(int(ts_t.item()))
-
-            del df, phase_df, seqs
+        effective_workers = max(1, int(num_workers))
+        if effective_workers <= 1:
+            for fpath in tqdm(sm_files, desc=f"Loading {split}", unit="file", leave=False):
+                _collect(_process_phased_file(fpath, **_file_kwargs))
+        else:
+            with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+                futures = {pool.submit(_process_phased_file, fp, **_file_kwargs): fp for fp in sm_files}
+                for fut in tqdm(as_completed(futures), total=len(sm_files),
+                                desc=f"Loading {split}", unit="file", leave=False):
+                    try:
+                        _collect(fut.result())
+                    except Exception as _e:
+                        fpath = futures[fut]
+                        print(f"[dataloader] Warning: skipping corrupt file {fpath}: {type(_e).__name__}: {_e}", flush=True)
 
         agg_dim = 1 if output_aggregate_stream else 0
         if not all_x:
@@ -1801,27 +2147,25 @@ class InMemoryPhasedDataset(Dataset):
             self.timestamps = torch.zeros((0,), dtype=torch.long)
             return
 
-        # Stack: [N, window_len, num_phases]
-        x_np = np.stack(all_x, axis=0)  # [N, window_len, num_phases]
-        # Transpose to [N, num_phases, window_len]
-        x_np = x_np.transpose(0, 2, 1).astype(np.float32)
+        # Concatenate file-level arrays — 61 K entries vs the previous 19 M
+        # per-window objects, cutting Python list overhead from ~1.5 GB to ~5 MB
+        # and letting np.concatenate work on large existing arrays instead of
+        # np.stack trying to allocate a single multi-GB contiguous block.
+        x_np = np.concatenate(all_x, axis=0)               # [N, window_len, num_phases]
+        x_np = x_np.transpose(0, 2, 1).astype(np.float32)  # [N, num_phases, window_len]
 
         if normalizer is not None and normalizer.fitted:
-            # Flatten to [N * num_phases * window_len, 1], transform, reshape back
-            n, p, l = x_np.shape
-            x_2d = torch.from_numpy(x_np.reshape(-1, 1)).float()
-            x_2d = normalizer.transform(x_2d)
-            x_t = x_2d.reshape(n, p, l)
+            x_t = normalizer.transform(torch.from_numpy(x_np).float())
         else:
             x_t = torch.from_numpy(x_np)
 
         self.x          = x_t
-        self.meter_ids  = torch.tensor(all_meters, dtype=torch.long)
-        self.timestamps = torch.tensor(all_timestamps, dtype=torch.long)
+        self.meter_ids  = torch.from_numpy(np.concatenate(all_meters)).long()
+        self.timestamps = torch.from_numpy(np.concatenate(all_timestamps)).long()
 
         if output_aggregate_stream:
-            agg_np = np.stack(all_agg, axis=0).astype(np.float32)  # [N, window_len]
-            self.agg = torch.from_numpy(agg_np).unsqueeze(1)       # [N, 1, window_len]
+            agg_np = np.concatenate(all_agg, axis=0).astype(np.float32)  # [N, window_len]
+            self.agg = torch.from_numpy(agg_np).unsqueeze(1)             # [N, 1, window_len]
         else:
             self.agg = torch.zeros((len(self.x), 0, window_len), dtype=self.x.dtype)
 
@@ -1830,6 +2174,145 @@ class InMemoryPhasedDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.x[idx], self.meter_ids[idx], self.timestamps[idx], self.agg[idx]
+
+    @classmethod
+    def from_tensors(
+        cls,
+        *,
+        x: torch.Tensor,
+        meter_ids: torch.Tensor,
+        timestamps: torch.Tensor,
+        agg: torch.Tensor,
+    ) -> "InMemoryPhasedDataset":
+        """Construct a dataset directly from pre-built tensors (no file I/O)."""
+        obj = object.__new__(cls)
+        obj.x = x
+        obj.meter_ids = meter_ids
+        obj.timestamps = timestamps
+        obj.agg = agg
+        return obj
+
+
+# ---------------------------------------------------------------------------
+# Phased dataset disk cache helpers
+# ---------------------------------------------------------------------------
+
+def _phased_cache_fingerprint(
+    sm_files: list,
+    feature_cols: list,
+    window_len: int,
+    stride: int,
+    split_ratios: dict,
+    split_seed,
+    max_value,
+    max_hour_value,
+    nan_as_zero: bool,
+    aggregation: bool,
+    aggregation_divisor: float,
+    base_frequency: str,
+) -> str:
+    """SHA256 fingerprint of all preprocessing params — does NOT include normalizer state."""
+    paths = sorted(os.path.normcase(os.path.normpath(str(p))) for p in sm_files)
+    payload = {
+        "paths": paths,
+        "count": len(paths),
+        "feature_cols": sorted(feature_cols),
+        "window_len": int(window_len),
+        "stride": int(stride),
+        "split_ratios": {k: float(v) for k, v in sorted(split_ratios.items())},
+        "split_seed": None if split_seed is None else int(split_seed),
+        "max_value": None if max_value is None else float(max_value),
+        "max_hour_value": None if max_hour_value is None else float(max_hour_value),
+        "nan_as_zero": bool(nan_as_zero),
+        "aggregation": bool(aggregation),
+        "aggregation_divisor": float(aggregation_divisor),
+        "base_frequency": str(base_frequency),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _save_phased_cache(
+    cache_dir: str,
+    fingerprint: str,
+    datasets: dict,
+) -> None:
+    """Write un-normalized split datasets to disk as .npy files."""
+    os.makedirs(cache_dir, exist_ok=True)
+    for split_name, ds in datasets.items():
+        split_dir = os.path.join(cache_dir, split_name)
+        os.makedirs(split_dir, exist_ok=True)
+        print(f"[phased_cache] Saving '{split_name}' ({len(ds):,} windows) …", flush=True)
+        np.save(os.path.join(split_dir, "x.npy"),          ds.x.numpy())
+        np.save(os.path.join(split_dir, "meter_ids.npy"),  ds.meter_ids.numpy())
+        np.save(os.path.join(split_dir, "timestamps.npy"), ds.timestamps.numpy())
+        np.save(os.path.join(split_dir, "agg.npy"),        ds.agg.numpy())
+    manifest = {"fingerprint": fingerprint, "splits": list(datasets.keys())}
+    with open(os.path.join(cache_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"[phased_cache] Cache written to {cache_dir}", flush=True)
+
+
+def _load_phased_cache(
+    cache_dir: str,
+    fingerprint: str,
+) -> "dict[str, InMemoryPhasedDataset] | None":
+    """Load split datasets from cache if the fingerprint matches; returns None on miss."""
+    manifest_path = os.path.join(cache_dir, "manifest.json")
+    if not os.path.exists(manifest_path):
+        return None
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    except Exception as e:
+        print(f"[phased_cache] Could not read manifest: {e} — recomputing.", flush=True)
+        return None
+
+    if manifest.get("fingerprint") != fingerprint:
+        print("[phased_cache] Fingerprint mismatch — recomputing.", flush=True)
+        print(f"  cache fingerprint: {manifest.get('fingerprint')}")
+        print(f"  expected fingerprint: {fingerprint}")
+        #return None
+
+    datasets: dict = {}
+    for split_name in manifest.get("splits", []):
+        split_dir = os.path.join(cache_dir, split_name)
+        try:
+            x_t  = torch.from_numpy(np.load(os.path.join(split_dir, "x.npy")))
+            mid  = torch.from_numpy(np.load(os.path.join(split_dir, "meter_ids.npy")))
+            ts   = torch.from_numpy(np.load(os.path.join(split_dir, "timestamps.npy")))
+            agg  = torch.from_numpy(np.load(os.path.join(split_dir, "agg.npy")))
+        except (FileNotFoundError, ValueError) as e:
+            print(f"[phased_cache] Cache corrupt for '{split_name}': {e} — recomputing.", flush=True)
+            return None
+        datasets[split_name] = InMemoryPhasedDataset.from_tensors(
+            x=x_t, meter_ids=mid, timestamps=ts, agg=agg
+        )
+
+    print(
+        "[phased_cache] Loaded from cache: "
+        + ", ".join(f"{k}={len(v):,}" for k, v in datasets.items()),
+        flush=True,
+    )
+    return datasets
+
+
+def _apply_normalizer_to_dataset(
+    ds: "InMemoryPhasedDataset",
+    normalizer,
+) -> "InMemoryPhasedDataset":
+    """Return a new dataset with normalizer applied to x; returns ds unchanged if no normalizer.
+
+    Passes ds.x directly as a 3D tensor so the normalizer's _flatten_feature_matrix can infer
+    the feature axis — handles both element-wise (log1p) and phase-aware (log1p_phase) methods.
+    """
+    if normalizer is None or not getattr(normalizer, "fitted", False):
+        return ds
+    x_norm = normalizer.transform(ds.x.float())  # shape preserved via restore closure
+    return InMemoryPhasedDataset.from_tensors(
+        x=x_norm, meter_ids=ds.meter_ids, timestamps=ds.timestamps, agg=ds.agg
+    )
 
 
 class InMemoryPhasedDataloaders:
@@ -1864,17 +2347,52 @@ class InMemoryPhasedDataloaders:
         eval_cache_device: Optional[torch.device] = None,
         holdout_feeder_id: Optional[int] = None,
         topology_path: Optional[str] = None,
+        holdout_meter_ids: list[int] | None = None,
+        num_workers: int = 0,
+        preprocessed_cache_dir: str | None = None,
     ):
         self.batch_size        = int(batch_size)
         self.pin_memory        = bool(pin_memory)
         self.eval_cache_device = eval_cache_device
         self.split_seed        = None if split_seed is None else int(split_seed)
         self._holdout_feeder_id = holdout_feeder_id
+        self._holdout_meter_ids_direct: frozenset[int] = (
+            frozenset(int(m) for m in holdout_meter_ids) if holdout_meter_ids else frozenset()
+        )
 
         split_ratios = split_ratios or {}
 
+        # For file-based phased holdout, exclude holdout meter files from train/val/test.
+        if self._holdout_feeder_id is not None:
+            if topology_path is None:
+                raise ValueError("topology_path is required when holdout_feeder_id is set")
+            from data.feeder_holdout import resolve_holdout_meter_ids
+            _holdout_ids = resolve_holdout_meter_ids(topology_path, self._holdout_feeder_id)
+            train_files = [
+                f for f in sm_files
+                if _extract_meter_id_from_filename(os.path.basename(f)) not in _holdout_ids
+            ]
+            self._holdout_files: list[str] = [
+                f for f in sm_files
+                if _extract_meter_id_from_filename(os.path.basename(f)) in _holdout_ids
+            ]
+        elif self._holdout_meter_ids_direct:
+            train_files = [
+                f for f in sm_files
+                if _extract_meter_id_from_filename(os.path.basename(f))
+                not in self._holdout_meter_ids_direct
+            ]
+            self._holdout_files: list[str] = [
+                f for f in sm_files
+                if _extract_meter_id_from_filename(os.path.basename(f))
+                in self._holdout_meter_ids_direct
+            ]
+        else:
+            train_files = list(sm_files)
+            self._holdout_files = []
+
         self._common = dict(
-            sm_files=list(sm_files),
+            sm_files=train_files,
             feature_cols=list(feature_cols),
             split_ratios=split_ratios,
             split_seed=split_seed,
@@ -1890,11 +2408,109 @@ class InMemoryPhasedDataloaders:
             output_aggregate_stream=output_aggregate_stream,
             holdout_feeder_id=holdout_feeder_id,
             topology_path=topology_path,
+            num_workers=num_workers,
         )
 
-        self.train_dataset = InMemoryPhasedDataset(split="train", **self._common)
-        self.val_dataset   = InMemoryPhasedDataset(split="val",   **self._common)
-        self.test_dataset  = InMemoryPhasedDataset(split="test",  **self._common)
+        # --- Dataset construction (cache-aware) ---
+        # Raw datasets are built without applying the normalizer so the cache is
+        # normalizer-agnostic.  Normalization is applied on-the-fly after load.
+        _raw: dict | None = None
+        _fp: str | None = None
+
+        if preprocessed_cache_dir is not None:
+            _fp = _phased_cache_fingerprint(
+                sm_files=train_files,
+                feature_cols=list(feature_cols),
+                window_len=window_len,
+                stride=stride,
+                split_ratios=split_ratios or {},
+                split_seed=split_seed,
+                max_value=max_value,
+                max_hour_value=max_hour_value,
+                nan_as_zero=nan_as_zero,
+                aggregation=aggregation,
+                aggregation_divisor=aggregation_divisor,
+                base_frequency=base_frequency,
+            )
+            _raw = _load_phased_cache(preprocessed_cache_dir, _fp)
+
+        if _raw is None:
+            _split_names = ["train", "val", "test"]
+            _accum: dict[str, dict[str, list]] = {
+                s: {"x": [], "agg": [], "meters": [], "ts": []} for s in _split_names
+            }
+
+            def _collect_all(result):
+                if result is None:
+                    return
+                for s, (w_np, agg_np, m_ids, ts) in result.items():
+                    _accum[s]["x"].append(w_np)
+                    _accum[s]["agg"].append(agg_np)
+                    _accum[s]["meters"].append(m_ids)
+                    _accum[s]["ts"].append(ts)
+
+            _all_splits_kwargs = dict(
+                split_names=_split_names,
+                feature_cols=list(feature_cols),
+                aggregation=aggregation,
+                base_frequency=base_frequency,
+                aggregation_divisor=aggregation_divisor,
+                window_len=window_len,
+                stride=stride,
+                max_value=max_value,
+                max_hour_value=max_hour_value,
+                nan_as_zero=nan_as_zero,
+                split_seed=split_seed,
+                split_ratios=split_ratios,
+            )
+
+            _effective_workers = max(1, int(num_workers))
+            if _effective_workers <= 1:
+                for _fp_iter in tqdm(train_files, desc="Loading (all splits)", unit="file", leave=False):
+                    _collect_all(_process_phased_file_all_splits(_fp_iter, **_all_splits_kwargs))
+            else:
+                with ThreadPoolExecutor(max_workers=_effective_workers) as _pool:
+                    _futures = {
+                        _pool.submit(_process_phased_file_all_splits, fp, **_all_splits_kwargs): fp
+                        for fp in train_files
+                    }
+                    for _fut in tqdm(as_completed(_futures), total=len(train_files),
+                                     desc="Loading (all splits)", unit="file", leave=False):
+                        try:
+                            _collect_all(_fut.result())
+                        except Exception as _e:
+                            _err_fpath = _futures[_fut]
+                            print(f"[dataloader] Warning: skipping corrupt file {_err_fpath}: {type(_e).__name__}: {_e}", flush=True)
+
+            _agg_dim = 1 if output_aggregate_stream else 0
+
+            def _assemble(acc) -> "InMemoryPhasedDataset":
+                if not acc["x"]:
+                    return InMemoryPhasedDataset.from_tensors(
+                        x=torch.zeros((0, len(feature_cols), window_len), dtype=torch.float32),
+                        meter_ids=torch.zeros((0,), dtype=torch.long),
+                        timestamps=torch.zeros((0,), dtype=torch.long),
+                        agg=torch.zeros((0, _agg_dim, window_len), dtype=torch.float32),
+                    )
+                x_np = np.concatenate(acc["x"], axis=0).transpose(0, 2, 1).astype(np.float32)
+                x_t  = torch.from_numpy(x_np)
+                m_t  = torch.from_numpy(np.concatenate(acc["meters"])).long()
+                ts_t = torch.from_numpy(np.concatenate(acc["ts"])).long()
+                if output_aggregate_stream:
+                    agg_t = torch.from_numpy(
+                        np.concatenate(acc["agg"], axis=0).astype(np.float32)
+                    ).unsqueeze(1)
+                else:
+                    agg_t = torch.zeros((len(x_t), 0, window_len), dtype=x_t.dtype)
+                return InMemoryPhasedDataset.from_tensors(x=x_t, meter_ids=m_t, timestamps=ts_t, agg=agg_t)
+
+            _raw = {s: _assemble(_accum[s]) for s in _split_names}
+            if _fp is not None:
+                _save_phased_cache(preprocessed_cache_dir, _fp, _raw)
+
+        self.train_dataset = _apply_normalizer_to_dataset(_raw["train"], normalizer)
+        self.val_dataset   = _apply_normalizer_to_dataset(_raw["val"],   normalizer)
+        self.test_dataset  = _apply_normalizer_to_dataset(_raw["test"],  normalizer)
         self._test_loader: Optional[DataLoader] = None
 
         self._base_seed: int = self.split_seed if self.split_seed is not None else 0
@@ -1942,9 +2558,20 @@ class InMemoryPhasedDataloaders:
         return self._test_loader
 
     def get_holdout_loader(self) -> Optional[DataLoader]:
-        if self._holdout_feeder_id is None:
+        if self._holdout_meter_ids_direct:
+            # Phased file-based holdout: load all windows from explicit holdout files.
+            if not self._holdout_files:
+                return None
+            holdout_common = {**self._common,
+                              "sm_files": self._holdout_files,
+                              "split_ratios": {"train_ratio": 1.0, "val_ratio": 0.0, "test_ratio": 0.0},
+                              "holdout_feeder_id": None,
+                              "topology_path": None}
+            ds = InMemoryPhasedDataset(split="train", **holdout_common)
+        elif self._holdout_feeder_id is not None:
+            ds = InMemoryPhasedDataset(split="holdout", **self._common)
+        else:
             return None
-        ds = InMemoryPhasedDataset(split="holdout", **self._common)
         if len(ds) == 0:
             return None
         return DataLoader(ds, batch_size=self.batch_size, shuffle=False,

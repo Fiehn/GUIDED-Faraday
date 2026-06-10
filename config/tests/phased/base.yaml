@@ -16,19 +16,19 @@ data:
   max_value: 200.0
   max_hour_value: 20.0
   splits:
-    train_ratio: 0.85
-    val_ratio: 0.1
+    train_ratio: 0.9
+    val_ratio: 0.05
     test_ratio: 0.05
     random_seed: 42
   window:
     aggregated: true
     input_len: 24
     stride: 24
-  batch_size: 512
+  batch_size: 1024
   shuffle: true
-  replay_buffer_capacity: 10000
-  min_buffer_size: 2000
-  num_workers: 2
+  replay_buffer_capacity: 50000
+  min_buffer_size: 5000
+  num_workers: 1
   steps_per_epoch: 500
   eval_batches: 5
   eval_cache_on_gpu: true
@@ -38,8 +38,11 @@ data:
   max_skip_warnings: 20
   aggregation_energy_unit: kwh
   output_aggregate_stream: false
-  in_memory: false
+  in_memory: true
   max_passes: 20
+  preprocessed_cache_dir: "E:/Data/processed_data/cached_data"
+  holdout_feeder_id: [291556, 887337, 267697, 129571, 921498, 123538, 615734, 144397, 652352, 942339, 47021, 60068, 641430, 667455, 318813, 732417, 164883, 307389, 657188, 893397]   #291556:  n=42   ev=28.6%   hp=31.0%    avg?=9.70    cover?=100.0%
+  topology_path: data/topology/cleaned/Cleaned_SM_Topology_mapping.json       # path to topology JSON; required when holdout_feeder_id is set
 
 normalization:
   method: log1p
@@ -84,19 +87,19 @@ training:
     enabled: true
     stop_on_all_files_used: false
     min_epochs_before_full_data_stop: 1
-    patience: 5
+    patience: 15
     min_delta: 0.01
   checkpointing:
     save_freq: 20
-    save_dir: E:/models/phased/
+    save_dir: E:/models/phased4/
     save_best_model: true
-    save_best_after_fraction: 0.15
+    save_best_after_fraction: 0.0
     save_final_model: true
 
 logging:
-  log_dir: E:/models/phased/
+  log_dir: E:/models/phased4/
   save_config: true
-  config_save_dir: E:/models/phased/
+  config_save_dir: E:/models/phased4/
 
 visualize:
   num_samples: 5

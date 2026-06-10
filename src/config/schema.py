@@ -149,6 +149,12 @@ class BaselineMeanModelConfig(BaseModel):
     type: Literal["baseline_mean"]
 
 
+class BaselineRealDataModelConfig(BaseModel):
+    type: Literal["baseline_real_data"]
+    reservoir_size: int = 500_000
+    min_bucket_samples: int = 30
+
+
 ModelConfig = Annotated[
     Union[
         ArtModelConfig,
@@ -163,6 +169,7 @@ ModelConfig = Annotated[
         BaselineAverageModelConfig,
         BaselineQuantileModelConfig,
         BaselineMeanModelConfig,
+        BaselineRealDataModelConfig,
     ],
     Field(discriminator="type"),
 ]

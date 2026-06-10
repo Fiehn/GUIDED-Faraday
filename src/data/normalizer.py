@@ -378,6 +378,18 @@ class Normalizer:
         digest_input = {'files': file_meta}
         return hashlib.sha256(cls._stable_json_dumps(digest_input).encode('utf-8')).hexdigest()
 
+    @classmethod
+    def _build_path_fingerprint(cls, filenames: list[str]) -> str:
+        """Fingerprint from sorted normalized paths only — no os.stat() calls.
+
+        Used for phased datasets where there are tens of thousands of files
+        and stat-ing each one at startup would add minutes of overhead.
+        """
+        paths = sorted(os.path.normcase(os.path.normpath(str(p))) for p in filenames)
+        return hashlib.sha256(
+            cls._stable_json_dumps({'paths': paths, 'count': len(paths)}).encode('utf-8')
+        ).hexdigest()
+
     @staticmethod
     def _resolve_cache_target(save_path: str | None, manifest_hash: str) -> tuple[str, str | None]:
         if save_path is None:
@@ -545,7 +557,12 @@ class Normalizer:
             'input_len': window_spec.input_len,
             'stride': window_spec.stride,
         }
-        file_fingerprint = self._build_file_fingerprint(filenames)
+        if phased:
+            # Phased datasets have tens of thousands of files; os.stat() on each
+            # adds minutes of startup time. A path-only fingerprint is sufficient.
+            file_fingerprint = self._build_path_fingerprint(filenames)
+        else:
+            file_fingerprint = self._build_file_fingerprint(filenames)
         normalizer_manifest = {
             'manifest_version': 2,
             'method': self.method,
@@ -615,7 +632,7 @@ class Normalizer:
             max_batches = max(200, capacity)
             batches = 0
             print(f"Fitting normalizer with method '{self.method}' on {len(filenames)} files...")
-            for X_batch in train_loader: #tqdm(itertools.islice(train_loader, max_batches), desc="Fitting normalizer", total=max_batches):
+            for X_batch in tqdm(train_loader, desc="Fitting normalizer", total=max_batches):
                 x_gpu = X_batch[0].to(device)
                 self.fit_incremental(x_gpu)
                 batches += 1

@@ -20,6 +20,14 @@ class HoldoutWindows(NamedTuple):
     meter_ids: np.ndarray  # [N] int64
 
 
+class HoldoutPhasedWindows(NamedTuple):
+    """Raw (un-normalised) phased windows for a phased holdout set."""
+    x: np.ndarray           # [N, n_phases, window_len] float32
+    timestamps: np.ndarray  # [N] int64 unix seconds
+    meter_ids: np.ndarray   # [N] int64
+    feature_cols: list      # e.g. ['active_power_p14_l1', ...]
+
+
 def load_holdout_windows_raw(
     feeder_id: int,
     data_files: list[str],
@@ -140,6 +148,65 @@ def load_holdout_windows_raw(
     )
 
 
+def load_holdout_windows_phased(
+    files: list[str],
+    feature_cols: list[str],
+    window_size: int,
+    stride: int = 24,
+    max_hour_value: float | None = 20.0,
+    max_value: float | None = None,
+    nan_as_zero: bool = False,
+    aggregation: bool = True,
+    aggregation_divisor: float = 1.0,
+) -> HoldoutPhasedWindows:
+    """Load raw (un-normalised) phased windows from a list of per-meter parquet files.
+
+    Used for phased holdout analysis where holdout_meter_ids are specified in the
+    training config. Returns all valid windows from the given files without any
+    train/val/test split filtering.
+
+    Returns HoldoutPhasedWindows with x of shape [N, n_phases, window_size].
+    """
+    import sys as _sys
+    import os as _os
+    _parent = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _parent not in _sys.path:
+        _sys.path.insert(0, _parent)
+    from data.dataloader_phased import InMemoryPhasedDataset
+
+    ds = InMemoryPhasedDataset(
+        sm_files=files,
+        split="train",
+        feature_cols=feature_cols,
+        split_ratios={"train_ratio": 1.0, "val_ratio": 0.0, "test_ratio": 0.0},
+        split_seed=None,
+        window_len=window_size,
+        stride=stride,
+        aggregation=aggregation,
+        aggregation_divisor=aggregation_divisor,
+        max_hour_value=max_hour_value,
+        max_value=max_value,
+        nan_as_zero=nan_as_zero,
+        normalizer=None,
+        output_aggregate_stream=False,
+        holdout_feeder_id=None,
+        topology_path=None,
+    )
+
+    if len(ds) == 0:
+        raise ValueError(
+            f"No valid phased windows found across {len(files)} holdout file(s). "
+            "Check that holdout_meter_ids match files in data_dir."
+        )
+
+    return HoldoutPhasedWindows(
+        x=ds.x.numpy(),
+        timestamps=ds.timestamps.numpy(),
+        meter_ids=ds.meter_ids.numpy(),
+        feature_cols=list(feature_cols),
+    )
+
+
 def resolve_holdout_meter_ids(
     topology_path: str, feeder_id: int | list[int]
 ) -> frozenset[int]:
@@ -196,12 +263,12 @@ def compute_feeder_aggregated_profile(
     across all dates.
 
     Args:
-        windows:    [N, window_size] float array â€” one row per window.
-        timestamps: [N] int64 array â€” Unix seconds marking the start of each window.
-        meter_ids:  [N] int array â€” meter ID for each window (used for grouping only).
+        windows:    [N, window_size] float array - one row per window.
+        timestamps: [N] int64 array - Unix seconds marking the start of each window.
+        meter_ids:  [N] int array - meter ID for each window (used for grouping only).
 
     Returns:
-        (mean, p05, p95) â€” three arrays each of shape [window_size].
+        (mean, p05, p95) - three arrays each of shape [window_size].
     """
     daily_matrix = _compute_daily_matrix(windows, timestamps)
     mean = daily_matrix.mean(axis=0)
@@ -241,16 +308,16 @@ def plot_feeder_aggregated_profile(
     p95_s = np.percentile(synth_daily, 95, axis=0).astype(np.float32)
 
     n_meters = len(np.unique(real_meter_ids))
-    title = f"Feeder Holdout Aggregated Profile â€” {n_meters} meters"
+    title = f"Feeder Holdout Aggregated Profile - {n_meters} meters"
     if title_suffix:
-        title = f"{title} â€” {title_suffix}"
+        title = f"{title} - {title_suffix}"
 
     hours = np.arange(len(mean_r))
     fig, ax = plt.subplots()
     ax.plot(hours, mean_r, color="steelblue", label="Real (mean)")
-    ax.fill_between(hours, p05_r, p95_r, color="steelblue", alpha=0.25, label="Real (5â€“95%)")
+    ax.fill_between(hours, p05_r, p95_r, color="steelblue", alpha=0.25, label="Real (95%)")
     ax.plot(hours, mean_s, color="darkorange", label="Synthetic (mean)")
-    ax.fill_between(hours, p05_s, p95_s, color="darkorange", alpha=0.25, label="Synthetic (5â€“95%)")
+    ax.fill_between(hours, p05_s, p95_s, color="darkorange", alpha=0.25, label="Synthetic (95%)")
     ax.set_title(title)
     ax.set_xlabel("Hour of day")
     ax.set_ylabel("Aggregated consumption [kWh]")
@@ -270,9 +337,9 @@ def _get_ev_hp_flags_per_window(
     if the conditioner lacks EV/HP items or the call fails.
 
     Interpretation:
-      ElectricVehicleConditionerBool  â†’ [N, 1] float: 0=no EV, 1=has EV
-      ElectricVehicleConditioner      â†’ [N, 4] one-hot: index 0 = no EV
-      HeatpumpPhaseConditioner        â†’ [N, 4] one-hot: index 0 = no HP
+      ElectricVehicleConditionerBool  [N, 1] float: 0=no EV, 1=has EV
+      ElectricVehicleConditioner      [N, 4] one-hot: index 0 = no EV
+      HeatpumpPhaseConditioner        [N, 4] one-hot: index 0 = no HP
     In all cases: index/value 0 means absence, non-zero means presence.
     """
     import torch
@@ -299,7 +366,7 @@ def _get_ev_hp_flags_per_window(
             continue
 
         try:
-            # Use the public API â€” identical code path to training, handles all edge cases.
+            # Use the public API - identical code path to training, handles all edge cases.
             result = cond_item.get_conditions(x=None, meter_id=meter_tensor, timestamps=None)
             # result: [N, dim] float tensor
             # dim=1 (Bool): 0.0 = absent, 1.0 = present
@@ -341,11 +408,11 @@ def plot_feeder_holdout_analysis(
     """Generate all feeder holdout profile plots and save them to output_dir.
 
     Produces:
-    - feeder_holdout_profile_all.pdf       â€” full dataset
-    - feeder_holdout_profile_dow_*.pdf     â€” one per day of week (Monâ€“Sun)
-    - feeder_holdout_profile_month_*.pdf   â€” one per month present in the data
-    - feeder_holdout_profile_ev.pdf / no_ev.pdf   â€” EV vs no-EV (if conditioner)
-    - feeder_holdout_profile_hp.pdf / no_hp.pdf   â€” HP vs no-HP (if conditioner)
+    - feeder_holdout_profile_all.pdf       - full dataset
+    - feeder_holdout_profile_dow_*.pdf     - one per day of week (Mon-Sun)
+    - feeder_holdout_profile_month_*.pdf   - one per month present in the data
+    - feeder_holdout_profile_ev.pdf / no_ev.pdf   - EV vs no-EV (if conditioner)
+    - feeder_holdout_profile_hp.pdf / no_hp.pdf   - HP vs no-HP (if conditioner)
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -358,10 +425,10 @@ def plot_feeder_holdout_analysis(
 
     def _safe_plot(r_win, r_ts, r_mid, s_win, s_ts, s_mid, fname, suffix, s_extra_draws=None):
         if len(r_win) == 0:
-            print(f"  [holdout analysis] Skipping '{suffix}' â€” no real windows.")
+            print(f"  [holdout analysis] Skipping '{suffix}' - no real windows.")
             return
         if len(s_win) == 0:
-            print(f"  [holdout analysis] Skipping '{suffix}' â€” no synthetic windows.")
+            print(f"  [holdout analysis] Skipping '{suffix}' - no synthetic windows.")
             return
         n_m = len(np.unique(r_mid))
         try:
@@ -425,7 +492,7 @@ def plot_feeder_holdout_analysis(
 
     # --- EV / HP ---
     if conditioner is None:
-        print("  [holdout analysis] No conditioner provided â€” skipping EV/HP plots.")
+        print("  [holdout analysis] No conditioner provided - skipping EV/HP plots.")
         return
 
     ev_flags_r, hp_flags_r = _get_ev_hp_flags_per_window(real_meter_ids, conditioner)
@@ -466,7 +533,7 @@ def extract_power_flow_scalars(
 ) -> tuple[float, float]:
     """Return (voltage_nadir, transformer_utilisation) for one calendar day.
 
-    load_array: [n_meters Ã— 24] kW. Row order must match meter_to_load_index key order.
+    load_array: [n_meters x 24] kW. Row order must match meter_to_load_index key order.
     Non-converging timesteps are logged and skipped; returns (nan, nan) if all fail.
     """
     try:
@@ -514,9 +581,9 @@ def compute_power_flow_daily_scalars(
     meter_ids: np.ndarray,
     feeder_id: str | int = "",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (voltage_nadirs, transformer_utilisations) â€” one scalar per calendar day.
+    """Return (voltage_nadirs, transformer_utilisations) - one scalar per calendar day.
 
-    Groups windows by calendar date, builds a [meters Ã— 24] kW load matrix for each
+    Groups windows by calendar date, builds a [meters x 24] kW load matrix for each
     date (meters absent on a date get 0 kW), and calls extract_power_flow_scalars.
     """
     windows = np.asarray(windows, dtype=np.float64)
@@ -637,7 +704,7 @@ def plot_power_flow_cdf(
 
     X-axis: scalar value (e.g. voltage in pu, utilisation ratio).
     Y-axis: cumulative fraction of days (empirical CDF).
-    Synthetic mean CDF is plotted with a Â±1 std shaded band across draws.
+    Synthetic mean CDF is plotted with a ±1 std shaded band across draws.
     A vertical dashed reference line is drawn at *reference_x*.
 
     output_path must end in .png; its parent directory is created if absent.
@@ -677,7 +744,7 @@ def plot_power_flow_cdf(
                 synth_mean + synth_std,
                 color="darkorange",
                 alpha=0.25,
-                label="Synthetic (Â±1 std)",
+                label="Synthetic (±1 std)",
             )
 
     ax.axvline(x=reference_x, color="black", linestyle="--", linewidth=1.2, label=reference_label)
@@ -704,9 +771,9 @@ def run_coincidence_factor_analysis(
     """Compute CF(N) three-curve analysis and save the plot to output_dir.
 
     Three curves:
-      (1) Real â€” same-day grouping on holdout feeder windows.
-      (2) Synthetic independent â€” random draws from synth_windows, no day structure.
-      (3) Synthetic shared-condition â€” same-day grouping on synth_windows using the
+      (1) Real - same-day grouping on holdout feeder windows.
+      (2) Synthetic independent - random draws from synth_windows, no day structure.
+      (3) Synthetic shared-condition - same-day grouping on synth_windows using the
           real meter IDs and timestamps (valid when preserve_condition_order=True).
 
     Returns a dict of scalars suitable for merging into eval_results_feeder_holdout.json:
@@ -734,7 +801,7 @@ def run_coincidence_factor_analysis(
                 plot_coincidence_factor_curves,
             )
         except ImportError as exc:
-            print(f"  [CF] Skipping coincidence factor analysis â€” import failed: {exc}")
+            print(f"  [CF] Skipping coincidence factor analysis - import failed: {exc}")
             return {}
 
     os.makedirs(output_dir, exist_ok=True)
@@ -749,7 +816,7 @@ def run_coincidence_factor_analysis(
     rng = np.random.default_rng(42)
 
     try:
-        print(f"  [CF] Computing real CF(N) â€” {n_max} meters, {n_bootstrap} bootstrap draws...", flush=True)
+        print(f"  [CF] Computing real CF(N) - {n_max} meters, {n_bootstrap} bootstrap draws...", flush=True)
         real_cf = compute_coincidence_factor(
             real_windows, real_meter_ids, real_timestamps,
             n_bootstrap=n_bootstrap, rng=rng,
@@ -782,7 +849,7 @@ def run_coincidence_factor_analysis(
             print(f"  [CF] Shared-condition synthetic CF(N) failed: {e}")
             traceback.print_exc()
     else:
-        print(f"  [CF] Skipping shared-condition CF(N) â€” synthetic meter IDs cover "
+        print(f"  [CF] Skipping shared-condition CF(N) - synthetic meter IDs cover "
               f"{len(np.unique(synth_meter_ids))} unique meters (need {n_max}).")
 
     try:
@@ -814,3 +881,140 @@ def run_coincidence_factor_analysis(
             + "  ".join(f"{k}={v:.4f}" for k, v in scalars.items())
         )
     return scalars
+
+
+# ---------------------------------------------------------------------------
+# EV Variance Profile plots
+# ---------------------------------------------------------------------------
+
+def _compute_hourly_quantiles(windows: np.ndarray) -> dict:
+    """Per-hour quantile summary for individual windows [N, window_size].
+
+    Returns dict with keys mean, p5, p25, p75, p95 — each shape [window_size].
+    """
+    w = np.asarray(windows, dtype=np.float64)
+    if w.ndim == 3:
+        w = w[:, :, 0]
+    return {
+        "mean": w.mean(axis=0),
+        "p5":   np.percentile(w,  5, axis=0),
+        # "p25":  np.percentile(w, 25, axis=0),
+        # "p75":  np.percentile(w, 75, axis=0),
+        "p95":  np.percentile(w, 95, axis=0),
+        "p99": np.percentile(w, 99, axis=0),
+    }
+
+
+def _draw_ev_stratum(
+    ax,
+    hours: np.ndarray,
+    q: dict,
+    color: str,
+    label: str,
+    n: int,
+    synthetic: bool = False,
+) -> None:
+    """Draw mean line (with markers) + p25/p75 inner band + p5/p95 outer band."""
+    ls = "--" if synthetic else "-"
+    ax.fill_between(hours, q["p5"],  q["p99"], color=color, alpha=0.12)
+    ax.plot(hours, q["mean"], ls + "o", color=color, linewidth=2, markersize=6,
+            label=f"{label} (n={n})")
+
+
+def plot_ev_variance_profile(
+    real_ev: np.ndarray,
+    synth_ev: "np.ndarray | None",
+    real_noev: np.ndarray,
+    synth_noev: "np.ndarray | None",
+    output_dir: str,
+    suffix: str = "",
+) -> None:
+    """Save three EV Variance Profile PDFs to output_dir.
+
+    Produces:
+      ev_variance_profile_combined.pdf  — all four strata
+      ev_variance_profile_ev.pdf        — real EV + synthetic EV
+      ev_variance_profile_no_ev.pdf     — real no-EV + synthetic no-EV
+
+    All three share the same y-axis scale so overnight bands are directly
+    comparable across plots.  Each stratum is drawn as a mean line (solid=real,
+    dashed=synthetic) with markers, a p25/p75 inner band, and a p5/p95 outer
+    band (raw kWh, individual-window distribution — not feeder-level aggregates).
+
+    The key diagnostic: elevated overnight (midnight-5am) upper quantiles in
+    real EV windows should also appear in synthetic EV-conditioned windows if
+    the conditioner's EV flag is captured in generation.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    real_ev   = np.asarray(real_ev,   dtype=np.float32)
+    real_noev = np.asarray(real_noev, dtype=np.float32)
+    if real_ev.ndim == 3:
+        real_ev = real_ev[:, :, 0]
+    if real_noev.ndim == 3:
+        real_noev = real_noev[:, :, 0]
+
+    hours = np.arange(real_ev.shape[1])
+
+    q_real_ev    = _compute_hourly_quantiles(real_ev)
+    q_real_noev  = _compute_hourly_quantiles(real_noev)
+    q_synth_ev   = _compute_hourly_quantiles(synth_ev)   if synth_ev   is not None else None
+    q_synth_noev = _compute_hourly_quantiles(synth_noev) if synth_noev is not None else None
+
+    # Shared y-axis: global p5 floor and p95 ceiling across all available strata
+    all_qs = [q for q in (q_real_ev, q_real_noev, q_synth_ev, q_synth_noev) if q is not None]
+    ymin = min(q["p5"].min()  for q in all_qs)
+    ymax = max(q["p99"].max() for q in all_qs)
+    margin = max((ymax - ymin) * 0.05, 0.01)
+    ylim = (max(0.0, ymin - margin), ymax + margin)
+
+    C_REAL_EV    = "steelblue"
+    C_SYNTH_EV   = "darkorange"
+    C_REAL_NOEV  = "#555555"
+    C_SYNTH_NOEV = "#cc3333"
+
+    def _make_ax(title: str):
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.set_xlabel("Hour of Day", fontsize=12, fontweight="bold")
+        ax.set_ylabel("Consumption (kWh)", fontsize=12, fontweight="bold")
+        ax.set_xlim(-0.5, len(hours) - 0.5)
+        ax.set_ylim(*ylim)
+        ax.set_xticks(hours)
+        ax.grid(True, alpha=0.3)
+        return fig, ax
+
+    # --- combined ---
+    fig, ax = _make_ax("EV Variance Profile — all strata")
+    _draw_ev_stratum(ax, hours, q_real_noev,  C_REAL_NOEV,  "Real no-EV",      len(real_noev),  synthetic=False)
+    _draw_ev_stratum(ax, hours, q_real_ev,    C_REAL_EV,    "Real EV",          len(real_ev),    synthetic=False)
+    if q_synth_noev is not None:
+        _draw_ev_stratum(ax, hours, q_synth_noev, C_SYNTH_NOEV, "Synthetic no-EV", len(synth_noev), synthetic=True)
+    if q_synth_ev is not None:
+        _draw_ev_stratum(ax, hours, q_synth_ev,   C_SYNTH_EV,   "Synthetic EV",    len(synth_ev),   synthetic=True)
+    ax.legend(fontsize=10, loc="best", ncol=2)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, f"ev_variance_profile_combined{suffix}.pdf"), dpi=150, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+
+    # --- EV panel ---
+    fig, ax = _make_ax("EV Variance Profile — EV condition")
+    _draw_ev_stratum(ax, hours, q_real_ev, C_REAL_EV, "Real EV", len(real_ev), synthetic=False)
+    if q_synth_ev is not None:
+        _draw_ev_stratum(ax, hours, q_synth_ev, C_SYNTH_EV, "Synthetic EV", len(synth_ev), synthetic=True)
+    ax.legend(fontsize=10, loc="best")
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, f"ev_variance_profile_ev{suffix}.pdf"), dpi=150, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+
+    # --- no-EV panel ---
+    fig, ax = _make_ax("EV Variance Profile — no-EV condition")
+    _draw_ev_stratum(ax, hours, q_real_noev, C_REAL_NOEV, "Real no-EV", len(real_noev), synthetic=False)
+    if q_synth_noev is not None:
+        _draw_ev_stratum(ax, hours, q_synth_noev, C_SYNTH_NOEV, "Synthetic no-EV", len(synth_noev), synthetic=True)
+    ax.legend(fontsize=10, loc="best")
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, f"ev_variance_profile_no_ev{suffix}.pdf"), dpi=150, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"  [ev_hp] EV variance profiles saved to {output_dir}/ev_variance_profile_*{suffix}.pdf")

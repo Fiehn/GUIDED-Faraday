@@ -137,12 +137,10 @@ class BaseModel(nn.Module, ABC):
         # --- atomic write ---
         temp_path = model_path + ".tmp"
         try:
-            with open(temp_path, "wb") as f:
-                torch.save(checkpoint, f)
+            torch.save(checkpoint, temp_path)
 
-            # Quick integrity check — open in binary mode to avoid Windows codec issues
-            with open(temp_path, "rb") as f:
-                test_load = torch.load(f, map_location="cpu", weights_only=False)
+            # Quick integrity check — passing path directly uses native PyTorch serialization
+            test_load = torch.load(temp_path, map_location="cpu", weights_only=False)
             assert "model_state_dict" in test_load, "Checkpoint missing model_state_dict"
 
             if os.path.exists(model_path):
@@ -166,11 +164,17 @@ class BaseModel(nn.Module, ABC):
         Returns:
             tuple: ``(normalizer_or_None, conditioner_or_None)``
         """
-        with open(load_path, "rb") as f:
-            checkpoint = torch.load(f, map_location=device, weights_only=False)
+        checkpoint = torch.load(load_path, map_location=device, weights_only=False)
 
         # --- model weights ---
-        self.load_state_dict(checkpoint["model_state_dict"])
+        state_dict = checkpoint["model_state_dict"]
+        # Backward compat: _gmm_hh_indices was added when conditional GMM prior was
+        # introduced. Old checkpoints lack it; inject the empty-tensor default only
+        # when THIS model actually expects the key (i.e. is a GuidedFaradayModel).
+        model_keys = set(self.state_dict().keys())
+        if "_gmm_hh_indices" in model_keys and "_gmm_hh_indices" not in state_dict:
+            state_dict["_gmm_hh_indices"] = torch.tensor([], dtype=torch.long)
+        self.load_state_dict(state_dict)
         self.to(device)
 
         # --- normalizer ---

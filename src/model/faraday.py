@@ -177,6 +177,7 @@ class FaradayModel(BaseModel):
         gmm_n_components: int = 300,
         gmm_max_iter: int = 100,
         gmm_reg_covar: float = 1e-6,
+        gmm_include_tags: list[str] | None = None,
         **kwargs,
     ):
         super().__init__(phased_mode=False, sequence_length=sequence_length)
@@ -202,11 +203,31 @@ class FaradayModel(BaseModel):
 
         self.hierarchy = None
 
+        # Resolve household condition indices for joint GMM (OpenSynth approach).
+        gmm_hh_indices: list[int] = []
+        if conditioner is not None and gmm_include_tags:
+            for tag in gmm_include_tags:
+                try:
+                    start, end = conditioner.get_condition_indexes(tag)
+                    gmm_hh_indices.extend(range(start, end))
+                except ValueError:
+                    pass
+        _gmm_hh_idx_tensor = (
+            torch.tensor(gmm_hh_indices, dtype=torch.long)
+            if gmm_hh_indices
+            else torch.tensor([], dtype=torch.long)
+        )
+        self.register_buffer("_gmm_hh_indices", _gmm_hh_idx_tensor)
+        self._gmm_hh_indices: torch.Tensor = _gmm_hh_idx_tensor
+
         # GMM is a registered submodule — its buffers are part of state_dict
         # and follow the model's device automatically via .to(device).
+        # When gmm_include_tags is set, GMM is fitted on [z, c_hh] jointly
+        # (n_features = latent_dim + hh_cond_dim, latent_dim=0 → unconditional sampling).
+        gmm_n_features = latent_dim + len(gmm_hh_indices)
         self.gmm = GaussianMixtureModel(
             n_components=gmm_n_components,
-            n_features=latent_dim,
+            n_features=gmm_n_features,
             reg_covar=gmm_reg_covar,
         )
 
@@ -312,13 +333,19 @@ class FaradayModel(BaseModel):
         c = conditions.to(device)
         B = c.shape[0]
 
+        c_hh_gmm: torch.Tensor | None = None
         if self.gmm.fitted:
-            z_flat = self.gmm.sample(num_prior_samples * B)[:, : self.latent_dim]
+            joint = self.gmm.sample(num_prior_samples * B).to(device)
+            z_flat = joint[:, : self.latent_dim]
+            if self._gmm_hh_indices.numel() > 0:
+                c_hh_gmm = joint[:, self.latent_dim:]  # [num_prior_samples*B, hh_cond_dim]
         else:
             z_flat = torch.randn(num_prior_samples * B, self.latent_dim, device=device)
 
-        z = z_flat.to(device).reshape(num_prior_samples, B, self.latent_dim)
-        c_exp = c.unsqueeze(0).expand(num_prior_samples, -1, -1)
+        z = z_flat.reshape(num_prior_samples, B, self.latent_dim)
+        c_exp = c.unsqueeze(0).expand(num_prior_samples, -1, -1).clone()  # [P, B, cond_dim]
+        if c_hh_gmm is not None:
+            c_exp[:, :, self._gmm_hh_indices] = c_hh_gmm.reshape(num_prior_samples, B, -1)
         dec_in = torch.cat([z, c_exp], dim=-1).reshape(num_prior_samples * B, -1)
         x_hat = self.decoder(dec_in)["mu"].reshape(num_prior_samples, B, self.sequence_length)
 
@@ -374,12 +401,16 @@ class FaradayModel(BaseModel):
                 x_flat = self._prep_inputs(x)
                 c = self._get_conditions(x, meter_id=meter_id, timestamps=timestamps, device=device)
                 mu, _ = self.encoder(torch.cat([x_flat, c], dim=-1))
-                z_list.append(mu)
+                if self._gmm_hh_indices.numel() > 0:
+                    c_hh = c[:, self._gmm_hh_indices]
+                    z_list.append(torch.cat([mu, c_hh], dim=-1))
+                else:
+                    z_list.append(mu)
 
         if not z_list:
             return
 
-        Z = torch.cat(z_list, dim=0)   # [N, latent_dim] — on `device`
+        Z = torch.cat(z_list, dim=0)   # [N, latent_dim (+ hh_cond_dim)] — on `device`
         self.gmm.to(device)
         self.gmm.fit(Z, n_iter=self.gmm_max_iter)
 
