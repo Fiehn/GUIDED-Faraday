@@ -10,8 +10,8 @@ from data.conditioner import *
 from model.base.priors import *
 from data.normalizer import *
  
-from src.model.hierarchical.config import HierarchicalConfig
-from src.model.hierarchical.core import HierarchicalLatentModule
+from model.balanced_phase.hierarchical.config import HierarchicalConfig
+from model.balanced_phase.hierarchical.core import HierarchicalLatentModule
 
 from model.base.model import BaseModel
 

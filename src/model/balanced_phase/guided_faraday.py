@@ -27,7 +27,7 @@ import torch.nn as nn
 
 from model.base.model import BaseModel
 from model.base.gmm import GaussianMixtureModel
-from model.faraday import mmd_loss, quantile_loss, mse_loss, _FaradayEncoder
+from model.balanced_phase.faraday import mmd_loss, quantile_loss, mse_loss, _FaradayEncoder
 from model.base.encoder_decoder_model import TemporalCNNEncoder, DictionaryCoder
 
 

@@ -1,4 +1,4 @@
-from src.model.vae import *
+from model.balanced_phase.vae import *
 
 # ==============
 # Define the Conditional VAE (CVAE) class

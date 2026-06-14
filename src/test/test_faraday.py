@@ -14,7 +14,7 @@ if str(ROOT_DIR) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from model.faraday import mmd_loss, quantile_loss, mse_loss
+from model.balanced_phase.faraday import mmd_loss, quantile_loss, mse_loss
 from pydantic import ValidationError
 from config.loader import load_config
 
@@ -124,7 +124,7 @@ class _StubConditioner:
 
 
 def test_faraday_sample_output_shape():
-    from model.faraday import FaradayModel
+    from model.balanced_phase.faraday import FaradayModel
     from model.base.gmm import GaussianMixtureModel
 
     sequence_length = 24

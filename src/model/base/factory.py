@@ -6,15 +6,14 @@ from types import SimpleNamespace
 import yaml
 
 from src.config.loader import load_config as _load_validated_config
-from src.model.cvae import CVAE
-from src.model.set import SetGuideVAE
-from src.model.sequential import SequentialPhaseVAE
-from src.model.vae import VAE
-from src.model.art import AutoRegressiveTransformerVAE
-from src.model.diffusion import DiffusionModel, NoiseScheduler, ConditionalUNet1D
-from src.model.phase_splitter import HierarchicalSplitter
-from src.model.hierarchical.config import HierarchicalConfig, LevelConfig
-from src.data.conditioner import (
+from model.balanced_phase.cvae import CVAE
+from model.three_single_phased.set import SetGuideVAE
+from model.three_single_phased.sequential import SequentialPhaseVAE
+from model.balanced_phase.vae import VAE
+from model.balanced_phase.diffusion import DiffusionModel, NoiseScheduler, ConditionalUNet1D
+from model.three_single_phased.phase_splitter import HierarchicalSplitter
+from model.balanced_phase.hierarchical.config import HierarchicalConfig, LevelConfig
+from data.conditioner import (
     Conditioner, DayOfWeekConditioner, UserProfiler, 
     HolidayConditioner, MonthOfYearConditioner, 
     ActivePhaseCountConditioner, HeatpumpPhaseConditioner, ElectricVehicleConditioner, SolarPanelConditioner, ElectricVehicleConditionerBool
@@ -270,30 +269,6 @@ def create_model_from_config(config, device ="cpu"):
             decoder_dropout=decoder_dropout,
             phased_mode=phased_mode,
         )
-    elif model_type == "art":
-        art_cfg = getattr(model_cfg, "art", SimpleNamespace())
-        model = AutoRegressiveTransformerVAE(
-            input_dim=input_dim,
-            latent_dim=model_cfg.latent_dim,
-            conditioner=conditioner,
-            dictionary_size=getattr(prior_cfg, "dictionary_size", 512),
-            vamp_num_components=getattr(prior_cfg, "vamp_num_components", 20),
-            encoder_type=encoder_cfg.type,
-            decoder_type=decoder_cfg.type,
-            prior_type=prior_cfg.type,
-            hierarchy_config=hierarchy,
-            bin_size=getattr(art_cfg, "num_bins", 1024),
-            nhead=getattr(art_cfg, "transformer_num_heads", 4),
-            num_layers=getattr(art_cfg, "transformer_num_layers", 2),
-            d_model=getattr(art_cfg, "d_model", 128),
-            sequence_length=seq_len,
-            num_features=set_num_features,
-            encoder_hidden_dims=encoder_hidden_dims,
-            decoder_hidden_dims=decoder_hidden_dims,
-            encoder_dropout=encoder_dropout,
-            decoder_dropout=decoder_dropout,
-            phased_mode=phased_mode,
-        )
     elif model_type == "diffusion":
         diff_cfg = getattr(model_cfg, "diffusion", SimpleNamespace())
         scheduler = NoiseScheduler(
@@ -401,7 +376,7 @@ def create_model_from_config(config, device ="cpu"):
             phased_mode=phased_mode,
         )
     elif model_type == "guided_faraday":
-        from src.model.guided_faraday import GuidedFaradayModel
+        from model.balanced_phase.guided_faraday import GuidedFaradayModel
         faraday_cfg = getattr(model_cfg, "faraday", SimpleNamespace())
         gf_cfg = getattr(model_cfg, "guided_faraday", SimpleNamespace())
         gmm_cfg = getattr(model_cfg, "gmm", SimpleNamespace())
@@ -429,7 +404,7 @@ def create_model_from_config(config, device ="cpu"):
             gmm_include_tags=list(getattr(gf_cfg, "gmm_include_tags", [])) or None,
         )
     elif model_type == "faraday":
-        from src.model.faraday import FaradayModel
+        from model.balanced_phase.faraday import FaradayModel
         faraday_cfg = getattr(model_cfg, "faraday", SimpleNamespace())
         gmm_cfg = getattr(model_cfg, "gmm", SimpleNamespace())
         model = FaradayModel(

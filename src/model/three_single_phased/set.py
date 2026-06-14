@@ -1,9 +1,9 @@
-from src.model.cvae import *
+from model.balanced_phase.cvae import *
 import torch
 import itertools
-from src.data.conditioner import Conditioner
-from src.model.cvae import get_encoder_model, VampPrior
-from src.model.vae import HierarchicalConfig
+from data.conditioner import Conditioner
+from model.balanced_phase.cvae import get_encoder_model, VampPrior
+from model.balanced_phase.vae import HierarchicalConfig
 
 
 # ==============

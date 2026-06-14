@@ -14,13 +14,13 @@ parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 from model.base.encoder_decoder_model import *
 from data.conditioner import *
-from src.model.cvae import *
-from src.model.set import *
-from src.model.vae import *
+from model.balanced_phase.cvae import *
+from model.three_single_phased.set import *
+from model.balanced_phase.vae import *
 from data.dataloader_phased import *
 from data.normalizer import *
-from src.model.hierarchical.aggregation import *
-from src.model.hierarchical.config import *
+from model.balanced_phase.hierarchical.aggregation import *
+from model.balanced_phase.hierarchical.config import *
 from src.visualization.visualizer import Visualizer
 from src.visualization.writer import Writer
 from src.visualization.plot_styling import PlotStyle

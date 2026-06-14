@@ -8,9 +8,9 @@ Phase 3 conditioned on Phases 1 and 2. All three models share the same Condition
 import torch
 import torch.nn as nn   
 from typing import Dict
-from src.model.cvae import CVAE
-from src.model.vae import HierarchicalConfig
-from src.data.conditioner import Conditioner
+from model.balanced_phase.cvae import CVAE
+from model.balanced_phase.vae import HierarchicalConfig
+from data.conditioner import Conditioner
 from model.base.model import BaseModel
 
 
