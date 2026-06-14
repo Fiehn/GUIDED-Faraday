@@ -49,30 +49,10 @@ OUTPUT_DIR = os.path.join("evaluation_comparison", "1-generated")
 STANDALONE_DIR = os.path.join(OUTPUT_DIR, "standalone")
 N_MEAN_DRAWS = 12
 
-REAL_DATA_MODEL = "E:/models/new4/RealDataBaselineModel_20260608_143634"
-
-MODELS = [
-    "E:/models/new4/GuidedFaradayModel_20260605_105946",
-    "E:/models/new4/GuidedFaradayModel_20260605_201145",
-    "E:/models/new4/CVAE_20260531_185015_guide_cnn_h_broken",
-    "E:/models/new4/DiffusionModel_20260601_002842",
-    "E:/models/new4/FaradayModel_20260601_060319",
-    "E:/models/new4/CVAE_20260601_022452_guide",
-    "E:/models/new4/CVAE_20260531_180003_cvae",
-    "E:/models/new4/QuantileBaselineModel_20260601_005326",
-    "E:/models/new4/AverageBaselineModel_20260531_173051",
-]
-NAMES = [
-    "Guided-Faraday-CNN",
-    "Guided-Faraday-CNN-UserProfiles",
-    "H-Guide-CNN",
-    "Diffusion",
-    "Faraday",
-    "Guide",
-    "CVAE",
-    "Baseline-Quantile",
-    "Baseline-Average",
-]
+# Pass model paths and names via CLI: --models <path1> <path2> ... --names <name1> <name2> ...
+REAL_DATA_MODEL: str = ""
+MODELS: list[str] = []
+NAMES: list[str] = []
 
 
 # ---------------------------------------------------------------------------

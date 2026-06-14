@@ -484,7 +484,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Refit Faraday GMM on a saved checkpoint")
     parser.add_argument(
         "--config",
-        default=os.path.join(_project_dir, "config", "tests", "agg_runs", "faraday.yaml"),
+        default=os.path.join(_project_dir, "config", "tests", "agg", "faraday.yaml"),
     )
     parser.add_argument(
         "--model-dir",

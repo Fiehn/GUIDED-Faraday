@@ -497,9 +497,9 @@ if __name__ == "__main__":
     import argparse
     import copy
 
-    _this_dir = os.path.dirname(os.path.abspath(__file__))   # src/model/
-    _src_dir = os.path.dirname(_this_dir)                    # src/
-    _project_dir = os.path.dirname(_src_dir)                 # project root
+    _this_dir = os.path.dirname(os.path.abspath(__file__))   # src/model/balanced_phase/
+    _src_dir = os.path.dirname(_this_dir)                    # src/model/
+    _project_dir = os.path.dirname(_src_dir)                 # src/
     for _p in (_src_dir, _project_dir):
         if _p not in sys.path:
             sys.path.insert(0, _p)
@@ -512,7 +512,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Refit GuidedFaraday GMM on a saved checkpoint")
     parser.add_argument(
         "--config",
-        default=os.path.join(_project_dir, "config", "tests", "agg_runs", "guided_faraday.yaml"),
+        default=os.path.join(_project_dir, "config", "tests", "agg", "guided_faraday.yaml"),
     )
     parser.add_argument(
         "--model-dir",

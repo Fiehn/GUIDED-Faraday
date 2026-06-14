@@ -60,33 +60,10 @@ STANDALONE_DIR = os.path.join(OUTPUT_DIR, "standalone")
 N_MEAN_DRAWS = 12
 PHASE_LABELS = ["L_min", "L_mid", "L_max"]
 
-MODELS = [
-    "E:/models/phased2/SetGuideVAE_20260607_124614",
-    "E:/models/phased2/SetGuideVAE_20260607_132508_CNN",
-    "E:/models/phased2/DiffusionModel_20260607_080656",
-    "E:/models/phased2/SequentialPhaseVAE_20260607_082110",
-    "E:/models/new4/GuidedFaradayModel_20260605_105946",
-    "E:/models/phased2/QuantileBaselineModel_20260607_112946",
-    "E:/models/phased2/AverageBaselineModel_20260607_113136",
-]
-SECONDARY_MODELS = [
-    None,
-    None,
-    None,
-    None,
-    "E:/models/phased/HierarchicalSplitter_20260604_171559",
-    None,
-    None,
-]
-NAMES = [
-    "Set-Guide-VAE",
-    "Set-Guide-VAE-CNN",
-    "Diffusion (Phased)",
-    "Sequential",
-    "Guide-CNN + Hierarchical Splitter",
-    "Quantile Baseline",
-    "Average Baseline",
-]
+# Pass model paths and names via CLI: --models <path1> <path2> ... --names <name1> <name2> ...
+MODELS: list[str] = []
+SECONDARY_MODELS: list[str | None] = []
+NAMES: list[str] = []
 
 
 # ---------------------------------------------------------------------------

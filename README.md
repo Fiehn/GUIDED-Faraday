@@ -13,14 +13,16 @@ src/
     metrics/       # Individual metric implementations (MMD, ACF, TSTR, MIA, ...)
     scripts/       # Helper scripts: checkpoint sweep, condition mixing analysis
   model/           # All generative models and priors
-    hierarchical/  # Hierarchy support for VAE-family models
-    scripts/       # Helper scripts: parameter budget counting
+    balanced_phase/    # VAE family + Faraday family models (joint 3-phase output)
+      hierarchical/    # Hierarchy support for VAE-family models
+    three_single_phased/ # Models that process each phase independently
+    base/            # Base classes, factory, priors, GMM, baselines
+    scripts/         # Helper scripts: parameter budget counting
   power_flow/      # Pandapower network builder and load flow integration
   test/            # Pytest test suite
   visualization/   # Plot styling and output writers
-config/            # Base config and per-condition YAML overrides
+config/tests/      # Per-model experiment configs (base + override YAML pairs)
 slurmjobs/         # SLURM job scripts for DTU HPC cluster
-scripts/           # One-off helper scripts (e.g. find_holdout_feeder)
 ```
 
 Domain vocabulary (Window, Meter, LV Feeder, Holdout feeder pool, Conditioner, etc.) is defined in `CONTEXT.md`. Architecture decisions are in `docs/adr/`.
@@ -38,13 +40,13 @@ For CUDA on Linux, edit `pyproject.toml` to add the `pytorch-cu130` index marker
 ## Training a model
 
 ```bash
-uv run src/train.py --config config/config.yaml
+uv run src/train.py --config config/tests/agg/guided_faraday_cnn.yaml
 ```
 
-The base config at `config/config.yaml` sets data paths, normalization, conditioning, and training hyperparameters. Per-model architecture is supplied via an override config that declares `base: config/config.yaml` and adds model-specific keys:
+Each config in `config/tests/` is an override config: it declares a `base:` path pointing to the shared base config for that experiment set, and adds model-specific architecture settings. The base config sets data paths, normalisation, conditioning, and training hyperparameters. Phased models use configs under `config/tests/phased/`:
 
 ```bash
-uv run src/train.py --config config/set/set.yaml
+uv run src/train.py --config config/tests/phased/diffusion.yaml
 ```
 
 On the DTU HPC cluster, use the SLURM scripts in `slurmjobs/`:

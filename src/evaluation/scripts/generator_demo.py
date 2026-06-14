@@ -208,8 +208,6 @@ def main():
 
     args = parser.parse_args()
 
-    #uv run src/evaluation/generator_demo.py --model-path "E:/models/new4/GuidedFaradayModel_20260605_105946" --ev-path "data\EV\EV_detection_reduced_60000_SM.csv"
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.output_dir, exist_ok=True)
 
