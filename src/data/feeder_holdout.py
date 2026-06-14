@@ -783,7 +783,7 @@ def run_coincidence_factor_analysis(
       CF_area_shared_cond          mean |CF_real(N) - CF_synth_shared(N)| over N
     """
     try:
-        from evaluation.coincidence import (
+        from evaluation.metrics.coincidence import (
             compute_coincidence_factor,
             compute_coincidence_factor_independent,
             coincidence_factor_scalars,
@@ -794,7 +794,7 @@ def run_coincidence_factor_analysis(
             import sys as _sys
             import os as _os
             _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
-            from src.evaluation.coincidence import (
+            from evaluation.metrics.coincidence import (
                 compute_coincidence_factor,
                 compute_coincidence_factor_independent,
                 coincidence_factor_scalars,
@@ -985,7 +985,7 @@ def plot_ev_variance_profile(
         return fig, ax
 
     # --- combined ---
-    fig, ax = _make_ax("EV Variance Profile — all strata")
+    fig, ax = _make_ax("EV Variance Profile")
     _draw_ev_stratum(ax, hours, q_real_noev,  C_REAL_NOEV,  "Real no-EV",      len(real_noev),  synthetic=False)
     _draw_ev_stratum(ax, hours, q_real_ev,    C_REAL_EV,    "Real EV",          len(real_ev),    synthetic=False)
     if q_synth_noev is not None:
@@ -998,7 +998,7 @@ def plot_ev_variance_profile(
     plt.close(fig)
 
     # --- EV panel ---
-    fig, ax = _make_ax("EV Variance Profile — EV condition")
+    fig, ax = _make_ax("EV Variance Profile - EV condition")
     _draw_ev_stratum(ax, hours, q_real_ev, C_REAL_EV, "Real EV", len(real_ev), synthetic=False)
     if q_synth_ev is not None:
         _draw_ev_stratum(ax, hours, q_synth_ev, C_SYNTH_EV, "Synthetic EV", len(synth_ev), synthetic=True)
@@ -1008,7 +1008,7 @@ def plot_ev_variance_profile(
     plt.close(fig)
 
     # --- no-EV panel ---
-    fig, ax = _make_ax("EV Variance Profile — no-EV condition")
+    fig, ax = _make_ax("EV Variance Profile - no-EV condition")
     _draw_ev_stratum(ax, hours, q_real_noev, C_REAL_NOEV, "Real no-EV", len(real_noev), synthetic=False)
     if q_synth_noev is not None:
         _draw_ev_stratum(ax, hours, q_synth_noev, C_SYNTH_NOEV, "Synthetic no-EV", len(synth_noev), synthetic=True)

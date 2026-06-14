@@ -20,8 +20,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from src.evaluation.load_model import load_model
-from src.model.factory import _load_train_config
-from src.data.dataloader_phased import PhasedReplayDataloaders, WindowSpec, _extract_meter_id_from_filename
+from model.base.factory import _load_train_config
+from src.data.dataloader_phased import WindowSpec, _extract_meter_id_from_filename
 from src.evaluation.eval_framework import EvalFramework, PhasedEvaluationSuite, VisualEvaluation
 from src.visualization.plot_styling import PlotStyle
 from src.data.feeder_holdout import (
@@ -29,7 +29,6 @@ from src.data.feeder_holdout import (
     HoldoutPhasedWindows,
     load_holdout_windows_raw,
     load_holdout_windows_phased,
-    plot_feeder_aggregated_profile,
     plot_feeder_holdout_analysis,
     run_coincidence_factor_analysis,
 )
@@ -56,27 +55,6 @@ class PhasedModelComparator:
         self._param_counts: dict[str, int | None] = {}
         # We define a superset of possible phases.
         self.phases = ['full_eval', 'aggregated_phase', 'ranked_phase_1', 'ranked_phase_2', 'ranked_phase_3', 'cross_phase', 'c2st']
-
-    def _metric_target_label(self, metric: str) -> str:
-        """Return target direction/target value for plot titles."""
-        display_name = self._display_metric_name(metric)
-
-        if metric.startswith("Avg MinMax") or "BEST Overall" in display_name:
-            return "↑"
-
-        if "TSTR" in metric or "Train on Synthetic" in display_name:
-            return "target=1"
-
-        if "MMD" in metric or "MaximumMeanDiscrepancy" in metric or "Maximum Mean Discrepancy" in display_name:
-            return "target=0"
-
-        if any(term in metric for term in ["LogLikelihood", "Log-Likelihood", "Accuracy", "Score", "R2"]):
-            return "↑"
-
-        return "↓"
-
-    def _display_metric_title(self, metric: str) -> str:
-        return f"{self._display_metric_name(metric)} ({self._metric_target_label(metric)})"
 
     def _display_metric_name(self, metric: str) -> str:
 
@@ -238,6 +216,17 @@ class PhasedModelComparator:
             "cfareaindependent",
             "cferrornmaxsharedcond",
             "cfareasharedcond",
+            # Cross-phase metrics
+            "crossphasecorrelationerror",
+            "crosscorrelationdistributionks",
+            "slicedwassersteindistance",
+            "classifiertwosampletestauc",
+            # C2ST per-channel metrics
+            "c2staucaggregate",
+            "c2staucphase1low",
+            "c2staucphase2mid",
+            "c2staucphase3high",
+            "c2staucsinglechannel",
         }
 
         summary_metrics = {
@@ -1611,7 +1600,7 @@ def _build_eval_test_loader(
         return _DL(_TDS(_x, _m, _t, _agg), batch_size=1024, shuffle=False, num_workers=0, pin_memory=False)
 
     # --- Try loading from cache ----------------------------------------------
-    if os.path.exists(cache_path) and not phased:
+    if cache_path is not None and os.path.exists(cache_path) and not phased:
         try:
             cached = torch.load(cache_path, weights_only=True)
             print(f"[eval cache] Cache hit: {len(cached['x'])} total test windows.")
@@ -1860,36 +1849,6 @@ def _write_holdout_summary(model_output_dir: str, feeder_ids: list[int]) -> None
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"[holdout summary] Written: {out_path}")
-
-
-def _load_holdout_scalars(model_dir: str) -> dict[str, float]:
-    """Return flat {metric: float} dict from per-feeder or legacy holdout JSON files.
-
-    Looks for eval_results_feeder_holdout_*.json first; falls back to
-    eval_results_feeder_holdout.json.  Handles both the new {mean, std, values}
-    schema and the legacy flat-scalar schema.
-    """
-    import glob as _glob
-    per_feeder = sorted(
-        _glob.glob(os.path.join(model_dir, "eval_results_feeder_holdout_*.json"))
-    )
-    legacy = os.path.join(model_dir, "eval_results_feeder_holdout.json")
-    files = per_feeder if per_feeder else ([legacy] if os.path.exists(legacy) else [])
-
-    result: dict[str, float] = {}
-    for filepath in files:
-        try:
-            with open(filepath) as f:
-                data = json.load(f)
-            for k, v in data.items():
-                if isinstance(v, dict) and "mean" in v:
-                    result[k] = float(v["mean"])
-                elif isinstance(v, (int, float)):
-                    result[k] = float(v)
-        except Exception as e:
-            print(f"  [holdout] Error loading {filepath}: {e}")
-    return result
-
 
 def _copy_results_to_checkpoint_dir(model_output_dir: str, checkpoint_dir: str) -> None:
     """Copy all eval_results*.json from model_output_dir to checkpoint_dir.
@@ -2144,7 +2103,7 @@ def _run_holdout_eval_inner(
 
         # --- Power flow scalars (voltage_nadir, transformer_utilisation) ---
         if True:
-            return # Temporarily disable power flow analysis to save time during development; re-enable when needed.
+            return # Disabled as we are unsure of this methods viability. re-enable if needed.
         try:
             from src.power_flow.network_builder import build_feeder_network
             from src.data.feeder_holdout import (
@@ -2857,6 +2816,256 @@ def _run_ev_hp_breakdown(
                     _evhp_tb.print_exc()
             else:
                 print("  [ev_hp] Skipping EV variance profile — EV groups had too few windows.")
+    finally:
+        _remove_injected_holdout_profiles(conditioner, _injected_ev)
+
+    return _shared_real
+
+
+def _denorm_phased_windows(x_phased: "torch.Tensor", normalizer) -> "np.ndarray | None":
+    """Denormalize phase-first [N, 3, L] windows to [N, 3, L] float32 numpy.
+
+    Mirrors EvalFramework._inverse_transform_for_metrics for [B, F, L] input:
+    reshapes to [N*L, 3] before calling inverse_transform, then reshapes back.
+    Accepts [N, 3, L] (phase-first) or [N, L, 3] (time-first) and always returns
+    [N, 3, L]. Returns None on unexpected input (with a warning).
+    """
+    x = x_phased.float() if isinstance(x_phased, torch.Tensor) else torch.as_tensor(x_phased, dtype=torch.float32)
+    if x.dim() != 3:
+        print(f"  [ev_hp_phased] _denorm_phased_windows: expected 3D tensor, got {x.dim()}D.")
+        return None
+    if x.shape[1] == 3:
+        pass  # already [N, 3, L] phase-first
+    elif x.shape[2] == 3:
+        x = x.permute(0, 2, 1)  # [N, L, 3] -> [N, 3, L]
+    else:
+        print(f"  [ev_hp_phased] _denorm_phased_windows: no phase-3 axis in shape {tuple(x.shape)}.")
+        return None
+
+    _inv = getattr(normalizer, 'inverse_transform', None)
+    if _inv is None:
+        return x.detach().cpu().numpy().astype(np.float32)
+
+    N, F, L = x.shape
+    with torch.no_grad():
+        x_last = x.permute(0, 2, 1).contiguous()               # [N, L, 3]
+        y_last = _inv(x_last.reshape(-1, F)).reshape(N, L, F)  # [N, L, 3]
+    return y_last.permute(0, 2, 1).detach().cpu().numpy().astype(np.float32)  # [N, 3, L]
+
+
+def _run_ev_hp_breakdown_phased(
+    model,
+    normalizer,
+    conditioner,
+    dataloader,
+    model_output_dir: str,
+    device: str,
+    window_size: int,
+    n_synthetic_samples: int,
+    min_group_size: int = 30,
+    _shared_real: "dict | None" = None,
+    random_user_profiles: bool = False,
+) -> "dict | None":
+    """Phased counterpart of _run_ev_hp_breakdown.
+
+    Windows are [N, 3, 24] (phase-first, normalized). FD is computed on the
+    phase-summed [N, 24] aggregate so it is directly comparable to the non-phased
+    FD number. Three EV Variance Profile PDF sets are produced per model:
+      - aggregate (sum of phases): ev_variance_profile_*{suffix}.pdf
+      - per-phase L1/L2/L3: ev_variance_profile_*_ph{0,1,2}{suffix}.pdf
+
+    _shared_real stores both raw phased arrays and their phase sums:
+      "ev"/"noev"       : [N, 3, 24] denormalized
+      "ev_agg"/"noev_agg": [N, 24] (sum of phases)
+    Returns the (possibly newly built) _shared_real dict, or None on early exit.
+    """
+    import copy
+    import traceback as _tb
+    from torch.utils.data import TensorDataset, DataLoader as _DL
+    from src.data.feeder_holdout import _get_ev_hp_flags_per_window, plot_ev_variance_profile
+    from src.evaluation.metrics.aggregates import AggregatedProfiles as _AFP
+
+    _AFP_KEY = "Aggregated Profiles (Flexibility Distance)"
+    print("  [ev_hp_phased] Collecting test windows for EV/HP breakdown...")
+
+    all_x, all_m, all_t, all_agg = [], [], [], []
+    try:
+        for batch in dataloader:
+            x, m, t, agg = batch
+            all_x.append(x.cpu()); all_m.append(m.cpu())
+            all_t.append(t.cpu()); all_agg.append(agg.cpu())
+    except Exception as e:
+        print(f"  [ev_hp_phased] Data collection failed: {e}")
+        _tb.print_exc()
+        return _shared_real
+
+    if not all_x:
+        print("  [ev_hp_phased] No data collected; skipping.")
+        return _shared_real
+
+    x_all   = torch.cat(all_x,   dim=0)  # [N, 3, 24] normalized
+    m_all   = torch.cat(all_m,   dim=0)
+    t_all   = torch.cat(all_t,   dim=0)
+    agg_all = torch.cat(all_agg, dim=0)
+
+    ev_flags, hp_flags = _get_ev_hp_flags_per_window(m_all.numpy(), conditioner)
+    has_ev = bool(ev_flags.any())
+    has_hp = bool(hp_flags.any())
+    if not has_ev and not has_hp:
+        print("  [ev_hp_phased] Conditioner has no EV or HP items; writing empty sidecar.")
+        os.makedirs(model_output_dir, exist_ok=True)
+        with open(os.path.join(model_output_dir, "ev_hp_breakdown.json"), "w") as f:
+            json.dump({}, f)
+        return _shared_real
+
+    if _shared_real is None:
+        _xd = _denorm_phased_windows(x_all, normalizer)
+        if _xd is None:
+            print("  [ev_hp_phased] Could not denormalize real windows; variance profiles will be skipped.")
+        else:
+            _shared_real = {
+                "ev":       _xd[ev_flags],                   # [N_ev, 3, 24]
+                "noev":     _xd[~ev_flags],                  # [N_noev, 3, 24]
+                "ev_agg":   _xd[ev_flags].sum(axis=1),       # [N_ev, 24]
+                "noev_agg": _xd[~ev_flags].sum(axis=1),      # [N_noev, 24]
+            }
+            print(f"  [ev_hp_phased] Real windows: EV={len(_shared_real['ev'])}, No-EV={len(_shared_real['noev'])}")
+
+    groups: list[tuple[str, np.ndarray]] = []
+    if has_ev:
+        groups += [("EV", ev_flags), ("No-EV", ~ev_flags)]
+    if has_hp:
+        groups += [("HP", hp_flags), ("No-HP", ~hp_flags)]
+
+    _sidecar = "ev_hp_breakdown_random_profiles.json" if random_user_profiles else "ev_hp_breakdown.json"
+    _vp_suffix = "_random_profiles" if random_user_profiles else ""
+
+    _injected_ev: set = set()
+    if random_user_profiles:
+        _injected_ev = _inject_random_holdout_profiles(conditioner, m_all.numpy(), seed=42)
+        if not _injected_ev:
+            print("  [ev_hp_phased] random_user_profiles=True but conditioner has no user_profile item; proceeding without injection.")
+
+    try:
+        results: dict[str, dict] = {}
+        _evvp_synth: dict[str, "np.ndarray | None"] = {"EV": None, "No-EV": None}  # [N_synth, 3, 24]
+
+        for group_name, mask in groups:
+            n_group = int(mask.sum())
+            results[group_name] = {"fd": None, "n_real": n_group}
+            if n_group < min_group_size:
+                print(f"  [ev_hp_phased] '{group_name}': {n_group} windows < {min_group_size}; skipping.")
+                continue
+
+            mask_t = torch.from_numpy(mask)
+            x_g   = x_all[mask_t]    # [n_group, 3, 24] normalized
+            m_g   = m_all[mask_t]
+            t_g   = t_all[mask_t]
+            agg_g = agg_all[mask_t]
+            n_synth_g = min(n_synthetic_samples, n_group)
+
+            group_loader = _DL(
+                TensorDataset(x_g, m_g, t_g, agg_g),
+                batch_size=512, shuffle=False, num_workers=0,
+            )
+            out_subdir = os.path.join(
+                model_output_dir,
+                f"ev_hp_{group_name.lower().replace(' ', '_').replace('-', '_')}",
+            )
+            try:
+                # Generate phased synthetic data; _synthetic_data is [N_synth, 72] phase-first
+                ev_gen = EvalFramework(
+                    model=model,
+                    dataloader=group_loader,
+                    normalizer=copy.deepcopy(normalizer),
+                    conditioner=conditioner,
+                    device=device,
+                    window_size=window_size,
+                    output_path=out_subdir,
+                    n_synthetic_samples=n_synth_g,
+                    silent=True,
+                )
+                ev_gen._prepare_data()
+
+                # Reshape flattened phase-first [N, 3*window_size] → [N, 3, window_size]
+                synth_phased = ev_gen._synthetic_data.reshape(-1, 3, window_size)  # [N_synth, 3, 24]
+                real_phased  = ev_gen._real_data.reshape(-1, 3, window_size)       # [M, 3, 24]
+
+                if group_name in _evvp_synth:
+                    _evvp_synth[group_name] = synth_phased
+
+                # FD on phase aggregate via a second EvalFramework that skips re-generation
+                real_agg  = real_phased.sum(axis=1)   # [M, 24]
+                synth_agg = synth_phased.sum(axis=1)  # [N_synth, 24]
+
+                ev_fd = EvalFramework(
+                    model=model,
+                    dataloader=group_loader,
+                    normalizer=None,
+                    conditioner=conditioner,
+                    device=device,
+                    window_size=window_size,
+                    output_path=out_subdir,
+                    n_synthetic_samples=n_synth_g,
+                    prepared_data={
+                        "real_data":          real_agg,
+                        "reconstructed_data": np.empty((0,), dtype=np.float32),
+                        "synthetic_data":     synth_agg,
+                        "timestamps":         ev_gen._timestamps,
+                        "meter_ids":          ev_gen._meter_ids,
+                    },
+                    silent=True,
+                )
+                ev_fd.register_metric(_AFP(n_samples=min(100, n_group), window_size=window_size))
+                ev_fd._prepare_data()
+                ev_fd._inject_data_into_metrics()
+                ev_fd.evaluate_synthetic_only()
+                fd = ev_fd.results.get(_AFP_KEY)
+                results[group_name]["fd"] = float(fd) if fd is not None else None
+                _fd_str = f"{fd:.4f}" if fd is not None else "None"
+                print(f"  [ev_hp_phased] '{group_name}': n={n_group}, FD={_fd_str}")
+
+            except Exception as e:
+                print(f"  [ev_hp_phased] '{group_name}' failed: {e}")
+                _tb.print_exc()
+
+        os.makedirs(model_output_dir, exist_ok=True)
+        with open(os.path.join(model_output_dir, _sidecar), "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"  [ev_hp_phased] Breakdown saved to {os.path.join(model_output_dir, _sidecar)}")
+
+        if has_ev and _shared_real is not None:
+            if _evvp_synth["EV"] is not None or _evvp_synth["No-EV"] is not None:
+                try:
+                    _synth_ev_agg   = _evvp_synth["EV"].sum(axis=1)    if _evvp_synth["EV"]   is not None else None
+                    _synth_noev_agg = _evvp_synth["No-EV"].sum(axis=1) if _evvp_synth["No-EV"] is not None else None
+
+                    # Aggregate profile (sum of all three phases)
+                    plot_ev_variance_profile(
+                        real_ev=_shared_real["ev_agg"],
+                        synth_ev=_synth_ev_agg,
+                        real_noev=_shared_real["noev_agg"],
+                        synth_noev=_synth_noev_agg,
+                        output_dir=model_output_dir,
+                        suffix=_vp_suffix,
+                    )
+                    # Per-phase profiles (ph0=L1, ph1=L2, ph2=L3 in canonical sort order)
+                    for ph in range(3):
+                        plot_ev_variance_profile(
+                            real_ev=_shared_real["ev"][:, ph, :],
+                            synth_ev=_evvp_synth["EV"][:, ph, :]    if _evvp_synth["EV"]   is not None else None,
+                            real_noev=_shared_real["noev"][:, ph, :],
+                            synth_noev=_evvp_synth["No-EV"][:, ph, :] if _evvp_synth["No-EV"] is not None else None,
+                            output_dir=model_output_dir,
+                            suffix=f"_ph{ph}{_vp_suffix}",
+                        )
+                except Exception as e:
+                    print(f"  [ev_hp_phased] EV variance profile plots failed: {e}")
+                    _tb.print_exc()
+            else:
+                print("  [ev_hp_phased] Skipping EV variance profiles — EV groups had too few windows.")
+        elif has_ev and _shared_real is None:
+            print("  [ev_hp_phased] Skipping EV variance profiles — real window denormalization failed.")
     finally:
         _remove_injected_holdout_profiles(conditioner, _injected_ev)
 
@@ -3694,7 +3903,7 @@ def compare_models(model_paths: list[str],
 
         used_eval_dirs.append(model_output_dir)
 
-        # EV/HP breakdown (optional, unphased only — phased uses a different evaluator structure)
+        # EV/HP breakdown — supported for both phased and non-phased models.
         # Always recomputes when the flag is set — no sidecar caching.
         if ev_hp_breakdown and not phased:
             try:
@@ -3712,6 +3921,23 @@ def compare_models(model_paths: list[str],
                 ) or _ev_shared_real
             except Exception as _evhp_e:
                 print(f"  [ev_hp] EV/HP breakdown failed for '{name}': {_evhp_e}")
+                import traceback as _evhp_loop_tb; _evhp_loop_tb.print_exc()
+        elif ev_hp_breakdown and phased:
+            try:
+                _ev_shared_real = _run_ev_hp_breakdown_phased(
+                    model=model,
+                    normalizer=normalizer,
+                    conditioner=conditioner,
+                    dataloader=dataloader,
+                    model_output_dir=model_output_dir,
+                    device=device,
+                    window_size=window.input_len,
+                    n_synthetic_samples=num_samples,
+                    _shared_real=_ev_shared_real,
+                    random_user_profiles=ev_random_user_profiles,
+                ) or _ev_shared_real
+            except Exception as _evhp_e:
+                print(f"  [ev_hp_phased] EV/HP breakdown failed for '{name}': {_evhp_e}")
                 import traceback as _evhp_loop_tb; _evhp_loop_tb.print_exc()
 
         # Release GPU memory between models so each starts with a clean VRAM state.
@@ -3847,6 +4073,55 @@ def compare_models(model_paths: list[str],
                     print(f"  [ev_hp fallback] Failed for '{_evhp_fp2['name']}': {_evhp_re}")
                     import traceback as _evhp_ftb; _evhp_ftb.print_exc()
 
+    # 5c-phased. EV/HP breakdown fallback for phased models.
+    if ev_hp_breakdown and phased and data_files:
+        _evhp_phased_missing = list(enumerate(eval_plan))
+        if _evhp_phased_missing:
+            _evhp_ph_loader = shared_test_loader
+            _evhp_ph_model_cache: dict[int, tuple] = dict(_first_model_cache)
+
+            if _evhp_ph_loader is None:
+                print("\n[ev_hp_phased fallback] Building data loader (main loop was skipped)...")
+                try:
+                    _evhp_ph_fi, _evhp_ph_fp = _evhp_phased_missing[0]
+                    _evhp_ph_fm, _evhp_ph_fn, _evhp_ph_fc = load_model(_evhp_ph_fp["path"], device=device)
+                    _evhp_ph_model_cache[_evhp_ph_fi] = (_evhp_ph_fm, _evhp_ph_fn, _evhp_ph_fc)
+                    _evhp_ph_loader = _build_eval_test_loader(
+                        data_files=data_files, split_seed=split_seed,
+                        split_ratios=split_ratios, max_value=max_value,
+                        window_len=window.input_len, normalizer=None,
+                        num_samples=num_samples, output_dir=output_dir,
+                        phased=True, agg_divisor=agg_divisor,
+                        preprocessed_cache_dir=preprocessed_cache_dir,
+                    )
+                except Exception as _evhp_ph_bl:
+                    print(f"  [ev_hp_phased fallback] Could not build loader: {_evhp_ph_bl}")
+                    import traceback as _evhp_ph_btb; _evhp_ph_btb.print_exc()
+                    _evhp_ph_loader = None
+
+            for _evhp_ph_fi2, _evhp_ph_fp2 in _evhp_phased_missing:
+                if _evhp_ph_loader is None:
+                    print(f"  [ev_hp_phased fallback] No loader; skipping '{_evhp_ph_fp2['name']}'.")
+                    continue
+                print(f"\n[ev_hp_phased fallback] Computing breakdown for '{_evhp_ph_fp2['name']}'...")
+                try:
+                    if _evhp_ph_fi2 in _evhp_ph_model_cache:
+                        _ph_fm, _ph_fn, _ph_fc = _evhp_ph_model_cache[_evhp_ph_fi2]
+                    else:
+                        _ph_fm, _ph_fn, _ph_fc = load_model(_evhp_ph_fp2["path"], device=device)
+                    _ev_shared_real = _run_ev_hp_breakdown_phased(
+                        model=_ph_fm, normalizer=_ph_fn, conditioner=_ph_fc,
+                        dataloader=_evhp_ph_loader,
+                        model_output_dir=_evhp_ph_fp2["model_output_dir"],
+                        device=device, window_size=window.input_len,
+                        n_synthetic_samples=num_samples,
+                        _shared_real=_ev_shared_real,
+                        random_user_profiles=ev_random_user_profiles,
+                    ) or _ev_shared_real
+                except Exception as _evhp_ph_re:
+                    print(f"  [ev_hp_phased fallback] Failed for '{_evhp_ph_fp2['name']}': {_evhp_ph_re}")
+                    import traceback as _evhp_ph_ftb; _evhp_ph_ftb.print_exc()
+
     # 6. Use PhasedModelComparator to generate comparison tables and plots
     print("\n" + "="*50)
     print("GENERATING COMPARISON")
@@ -3862,7 +4137,7 @@ def compare_models(model_paths: list[str],
             _param_counts[_name] = None
             continue
         try:
-            from src.model.usable.count_learnable_params import (  # noqa: PLC0415
+            from src.model.scripts.count_learnable_params import (  # noqa: PLC0415
                 _load_config as _clp_load_config,
                 count_from_config as _clp_count,
             )
@@ -3938,66 +4213,66 @@ if __name__ == "__main__":
     n_draws = int(args.n_draws)
 
 
-    # args.models = [
-    #             #    "E:/models/new4/CVAE_20260601_034519_guide_cnn",
-    #             #    "E:/models/new4/FaradayModel_20260531_124255",
-    #             #    "E:/models/new4/FaradayModel_20260601_060319",
-    #             #    "E:/models/new4/GuidedFaradayModel_20260531_115215",
-    #             #    "E:/models/new4/GuidedFaradayModel_20260531_131653_relu",
-    #             #    "E:/models/new4/GuidedFaradayModel_20260531_143252_peaks",
-    #             #    "E:/models/new4/GuidedFaradayModel_20260531_204015",
-    #             #    "E:/models/new4/GuidedFaradayModel_20260531_211801_cnn",
-    #             # "E:/models/new4/GuidedFaradayModel_20260531_225823_userprofile",
-    #             # "E:/models/new3/FaradayModel_20260529_021321", # NOT for holdout
-    #             # "E:/models/new3/GuidedFaradayModel_20260528_223126", # NOt for holdout
-    #             # "E:/models/new3/GuidedFaradayModel_20260529_000300_cnn", # NOT for holdout
-    #             # "E:/models/new3/GuidedFaradayModel_20260529_012840_cnn_mmd" # NOT for holdout
-    #             #"E:/models/new4/GuidedFaradayModel_20260604_102425_deterministic", # use
-    #             #"E:/models/new4/GuidedFaradayModel_20260603_123450", # use
-    #             #"E:/models/new4/GuidedFaradayModel_20260605_173422",
-    #             # "E:/models/new4/GuidedFaradayModel_20260603_120241", # use
-    #             # "E:/models/new4/GuidedFaradayModel_20260603_102551", # use
-    #             "E:/models/new4/GuidedFaradayModel_20260605_105946",# "E:/models/new4/GuidedFaradayModel_20260605_112623",
-    #             "E:/models/new4/GuidedFaradayModel_20260605_201145",
-    #             "E:/models/new4/CVAE_20260531_185015_guide_cnn_h_broken",
-    #             "E:/models/new4/DiffusionModel_20260601_002842", # use
-    #             "E:/models/new4/FaradayModel_20260601_060319", # USe
-    #             "E:/models/new4/CVAE_20260601_022452_guide", # USE
-    #             "E:/models/new4/CVAE_20260531_180003_cvae",
-    #             "E:/models/new4/QuantileBaselineModel_20260601_005326",
-    #             "E:/models/new4/AverageBaselineModel_20260531_173051",
-    #             "E:/models/new4/RealDataBaselineModel_20260608_143634",
-    #                ]
-    # args.names = [
-    #                 # "Guide-CNN",
-    #                 # "Faraday",
-    #                 # "Faraday-new-fix",
-    #                 # "Guided-Faraday",
-    #                 # "Guided-Faraday-RELU",
-    #                 # "Guided-Faraday-PEAKS",
-    #                 # "Guided-Faraday-Deterministic",
-    #                 # "Guided-Faraday-CNN-2",
-    #                 # "Guided-Faraday-UserProfile",
-    #                 # "Faraday-OLD",
-    #                 # "Guided-Faraday-OLD",
-    #                 # "Guided-Faraday-CNN-OLD",
-    #                 # "Guided-Faraday-CNN-MMD-OLD",
-    #                 #"Guided-Faraday-CNN-Deterministic-big", # use
-    #                 #"Guided-Faraday-CNN-Stochastic-big", # Use
-    #                 #"Guided-Faraday-CNN-newGMM",
-    #                 #"Guided-Faraday-UserProfiles", # use
-    #                 #"Guided-Faraday", # USe
-    #                 "Guided-Faraday-CNN",# "Guided-Faraday-CNN-Stochastic",
-    #                 "Guided-Faraday-CNN-UserProfiles",
-    #                 "H-Guide-CNN", # use
-    #                 "Diffusion", # use
-    #                 "Faraday", # USE
-    #                 "Guide", # USE
-    #                 "CVAE", # use
-    #                 "Baseline-Quantile", # use
-    #                 "Baseline-Average", # use
-    #                 "Baseline-RealData", # use
-    # ]
+    args.models = [
+                #    "E:/models/new4/CVAE_20260601_034519_guide_cnn",
+                #    "E:/models/new4/FaradayModel_20260531_124255",
+                #    "E:/models/new4/FaradayModel_20260601_060319",
+                #    "E:/models/new4/GuidedFaradayModel_20260531_115215",
+                #    "E:/models/new4/GuidedFaradayModel_20260531_131653_relu",
+                #    "E:/models/new4/GuidedFaradayModel_20260531_143252_peaks",
+                #    "E:/models/new4/GuidedFaradayModel_20260531_204015",
+                #    "E:/models/new4/GuidedFaradayModel_20260531_211801_cnn",
+                # "E:/models/new4/GuidedFaradayModel_20260531_225823_userprofile",
+                # "E:/models/new3/FaradayModel_20260529_021321", # NOT for holdout
+                # "E:/models/new3/GuidedFaradayModel_20260528_223126", # NOt for holdout
+                # "E:/models/new3/GuidedFaradayModel_20260529_000300_cnn", # NOT for holdout
+                # "E:/models/new3/GuidedFaradayModel_20260529_012840_cnn_mmd" # NOT for holdout
+                #"E:/models/new4/GuidedFaradayModel_20260604_102425_deterministic", # use
+                #"E:/models/new4/GuidedFaradayModel_20260603_123450", # use
+                #"E:/models/new4/GuidedFaradayModel_20260605_173422",
+                # "E:/models/new4/GuidedFaradayModel_20260603_120241", # use
+                # "E:/models/new4/GuidedFaradayModel_20260603_102551", # use
+                "E:/models/new4/GuidedFaradayModel_20260605_105946",# "E:/models/new4/GuidedFaradayModel_20260605_112623",
+                "E:/models/new4/GuidedFaradayModel_20260605_201145",
+                "E:/models/new4/CVAE_20260531_185015_guide_cnn_h_broken",
+                "E:/models/new4/DiffusionModel_20260601_002842", # use
+                "E:/models/new4/FaradayModel_20260601_060319", # USe
+                "E:/models/new4/CVAE_20260601_022452_guide", # USE
+                "E:/models/new4/CVAE_20260531_180003_cvae",
+                "E:/models/new4/QuantileBaselineModel_20260601_005326",
+                "E:/models/new4/AverageBaselineModel_20260531_173051",
+                "E:/models/new4/RealDataBaselineModel_20260608_143634",
+                   ]
+    args.names = [
+                    # "Guide-CNN",
+                    # "Faraday",
+                    # "Faraday-new-fix",
+                    # "Guided-Faraday",
+                    # "Guided-Faraday-RELU",
+                    # "Guided-Faraday-PEAKS",
+                    # "Guided-Faraday-Deterministic",
+                    # "Guided-Faraday-CNN-2",
+                    # "Guided-Faraday-UserProfile",
+                    # "Faraday-OLD",
+                    # "Guided-Faraday-OLD",
+                    # "Guided-Faraday-CNN-OLD",
+                    # "Guided-Faraday-CNN-MMD-OLD",
+                    #"Guided-Faraday-CNN-Deterministic-big", # use
+                    #"Guided-Faraday-CNN-Stochastic-big", # Use
+                    #"Guided-Faraday-CNN-newGMM",
+                    #"Guided-Faraday-UserProfiles", # use
+                    #"Guided-Faraday", # USe
+                    "Guided-Faraday-CNN",# "Guided-Faraday-CNN-Stochastic",
+                    "Guided-Faraday-CNN-UserProfiles",
+                    "H-Guide-CNN", # use
+                    "Diffusion", # use
+                    "Faraday", # USE
+                    "Guide", # USE
+                    "CVAE", # use
+                    "Baseline-Quantile", # use
+                    "Baseline-Average", # use
+                    "Baseline-RealData", # use
+    ]
     # args.mia_models = [
     #     "Guided-Faraday-CNN",
     #     "Diffusion",
@@ -4005,30 +4280,30 @@ if __name__ == "__main__":
     # ]
 
     # PHASED:
-    # args.models = ["E:/models/phased2/SetGuideVAE_20260607_124614",
-    #                "E:/models/phased2/SetGuideVAE_20260607_132508_CNN",
-    #               "E:/models/phased2/DiffusionModel_20260607_080656",
-    #               "E:/models/phased2/SequentialPhaseVAE_20260607_082110",
-    #                 "E:/models/new4/GuidedFaradayModel_20260605_105946",
-    #                 "E:/models/phased2/QuantileBaselineModel_20260607_112946",
-    #                 "E:/models/phased2/AverageBaselineModel_20260607_113136"
-    #                ]
-    # args.secondary_models = [None, 
-    #                          None, 
-    #                          None,
-    #                          None, 
-    #                          "E:/models/phased/HierarchicalSplitter_20260604_171559", 
-    #                          None,
-    #                          None
-    #                          ]
-    # args.names = [ "Set-Guide-VAE",
-    #                 "Set-Guide-VAE-CNN",
-    #                 "Diffusion_phased", 
-    #                 "Sequential",
-    #                 "Guide-CNN (with Hierarchical Splitter)",
-    #                 "Quantile Baseline",
-    #                 "Average Baseline"
-    #               ]
+    args.models = ["E:/models/phased2/SetGuideVAE_20260607_124614",
+                   "E:/models/phased2/SetGuideVAE_20260607_132508_CNN",
+                  "E:/models/phased2/DiffusionModel_20260607_080656",
+                  "E:/models/phased2/SequentialPhaseVAE_20260607_082110",
+                    "E:/models/new4/GuidedFaradayModel_20260605_105946",
+                    "E:/models/phased2/QuantileBaselineModel_20260607_112946",
+                    "E:/models/phased2/AverageBaselineModel_20260607_113136"
+                   ]
+    args.secondary_models = [None, 
+                             None, 
+                             None,
+                             None, 
+                             "E:/models/phased/HierarchicalSplitter_20260604_171559", 
+                             None,
+                             None
+                             ]
+    args.names = ["Set-Guide-VAE",
+                    "Set-Guide-VAE-CNN",
+                    "Diffusion_phased", 
+                    "Sequential",
+                    "Guide-CNN (with Hierarchical Splitter)",
+                    "Quantile Baseline",
+                    "Average Baseline"
+                  ]
     # uv run .\src\evaluation\compare_models.py --models "s" --names "s" --holdout-n-draws 5 --num-samples 50000 --data-dir "E:\Data\processed_data\second_batch\individual_sm_datasets\raw_profiles" --n-draws 10 --phased --cache-dir "E:/Data/processed_data/cached_data" --no-sort
 
 

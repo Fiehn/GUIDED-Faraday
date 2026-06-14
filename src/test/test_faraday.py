@@ -125,7 +125,7 @@ class _StubConditioner:
 
 def test_faraday_sample_output_shape():
     from model.faraday import FaradayModel
-    from model.gmm import GaussianMixtureModel
+    from model.base.gmm import GaussianMixtureModel
 
     sequence_length = 24
     latent_dim = 16

@@ -12,8 +12,8 @@ from sklearn.metrics import roc_auc_score, roc_curve
 
 from src.evaluation.metrics.base.base import _resolve_output_directory, _to_json_serializable
 
-_COLOR_REAL = "#111111"
-_COLOR_SYN  = "#5f88b0"
+_COLOR_REAL = "#1f77b4"
+_COLOR_SYN  = "#ff7f0e"
 _CHANNEL_PALETTE = ["#5f88b0", "#c6ad8f", "#7ea06b", "#d9a066"]
 _PHASE_LABELS = ["Phase 1 (low)", "Phase 2 (mid)", "Phase 3 (high)"]
 
@@ -127,22 +127,20 @@ class C2STSuite:
                             plot_dir,
                             f"c2st_{ch_name.replace(' ', '_').lower()}.pdf",
                         )
-                        if not os.path.exists(plot_path):
-                            try:
-                                self._plot_channel(ch_name, y_true, y_score, auc, plot_path)
-                            except Exception as e:
-                                print(f"  [C2STSuite] per-channel plot failed ({ch_name}): {e}")
+                        try:
+                            self._plot_channel(ch_name, y_true, y_score, auc, plot_path)
+                        except Exception as e:
+                            print(f"  [C2STSuite] per-channel plot failed ({ch_name}): {e}")
 
             draw_results.append(draw_result)
 
         # Generate combined overview on draw 0
         if plot_dir:
             overview_path = os.path.join(plot_dir, "c2st_overview.pdf")
-            if not os.path.exists(overview_path):
-                try:
-                    self._plot_overview(list(channels.keys()), ch0_scores, overview_path)
-                except Exception as e:
-                    print(f"  [C2STSuite] overview plot failed: {e}")
+            try:
+                self._plot_overview(list(channels.keys()), ch0_scores, overview_path)
+            except Exception as e:
+                print(f"  [C2STSuite] overview plot failed: {e}")
 
         # Aggregate across draws
         if len(draw_results) == 1:
@@ -270,24 +268,24 @@ class C2STSuite:
                 y   = kde(x)
                 ax.plot(x, y, color=color, lw=2, label=label)
                 ax.fill_between(x, y, alpha=0.15, color=color)
-        ax.axvline(0.5, color="gray", lw=1, ls="--", alpha=0.7, label="Random")
-        ax.set_xlabel("P(Synthetic)", fontsize=10)
-        ax.set_ylabel("Density", fontsize=10)
-        ax.set_title(f"Score Distributions — {ch_name}", fontsize=11)
-        ax.legend(fontsize=9)
+        ax.axvline(0.5, color="gray", lw=1, ls="--", alpha=0.7, label="Random (0.5)")
+        ax.set_xlabel("P(Synthetic)", fontsize=12)
+        ax.set_ylabel("Density", fontsize=12)
+        ax.set_title("Classifier Score Distributions", fontsize=13)
+        ax.legend(fontsize=11)
 
         ax = axes[1]
         fpr, tpr, _ = roc_curve(y_true, y_score)
         ax.plot(fpr, tpr, color=_COLOR_SYN, lw=2, label=f"AUC = {auc:.3f}")
         ax.fill_between(fpr, tpr, alpha=0.10, color=_COLOR_SYN)
         ax.plot([0, 1], [0, 1], color="gray", lw=1, ls="--", label="Random")
-        ax.set_xlabel("False Positive Rate", fontsize=10)
-        ax.set_ylabel("True Positive Rate", fontsize=10)
-        ax.set_title(f"ROC Curve — {ch_name}", fontsize=11)
-        ax.legend(fontsize=9)
+        ax.set_xlabel("False Positive Rate", fontsize=12)
+        ax.set_ylabel("True Positive Rate", fontsize=12)
+        ax.set_title("Receiver Operating Characteristic", fontsize=13)
+        ax.legend(fontsize=11)
         ax.set_xlim(0, 1); ax.set_ylim(0, 1)
 
-        fig.suptitle(f"C2ST Diagnostics — {ch_name}", fontsize=13)
+        fig.suptitle("Classifier Two-Sample Test Diagnostics", fontsize=15)
         fig.tight_layout()
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
@@ -324,10 +322,10 @@ class C2STSuite:
                     ax.plot(x, y, color=color, lw=2, label=label)
                     ax.fill_between(x, y, alpha=0.15, color=color)
             ax.axvline(0.5, color="gray", lw=1, ls="--", alpha=0.7)
-            ax.set_xlabel("P(Synthetic)", fontsize=9)
-            ax.set_ylabel("Density", fontsize=9)
-            ax.set_title(f"Scores — {ch_name}", fontsize=10)
-            ax.legend(fontsize=8)
+            ax.set_xlabel("P(Synthetic)", fontsize=11)
+            ax.set_ylabel("Density", fontsize=11)
+            ax.set_title("Score Distributions", fontsize=12)
+            ax.legend(fontsize=10)
 
             ax = axes[row, 1]
             fpr, tpr, _ = roc_curve(y_true, y_score)
@@ -335,13 +333,13 @@ class C2STSuite:
             ax.plot(fpr, tpr, color=color, lw=2, label=f"AUC = {auc:.3f}")
             ax.fill_between(fpr, tpr, alpha=0.10, color=color)
             ax.plot([0, 1], [0, 1], color="gray", lw=1, ls="--")
-            ax.set_xlabel("FPR", fontsize=9)
-            ax.set_ylabel("TPR", fontsize=9)
-            ax.set_title(f"ROC — {ch_name}", fontsize=10)
-            ax.legend(fontsize=8)
+            ax.set_xlabel("False Positive Rate", fontsize=11)
+            ax.set_ylabel("True Positive Rate", fontsize=11)
+            ax.set_title("ROC Curve", fontsize=12)
+            ax.legend(fontsize=10)
             ax.set_xlim(0, 1); ax.set_ylim(0, 1)
 
-        fig.suptitle("C2ST Analysis — All Channels", fontsize=14, fontweight="bold")
+        fig.suptitle("Classifier Two-Sample Test Analysis", fontsize=16, fontweight="bold")
         fig.tight_layout()
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)

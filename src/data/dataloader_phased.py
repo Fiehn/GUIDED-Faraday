@@ -436,7 +436,7 @@ class StreamingParquetBuffer(IterableDataset):
         return prepared
 
     def _impute_to_base_frequency(self, df: pd.DataFrame) -> pd.DataFrame:
-        # TODO: REMEMBER THIS 'guy'! we are using kw not kwh on the 15 min scale
+        # Unit is kW (power per 15-min interval), not kWh (energy)
         return _impute_to_base_frequency(df, self.aggregation, self.base_frequency, self.aggregation_divisor)
 
     def _load_file_dataframe(self, file_path: str):
@@ -1771,7 +1771,6 @@ class InMemoryCSVDataloaders:
         self._train_perm: list[int] = self._new_perm(len(self.train_dataset), 0)
         self._train_ptr: int = 0
         self._passes_completed: int = 0
-        self._total_samples_seen: int = 0
 
     def _new_perm(self, n: int, pass_idx: int) -> list[int]:
         if n == 0:
@@ -1794,7 +1793,6 @@ class InMemoryCSVDataloaders:
         end   = min(start + steps_per_epoch * self.batch_size, len(self._train_perm))
         indices = self._train_perm[start:end]
         self._train_ptr = end
-        self._total_samples_seen += len(indices)
         subset = Subset(self.train_dataset, indices)
         return DataLoader(
             subset,
@@ -2517,7 +2515,6 @@ class InMemoryPhasedDataloaders:
         self._train_perm: list[int] = self._new_perm(len(self.train_dataset), 0)
         self._train_ptr: int = 0
         self._passes_completed: int = 0
-        self._total_samples_seen: int = 0
 
     def _new_perm(self, n: int, pass_idx: int) -> list[int]:
         if n == 0:
@@ -2537,7 +2534,6 @@ class InMemoryPhasedDataloaders:
         end   = min(start + steps_per_epoch * self.batch_size, len(self._train_perm))
         indices = self._train_perm[start:end]
         self._train_ptr = end
-        self._total_samples_seen += len(indices)
         subset = Subset(self.train_dataset, indices)
         return DataLoader(subset, batch_size=self.batch_size, shuffle=False,
                           num_workers=0, pin_memory=self.pin_memory)

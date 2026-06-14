@@ -18,7 +18,7 @@ import warnings
 from pydantic import ValidationError
 
 from config.loader import load_config
-from model.factory import _load_train_config
+from model.base.factory import _load_train_config
 
 
 # ---------------------------------------------------------------------------

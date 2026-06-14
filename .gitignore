@@ -10,12 +10,21 @@ wheels/
 .venv
 .venv-cu12-py311
 
+
 # Other
 data/
 models/
 runs/
 Output/
 topology/
+
+# Internal docs (keep locally, do not publish)
+docs/
+handoff-*.md
+
+# Output artifacts (reproducible from code)
+aggregated_profiles/
+peak_magnitude/
 
 !src/data/
 !src/data/*.py
@@ -27,3 +36,8 @@ slurmjobs/outputs/
 
 evaluation_comparison/*
 evaluation_comparison_*/*
+
+# All hidden files
+.*/
+
+test_*.py

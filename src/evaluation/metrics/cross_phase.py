@@ -12,8 +12,8 @@ from sklearn.metrics import roc_auc_score, roc_curve
 
 from src.evaluation.metrics.base.base import SyntheticMetric, _sanitize_numeric_array, _resolve_output_directory
 
-_COLOR_REAL = "#111111"
-_COLOR_SYN  = "#5f88b0"
+_COLOR_REAL = "#1f77b4"
+_COLOR_SYN  = "#ff7f0e"
 _PHASE_LABELS = ["P1 (low)", "P2 (mid)", "P3 (high)"]
 
 
@@ -54,11 +54,10 @@ class CrossPhaseCorrelationError(SyntheticMetric):
         output_dir = _resolve_output_directory(self.output_path)
         if output_dir:
             plot_path = os.path.join(output_dir, "cross_phase_correlation_matrices.pdf")
-            if not os.path.exists(plot_path):
-                try:
-                    self._plot(R_real, R_syn, plot_path)
-                except Exception as e:
-                    print(f"[CrossPhaseCorrelationError] plot failed: {e}")
+            try:
+                self._plot(R_real, R_syn, plot_path)
+            except Exception as e:
+                print(f"[CrossPhaseCorrelationError] plot failed: {e}")
 
         return float(np.linalg.norm(R_real - R_syn, 'fro'))
 
@@ -75,16 +74,16 @@ class CrossPhaseCorrelationError(SyntheticMetric):
             (axes[2], diff,   "Real - Syn",-lim,  lim,  "RdBu_r"),
         ]:
             im = ax.imshow(mat, vmin=vmin, vmax=vmax, cmap=cmap, aspect="auto")
-            ax.set_xticks(range(3)); ax.set_xticklabels(labels, fontsize=9)
-            ax.set_yticks(range(3)); ax.set_yticklabels(labels, fontsize=9)
-            ax.set_title(title, fontsize=11)
+            ax.set_xticks(range(3)); ax.set_xticklabels(labels, fontsize=11)
+            ax.set_yticks(range(3)); ax.set_yticklabels(labels, fontsize=11)
+            ax.set_title(title, fontsize=13)
             for i in range(3):
                 for j in range(3):
                     ax.text(j, i, f"{mat[i, j]:.2f}", ha="center", va="center",
-                            fontsize=9, color="white" if abs(mat[i, j]) > 0.5 else "black")
+                            fontsize=11, color="white" if abs(mat[i, j]) > 0.5 else "black")
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-        fig.suptitle("Cross-Phase Correlation Matrices", fontsize=13)
+        fig.suptitle("Cross-Phase Correlation Matrices", fontsize=15)
         fig.tight_layout()
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
@@ -160,17 +159,15 @@ class CrossCorrelationDistribution(SyntheticMetric):
         output_dir = _resolve_output_directory(self.output_path)
         if output_dir:
             plot_path = os.path.join(output_dir, "cross_phase_ccf_profile.pdf")
-            if not os.path.exists(plot_path):
-                try:
-                    self._plot(real_ccf, syn_ccf, plot_path)
-                except Exception as e:
-                    print(f"[CrossCorrelationDistribution] plot failed: {e}")
+            try:
+                self._plot(real_ccf, syn_ccf, plot_path)
+            except Exception as e:
+                print(f"[CrossCorrelationDistribution] plot failed: {e}")
             dist_path = os.path.join(output_dir, "cross_phase_ccf_distributions.pdf")
-            if not os.path.exists(dist_path):
-                try:
-                    self._plot_distributions(real_ccf, syn_ccf, dist_path)
-                except Exception as e:
-                    print(f"[CrossCorrelationDistribution] distribution plot failed: {e}")
+            try:
+                self._plot_distributions(real_ccf, syn_ccf, dist_path)
+            except Exception as e:
+                print(f"[CrossCorrelationDistribution] distribution plot failed: {e}")
 
         return float(np.mean(ks_stats))
 
@@ -191,14 +188,14 @@ class CrossCorrelationDistribution(SyntheticMetric):
             ax.fill_between(lags, s_p25, s_p75, color=_COLOR_SYN,  alpha=0.20)
 
             ax.axhline(0, color="gray", lw=0.8, ls="--")
-            ax.set_title(lbl, fontsize=11)
-            ax.set_xlabel("Lag τ (hours)", fontsize=10)
+            ax.set_title(lbl, fontsize=13)
+            ax.set_xlabel("Lag τ (hours)", fontsize=12)
             ax.set_xticks(lags)
             if pi == 0:
-                ax.set_ylabel("Cross-Correlation", fontsize=10)
-            ax.legend(fontsize=9)
+                ax.set_ylabel("Cross-Correlation", fontsize=12)
+            ax.legend(fontsize=11)
 
-        fig.suptitle("Cross-Phase CCF Profile  (mean ± p25/p75 across windows)", fontsize=12)
+        fig.suptitle("Cross-Phase CCF Profile  (mean ± p25/p75 across windows)", fontsize=14)
         fig.tight_layout()
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
@@ -236,16 +233,16 @@ class CrossCorrelationDistribution(SyntheticMetric):
 
             ax.axhline(0, color='gray', lw=0.8, ls='--')
             ax.set_xticks(np.arange(n_lags) * 2.5)
-            ax.set_xticklabels([f"τ={tau}" for tau in range(n_lags)], fontsize=9)
-            ax.set_title(lbl, fontsize=11)
+            ax.set_xticklabels([f"τ={tau}" for tau in range(n_lags)], fontsize=11)
+            ax.set_title(lbl, fontsize=13)
             if pi == 0:
-                ax.set_ylabel("CCF Value", fontsize=10)
+                ax.set_ylabel("CCF Value", fontsize=12)
             ax.legend(handles=[
                 Patch(facecolor=_COLOR_REAL, alpha=0.75, label='Real'),
                 Patch(facecolor=_COLOR_SYN,  alpha=0.75, label='Synthetic'),
-            ], fontsize=9)
+            ], fontsize=11)
 
-        fig.suptitle("Cross-Phase CCF Distributions per Lag  (box: IQR, whiskers: 5th–95th pct)", fontsize=12)
+        fig.suptitle("Cross-Phase CCF Distributions per Lag  (box: IQR, whiskers: 5th–95th pct)", fontsize=14)
         fig.tight_layout()
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
@@ -304,11 +301,10 @@ class SlicedWassersteinDistance(SyntheticMetric):
         output_dir = _resolve_output_directory(self.output_path)
         if output_dir:
             pca_path = os.path.join(output_dir, "cross_phase_pca_joint.pdf")
-            if not os.path.exists(pca_path):
-                try:
-                    self._plot_pca(real, syn, pca_path)
-                except Exception as e:
-                    print(f"[SlicedWassersteinDistance] PCA plot failed: {e}")
+            try:
+                self._plot_pca(real, syn, pca_path)
+            except Exception as e:
+                print(f"[SlicedWassersteinDistance] PCA plot failed: {e}")
 
         return float(np.mean(np.abs(real_sorted - syn_sorted)))
 
@@ -332,10 +328,10 @@ class SlicedWassersteinDistance(SyntheticMetric):
                    label=f"Real (n={n})")
         ax.scatter(syn_2d[:, 0], syn_2d[:, 1], c=_COLOR_SYN, alpha=0.25, s=6,
                    label=f"Synthetic (n={n})")
-        ax.set_xlabel(f"PC1  ({pca.explained_variance_ratio_[0]:.1%} var)", fontsize=10)
-        ax.set_ylabel(f"PC2  ({pca.explained_variance_ratio_[1]:.1%} var)", fontsize=10)
-        ax.set_title("PCA of Joint 3-Phase Windows (72-dim)", fontsize=12)
-        ax.legend(markerscale=3, fontsize=10)
+        ax.set_xlabel(f"PC1  ({pca.explained_variance_ratio_[0]:.1%} var)", fontsize=12)
+        ax.set_ylabel(f"PC2  ({pca.explained_variance_ratio_[1]:.1%} var)", fontsize=12)
+        ax.set_title("PCA of Joint 3-Phase Windows (72-dim)", fontsize=14)
+        ax.legend(markerscale=3, fontsize=12)
         fig.tight_layout()
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
@@ -465,11 +461,10 @@ class ClassifierTwoSampleTest(SyntheticMetric):
         output_dir = _resolve_output_directory(self.output_path)
         if output_dir:
             score_path = os.path.join(output_dir, "cross_phase_c2st_scores.pdf")
-            if not os.path.exists(score_path):
-                try:
-                    self._plot_scores(y_true, y_score, score_path)
-                except Exception as e:
-                    print(f"[ClassifierTwoSampleTest] score plot failed: {e}")
+            try:
+                self._plot_scores(y_true, y_score, score_path)
+            except Exception as e:
+                print(f"[ClassifierTwoSampleTest] score plot failed: {e}")
 
         try:
             return float(roc_auc_score(y_true, y_score))
@@ -497,10 +492,10 @@ class ClassifierTwoSampleTest(SyntheticMetric):
                 ax.plot(x, y, color=color, lw=2, label=label)
                 ax.fill_between(x, y, alpha=0.15, color=color)
         ax.axvline(0.5, color="gray", lw=1, ls="--", alpha=0.7, label="Random (0.5)")
-        ax.set_xlabel("P(Synthetic)", fontsize=10)
-        ax.set_ylabel("Density", fontsize=10)
-        ax.set_title("Classifier Score Distributions", fontsize=11)
-        ax.legend(fontsize=9)
+        ax.set_xlabel("P(Synthetic)", fontsize=12)
+        ax.set_ylabel("Density", fontsize=12)
+        ax.set_title("Classifier Score Distributions", fontsize=13)
+        ax.legend(fontsize=11)
 
         # Right panel: ROC curve
         ax = axes[1]
@@ -509,13 +504,13 @@ class ClassifierTwoSampleTest(SyntheticMetric):
         ax.plot(fpr, tpr, color=_COLOR_SYN, lw=2, label=f"AUC = {auc_val:.3f}")
         ax.fill_between(fpr, tpr, alpha=0.10, color=_COLOR_SYN)
         ax.plot([0, 1], [0, 1], color="gray", lw=1, ls="--", label="Random")
-        ax.set_xlabel("False Positive Rate", fontsize=10)
-        ax.set_ylabel("True Positive Rate", fontsize=10)
-        ax.set_title("Receiver Operating Characteristic", fontsize=11)
-        ax.legend(fontsize=9)
+        ax.set_xlabel("False Positive Rate", fontsize=12)
+        ax.set_ylabel("True Positive Rate", fontsize=12)
+        ax.set_title("Receiver Operating Characteristic", fontsize=13)
+        ax.legend(fontsize=11)
         ax.set_xlim(0, 1); ax.set_ylim(0, 1)
 
-        fig.suptitle("Classifier Two-Sample Test Diagnostics", fontsize=13)
+        fig.suptitle("Classifier Two-Sample Test Diagnostics", fontsize=15)
         fig.tight_layout()
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)

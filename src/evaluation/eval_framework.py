@@ -19,7 +19,7 @@ matplotlib.use("Agg")
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-from src.model.generators import SyntheticGenerator
+from model.base.generators import SyntheticGenerator
 
 from src.evaluation.metrics.flexibility_distance import FlexibilityDistance
 from src.evaluation.metrics.acf import ACFDistribution
@@ -1945,7 +1945,7 @@ class ClassicalStatistics(SyntheticMetric):
     def compute(self) -> Dict[str, Any]:
         """Compute and compare classical statistics between real and synthetic data.
         
-        Returns: TODO: THIS IS NOT TRUE IT IS CURRENTLY A FLOAT VALUE (MAE OF MEAN PROFILES)
+        Returns:
             Dict[str, Any]: Dictionary containing both real and synthetic statistics
         """
         real_stats = self._compute_stats(self.real_data)

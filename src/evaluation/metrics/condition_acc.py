@@ -45,7 +45,7 @@ class EVConditionAccuracy(SyntheticMetric):
     def compute(self) -> float:
         import pandas as pd
         import torch
-        from src.evaluation.ev_detection import detect_platos_unified_dP2_std
+        from evaluation.scripts.ev_detection import detect_platos_unified_dP2_std
         
         if self.synthetic_data is None or self.synthetic_conditions is None:
             return 0.0

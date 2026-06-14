@@ -7,7 +7,7 @@ import os
 import numpy as np
 from sklearn.decomposition import PCA 
 from sklearn.manifold import TSNE
-from src.model.generators import SyntheticGenerator 
+from model.base.generators import SyntheticGenerator 
  
 class Visualizer:
     """Class for visualizing training results and model performance."""
@@ -829,7 +829,7 @@ class Visualizer:
                     alpha=0.7,
                 )
             ax1.set_ylim(0, y_max)
-            ax1.set_title(f"5 Real Profiles ({view_label})", fontsize=12, fontweight='bold')
+            ax1.set_title(f"5 Real Profiles", fontsize=12, fontweight='bold')
             ax1.set_xlabel("Hour", fontsize=10)
             ax1.set_ylabel("Energy (kWh)", fontsize=10)
             ax1.legend(loc='upper right', fontsize=8)
@@ -849,7 +849,7 @@ class Visualizer:
                     markersize=4,
                     alpha=0.7
                 )
-            ax2.set_title(f"5 Synthetic Profiles ({view_label})", fontsize=12, fontweight='bold')
+            ax2.set_title(f"5 Synthetic Profiles", fontsize=12, fontweight='bold')
             ax2.set_xlabel("Hour", fontsize=10)
             ax2.set_ylabel("Energy (kWh)", fontsize=10)
             ax2.legend(loc='upper right', fontsize=8)
@@ -883,7 +883,7 @@ class Visualizer:
             )
             
             ax3.set_title(
-                f"Mean Comparison ({view_label})",
+                f"Mean Comparison",
                 fontsize=12,
                 fontweight='bold'
             )

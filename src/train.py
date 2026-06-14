@@ -12,7 +12,7 @@ faulthandler.enable()  # dumps C-level traceback on SIGSEGV / fatal errors
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
-from model.encoder_decoder_model import *
+from model.base.encoder_decoder_model import *
 from data.conditioner import *
 from src.model.cvae import *
 from src.model.set import *
@@ -24,8 +24,7 @@ from src.model.hierarchical.config import *
 from src.visualization.visualizer import Visualizer
 from src.visualization.writer import Writer
 from src.visualization.plot_styling import PlotStyle
-from src.model.factory import _load_train_config, _save_training_config_snapshot, create_model_from_config
-from data.feeder_holdout import plot_feeder_holdout_analysis, run_coincidence_factor_analysis
+from model.base.factory import _load_train_config, _save_training_config_snapshot, create_model_from_config
 
 def _run_visualization(model, test_loader, normalizer, conditioner, writer, device, log_path, config, secondary_model=None):
     """Run post-training visualizations. Metric evaluation is exclusively in compare_models (ADR-0011)."""

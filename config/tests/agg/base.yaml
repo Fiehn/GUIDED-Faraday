@@ -1,11 +1,10 @@
-# Shared base config for phased comparison experiments.
+# Shared base config for aggregated (hourly) data experiments.
 # Machine-specific: edit data.data_dir for your machine.
 # Override configs reference this file via `base: base.yaml`.
 
 data:
   mode: csv
-  # Edit this path for your machine:
-  data_dir: "data/_parquet_cache" #"E:/Data/processed_data/hourly_data/_parquet_cache"
+  data_dir: E:/Data/processed_data/hourly_data/_parquet_cache #"data/_parquet_cache" #
   data_files: []
   columns:
     meter_id: meter_number
@@ -16,9 +15,9 @@ data:
   max_value: 200.0
   max_hour_value: 20.0
   splits:
-    train_ratio: 0.8
-    val_ratio: 0.1
-    test_ratio: 0.1
+    train_ratio: 0.9
+    val_ratio: 0.05
+    test_ratio: 0.05
     random_seed: 42
   window:
     aggregated: true
@@ -26,9 +25,9 @@ data:
     stride: 24
   batch_size: 2048
   shuffle: true
-  replay_buffer_capacity: 20000
-  min_buffer_size: 2000
-  num_workers: 2
+  replay_buffer_capacity: 10000
+  min_buffer_size: 3000
+  num_workers: 8
   steps_per_epoch: 500
   eval_batches: 5
   eval_cache_on_gpu: true
@@ -40,16 +39,83 @@ data:
   output_aggregate_stream: false
   in_memory: true
   max_passes: 20
+  holdout_feeder_id: [291556, 887337, 267697, 129571, 921498, 123538, 615734, 144397, 652352, 942339, 47021, 60068, 641430, 667455, 318813, 732417, 164883, 307389, 657188, 893397]   #291556:  n=42   ev=28.6%   hp=31.0%    avg?=9.70    cover?=100.0%
+  topology_path: data/topology/cleaned/Cleaned_SM_Topology_mapping.json       # path to topology JSON; required when holdout_feeder_id is set
 
 normalization:
-  method: null
+  method: log1p
   cache_dir: null
   force_recompute: false
   log1p:
     epsilon: 1.0e-6
 
+model:
+  type: baseline_mean
+  latent_dim: 64
+  encoder:
+    type: dictionary
+    hidden_dims: [256, 512, 1024, 256, 128]
+    dropout: 0.2
+  decoder:
+    type: dictionary
+    hidden_dims: [128, 256, 512, 1024, 256]
+    dropout: 0.2
+  prior:
+    type: learnable_dictionary
+    dictionary_size: 256
+    vamp_num_components: 40
+    init_from_data: true
+    init_noise_scale: 0.01
+  phase_splitter:
+    base_channels: 64
+    temperature: 2.0
+  set:
+    hidden_dim: 256
+    num_heads: 4
+    num_inds: 16
+    num_blocks: 2
+    num_features: 3
+    is_isab: true
+    use_abl_pool: false
+  art:
+    num_bins: 64
+    transformer_num_heads: 8
+    transformer_num_layers: 4
+    d_model: 64
+  diffusion:
+    num_timesteps: 200
+    schedule_type: cosine
+    cosine_s: 0.008
+    max_beta: 0.999
+    beta_start: 1.0e-4
+    beta_end: 0.02
+    time_dim: 128
+    base_channels: 128
+    num_blocks: 16
+    self_attention_heads: 16
+    use_condition_cross_attention: true
+    condition_cross_attention_heads: 16
+    condition_tokens: 16
+    condition_dropout_prob: 0.10
+    reconstruction_noise_fraction: 0.30
+    deterministic_reconstruction: true
+
+  hierarchy:
+    enabled: false
+    levels: [linear, linear, linear]
+    latent_dims: [64, 32, 16]
+    top_down: [false, false, false]
+    bottom_up: [false, false, false]
+    loss_weights: [1.0, 1.0, 1.0]
+    aggregation: concat
+    bidirectional: false
+    residual_connections: false
+    kl_annealing: true
+    kl_warmup_steps: 1000
+    free_bits: 0.1
+
 conditioning:
-  tags: [day_of_week, month_of_year, heatpump_phase, ev, pv] # user_profile, 
+  tags: [day_of_week, month_of_year, user_profile, heatpump_phase, ev, pv]
   user_profile:
     online: false
     n_topics: 40
@@ -81,22 +147,22 @@ training:
     ratio: 0.25
   weighted_loss: 0.2
   early_stopping:
-    enabled: false
-    stop_on_all_files_used: true
+    enabled: true
+    stop_on_all_files_used: false
     min_epochs_before_full_data_stop: 1
     patience: 7
     min_delta: 0.001
   checkpointing:
-    save_freq: 15
-    save_dir: ./models
+    save_freq: 20
+    save_dir: E:/models/new4/
     save_best_model: true
-    save_best_after_fraction: 0.0
+    save_best_after_fraction: 0.00
     save_final_model: true
 
 logging:
-  log_dir: ./models
+  log_dir: E:/models/new4/
   save_config: true
-  config_save_dir: ./models
+  config_save_dir: E:/models/new4/
 
 visualize:
   num_samples: 5

@@ -1,7 +1,7 @@
 [project]
-name = "thesis"
+name = "3phase-synthetic-data"
 version = "0.1.0"
-description = "Add your description here"
+description = "Conditional generative modeling for statistically representative per-phase smart meter time series"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -45,6 +45,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+pythonpath = ["src"]
 testpaths = ["src/test"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
