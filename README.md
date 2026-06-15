@@ -25,8 +25,6 @@ config/tests/      # Per-model experiment configs (base + override YAML pairs)
 slurmjobs/         # SLURM job scripts for DTU HPC cluster
 ```
 
-Domain vocabulary (Window, Meter, LV Feeder, Holdout feeder pool, Conditioner, etc.) is defined in `CONTEXT.md`. Architecture decisions are in `docs/adr/`.
-
 ## Installation
 
 Requires Python 3.11+. Dependencies are managed with [uv](https://github.com/astral-sh/uv).
