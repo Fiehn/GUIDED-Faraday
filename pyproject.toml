@@ -1,0 +1,24 @@
+[project]
+name = "3phase-synthetic-data"
+version = "0.1.0"
+description = "Inference API for 3-phase synthetic smart-meter profiles"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "scikit-learn>=1.3",
+    "scipy>=1.10",
+    "torch>=2.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]

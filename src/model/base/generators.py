@@ -1,0 +1,947 @@
+import torch
+import numpy as np
+from datetime import datetime, timedelta
+import sys
+from pathlib import Path
+# Add project roots for imports
+CURRENT_DIR = Path(__file__).resolve().parent
+SRC_DIR = CURRENT_DIR.parent
+ROOT_DIR = SRC_DIR.parent
+
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+
+class SyntheticGenerator:
+    """Called to generate synthetic samples from a trained model.
+    This class provides methods to generate synthetic data using a trained generative model (like a CVAE).
+    It supports:
+    - Reconstructing input data with optional
+        new conditions, allowing for manipulation of the reconstruction by changing the conditions.
+    - Generating new samples for a single day based on specified conditions (meter ID, date, or pre-built conditions).
+    - Generating continuous multi-day sequences by sampling multiple candidates for each day and selecting the one that best continues from the previous day, ensuring smoother transitions at day boundaries.
+
+    Includes built-in safeguards for log-space generation:
+    - Temperature scaling: Shrink the variance of the generated noise.
+    - Rejection sampling: Automatically discard and re-roll mathematically explosive samples.
+
+    Args:
+        model: A trained generative model (e.g., CVAE) that has a .sample() and .reconstruct() method and optionally: [.conditioner, .encoder, .decoder, .hierarchy].
+        conditioner: Optional Conditioner object to build conditions for generation. If None, it will try to use model.conditioner.
+        normalizer: Optional Normalizer object to inverse-transform generated data back to original scale.
+        device: Device to run generation on ('cpu' or 'cuda').
+
+    Attributes:
+        model: The generative model used for sampling.
+        conditioner: The conditioner used to build conditions for generation.
+        normalizer: The normalizer used to inverse-transform generated data.
+        device: The device on which the model and data are placed for generation.
+        _is_cvae: Boolean flag indicating if the model is a CVAE (i.e., has a conditioner).
+    """
+
+    def __init__(self, model, conditioner=None, normalizer = None, secondary_model = None, device = 'cpu'):
+        self.model = model
+        self.conditioner = conditioner if conditioner is not None else getattr(model, 'conditioner', None)
+        self.normalizer = normalizer
+        self.secondary_model = secondary_model
+        self.device = device
+        self._is_cvae = hasattr(model, 'conditioner') and model.conditioner is not None
+        self._is_diffusion = self._is_diffusion_model()
+        # Post-hoc temperature to correct for under-dispersion in z-space (Jensen bias).
+        # Set via DispersionCalibrator; None means fall back to temperature=1.0.
+        self.calibrated_temperature: float | None = None
+
+        if self._is_baseline_model() and normalizer is not None:
+            if getattr(self.model, 'normalizer', None) is None:
+                self.model.normalizer = normalizer
+
+    def _is_diffusion_model(self) -> bool:
+        return hasattr(self.model, 'noise_scheduler') and hasattr(self.model, 'reconstruct')
+
+    def _is_phase_first_model(self) -> bool:
+        return (
+            hasattr(self.model, '_to_phase_first')
+            and getattr(self.model, 'num_features', None) is not None
+            and getattr(self.model, 'sequence_length', None) is not None
+        )
+
+    def _is_baseline_model(self) -> bool:
+        return hasattr(self.model, 'tag') and 'baseline' in self.model.tag
+
+    def _is_art_model(self) -> bool:
+        """Best-effort capability check for ART-style token decoders."""
+        decoder = getattr(self.model, 'decoder', None)
+        return (
+            hasattr(self.model, 'tokenizer')
+            and decoder is not None
+            and hasattr(decoder, 'token_embedding')
+            and hasattr(decoder, 'sample')
+        )
+
+    def _normalizer_feature_dim(self) -> int | None:
+        """Infer feature dimension expected by the normalizer stats."""
+        if self.normalizer is None:
+            return None
+        stats = getattr(self.normalizer, 'mean', None)
+        if stats is None:
+            return None
+        if isinstance(stats, torch.Tensor):
+            if stats.numel() == 0:
+                return None
+            return int(stats.reshape(-1).shape[0])  # SHAPER: stats -> [num_features] after reshape(-1)
+        if isinstance(stats, np.ndarray):
+            if stats.size == 0:
+                return None
+            return int(stats.reshape(-1).shape[0])  # SHAPER: stats -> [num_features] after reshape(-1)
+        try:
+            return int(np.asarray(stats).reshape(-1).shape[0])  # SHAPER: np.asarray(stats).reshape(-1) -> [num_features]
+        except Exception:
+            return None
+
+    def _apply_normalizer(self, x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+        """Apply (inverse) normalization for 2D or 3D tensors with robust axis handling.
+        SHAPER:
+          x  : [batch_size, seq_len, num_features] | [batch_size, num_features, seq_len] | [batch_size, num_features]
+          -> : same shape as x
+        """
+        if self.normalizer is None:
+            return x
+
+        fn = self.normalizer.inverse_transform if inverse else self.normalizer.transform
+        feature_dim = self._normalizer_feature_dim()
+
+        if x.dim() == 2:
+            return fn(x)
+
+        if x.dim() != 3:
+            raise ValueError(f"Expected 2D or 3D tensor for normalization, got shape {tuple(x.shape)}")
+
+        if feature_dim is not None and x.shape[-1] == feature_dim:
+            return fn(x.reshape(-1, feature_dim)).reshape_as(x)  # SHAPER: x [batch_size, seq_len, num_features] -> reshape(-1, num_features) -> [batch_size * seq_len, num_features] -> fn -> reshape_as(x) -> [batch_size, seq_len, num_features]
+
+        if feature_dim is not None and x.shape[1] == feature_dim:
+            x_last = x.movedim(1, -1)  # SHAPER: [batch_size, num_features, seq_len] -> [batch_size, seq_len, num_features]
+            y_last = fn(x_last.reshape(-1, feature_dim)).reshape_as(x_last)  # SHAPER: x_last.reshape(-1, num_features) -> [batch_size * seq_len, num_features] -> fn -> reshape_as -> [batch_size, seq_len, num_features]
+            return y_last.movedim(-1, 1)  # SHAPER: [batch_size, seq_len, num_features] -> [batch_size, num_features, seq_len]
+
+        # Fallback for unknown feature dim: preserve existing behavior.
+        return fn(x.reshape(-1, x.shape[-1])).reshape_as(x)  # SHAPER: x.reshape(-1, last_dim) -> [batch_size * seq_len, last_dim] -> fn -> reshape_as(x) -> [batch_size, seq_len, last_dim]
+
+    def _apply_normalizer_with(self, x: torch.Tensor, normalizer, inverse: bool = False) -> torch.Tensor:
+        """Apply (inverse) normalization with an explicit normalizer instance.
+        SHAPER:
+          x  : [batch_size, seq_len, num_features] | [batch_size, num_features, seq_len] | [batch_size, num_features]
+          -> : same shape as x
+        """
+        if normalizer is None:
+            return x
+
+        fn = normalizer.inverse_transform if inverse else normalizer.transform
+        feature_dim = None
+        stats = getattr(normalizer, 'mean', None)
+        if stats is not None:
+            try:
+                feature_dim = int(np.asarray(stats).reshape(-1).shape[0])  # SHAPER: stats -> [num_features] after reshape(-1)
+            except Exception:
+                feature_dim = None
+
+        if x.dim() == 2:
+            return fn(x)
+
+        if x.dim() != 3:
+            raise ValueError(f"Expected 2D or 3D tensor for normalization, got shape {tuple(x.shape)}")
+
+        if feature_dim is not None and x.shape[-1] == feature_dim:
+            return fn(x.reshape(-1, feature_dim)).reshape_as(x)  # SHAPER: x [batch_size, seq_len, num_features] -> reshape(-1, num_features) -> [batch_size * seq_len, num_features] -> fn -> reshape_as(x) -> [batch_size, seq_len, num_features]
+
+        if feature_dim is not None and x.shape[1] == feature_dim:
+            x_last = x.movedim(1, -1)  # SHAPER: [batch_size, num_features, seq_len] -> [batch_size, seq_len, num_features]
+            y_last = fn(x_last.reshape(-1, feature_dim)).reshape_as(x_last)  # SHAPER: x_last.reshape(-1, num_features) -> [batch_size * seq_len, num_features] -> fn -> reshape_as -> [batch_size, seq_len, num_features]
+            return y_last.movedim(-1, 1)  # SHAPER: [batch_size, seq_len, num_features] -> [batch_size, num_features, seq_len]
+
+        return fn(x.reshape(-1, x.shape[-1])).reshape_as(x)  # SHAPER: x.reshape(-1, last_dim) -> [batch_size * seq_len, last_dim] -> fn -> reshape_as(x) -> [batch_size, seq_len, last_dim]
+
+    @torch.no_grad()
+    def reconstruct(self, input_data: torch.Tensor,
+                    num_reconstructions: int = 1,
+                    meter_id: int | None = None,
+                    timestamp: datetime | torch.Tensor | None = None,
+                    new_conditions: torch.Tensor | None = None,
+                    encode_conditions: torch.Tensor | None = None,
+                    is_denormalized: bool = False,
+                    temperature: float = 1.0,
+                    use_rejection: bool = False,
+                    max_safe_z: float = 5.0,
+                    max_retries: int = 10) -> torch.Tensor | None:
+        """
+        Reconstruct input data with optional new conditions. If new_conditions is provided,
+        it will be used for the decoding and thus providing a way to manipulate the reconstruction by changing the conditions.
+
+        Args:
+            input_data (torch.Tensor): Tensor of original timeseries data to reconstruct of shape `(batch_size, 24, num_features)`.
+            new_conditions (Optional[torch.Tensor]): Tensor of new conditions to use for reconstruction of shape `(batch_size, num_conditions)`.
+                            If None, original conditions from the model will be used.
+            encode_conditions (Optional[torch.Tensor]): Optional conditions to use for encoding only. If provided and
+                            new_conditions is None, these conditions are also used for decoding.
+            is_denormalized (bool): Whether the input_data is already normalized. If False, it will be normalized using self.normalizer before reconstruction and inverse-transformed back to original scale at the end.
+            temperature (float): Temperature scaling factor for sampling. Values < 1.0 will produce less variance (safer samples), while values > 1.0 will produce more variance.
+            use_rejection (bool): Whether to use rejection sampling to discard and re-roll samples with extreme latent values that could lead to mathematically explosive reconstructions.
+            max_safe_z (float): The maximum absolute value for latent variables (z) considered safe. Samples with any latent dimension exceeding this value will be discarded and re-sampled if use_rejection is True.
+            max_retries (int): Maximum number of retries for rejection sampling before giving up and returning the best attempt.
+        Returns:
+            Reconstructed data tensor of shape `(num_reconstructions, batch_size, 24, num_features)` in original scale.
+
+        SHAPER:
+          input_data        : [batch_size, seq_len, num_features]
+          new_conditions    : [batch_size, num_conditions]
+          encode_conditions : [batch_size, num_conditions]
+          ->                : [num_reconstructions, batch_size, seq_len * num_features]
+        """
+        self.model.eval()
+        self.model.to(self.device)
+
+        # Robustly determine the model's dtype, handling models without parameters (like baselines)
+        try:
+            model_dtype = next(self.model.parameters()).dtype
+        except StopIteration:
+            try:
+                model_dtype = next(self.model.buffers()).dtype
+            except StopIteration:
+                model_dtype = torch.float32
+
+        input_data = input_data.to(self.device, dtype=model_dtype)  # SHAPER: [batch_size, seq_len, num_features]
+
+        phased_input_data = None
+        if self.secondary_model is not None:
+            # Phase-splitter runs consume real 3-phase input. If that input is still
+            # normalized in the secondary model's feature space, bring it back to
+            # real units first so we can aggregate phases correctly.
+            phased_input_data = input_data  # SHAPER: [batch_size, seq_len, num_phases]
+            sec_normalizer = getattr(self.secondary_model, 'normalizer', None)
+            if sec_normalizer is not None and not is_denormalized:
+                phased_input_data = self._apply_normalizer_with(phased_input_data, sec_normalizer, inverse=True)  # SHAPER: [batch_size, seq_len, num_phases]
+
+            # Aggregate across phases before the primary model's normalizer is applied.
+            if phased_input_data.dim() == 3:
+                if phased_input_data.shape[-1] == 3:
+                    input_data = phased_input_data.sum(dim=-1, keepdim=True)  # SHAPER: [batch_size, seq_len, num_phases] -> [batch_size, seq_len, 1]
+                elif phased_input_data.shape[1] == 3:
+                    input_data = phased_input_data.sum(dim=1, keepdim=True).transpose(1, 2)  # SHAPER: [batch_size, num_phases, seq_len] -> sum -> [batch_size, 1, seq_len] -> transpose -> [batch_size, seq_len, 1]
+                elif phased_input_data.shape[1] == 1:
+                    # Already aggregated to single phase [batch, 1, seq_len] → transpose to time-major
+                    input_data = phased_input_data.transpose(1, 2)  # SHAPER: [batch_size, 1, seq_len] -> [batch_size, seq_len, 1]
+                elif phased_input_data.shape[-1] == 1:
+                    input_data = phased_input_data  # SHAPER: already [batch_size, seq_len, 1]
+                else:
+                    input_data = phased_input_data.sum(dim=-1, keepdim=True)  # SHAPER: [batch_size, seq_len, num_phases] -> [batch_size, seq_len, 1]
+            else:
+                input_data = phased_input_data
+
+        if self.normalizer is not None and not is_denormalized:
+            input_data = self._apply_normalizer(input_data, inverse=False)
+            # Normalizers may return float64 tensors; align with model dtype for linear layers.
+            input_data = input_data.to(self.device, dtype=model_dtype)  # SHAPER: [batch_size, seq_len, num_features]
+
+        # Get conditions
+        conditions = None
+        if self._is_cvae and self.conditioner is not None:
+            cond_input = self.model._build_condition_input(self.model._to_phase_first(input_data))
+            conditions = self.conditioner.get_conditions(cond_input, meter_id, timestamp).to(self.device, dtype=model_dtype)  # SHAPER: [batch_size, num_conditions]
+            enc_conditions = conditions  # SHAPER: [batch_size, num_conditions]
+            if encode_conditions is not None:
+                enc_conditions = encode_conditions.to(self.device, dtype=model_dtype)  # SHAPER: [batch_size, num_conditions]
+                if new_conditions is None:
+                    conditions = enc_conditions  # SHAPER: [batch_size, num_conditions]
+        elif encode_conditions is not None or new_conditions is not None:
+            # If conditions are provided but conditioner is None, use them directly
+            if new_conditions is not None:
+                conditions = new_conditions.to(self.device, dtype=model_dtype)  # SHAPER: [batch_size, num_conditions]
+            elif encode_conditions is not None:
+                conditions = encode_conditions.to(self.device, dtype=model_dtype)  # SHAPER: [batch_size, num_conditions]
+
+        is_sequential_phase_vae = self.model.__class__.__name__ == 'SequentialPhaseVAE'
+        is_guided_faraday = self.model.__class__.__name__ == 'GuidedFaradayModel'
+
+        if self._is_baseline_model():
+            flat_output = self.model.reconstruct(input_data, meter_ids=meter_id, timestamps=timestamp)  # SHAPER: [batch_size, seq_len * num_features]
+        elif self._is_diffusion:
+            flat_output = self.model.reconstruct(
+                input_data,
+                meter_id=meter_id,
+                timestamps=timestamp,
+                c=new_conditions,
+                num_reconstructions=num_reconstructions,
+                temperature=temperature,
+                device=self.device,
+            )
+            if flat_output is None:
+                return None
+            if flat_output.dim() == 2:
+                flat_output = flat_output.unsqueeze(0)  # SHAPER: [batch_size, seq_len * num_features] -> [1, batch_size, seq_len * num_features]
+            if flat_output.dim() != 3:
+                raise ValueError(f"Unexpected diffusion reconstruction shape: {tuple(flat_output.shape)}")
+        elif is_sequential_phase_vae:
+            # For SequentialPhaseVAE, use its custom reconstruct method that handles phase concatenation
+            # Convert meter_id and timestamp to tensors if needed
+            B = input_data.shape[0]
+            if meter_id is not None and not isinstance(meter_id, torch.Tensor):
+                meter_ids_tensor = torch.full((B,), meter_id, dtype=torch.long, device=self.device)  # SHAPER: [batch_size]
+            else:
+                meter_ids_tensor = meter_id if isinstance(meter_id, torch.Tensor) else torch.zeros(B, dtype=torch.long, device=self.device)  # SHAPER: [batch_size]
+
+            if timestamp is not None and isinstance(timestamp, torch.Tensor):
+                timestamps_tensor = timestamp  # SHAPER: [batch_size]
+            elif timestamp is not None:
+                # For datetime or other types, create a dummy tensor
+                timestamps_tensor = torch.zeros(B, dtype=torch.long, device=self.device)  # SHAPER: [batch_size]
+            else:
+                timestamps_tensor = torch.zeros(B, dtype=torch.long, device=self.device)  # SHAPER: [batch_size]
+
+            phased_recon = self.model.reconstruct(input_data, meter_ids_tensor, timestamps_tensor)
+            # Shape: [B, 3, 24] or [B, 24, 3] depending on phase_first. Flatten to [B, 72]
+            flat_recon = phased_recon.reshape(phased_recon.shape[0], -1)  # SHAPER: [batch_size, num_phases, seq_len] | [batch_size, seq_len, num_phases] -> [batch_size, num_phases * seq_len]
+            # Add reconstruction count dimension to get [1, B, 72]
+            flat_output = flat_recon.unsqueeze(0)  # SHAPER: [batch_size, num_phases * seq_len] -> [1, batch_size, num_phases * seq_len]
+        elif is_guided_faraday:
+            # GuidedFaradayModel encoder takes (x_flat, c) separately — cannot use the CVAE path
+            # which passes a single concatenated tensor.
+            x_flat = self.model._prep_inputs(input_data.to(self.device))
+            c = self.model._get_conditions(
+                input_data, meter_id=meter_id, timestamps=timestamp, device=self.device
+            )
+            mu, _ = self.model.encoder(x_flat, self.model._enc_conditions(c))
+            recon_params = self.model.decoder(torch.cat([mu, c], dim=-1))  # {"mu": [B,D], "sigma": [B,D]}
+        # Conditions for the encoding are always based on the original meter_id and timestamp, to get the correct latent representation.
+        elif self._is_cvae:
+            # Ensure input_data is flattened appropriately
+            if hasattr(self.model, '_set_encode'):
+                x_enc = self.model._set_encode(self.model._to_phase_first(input_data))
+                enc_in = torch.cat([x_enc, enc_conditions], dim=-1)  # SHAPER: [batch_size, set_enc_dim + num_conditions]
+            else:
+                input_data_flat = input_data.reshape(input_data.shape[0], -1).to(self.device)  # SHAPER: [batch_size, seq_len, num_features] -> [batch_size, seq_len * num_features]
+                enc_in = torch.cat([input_data_flat, enc_conditions], dim=-1)  # SHAPER: [batch_size, seq_len * num_features + num_conditions]
+
+            q_params = self.model.encoder(enc_in) # dict of [B, latent_dim] params  # SHAPER: dict of [batch_size, latent_dim]
+
+            # Sample latent variables using reparameterization trick - sample z: [S, B, latent_dim]
+            z = self.model.encoder.reparameterize(q_params, num_samples=1)  # SHAPER: [num_samples=1, batch_size, latent_dim]
+
+            hierarchy_results = None
+            if self.model.hierarchy is not None:
+                S, B, D = z.shape  # 1, batch_size, latent_dim
+                z_flat = z.reshape(S * B, D)  # SHAPER: [1, batch_size, latent_dim] -> [batch_size, latent_dim]
+                hierarchy_results = self.model.hierarchy.forward(z_flat)
+                z_for_decoder = hierarchy_results["z"].reshape(S, B, -1)  # SHAPER: [batch_size, latent_dim_hier] -> [1, batch_size, latent_dim_hier]
+            else:
+                z_for_decoder = z  # SHAPER: [1, batch_size, latent_dim]
+            self._last_hierarchy_results = hierarchy_results
+
+            # Add new conditions in the decoder!
+            if new_conditions is not None:
+                conditions = new_conditions.to(self.device, dtype=model_dtype)  # SHAPER: [batch_size, num_conditions]
+
+            c_expanded = conditions.unsqueeze(0).expand(1, -1, -1)  # SHAPER: [batch_size, num_conditions] -> unsqueeze(0) -> [1, batch_size, num_conditions]
+
+            if self._is_art_model():
+                # ART decoder requires (z, c) and samples tokens autoregressively.
+                S, B, D_z = z_for_decoder.shape  # 1, batch_size, latent_dim
+                D_c = c_expanded.shape[-1]  # num_conditions
+                z_flat = z_for_decoder.reshape(S * B, D_z)  # SHAPER: [1, batch_size, latent_dim] -> [batch_size, latent_dim]
+                c_flat = c_expanded.reshape(S * B, D_c)  # SHAPER: [1, batch_size, num_conditions] -> [batch_size, num_conditions]
+
+                art_samples = []
+                for _ in range(max(1, int(num_reconstructions))):
+                    sampled_tokens = self.model.decoder.sample(z_flat, c_flat, temperature=temperature)
+                    sampled_tokens = sampled_tokens.reshape(S, B, -1)  # SHAPER: [batch_size, token_seq_len] -> [1, batch_size, token_seq_len]
+                    art_samples.append(self.model.tokenizer.decode(sampled_tokens))
+
+                flat_output = torch.cat(art_samples, dim=0)  # SHAPER: list of [1, batch_size, decoded_dim] -> [num_reconstructions, batch_size, decoded_dim]
+            else:
+                dec_in = torch.cat([z_for_decoder, c_expanded], dim=-1)  # SHAPER: [1, batch_size, latent_dim + num_conditions]
+                S, B, DC = dec_in.shape  # 1, batch_size, latent_dim + num_conditions
+                dec_in_flat = dec_in.reshape(S * B, DC)  # SHAPER: [1, batch_size, latent_dim + num_conditions] -> [batch_size, latent_dim + num_conditions]
+
+                # Decode latent samples to get reconstruction parameters
+                recon_params = self.model.decoder(dec_in_flat)   # dict of [S*B, D]  # SHAPER: dict of [batch_size, decoded_dim]
+
+                # reshape recon params back to [S, B, D]
+                for k in recon_params:
+                    recon_params[k] = recon_params[k].reshape(S, B, -1)  # SHAPER: [batch_size, decoded_dim] -> [1, batch_size, decoded_dim]
+
+        else:
+            recon_params, _ = self.model.reconstruct(input_data)
+
+        # Skip recon_params processing if we already have flat_output from diffusion/baseline/phased models
+        if (not self._is_diffusion) and (not self._is_baseline_model()) and (not is_sequential_phase_vae) and not (self._is_cvae and meter_id is not None and timestamp is not None and self._is_art_model()):
+            # Normalize decoder param tensors to [S, B, D] to avoid accidental shape expansion.
+            # Some model.reconstruct() implementations return [B, D] instead of [S, B, D].
+            for k, v in recon_params.items():
+                if v.dim() == 2:
+                    recon_params[k] = v.unsqueeze(0)  # SHAPER: [batch_size, decoded_dim] -> [1, batch_size, decoded_dim]
+                elif v.dim() != 3:
+                    raise ValueError(f"Unexpected decoder param shape for '{k}': {tuple(v.shape)}")
+
+            # recon_params has shape [S, B, D]. We decode each sample s to get [num_reconstructions, B, D]
+            S_dim = recon_params['mu'].shape[0]
+            xs_all = []
+            for s in range(S_dim):
+                params_s = {k: v[s] for k, v in recon_params.items()}  # SHAPER: dict of [batch_size, decoded_dim]
+
+                # --- Rejection Sampling Loop for Reconstruction ---
+                valid_samples = []
+                needed = num_reconstructions
+
+                for attempt in range(max_retries):
+                    xs = self.model.decoder.sample(params_s, num_samples=needed, temperature=temperature)  # SHAPER: [num_reconstructions, batch_size, decoded_dim]
+
+                    if not use_rejection:
+                        valid_samples.append(xs)
+                        needed = 0
+                        break
+
+                    # Check safe maximums across the [needed, B, D] tensor
+                    max_vals = xs.abs().amax(dim=-1) # [needed, B]  # SHAPER: [num_reconstructions, batch_size, decoded_dim] -> [num_reconstructions, batch_size]
+                    good_mask = (max_vals < max_safe_z).all(dim=-1) # Only keep if entire batch is safe  # SHAPER: [num_reconstructions, batch_size] -> [num_reconstructions]
+
+                    good_xs = xs[good_mask]  # SHAPER: [num_good, batch_size, decoded_dim]
+                    if len(good_xs) > 0:
+                        valid_samples.append(good_xs)
+                        needed -= len(good_xs)
+
+                    if needed <= 0:
+                        break
+
+                if needed > 0:
+                    print(f"Warning: Rejection sampling failed to find safe reconstructions. Injecting {needed} flatline means.")
+                    fallback = self.model.decoder.sample(params_s, num_samples=needed, temperature=0.0)  # SHAPER: [needed, batch_size, decoded_dim]
+                    valid_samples.append(fallback)
+
+                xs_all.append(torch.cat(valid_samples, dim=0)[:num_reconstructions])  # SHAPER: cat -> [num_reconstructions, batch_size, decoded_dim]
+            flat_output = torch.cat(xs_all, dim=0)  # SHAPER: list cat -> [num_latent_samples * num_reconstructions, batch_size, decoded_dim]
+
+        N, B, D = flat_output.shape  # num_reconstructions, batch_size, seq_len * num_features
+        flat_output = flat_output.reshape(N * B, D)  # SHAPER: [num_reconstructions, batch_size, seq_len * num_features] -> [num_reconstructions * batch_size, seq_len * num_features]
+
+        # 1. Un-flatten properly based on Phase-First vs Time-First
+        L = getattr(self.model, 'sequence_length', 24)
+        F = D // L
+        is_phase_first = getattr(self.model, 'num_features', None) is not None
+
+        if is_phase_first:
+            output = flat_output.reshape(-1, F, L).transpose(1, 2)  # SHAPER: [num_reconstructions * batch_size, seq_len * num_features] -> reshape -> [num_reconstructions * batch_size, num_features, seq_len] -> transpose -> [num_reconstructions * batch_size, seq_len, num_features]
+        else:
+            output = flat_output.reshape(-1, L, F)  # SHAPER: [num_reconstructions * batch_size, seq_len * num_features] -> [num_reconstructions * batch_size, seq_len, num_features]
+
+        skip_primary_inverse = False
+        if self.secondary_model is not None:
+            # Denormalise primary output to real units before the splitter sees it.
+            # The splitter is trained on real-unit aggregates and returns real-unit phases.
+            # It builds its own conditions from x_phased_real + meter_id/timestamp.
+            if self.normalizer is not None and not is_denormalized:
+                output = self._apply_normalizer(output, inverse=True)  # SHAPER: [num_reconstructions * batch_size, seq_len, num_features]
+            # Only pass x_phased_real if it contains actual multi-phase data (3 phases).
+            # When the loader already aggregated to 1 phase, the phase information is lost;
+            # fall back to metadata-only conditioning in the splitter.
+            _n_input_phases = (
+                phased_input_data.shape[1]
+                if phased_input_data is not None and phased_input_data.dim() == 3
+                else 0
+            )
+            output = self.secondary_model.reconstruct(
+                x_agg_generated=output,
+                conditions=conditions,
+                normalizer=None,
+                x_phased_real=phased_input_data if _n_input_phases == 3 else None,
+                meter_id=meter_id,
+                timestamp=timestamp,
+            )
+            # Secondary model returns [N*B, F_split, L]. Transpose to [N*B, L, F_split].
+            output = output.transpose(1, 2)  # SHAPER: [num_reconstructions * batch_size, num_phases, seq_len] -> [num_reconstructions * batch_size, seq_len, num_phases]
+            skip_primary_inverse = True
+
+        # 2. Apply inverse transform so it's in actual kWh, not Z-scores
+        if self.normalizer is not None and not is_denormalized and not self._is_art_model() and not skip_primary_inverse:
+            output = self._apply_normalizer(output, inverse=True)  # SHAPER: [num_reconstructions * batch_size, seq_len, num_features]
+
+        # Return as
+        return output.reshape(N, B, -1)  # SHAPER: [num_reconstructions * batch_size, seq_len, num_features] -> [num_reconstructions, batch_size, seq_len * num_features]
+
+    @torch.no_grad()
+    def generate(
+        self,
+        num_samples: int,
+        meter_id: int | None = None,
+        date: datetime | torch.Tensor | None = None,
+        conditions: torch.Tensor | None = None,
+        temperature: float | None = None,
+        use_rejection: bool = False,
+        max_safe_z: float = 4.5,
+        max_retries: int = 10,
+        meter_ids: "np.ndarray | torch.Tensor | None" = None,
+        timestamps: "np.ndarray | torch.Tensor | None" = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """
+        Generate samples from the model for a single day with given conditions.
+
+        Args:
+            num_samples (int): Number of samples to generate.
+            meter_id (int | None): Meter ID for user-profile conditioning.
+            date (datetime | torch.Tensor | None): Date for time-based conditioning.
+            conditions (torch.Tensor | None): Pre-built conditioning tensor `(batch_size, num_conditions)`.
+                If provided, it will be used directly for generation. If None, conditions will be built using meter_id and date.
+            temperature (float): Temperature scaling factor for sampling. Values < 1.0 will produce less variance (safer samples), while values > 1.0 will produce more variance.
+            use_rejection (bool): Whether to use rejection sampling to discard and re-roll samples with extreme latent values that could lead to mathematically explosive generations.
+            max_safe_z (float): The maximum absolute value for latent variables (z) considered safe. Samples with any latent dimension exceeding this value will be discarded and re-sampled if use_rejection is True.
+            max_retries (int): Maximum number of retries for rejection sampling before giving up and returning the best attempt.
+
+        Returns:
+            (torch.Tensor | None, torch.Tensor | None): Tuple of (generated_samples, used_conditions).
+            - generated_samples: Tensor of shape `(num_samples, 24, num_features)` in original scale.
+            - used_conditions: The conditions tensor that was used for generation, of shape `(num_samples, num_conditions)`.
+
+        SHAPER:
+          conditions : [batch_size, num_conditions] (optional; built internally if None)
+          ->         : ([num_samples, seq_len, num_features], [num_samples, num_conditions])
+        """
+        if temperature is None:
+            temperature = self.calibrated_temperature if self.calibrated_temperature is not None else 1.0
+
+        self.model.eval()
+        self.model.to(self.device)
+
+        valid_samples = []
+        needed = num_samples
+
+        if self._is_baseline_model() and not self._is_cvae:
+            samples = self.model.sample(num_samples=num_samples, conditions=conditions)
+            # Baseline returns [N, 1, 1, D], already correctly laid out (F-first if phased)
+            final_samples = samples.reshape(num_samples, -1)  # SHAPER: [num_samples, 1, 1, seq_len * num_features] -> [num_samples, seq_len * num_features]
+            valid_samples.append(final_samples)
+            needed = 0
+        elif self._is_art_model():
+            # ART tokens are already bounded in output space; latent rejection on x-scale is not meaningful.
+            use_rejection = False
+
+        if conditions is None:
+            random_cond = (date is None)
+            if isinstance(date, (int, float)):
+                date = datetime.fromtimestamp(date)
+            conditions = self._build_conditions(meter_id=meter_id, timestamp=date, random_condition=random_cond)  # SHAPER: [1, num_conditions]
+
+        if conditions is not None:
+            conditions = conditions.to(self.device)  # SHAPER: [batch_size, num_conditions]
+            # Ensure we have exactly one condition row per requested sample.
+            if conditions.shape[0] < num_samples:
+                repeats = (num_samples // conditions.shape[0]) + 1
+                conditions = conditions.repeat(repeats, 1)  # SHAPER: [batch_size * repeats, num_conditions]
+            conditions = conditions[:num_samples]  # SHAPER: [num_samples, num_conditions]
+
+        # Align per-sample metadata for the secondary model (e.g. HierarchicalSplitter
+        # needs its own meter_id/timestamps to build its own conditions).
+        _sec_meter_ids  = None
+        _sec_timestamps = None
+        if meter_ids is not None:
+            arr = np.asarray(meter_ids)
+            if len(arr) < num_samples:
+                arr = np.tile(arr, (num_samples // len(arr)) + 1)
+            _sec_meter_ids = torch.tensor(arr[:num_samples], dtype=torch.long)
+        if timestamps is not None:
+            arr = np.asarray(timestamps)
+            if len(arr) < num_samples:
+                arr = np.tile(arr, (num_samples // len(arr)) + 1)
+            _sec_timestamps = torch.tensor(arr[:num_samples], dtype=torch.long)
+
+
+        # --- Batched Rejection Sampling ---
+        for attempt in range(max_retries):
+            if self._is_cvae:
+                # One prior sample per condition row to avoid quadratic SxB expansion.
+                cond_batch = conditions[:needed] if conditions is not None else None  # SHAPER: [needed, num_conditions]
+                samples = self.model.sample(
+                    conditions=cond_batch,
+                    num_prior_samples=1,
+                    num_x_samples=1,
+                    device=self.device,
+                    temperature=temperature
+                )
+                # [1, 1, B, D] -> [B, D]
+                samples = samples.squeeze(0).squeeze(0)  # SHAPER: [1, 1, needed, decoded_dim] -> squeeze(0) -> [1, needed, decoded_dim] -> squeeze(0) -> [needed, decoded_dim]
+            else:
+                samples = self.model.sample(num_samples_prior=needed, num_samples_posterior=1, device=self.device, temperature=temperature)
+                if isinstance(samples, dict) and "samples" in samples:
+                    samples = samples["samples"]
+                # Collapse any extra sample dims into batch dim, keep last dim as feature dim.
+                samples = samples.reshape(-1, samples.shape[-1])  # SHAPER: [*, decoded_dim] -> [needed, decoded_dim]
+
+            if not use_rejection:
+                valid_samples.append(samples)
+                needed = 0
+                break
+
+            # samples shape: [N, D]
+            flat_samples = samples.reshape(samples.shape[0], -1)  # SHAPER: [needed, decoded_dim] (no-op if already 2D)
+            max_vals, _ = flat_samples.abs().max(dim=-1)  # SHAPER: [needed, decoded_dim] -> [needed]
+
+            good_mask = max_vals < max_safe_z  # SHAPER: [needed]
+            good_samples = samples[good_mask]  # SHAPER: [num_good, decoded_dim]
+
+            if len(good_samples) > 0:
+                valid_samples.append(good_samples)
+                needed -= len(good_samples)
+
+            if needed <= 0:
+                break
+
+        if needed > 0:
+            print(f"Warning: Rejection sampling yielded {needed} flatline means to avoid explosions.")
+            if self._is_cvae:
+                fallback = self.model.sample(
+                    conditions=conditions[:needed],
+                    num_prior_samples=1,
+                    num_x_samples=1,
+                    device=self.device,
+                    temperature=0.0,
+                ).squeeze(0).squeeze(0)  # SHAPER: [1, 1, needed, decoded_dim] -> squeeze -> squeeze -> [needed, decoded_dim]
+            else:
+                fallback = self.model.sample(num_samples_prior=needed, num_samples_posterior=1, device=self.device, temperature=0.0)
+                if isinstance(fallback, dict) and "samples" in fallback:
+                    fallback = fallback["samples"]
+                fallback = fallback.reshape(-1, fallback.shape[-1])  # SHAPER: [*, decoded_dim] -> [needed, decoded_dim]
+            valid_samples.append(fallback)
+
+        final_samples = torch.cat(valid_samples, dim=0)[:num_samples]  # SHAPER: list cat -> [total_valid, decoded_dim] -> slice -> [num_samples, decoded_dim]
+        N, D = final_samples.shape
+        flat = final_samples  # SHAPER: [num_samples, seq_len * num_features]
+
+        L = getattr(self.model, 'sequence_length', 24)
+        F = D // L
+
+        # Mirror reconstruct(): models with num_features output D in phase-first order [F*L],
+        # so reshape as [N, F, L] and transpose to get [N, L, F] for the normalizer.
+        is_phase_first = getattr(self.model, 'num_features', None) is not None
+        if is_phase_first:
+            output = flat.reshape(N, F, L).transpose(1, 2)  # SHAPER: [num_samples, seq_len * num_features] -> reshape -> [num_samples, num_features, seq_len] -> transpose -> [num_samples, seq_len, num_features]
+        else:
+            output = flat.reshape(N, L, F)  # SHAPER: [num_samples, seq_len * num_features] -> [num_samples, seq_len, num_features]
+
+        skip_primary_inverse = False
+        if self.secondary_model is not None:
+            # Denormalise primary output to real units before the splitter sees it.
+            # The splitter builds its own conditions from meter_id/timestamp.
+            if self.normalizer is not None:
+                output = self._apply_normalizer(output, inverse=True)  # SHAPER: [num_samples, seq_len, num_features]
+            split_cond = conditions
+            output = self.secondary_model.sample(
+                x_agg_generated=output,
+                conditions=conditions,
+                normalizer=None,
+                # Prefer batched metadata from the eval framework; fall back to
+                # the single meter_id / date used for primary-model conditioning.
+                meter_id=_sec_meter_ids if _sec_meter_ids is not None else meter_id,
+                timestamp=_sec_timestamps if _sec_timestamps is not None else date,
+            )
+            # Output is [N, F_split, L]. Transpose to [N, L, F_split].
+            output = output.transpose(1, 2)  # SHAPER: [num_samples, num_phases, seq_len] -> [num_samples, seq_len, num_phases]
+            F = output.shape[-1]
+            conditions = split_cond
+            skip_primary_inverse = True
+
+        if self.normalizer is not None and not self._is_art_model() and not skip_primary_inverse:
+            output = self._apply_normalizer(output, inverse=True)  # SHAPER: [num_samples, seq_len, num_features]
+
+        # If conditions had a batch size > 1 and S > 1, the returned shape is (S * B, L, F).
+        # To remain compatible with callers expecting (num_samples, L, F),
+        # if B == 1, we just return (S, L, F).
+        # If B > 1 and S == 1, it's (B, L, F).
+        # We let the callers handle the S * B size.
+        return output, conditions  # SHAPER: ([num_samples, seq_len, num_features], [num_samples, num_conditions])
+
+    @torch.no_grad()
+    def generate_continuous(
+        self,
+        num_days: int,
+        meter_id: int,
+        start_date: datetime,
+        num_candidates: int = 32,
+        continuity_weight: float = 1.0,
+        conditions = None,
+        temperature: float | None = None,
+        use_rejection: bool = False,
+        max_safe_z: float = 4.5
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Samples continuous multi-day sequences by sampling multiple candidates for each day and selecting the one that best continues from the previous day, ensuring smoother transitions at day boundaries.
+
+        Args:
+            num_days (int): Number of consecutive days to generate.
+            meter_id (int): Meter ID for user-profile conditioning.
+            start_date (datetime): Starting date for generation.
+            num_candidates (int): Number of candidate windows to sample for each day after the first, to select the best continuation.
+            continuity_weight (float): Weighting factor for the continuity score when selecting the best candidate. Higher values prioritize smoother transitions more strongly.
+            conditions (torch.Tensor | None): Optional pre-built conditions tensor to use for all days. If None, conditions will be built for each day using meter_id and date.
+            temperature (float): Temperature scaling factor for sampling. Values < 1.0 will produce less variance (safer samples), while values > 1.0 will produce more variance.
+            use_rejection (bool): Whether to use rejection sampling to discard and re-roll samples with extreme latent values that could lead to mathematically explosive generations.
+            max_safe_z (float): The maximum absolute value for latent variables (z) considered safe. Samples with any latent dimension exceeding this value will be discarded and re-sampled if use_rejection is True.
+
+        Returns:
+            (torch.Tensor | None, torch.Tensor | None): Tuple of (generated_samples, used_conditions).
+            - generated_samples: Tensor of shape `(num_days * 24, num_features)` in original scale.
+            - used_conditions: The conditions tensor that was used for generation, of shape `(num_days * 24, num_conditions)`.
+
+        SHAPER:
+          conditions : [1, num_conditions] (optional per-day; built internally if None)
+          ->         : ([num_days * seq_len, num_features], [num_days, num_conditions])
+        """
+        if temperature is None:
+            temperature = self.calibrated_temperature if self.calibrated_temperature is not None else 1.0
+
+        self.model.eval()
+        self.model.to(self.device)
+
+        all_windows = []
+        prev_window = None
+        used_conds = []
+        base_conditions = None
+
+        for day_idx in range(num_days):
+            day_start = start_date + timedelta(days=day_idx)
+            current_conditions = self._build_conditions(meter_id=meter_id, timestamp=day_start) if conditions is None else conditions  # SHAPER: [1, num_conditions]
+
+            if day_idx == 0:
+                base_conditions = current_conditions  # SHAPER: [1, num_conditions]
+
+            # Keep non-temporal conditions stable across all days
+            if self.conditioner is not None and base_conditions is not None and conditions is None:
+                stable_conditions = base_conditions.clone()  # SHAPER: [1, num_conditions]
+                temporal_tags = ["days", "day_of_week", "months", "month_of_year", "holidays"]
+                for tag in temporal_tags:
+                    if tag in self.conditioner.get_condition_tags():
+                        start, end = self.conditioner.get_condition_indexes(tag)
+                        stable_conditions[:, start:end] = current_conditions[:, start:end]  # SHAPER: [1, num_conditions] (partial in-place update)
+                current_conditions = stable_conditions  # SHAPER: [1, num_conditions]
+
+            used_conds.append(current_conditions)
+
+            if prev_window is None or num_candidates <= 1:
+                # Use generate() to get a single safe window
+                window, _ = self.generate(
+                    num_samples=1,
+                    conditions=current_conditions,
+                    temperature=temperature,
+                    use_rejection=use_rejection,
+                    max_safe_z=max_safe_z
+                )
+                window = window.squeeze(0) # Remove batch dim  # SHAPER: [1, seq_len, num_features] -> [seq_len, num_features]
+
+                # Inverse transform is handled inside generate, so we undo it here
+                # so the continuity tracker scores normalized data.
+                if self.normalizer is not None:
+                    window = self.normalizer.transform(window)  # SHAPER: [seq_len, num_features] (rank unchanged)
+            else:
+                window = self._select_best_continuation(
+                    conditions=current_conditions,
+                    prev_window=prev_window,
+                    continuity_weight=continuity_weight,
+                    num_candidates=num_candidates,
+                    temperature=temperature,
+                    use_rejection=use_rejection,
+                    max_safe_z=max_safe_z
+                )  # SHAPER: [seq_len, num_features]
+
+            all_windows.append(window.cpu())  # SHAPER: [seq_len, num_features]
+            prev_window = window  # SHAPER: [seq_len, num_features]
+
+        output = torch.cat(all_windows, dim=0)  # SHAPER: list of [seq_len, num_features] -> [num_days * seq_len, num_features]
+        if self.normalizer is not None:
+            output = self.normalizer.inverse_transform(output)  # SHAPER: [num_days * seq_len, num_features] (rank unchanged)
+
+        all_used_conditions = torch.cat(used_conds, dim=0) if used_conds else None  # SHAPER: list of [1, num_conditions] -> [num_days, num_conditions]
+
+        return output, all_used_conditions  # SHAPER: ([num_days * seq_len, num_features], [num_days, num_conditions])
+
+    def _sample_window(self, conditions: torch.Tensor) -> torch.Tensor:
+        """
+        SHAPER:
+          conditions : [1, num_conditions]
+          ->         : [seq_len, num_features]
+        """
+        samples = self.model.sample(
+            conditions=conditions,
+            num_prior_samples=1,
+            num_x_samples=1,
+            device=self.device,
+        )
+        flat = samples.reshape(-1)  # SHAPER: [1, 1, 1, seq_len * num_features] -> [seq_len * num_features]
+        L = getattr(self.model, 'sequence_length', 24)
+        F = flat.shape[0] // L
+
+        # Safely un-flatten Phase-First data
+        is_phase_first = self._is_phase_first_model()
+
+        if is_phase_first:
+            return flat.reshape(F, L).T  # SHAPER: [seq_len * num_features] -> reshape -> [num_features, seq_len] -> T -> [seq_len, num_features]
+        else:
+            return flat.reshape(L, F)  # SHAPER: [seq_len * num_features] -> [seq_len, num_features]
+
+    def _select_best_continuation(
+            self,
+            conditions: torch.Tensor,
+            prev_window: torch.Tensor,
+            num_candidates: int,
+            continuity_weight: float,
+            temperature: float = 1.0,
+            use_rejection: bool = False,
+            max_safe_z: float = 4.5
+        ) -> torch.Tensor:
+        """
+        Sample 'num_candidates' windows and return the one that
+        connects most smoothly to 'prev_window' at the midnight boundary.
+
+        Scores by matching:
+        - prev hour 23 candidate hour 0 (level continuity)
+        - prev hour 22-23 slope vs candidate hour 0-1 slope (trend continuity)
+
+        Args:
+            conditions (torch.Tensor): Conditions to use for sampling candidates, shape `(1, num_conditions)`.
+            prev_window (torch.Tensor): The previous day's window, shape `(24, num_features)`.
+            num_candidates (int): Number of candidate windows to sample.
+            continuity_weight (float): Weighting factor for the continuity score. Higher values prioritize smoother transitions more strongly.
+            temperature (float): Temperature scaling factor for sampling. Values < 1.0 will produce less variance (safer samples), while values > 1.0 will produce more variance.
+            use_rejection (bool): Whether to use rejection sampling to discard and re-roll samples with extreme latent values that could lead to mathematically explosive generations.
+            max_safe_z (float): The maximum absolute value for latent variables (z) considered safe. Samples with any latent dimension exceeding this value will be discarded and re-sampled if use_rejection is True.
+
+        Returns:
+            torch.Tensor: The selected window that best continues from the previous day, shape `(24, num_features)`.
+
+        SHAPER:
+          conditions  : [1, num_conditions]
+          prev_window : [seq_len, num_features]
+          ->          : [seq_len, num_features]
+        """
+        samples = self.model.sample(
+            conditions = conditions,
+            num_prior_samples = num_candidates,
+            num_x_samples = 1,
+            device = self.device,
+            temperature = temperature
+        )
+
+        candidates = samples.reshape(num_candidates, -1)  # SHAPER: [1, num_candidates, 1, seq_len * num_features] -> [num_candidates, seq_len * num_features]
+        L = getattr(self.model, 'sequence_length', 24)
+        F = candidates.shape[-1] // L
+
+        # Pre-filter dangerous candidates before scoring
+        if use_rejection and not self._is_art_model():
+            max_vals, _ = candidates.abs().max(dim=-1)  # SHAPER: [num_candidates, seq_len * num_features] -> [num_candidates]
+            good_mask = max_vals < max_safe_z  # SHAPER: [num_candidates]
+            if good_mask.any():
+                candidates = candidates[good_mask]  # SHAPER: [num_valid, seq_len * num_features]
+            else:
+                print("Warning: All continuation candidates were explosive. Generating flatline mean.")
+                safe_sample = self.model.sample(conditions=conditions, num_prior_samples=1, num_x_samples=1, device=self.device, temperature=0.0)
+                candidates = safe_sample.reshape(1, -1)  # SHAPER: [*, seq_len * num_features] -> [1, seq_len * num_features]
+
+        num_valid = candidates.shape[0]
+
+        is_phase_first = self._is_phase_first_model()
+        if is_phase_first:
+            candidates = candidates.reshape(num_valid, F, L).transpose(1, 2)  # SHAPER: [num_valid, seq_len * num_features] -> reshape -> [num_valid, num_features, seq_len] -> transpose -> [num_valid, seq_len, num_features]
+        else:
+            candidates = candidates.reshape(num_valid, L, F)  # SHAPER: [num_valid, seq_len * num_features] -> [num_valid, seq_len, num_features]
+
+        if self.normalizer is not None and self._is_art_model():
+            # ART samples decode directly to original scale; continuity scoring is done in normalized space.
+            candidates = self._apply_normalizer(candidates, inverse=False)  # SHAPER: [num_valid, seq_len, num_features]
+
+        # Score in Normalized Space
+        level_gap = (prev_window[-1] - candidates[:,0]) ** 2  # SHAPER: prev_window[-1] [num_features] broadcast with candidates[:,0] [num_valid, num_features] -> [num_valid, num_features]
+        level_cost = level_gap.sum(dim=-1)  # SHAPER: [num_valid, num_features] -> [num_valid]
+
+        prev_slope = prev_window[-1] - prev_window[-2]  # SHAPER: [num_features]
+        cand_slope = candidates[:,1] - candidates[:,0]  # SHAPER: [num_valid, num_features]
+        slope_gap = (prev_slope - cand_slope) ** 2  # SHAPER: [num_features] broadcast -> [num_valid, num_features]
+        slope_cost = slope_gap.sum(dim=-1)  # SHAPER: [num_valid, num_features] -> [num_valid]
+
+        total_cost = continuity_weight * level_cost + 0.5 * continuity_weight * slope_cost  # SHAPER: [num_valid]
+        best_idx = torch.argmin(total_cost)  # SHAPER: [num_valid] -> [] (scalar)
+
+        return candidates[best_idx]  # SHAPER: [num_valid, seq_len, num_features] -> [seq_len, num_features]
+
+    def _build_conditions(self, meter_id: int, timestamp: datetime, random_condition: bool = False) -> torch.Tensor:
+        """Build conditions tensor for generation based on meter_id and timestamp. If random_condition is True, it will ignore meter_id and timestamp and return random conditions.
+        Args:
+            meter_id (int): Meter ID for user-profile conditioning.
+            timestamp (datetime): Timestamp for time-based conditioning.
+            random_condition (bool): If True, ignore meter_id and timestamp and return random conditions.
+        Returns:
+            torch.Tensor: Conditions tensor of shape `(1, num_conditions)`.
+
+        SHAPER:
+          -> : [1, num_conditions]
+        """
+        if self.conditioner is None:
+            return None
+        if random_condition:
+            return self.conditioner.get_random_conditions(batch_size=1).to(self.device)  # SHAPER: [1, num_conditions]
+        meter_ids = torch.tensor([meter_id], device=self.device)  # SHAPER: [1]
+        unix_ts = int(timestamp.timestamp())
+        timestamps = torch.tensor([unix_ts], device=self.device)  # SHAPER: [1]
+        conditions = self.conditioner.get_conditions(
+            meter_id=meter_ids,
+            timestamps=timestamps,
+        )  # [B, C]  # SHAPER: [1, num_conditions]
+        return conditions.to(self.device)  # SHAPER: [1, num_conditions]
+
+    def _estimate_candidates_needed(test_loader, normalizer = None, target_gap_kwh: float = 0.5):
+        """
+        Estimate how many candidate samples are needed to find a smooth
+        midnight transition, based on the empirical variance at hour 23 and 0.
+
+        Args:
+            test_loader: (torch.utils.data.DataLoader): PyTorch DataLoader yielding
+                tuples of `(data, meter_id, timestamps)`. `data` must have shape
+                `(batch_size, seq_len, num_features)`.
+            normalizer: Optional normalizer to inverse-transform the data.
+            target_gap_kwh (float): The typical gap in kWh we want to be able to bridge.
+        Returns:
+            int: number of candidates for a smooth transition
+
+        SHAPER:
+          data (from loader) : [batch_size, seq_len, num_features]
+        """
+        hour_0_vals = []
+        hour_23_vals = []
+
+        for batch in test_loader:
+            windows = batch[0]  # SHAPER: [batch_size, seq_len, num_features]
+            if normalizer is not None:
+                windows = normalizer.inverse_transform(windows)  # SHAPER: [batch_size, seq_len, num_features] (rank unchanged)
+            hour_0_vals.append(windows[:,0])  # SHAPER: [batch_size, seq_len, num_features] -> [batch_size, num_features]
+            hour_23_vals.append(windows[:,-1])  # SHAPER: [batch_size, seq_len, num_features] -> [batch_size, num_features]
+
+        hour_0_vals = torch.cat(hour_0_vals, dim=0)  # SHAPER: list of [batch_size, num_features] -> [total_samples, num_features]
+        hour_23_vals = torch.cat(hour_23_vals, dim=0)  #  SHAPER: list of [batch_size, num_features] -> [total_samples, num_features]
+
+        std_0 = hour_0_vals.std(dim=0).mean()  # SHAPER: [total_samples, num_features] -> std(dim=0) -> [num_features] -> mean -> scalar
+        std_23 = hour_23_vals.std(dim=0).mean()  # SHAPER: [total_samples, num_features] -> std(dim=0) -> [num_features] -> mean -> scalar
+        avg_std = (std_0 + std_23) / 2
+
+        n_candidates = int(np.ceil((avg_std / target_gap_kwh) ** 2))
+        n_candidates = max(8, min(n_candidates,256))  # reasonable bounds
+
+        print(f"Estimated std at hour 0: {std_0:.2f} kWh, hour 23: {std_23:.2f} kWh"
+              f" => avg std: {avg_std:.2f} kWh. To bridge a gap of {target_gap_kwh} kWh,"
+              f" we estimate needing ~{n_candidates} candidates.")
+        return n_candidates
+
+
+if __name__ == "__main__":
+    import os
+    import sys
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    root_dir = os.path.dirname(parent_dir)
+    sys.path.append(parent_dir)
+    sys.path.append(root_dir)
+
