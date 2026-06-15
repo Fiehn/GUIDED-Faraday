@@ -215,7 +215,9 @@ class EvalFramework:
             self.register_metric(MembershipInferenceAttack(n_reconstruction_samples=k))
 
     def _is_cvae(self) -> bool:
-        """Check if model is a CVAE based on presence of conditioner on the model."""
+        """
+        Check if model is a CVAE based on presence of conditioner on the model.
+        """
         return hasattr(self.model, 'conditioner') and self.model.conditioner is not None
 
     def _prepare_condition_input(self, x: torch.Tensor) -> torch.Tensor:
@@ -652,7 +654,9 @@ class EvalFramework:
         return res
 
     def _inject_data_into_metrics(self) -> None:
-        """Inject prepared data into metrics that need it."""
+        """
+        Inject prepared data into metrics that need it.
+        """
         for metric in self.reconstruction_metrics.values():
             metric.real_data = self._real_data
             metric.reconstructed_data = self._reconstructed_data
@@ -733,8 +737,11 @@ class EvalFramework:
                 f"Metric {metric_label} must inherit from ReconstructionMetric, SyntheticMetric, or PrivacyMetric"
             )
     
-    def register_metrics(self, metrics: List[EvaluationMetric]) -> None:
-        """Register multiple metrics at once.
+    def register_metrics(self, 
+                         metrics: List[EvaluationMetric]) -> None:
+        """
+        Register multiple metrics at once.
+        
         Args:
             metrics: List of ReconstructionMetric or SyntheticMetric instances
         """
@@ -1078,7 +1085,9 @@ class EvalFramework:
         print()
 
     def get_results(self) -> Dict[str, float]:
-        """Get cached results from last evaluation."""
+        """
+        Get cached results from last evaluation.
+        """
         return self.results.copy()
 
     def save_results(self, output_path: str) -> None:
@@ -1099,7 +1108,19 @@ class EvalFramework:
 
 
 class PhasedEvaluationSuite:
-    """Run separate evaluation views for multi-phase data while preserving the original one-phase evaluator."""
+    """
+    Run separate evaluation views for multi-phase data while preserving the original one-phase evaluator.
+    
+    Attributes: 
+        model: The trained model to evaluate
+        dataloader: DataLoader for evaluation data
+        normalizer: Data normalizer (if used during training)
+        conditioner: Conditioner object (for CVAE, if applicable)
+        device: Device to run on ('cpu' or 'cuda')
+        window_size: Window size used for phase separation (e.g., 96 for 15-min data with 24h windows)
+        n_synthetic_samples: Number of synthetic samples to generate for evaluation
+        output_dir: Directory to save evaluation results and outputs
+    """
 
     def __init__(
         self,
@@ -1136,6 +1157,12 @@ class PhasedEvaluationSuite:
         self.run_c2st = run_c2st
 
     def _prepare_base_framework(self) -> EvalFramework:
+        """
+        Prepare the base evaluation framework to extract real, reconstructed, and synthetic data in phase-first format.
+        
+        Returns:
+            EvalFramework instance with prepared data ready for phased evaluation
+        """
         framework = EvalFramework(
             self.model,
             self.dataloader,
@@ -1720,7 +1747,13 @@ class CrossPhaseEvaluationSuite:
 # ============================================================================
 
 class VisualEvaluation(SyntheticMetric):
-    """Visual evaluation of synthetic data"""
+    """
+    Visual evaluation of synthetic data
+
+    Attributes: 
+        real_data: Real data from dataloader (injected before compute)
+        synthetic_data: Generated synthetic data (injected before compute)
+    """
     
     real_data: np.ndarray = None
     synthetic_data: np.ndarray = None   
@@ -1852,7 +1885,9 @@ class VisualEvaluation(SyntheticMetric):
         plt.close()
     
     def compute(self) -> float:
-        """Generate visual evaluation plots and return success indicator."""
+        """
+        Generate visual evaluation plots and return success indicator.
+        """
         try:
             self.pca()
             self.tsne()
@@ -1864,10 +1899,16 @@ class VisualEvaluation(SyntheticMetric):
 
 
 class ClassicalStatistics(SyntheticMetric):
-    """Classical statistics comparison between real and synthetic data.
-    
+    """
+    Classical statistics comparison between real and synthetic data.
+
     Computes and compares basic statistical properties including mean, variance,
     min/max, quantiles, and standard deviation across time for both datasets.
+
+    Attributes: 
+        real_data: Real data from dataloader (injected before compute)
+        synthetic_data: Generated synthetic data (injected before compute) (injected before compute)
+        output_path: Path to save metric result JSON file (injected before compute)
         Provides a comprehensive overview of how well the synthetic data captures the 
         central tendencies and variability of the real data, both overall and at each time step.
     """
@@ -1943,7 +1984,8 @@ class ClassicalStatistics(SyntheticMetric):
         return stats
     
     def compute(self) -> Dict[str, Any]:
-        """Compute and compare classical statistics between real and synthetic data.
+        """
+        Compute and compare classical statistics between real and synthetic data.
         
         Returns:
             Dict[str, Any]: Dictionary containing both real and synthetic statistics
@@ -1979,7 +2021,9 @@ class ClassicalStatistics(SyntheticMetric):
         return mean_profile_diff
     
     def print_comparison(self):
-        """Print formatted comparison of statistics."""
+        """
+        Print formatted comparison of statistics.
+        """
         stats = self.compute()
         real = stats['real']
         synth = stats['synthetic']

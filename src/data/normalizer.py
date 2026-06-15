@@ -15,10 +15,10 @@ class Normalizer:
     Normalizes data using specified methods.
     Supports both numpy arrays and torch tensors.
 
-    Methods:
-      - zero_preserved_log: Log-transform non-zero values, mark zeros with special sentinel
-      - standard:           Z-score normalisation
-      - log1p:              (log1p(x) - mean) / std 
+    Attributes:
+        zero_preserved_log: Log-transform non-zero values, mark zeros with special sentinel
+        standard: Z-score normalisation
+        log1p: (log1p(x) - mean) / std 
 
     The normalizer can be fitted once across multiple files using
     fit_incremental() / finalise_fit(), and persisted to disk with
@@ -60,8 +60,17 @@ class Normalizer:
         self.manifest = None  # Dict that stores metadata so the file can be reused
     
     # === Helpers ===
-    def to(self, device: str | torch.device) -> 'Normalizer':
-        """Move tensor stats to device."""
+    def to(self, 
+           device: str | torch.device) -> 'Normalizer':
+        """
+        Move tensor stats to device.
+        
+        Args: 
+            device: Target device (e.g. 'cpu' or 'cuda')
+        
+        Returns:
+            self: with stats moved to target device
+        """
         self.device = torch.device(device)
 
         def _move(t):
@@ -77,8 +86,17 @@ class Normalizer:
         self.std  = _move(self.std)
         return self
 
-    def _to_tensor(self, X: np.ndarray | torch.Tensor) -> torch.Tensor:
-        """Convert X to float32 on self.device."""
+    def _to_tensor(self, 
+                   X: np.ndarray | torch.Tensor) -> torch.Tensor:
+        """
+        Convert X to float32 on self.device.
+        
+        Args: 
+            X: Input data as numpy array or torch tensor
+        
+        Returns:
+            Tensor version of X on self.device
+        """
         if isinstance(X, np.ndarray):
             return torch.from_numpy(X.astype(np.float32)).to(self.device)
         return X.float().to(self.device)
@@ -295,12 +313,16 @@ class Normalizer:
     # Persistence
     # ---------------------------------------------------------------
 
-    def save(self, path: str) -> None:
-        """Save fitted stats to disk.
-
+    def save(self, 
+             path: str):
+        """
+        Save fitted stats to disk.
         The file is a plain torch.save dict and can be re-loaded with
         Normalizer.load(path).  It is safe to save before moving tensors
         to GPU; the file always stores stats on CPU.
+
+        Args:
+            path: File path to save the normalizer state (e.g. 'normalizer.pt')
         """
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         state = {
@@ -476,22 +498,38 @@ class Normalizer:
             Y = (torch.log(Y) - self.non_zero_mean) / (self.non_zero_std + self.epsilon) + self.shift
         return Y
 
-    def _zero_preserved_log_inverse(self, X: torch.Tensor) -> torch.Tensor:
-        Y       = X.clone()
+    def _zero_preserved_log_inverse(self, 
+                                    X: torch.Tensor) -> torch.Tensor:
+        """
+        Inverse of zero-preserved log transformation.
+        Values equal to zero_id are set to 0. Non-zero values are transformed back as exp((x - shift) * non_zero_std + non_zero_mean)
+        
+        Args: 
+            X: Input tensor (N, F)
+        
+        Returns:
+            Inverse transformed tensor of the same shape as X
+        """
+        Y = X.clone()
         is_zero = torch.isclose(Y, torch.tensor(float(self.zero_id), dtype=Y.dtype, device=Y.device), atol=0.1)
         Y[~is_zero] = torch.exp((Y[~is_zero] - self.shift) * (self.non_zero_std + self.epsilon) + self.non_zero_mean)
         Y[is_zero]  = 0.0
         return Y
     
-    def transform(self, X) -> torch.Tensor:
+    def transform(self, 
+                  X: np.ndarray | torch.Tensor) -> torch.Tensor:
         """
         Normalise X.  Always returns a float32 torch.Tensor on self.device.
 
-        Args:
-            X (np.ndarray | torch.Tensor): The data to transform. Shape (N, F).
-
+        Args: 
+            X: array-like or Tensor (N, F)
+        
         Returns:
-            torch.Tensor: The normalised data.
+            Normalised tensor of shape (N, F) on self.device
+        
+        Raises:
+            RuntimeError: If the normalizer has not been fitted yet
+            ValueError: If an unknown normalization method is specified
         """
         if not self.fitted:
             raise RuntimeError("Normalizer not fitted. call fit() or finalise_fit() first.")
@@ -514,11 +552,15 @@ class Normalizer:
         """
         Denormalise X back to the original scale.
 
-        Args:
-            X (np.ndarray | torch.Tensor): The normalised data. Shape (N, F).
-
+        Args: 
+            X: array-like or Tensor (N, F)
+        
         Returns:
-            torch.Tensor: The denormalised data on the original scale.
+            Denormalised tensor of shape (N, F) on self.device
+        
+        Raises:
+            RuntimeError: If the normalizer has not been fitted yet
+            ValueError: If an unknown normalization method is specified
         """
         if not self.fitted:
             raise RuntimeError("Normalizer not fitted. call fit() or finalise_fit() first.")

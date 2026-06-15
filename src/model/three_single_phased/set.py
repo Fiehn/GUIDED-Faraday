@@ -47,7 +47,24 @@ class SetGuideVAE(CVAE):
         use_abl_pool: bool = False,
         phased_mode: bool = False,
         **kwargs,
-    ):
+    ) -> None:
+        """Initialize SetGuideVAE.
+
+        Args:
+            input_dim: Flattened input dimensionality.
+            conditioner: Conditioner object for contextual features.
+            latent_dim: Latent dimensionality.
+            distribution_dict: Decoder distribution configuration.
+            prior_type: Prior distribution type name.
+            hierarchy_config: Optional hierarchical latent config.
+            sequence_length: Temporal length per set element.
+            num_features: Number of set elements (e.g., phases).
+            set_hidden_dim: Hidden size used in set encoder.
+            set_num_heads: Attention heads in set blocks.
+            set_num_inds: Number of inducing points in ISAB.
+            set_num_blocks: Number of stacked ISAB blocks.
+            **kwargs: Additional kwargs forwarded to backbone components.
+        """
         super().__init__(
             input_dim=input_dim,
             conditioner=conditioner,
@@ -273,7 +290,22 @@ class SetGuideVAE(CVAE):
 
     # accumulate metrics across validation batches
     @torch.no_grad()
-    def validate(self, valloader, num_samples=1, beta=1.0, device="cpu"):
+    def validate(self,
+                 valloader: torch.utils.data.DataLoader,
+                 num_samples: int = 1,
+                 beta: float = 1.0,
+                 device: str = "cpu") -> dict[str, float]:
+        """Evaluate model on validation data.
+
+        Args:
+            valloader: Validation dataloader.
+            num_samples: Number of posterior samples.
+            beta: KL weighting term.
+            device: Evaluation device.
+
+        Returns:
+            Dictionary of averaged validation metrics.
+        """
         self.eval()
         agg = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
         num_batches = 0
@@ -469,7 +501,15 @@ class MAB(nn.Module):
     Multihead Attention Block as used in Set Transformers.
     multi-head attention + layer norm + feedforward (like Transformer)
     """
-    def __init__(self, dim_Q, dim_K, dim_V, num_heads):
+    def __init__(self, dim_Q: int, dim_K: int, dim_V: int, num_heads: int) -> None:
+        """Initialize multihead attention block.
+
+        Args:
+            dim_Q: Query feature dimension.
+            dim_K: Key/value input feature dimension.
+            dim_V: Attention internal/output feature dimension.
+            num_heads: Number of attention heads.
+        """
         super(MAB, self).__init__()
         self.dim_Q = dim_Q
         self.dim_K = dim_K
@@ -490,7 +530,16 @@ class MAB(nn.Module):
             nn.Linear(dim_V, dim_V),
         )
 
-    def forward(self, Q, K):
+    def forward(self, Q: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+        """Apply multihead attention and feedforward refinement.
+
+        Args:
+            Q: Query tensor `[B, Nq, dQ]`.
+            K: Key/value tensor `[B, Nk, dK]`.
+
+        Returns:
+            Output tensor `[B, Nq, dim_V]`.
+        """
         # Q: [B, Nq, dQ], K: [B, Nk, dK]
         q = self.q_proj(Q)
         k = self.k_proj(K)
@@ -518,13 +567,29 @@ class MAB(nn.Module):
 class ISAB(nn.Module):
     """Direct attention between all element
     's (phases) in the set, with inducing points for efficiency."""
-    def __init__(self, dim_in, dim_out, num_heads=4, num_inds=16):
+    def __init__(self, dim_in: int, dim_out: int, num_heads: int = 4, num_inds: int = 16) -> None:
+        """Initialize induced set attention block.
+
+        Args:
+            dim_in: Input feature dimension per element.
+            dim_out: Output feature dimension.
+            num_heads: Number of attention heads.
+            num_inds: Number of inducing points.
+        """
         super(ISAB, self).__init__()
         self.inducing = nn.Parameter(torch.randn(1, num_inds, dim_out) * 0.02)
         self.mab0 = MAB(dim_Q=dim_out, dim_K=dim_in, dim_V=dim_out, num_heads=num_heads)
         self.mab1 = MAB(dim_Q=dim_in, dim_K=dim_out, dim_V=dim_out, num_heads=num_heads)
 
-    def forward(self, X):
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """Run ISAB over set elements.
+
+        Args:
+            X: Set tensor `[B, N, dim_in]`.
+
+        Returns:
+            Encoded set tensor `[B, N, dim_out]`.
+        """
         # X: [B, N, dim_in]
         B = X.shape[0]
         I = self.inducing.expand(B, -1, -1)
@@ -549,12 +614,27 @@ class SAB(nn.Module):
 # === ABL (Attentive Bottleneck Layer) ===
 class ABL(nn.Module):
     """Pools a set into a fixed-size representation using attention to learn importance weights."""
-    def __init__(self, dim, num_heads=4, num_seed_vectors=1):
+    def __init__(self, dim: int, num_heads: int = 4, num_seed_vectors: int = 1) -> None:
+        """Initialize attentive bottleneck pooling layer.
+
+        Args:
+            dim: Feature dimension of set elements.
+            num_heads: Number of attention heads.
+            num_seed_vectors: Number of pooled output vectors.
+        """
         super(ABL, self).__init__()
         self.seed_vectors = nn.Parameter(torch.randn(1, num_seed_vectors, dim) * 0.02)
         self.mab = MAB(dim_Q=dim, dim_K=dim, dim_V=dim, num_heads=num_heads)
 
-    def forward(self, X):
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """Pool a set into seed-conditioned representations.
+
+        Args:
+            X: Set tensor `[B, N, dim]`.
+
+        Returns:
+            Pooled tensor `[B, num_seed_vectors, dim]`.
+        """
         # X: [B, N, dim] -> [B, num_seed_vectors, dim]
         B = X.shape[0]
         S = self.seed_vectors.expand(B, -1, -1)

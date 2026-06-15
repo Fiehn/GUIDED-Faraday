@@ -2,65 +2,180 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 import numpy as np
+from typing import Any
  
 # =============
 # Prior Distribution Classes
 # =============
+
+
 class BasePrior(nn.Module, ABC):
     """ Base class for prior distributions. 
     Parameters:
     - latent_dim: Dimension of the latent space
     - device: Device to run the prior on
     """
-    def __init__(self, latent_dim, device):
+    def __init__(self, latent_dim: int, device: str | torch.device):
+        """Initialize base prior.
+
+        Args:
+            latent_dim: Latent dimensionality.
+            device: Device string or torch device.
+        """
         super().__init__()
         self.latent_dim = latent_dim
         self.device = device
     
     @abstractmethod
-    def get_params(self):
+    def get_params(self) -> dict[str, torch.Tensor]:
         """Return dict of prior parameters."""
         ...
 
     @abstractmethod
-    def sample(self,batch_size, num_samples=1, **kwargs):
+    def sample(self, batch_size: int, num_samples: int = 1) -> torch.Tensor:
         """Sample from the prior distribution."""
         ...
     
     @abstractmethod
-    def log_prob(self, z):
+    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
         """Compute log probability of z under the prior."""
         ...
     
     @abstractmethod
-    def forward(self, batch_size):
+    def forward(self, batch_size: int) -> dict[str, torch.Tensor]:
         """returns params expanded to batch_size."""
         ...
 
+
 class StandardGaussianPrior(BasePrior):
     """ Standard Normal Prior N(0, I) - non-learnable """
-    def __init__(self, latent_dim, device="cpu"):
+    def __init__(self, latent_dim: int, device: str | torch.device = "cpu"):
+        """Initialize standard Gaussian prior.
+
+        Args:
+            latent_dim: Latent dimensionality.
+            device: Target device.
+        """
         super().__init__(latent_dim, device)
         # We register parameters as buffers, this means that they are saved with the model and moved to device, but not updated during training
         self.register_buffer('mu', torch.zeros((1, latent_dim)))
         self.register_buffer('sigma', torch.ones((1, latent_dim)))
 
-    def get_params(self):
+    def get_params(self) -> dict[str, torch.Tensor]:
+        """Return prior parameters.
+
+        Returns:
+            Dictionary with `mu` and `sigma` buffers.
+        """
         return {"mu": self.mu, "sigma": self.sigma}
     
-    def sample(self, batch_size, num_samples=1, **kwargs):
+    def sample(self, batch_size: int, num_samples: int = 1) -> torch.Tensor:
+        """Draw samples from standard normal prior.
+
+        Args:
+            batch_size: Number of batch items.
+            num_samples: Number of samples per batch item.
+
+        Returns:
+            Tensor shaped `[S, B, D]`.
+        """
         return torch.randn((num_samples, batch_size, self.latent_dim), device=self.sigma.device)
     
-    def log_prob(self, z):
+    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        """Compute log probability under standard normal prior.
+
+        Args:
+            z: Latent tensor.
+
+        Returns:
+            Log-probability tensor.
+        """
         # log prob of standard normal
         return torch.tensor(-0.5 * (z ** 2 + np.log(2 * np.pi)).mean(dim=-1), dtype=z.dtype, device=z.device)
     
-    def forward(self, batch_size):
+    def forward(self, batch_size: int) -> dict[str, torch.Tensor]:
+        """Expand prior parameters to batch shape.
+
+        Args:
+            batch_size: Batch size.
+
+        Returns:
+            Expanded parameter dictionary.
+        """
         return {"mu": self.mu.expand(batch_size, -1), "sigma": self.sigma.expand(batch_size, -1)}
+
+
+class LearnableGaussianPrior(BasePrior):
+    """Learnable diagonal Gaussian prior in latent space.
+
+    Attributes:
+        mu: Learnable mean parameter of shape `[1, latent_dim]`.
+        log_sigma: Learnable log-standard-deviation parameter.
+    """
+
+    def __init__(self,
+                 latent_dim: int,
+                 device: str | torch.device = "cpu",
+                 init_mu: torch.Tensor | None = None,
+                 init_sigma: torch.Tensor | None = None) -> None:
+        """Initialize learnable Gaussian prior.
+
+        Args:
+            latent_dim: Latent dimensionality.
+            device: Target device.
+            init_mu: Optional initial mean tensor.
+            init_sigma: Optional initial sigma tensor.
+        """
+        super().__init__(latent_dim, device)
+
+        if init_mu is None:
+            init_mu = torch.zeros((1, latent_dim))
+        if init_sigma is None:
+            init_sigma = torch.ones((1, latent_dim))
+
+        self.mu = nn.Parameter(init_mu.to(device))
+        self.log_sigma = nn.Parameter(torch.log(init_sigma.to(device)))
+
+    def get_params(self) -> dict[str, torch.Tensor]:
+        """Return current prior parameters."""
+        return {"mu": self.mu, "sigma": torch.exp(self.log_sigma)}
+
+    def sample(self, batch_size: int, num_samples: int = 1) -> torch.Tensor:
+        """Sample latent vectors from the learnable prior."""
+        sigma = torch.exp(self.log_sigma)
+        eps = torch.randn((num_samples, batch_size, self.latent_dim), device=sigma.device)
+        return self.mu + eps * sigma
+
+    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        """Compute log probability of `z` under the learnable Gaussian prior."""
+        params = self.get_params()
+        mu = params["mu"]
+        sigma = params["sigma"]
+        return -0.5 * (((z - mu) / sigma) ** 2 + 2 * torch.log(sigma) + torch.log(2 * torch.pi)).sum(dim=-1)
+
+    def forward(self, batch_size: int) -> dict[str, torch.Tensor]:
+        """Expand prior parameters to batch size."""
+        sigma = torch.exp(self.log_sigma)
+        return {"mu": self.mu.expand(batch_size, -1), "sigma": sigma.expand(batch_size, -1)}
     
+
 class LearnableDictionaryPrior(BasePrior):
     """ Learnable Gaussian Prior N(mu, sigma) in dictionary space """
-    def __init__(self, latent_dim, dictionary_size, device="cpu", init_mu = None, init_sigma = None):
+    def __init__(self,
+                 latent_dim: int,
+                 dictionary_size: int,
+                 device: str | torch.device = "cpu",
+                 init_mu: torch.Tensor | None = None,
+                 init_sigma: torch.Tensor | None = None):
+        """Initialize learnable dictionary-space prior.
+
+        Args:
+            latent_dim: Latent dimensionality.
+            dictionary_size: Dictionary-space dimensionality.
+            device: Target device.
+            init_mu: Optional initial mean.
+            init_sigma: Optional initial sigma.
+        """
         super().__init__(latent_dim, device)
         self.dictionary_size = dictionary_size
 
@@ -72,14 +187,33 @@ class LearnableDictionaryPrior(BasePrior):
         self.mu = nn.Parameter(init_mu.to(device))
         self.log_sigma = nn.Parameter(torch.log(init_sigma.to(device)))  # We learn log(sigma) for stability
 
-    def get_params(self):
+    def get_params(self) -> dict[str, torch.Tensor]:
+        """Return current learnable prior parameters."""
         return {"mu": self.mu, "sigma": torch.exp(self.log_sigma)}
-    def sample(self, batch_size, num_samples=1, **kwargs):
+
+    def sample(self, batch_size: int, num_samples: int = 1) -> torch.Tensor:
+        """Sample latent vectors from learnable Gaussian prior.
+
+        Args:
+            batch_size: Number of batch items.
+            num_samples: Number of samples per batch item.
+
+        Returns:
+            Sample tensor.
+        """
         sigma = torch.exp(self.log_sigma)
         eps = torch.randn((num_samples, batch_size, self.latent_dim), device=sigma.device)
         return self.mu + eps * sigma
     
-    def log_prob(self, z):
+    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        """Compute log probability under learnable Gaussian prior.
+
+        Args:
+            z: Latent tensor.
+
+        Returns:
+            Log-probability tensor.
+        """
         params = self.get_params()
         mu = params["mu"]
         sigma = params["sigma"]
@@ -91,7 +225,14 @@ class LearnableDictionaryPrior(BasePrior):
     
 class StandardDictionaryPrior(BasePrior):
     """ Standard Normal Prior N(0, I) in dictionary space - non-learnable """
-    def __init__(self, latent_dim, dictionary_size, device="cpu"):
+    def __init__(self, latent_dim: int, dictionary_size: int, device: str | torch.device = "cpu"):
+        """Initialize standard dictionary prior.
+
+        Args:
+            latent_dim: Output latent dimensionality.
+            dictionary_size: Dictionary-space dimensionality.
+            device: Target device.
+        """
         super().__init__(latent_dim, device)
         self.dictionary_size = dictionary_size
 
@@ -99,14 +240,24 @@ class StandardDictionaryPrior(BasePrior):
         self.register_buffer('mu', torch.zeros((1, latent_dim)))
         self.register_buffer('sigma', torch.ones((1, dictionary_size)))
 
-    def get_params(self):
+    def get_params(self) -> dict[str, torch.Tensor]:
+        """Return prior parameters."""
         return {"mu": self.mu, "sigma": self.sigma}
     
-    def sample(self, batch_size, num_samples=1, **kwargs):
+    def sample(self, batch_size: int, num_samples: int = 1) -> torch.Tensor:
+        """Sample in dictionary space.
+
+        Args:
+            batch_size: Number of batch items.
+            num_samples: Number of samples per batch item.
+
+        Returns:
+            Dictionary-space tensor shaped `[S, B, dictionary_size]`.
+        """
         eps = torch.randn(num_samples, batch_size, self.dictionary_size, device=self.sigma.device)
         return eps  # Will be mapped by SigmaMapper in encoder
     
-    def log_prob(self, z):
+    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
         """
         Compute log prob.
         """
@@ -117,12 +268,28 @@ class StandardDictionaryPrior(BasePrior):
         #covariance_matrix = torch.diag(self.sigma.squeeze(0) ** 2).to(self.device)
         #return torch.distributions.MultivariateNormal(self.mu.squeeze(0), covariance_matrix).log_prob(z)
     
-    def forward(self, batch_size):
+    def forward(self, batch_size: int) -> dict[str, torch.Tensor]:
+        """Expand parameters to batch size."""
         return {"mu": self.mu.expand(batch_size, -1), "sigma": self.sigma.expand(batch_size, -1)}
-    
+
+
 class LearnableDictionaryPrior(BasePrior):
     """ Learnable Gaussian Prior N(mu, sigma) in dictionary space """
-    def __init__(self, latent_dim, dictionary_size, device="cpu", init_mu = None, init_sigma = None):
+    def __init__(self,
+                 latent_dim: int,
+                 dictionary_size: int,
+                 device: str | torch.device = "cpu",
+                 init_mu: torch.Tensor | None = None,
+                 init_sigma: torch.Tensor | None = None):
+        """Initialize learnable dictionary prior (dictionary-space sampling version).
+
+        Args:
+            latent_dim: Latent dimensionality.
+            dictionary_size: Dictionary-space dimensionality.
+            device: Target device.
+            init_mu: Optional initial mean.
+            init_sigma: Optional initial sigma.
+        """
         super().__init__(latent_dim, device)
         self.dictionary_size = dictionary_size
 
@@ -134,15 +301,34 @@ class LearnableDictionaryPrior(BasePrior):
         self.mu = nn.Parameter(init_mu.to(device))
         self.log_sigma = nn.Parameter(torch.log(init_sigma.to(device)))  # We learn log(sigma) for stability
 
-    def get_params(self):
+    def get_params(self) -> dict[str, torch.Tensor]:
+        """Return learnable prior parameters."""
         return {"mu": self.mu, "sigma": torch.exp(self.log_sigma)}
-    def sample(self, batch_size, num_samples=1, **kwargs):
+
+    def sample(self, batch_size: int, num_samples: int = 1) -> torch.Tensor:
+        """Sample dictionary-space latent codes.
+
+        Args:
+            batch_size: Number of batch items.
+            num_samples: Number of samples per batch item.
+
+        Returns:
+            Dictionary-space sample tensor.
+        """
         sigma = torch.exp(self.log_sigma)
         eps = torch.randn((num_samples, batch_size, self.dictionary_size), device=sigma.device)
         # Return samples in dictionary space only (mu in latent space is added after
         # the SigmaMapper transform in CVAE.sample, matching StandardDictionaryPrior behaviour)
         return eps * sigma
-    def log_prob(self, z):
+    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        """Compute log probability under learnable prior.
+
+        Args:
+            z: Latent tensor.
+
+        Returns:
+            Log-probability tensor.
+        """
         params = self.get_params()
         mu = params["mu"]
         sigma = params["sigma"]
@@ -150,6 +336,7 @@ class LearnableDictionaryPrior(BasePrior):
     def forward(self, batch_size):
         sigma = torch.exp(self.log_sigma)
         return {"mu": self.mu.expand(batch_size, -1), "sigma": sigma.expand(batch_size, -1)}
+
 
 class VampPrior(BasePrior):
     """ 
@@ -167,7 +354,23 @@ class VampPrior(BasePrior):
     """
     supports_analytical_kl = False  # Must use Monte Carlo KL
 
-    def __init__(self, latent_dim, input_shape, encoder=None, num_components=10, device="cpu", **_):
+    def __init__(self,
+                 latent_dim: int,
+                 input_shape: int | tuple[int, ...],
+                 encoder: Any | None = None,
+                 num_components: int = 10,
+                 device: str | torch.device = "cpu",
+                 **_):
+        """Initialize VampPrior.
+
+        Args:
+            latent_dim: Latent dimensionality.
+            input_shape: Pseudo-input shape used by encoder.
+            encoder: Encoder reference used to parameterize mixture components.
+            num_components: Number of pseudo-input components.
+            device: Target device.
+            **_: Unused compatibility kwargs.
+        """
         super().__init__(latent_dim, device)
         self.num_components = num_components
         self.encoder = encoder  # Reference — assigned before use!
@@ -180,7 +383,9 @@ class VampPrior(BasePrior):
         # Initialize with small noise to break symmetry
         self.pseudo_inputs = nn.Parameter(torch.randn(num_components, *input_shape) * 0.01)
 
-    def set_encoder(self, encoder, input_shape=None):
+    def set_encoder(self,
+                    encoder: Any,
+                    input_shape: int | tuple[int, ...] | None = None) -> None:
         """Re-point the prior to a (possibly new) encoder and optionally
         resize the pseudo-inputs to match a new input dimension."""
         self.encoder = encoder
@@ -194,7 +399,7 @@ class VampPrior(BasePrior):
                                 device=self.pseudo_inputs.device) * 0.01
                 )
 
-    def get_params(self):
+    def get_params(self) -> dict[str, torch.Tensor]:
         """Return MEAN parameters across all components to work with existing expand() logic.
         This lets VampPrior work with the existing VAE structure."""
         component_params = self.encoder(self.pseudo_inputs)  # [K, ...]
@@ -202,7 +407,7 @@ class VampPrior(BasePrior):
         # Return the mean across components - this works with existing expand() logic
         return {k: v.mean(dim=0, keepdim=True) for k, v in component_params.items()}
 
-    def sample(self, batch_size, num_samples=1, **kwargs):
+    def sample(self, batch_size: int, num_samples: int = 1) -> torch.Tensor:
         """Sample by randomly selecting components then using encoder's reparameterize."""
         component_params = self.encoder(self.pseudo_inputs)  # [K, ...]
 
@@ -220,7 +425,7 @@ class VampPrior(BasePrior):
         
         return torch.cat(samples_list, dim=0)  # [S, B, D]
 
-    def log_prob(self, z):
+    def log_prob(self, z: torch.Tensor) -> torch.Tensor:
         """Compute log p(z) = log( (1/K) sum_k q(z | u_k) )."""
         component_params = self.encoder(self.pseudo_inputs)  # [K, ...]
 
@@ -285,7 +490,7 @@ class VampPrior(BasePrior):
         # Mixture: log (1/K) sum_k exp(log_prob_k) = logsumexp - log(K)
         return logsumexp_all - np.log(K)
     
-    def forward(self, batch_size):
+    def forward(self, batch_size: int) -> dict[str, torch.Tensor]:
         """Return mean parameters expanded to batch_size for compatibility."""
         params = self.get_params()
         return {k: v.expand(batch_size, -1) for k, v in params.items()}

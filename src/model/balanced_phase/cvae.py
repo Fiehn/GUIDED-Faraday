@@ -4,6 +4,21 @@ from model.balanced_phase.vae import *
 # Define the Conditional VAE (CVAE) class
 # ==============
 class CVAE(VAE):
+    """
+    Conditional variational autoencoder for time-series generation.
+
+    This model extends `VAE` by concatenating condition vectors into both encoder
+    and decoder pathways. It supports optional hierarchical latent processing and
+    conditioned sampling/reconstruction workflows.
+
+    Attributes:
+        conditioner: Conditioner object used to build conditioning vectors.
+        condition_dim: Total dimensionality of concatenated condition vectors.
+        latent_dim: Latent dimensionality used by posterior and prior models.
+        encoder: Conditioned encoder expecting `[x, c]` input.
+        decoder: Conditioned decoder expecting `[z, c]` input.
+        num_parameters: Trainable parameter count for encoder and decoder.
+    """
     def __init__(
         self,
         input_dim: int,
@@ -22,6 +37,18 @@ class CVAE(VAE):
         decoder_mu_activation: str = "tanh",
         **kwargs,
     ):
+        """
+        Initialize a conditioned VAE architecture.
+
+        Args:
+            input_dim: Flattened input dimensionality of each sample.
+            conditioner: Conditioner instance for generating side-information.
+            latent_dim: Latent dimensionality.
+            distribution_dict: Decoder distribution configuration.
+            prior_type: Name of prior distribution variant.
+            hierarchy_config: Optional hierarchical latent configuration.
+            **kwargs: Additional model kwargs forwarded to encoder/decoder builders.
+        """
         if distribution_dict is None:
             distribution_dict = {}
         distribution_dict = dict(distribution_dict)
@@ -112,16 +139,17 @@ class CVAE(VAE):
 
     def forward(self, x: torch.Tensor, c: torch.Tensor, num_samples: int = 1):
         """
-        Forward pass with pre-computed conditions.
+        Run conditioned forward pass.
         
         Args:
-            x: Input tensor [B, D] (already flattened)
-            c: Condition tensor [B, C] (already computed)
-            num_samples: Number of latent samples
+            x: Flattened input tensor `[B, D]`.
+            c: Condition tensor `[B, C]`.
+            num_samples: Number of latent samples to draw from posterior.
         
         Returns:
-            recon_params: dict with [S, B, D] tensors
-            q_params: dict with [B, latent_dim] tensors
+            Tuple `(recon_params, q_params)` where:
+            - `recon_params` is a dict of tensors shaped `[S, B, D]`
+            - `q_params` is a dict of posterior params shaped `[B, latent_dim]`
         """
         # Encode: [B, D+C] -> posterior params
         enc_in = torch.cat([x, c], dim=-1)
@@ -176,6 +204,22 @@ class CVAE(VAE):
         return loss
 
     def train_core(self, batch, optim, beta=1.0,weighted_loss=0.0, gradient_clip=None, gradient_clip_kwargs=None, **_):
+        """
+        Run one CVAE training step.
+
+        Args:
+            batch: Batch in one of supported formats `(x, c, meter_id, timestamps)`,
+                `(x, meter_id, timestamps)`, `(x, meter_id)`, or `x` only.
+            optim: Optimizer used for parameter updates.
+            beta: KL weighting factor.
+            weighted_loss: Optional weighting passed into loss function.
+            gradient_clip: Enables gradient clipping when not None.
+            gradient_clip_kwargs: Options for `clip_grad_norm_`.
+            **_: Extra compatibility kwargs.
+
+        Returns:
+            Loss dictionary from `self.loss(...)`.
+        """
         self.train()
         x, meter_id, timestamps, agg = self._unpack_batch(batch)
                 
@@ -200,6 +244,18 @@ class CVAE(VAE):
 
     @torch.no_grad()
     def validate(self, valloader, num_samples: int = 1, beta: float = 1.0, device: str = "cpu"):
+        """
+        Evaluate CVAE loss terms on a validation loader.
+
+        Args:
+            valloader: Validation dataloader.
+            num_samples: Number of latent samples (kept for API compatibility).
+            beta: KL weighting factor.
+            device: Device used for evaluation.
+
+        Returns:
+            Dictionary with averaged `loss`, `recon_loglikelihood`, and `kl_divergence`.
+        """
         self.eval()
         metrics = {"loss": 0.0, "recon_loglikelihood": 0.0, "kl_divergence": 0.0}
         num_batches = 0
@@ -229,7 +285,19 @@ class CVAE(VAE):
         return metrics
 
     @torch.no_grad()
-    def sample(self, conditions: torch.Tensor, num_prior_samples: int = 1, num_x_samples: int = 1, device: str = "cpu", **kwargs):
+    def sample(self, conditions: torch.Tensor, num_prior_samples: int = 1, num_x_samples: int = 1, device: str = "cpu",):
+        """
+        Generate conditioned synthetic samples from the prior.
+
+        Args:
+            conditions: Condition tensor `[B, C]`.
+            num_prior_samples: Number of prior draws per batch element.
+            num_x_samples: Number of decoder samples per prior draw.
+            device: Device used for sampling.
+
+        Returns:
+            Tensor of generated samples shaped `[S, num_x_samples, B, D]`.
+        """
         self.eval()
 
         original_device = next(self.parameters()).device
@@ -306,6 +374,18 @@ class CVAE(VAE):
     
     @torch.no_grad()
     def reconstruct(self, x: torch.Tensor, meter_ids: torch.Tensor, timestamps: torch.Tensor, num_samples: int = 1):
+        """
+        Reconstruct inputs under observed conditions.
+
+        Args:
+            x: Input tensor in `[B, L, F]` or `[B, D]` format.
+            meter_ids: Meter identifiers used by conditioner.
+            timestamps: Timestamps used by conditioner.
+            num_samples: Number of posterior samples for reconstruction.
+
+        Returns:
+            Tuple `(recon_params, q_params)` from conditioned forward pass.
+        """
         self.eval()
         x = self._prep_inputs(x)
         c = self.conditioner.get_conditions(x, meter_id=meter_ids, timestamps=timestamps)
