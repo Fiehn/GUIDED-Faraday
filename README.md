@@ -79,3 +79,14 @@ uv run pytest
 - **Phased data**: 15-minute resolution 3-phase readings (distinct from hourly aggregated data)
 - **Conditioner**: produces a fixed-size conditioning vector per window (day-of-week, EV presence, user profile, ...)
 - **Holdout feeder pool**: LV Feeders jointly excluded from training for OOD evaluation
+
+## Cite
+If using the GUIDED-Faraday model for your work please cite the following.
+@thesis{kold2026a,
+  author = {Kold, Clara Regine Hoeg and Fiehn, Rasmus Lyhne},
+  title = {Conditional generative modeling for statistically representative per phase smart meter time series},
+  language = {eng},
+  format = {thesis},
+  year = {2026},
+  publisher = {DTU Department of Wind and Energy Systems}
+}
