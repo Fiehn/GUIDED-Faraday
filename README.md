@@ -82,6 +82,7 @@ uv run pytest
 
 ## Cite
 If using the GUIDED-Faraday model for your work please cite the following.
+```
 @thesis{kold2026a,
   author = {Kold, Clara Regine Hoeg and Fiehn, Rasmus Lyhne},
   title = {Conditional generative modeling for statistically representative per phase smart meter time series},
@@ -90,3 +91,4 @@ If using the GUIDED-Faraday model for your work please cite the following.
   year = {2026},
   publisher = {DTU Department of Wind and Energy Systems}
 }
+```
